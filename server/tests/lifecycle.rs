@@ -576,6 +576,7 @@ async fn duplicate_copies_the_template_and_nothing_that_would_surprise_you() {
         done_action: "notify".into(),
         confirm_finish: 0,
         bypass_permissions: 0,
+        archive_on_stop: 0,
         created: chrono::Utc::now().timestamp(),
         updated: chrono::Utc::now().timestamp(),
         deleted: None,
