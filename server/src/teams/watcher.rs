@@ -969,6 +969,7 @@ mod tests {
                 creator: None,
                 flags: None,
                 bypass_permissions: None,
+                archive_on_stop: None,
                 tags: None,
                 branch: None,
                 mcp: None,
@@ -1013,6 +1014,7 @@ mod tests {
                 creator: Some("team".into()),
                 flags: None,
                 bypass_permissions: None,
+                archive_on_stop: None,
                 tags: Some(vec!["team".into()]),
                 branch: None,
                 mcp: None,
@@ -1085,6 +1087,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                archive_on_stop: None,
             },
         )
         .await
@@ -1151,6 +1154,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                archive_on_stop: None,
             },
         )
         .await
@@ -1221,6 +1225,7 @@ mod tests {
             creator: None,
             flags: None,
             bypass_permissions: None,
+            archive_on_stop: None,
             tags: None,
             branch: None,
             mcp: None,
