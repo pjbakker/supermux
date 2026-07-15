@@ -1,4 +1,5 @@
 use supermux_server::config::{Config, ProviderDefaults, TlsConfig};
+use supermux_server::sessions::lifecycle;
 use supermux_server::state::AppState;
 use supermux_server::{db, http};
 
@@ -60,4 +61,37 @@ async fn archive_pending_true_only_when_flagged_and_live() {
     // Once archived, no longer pending.
     db::sessions::set_archived(&state.pool, "boot-a", true).await.unwrap();
     assert!(!db::sessions::archive_pending(&state.pool, "boot-a").await.unwrap());
+}
+
+#[tokio::test]
+async fn maybe_archive_on_stop_archives_only_flagged_and_is_idempotent() {
+    let (state, _router, _dir) = setup().await;
+    insert_session(&state, "flagged", true).await;
+    insert_session(&state, "plain", false).await;
+
+    // Flagged -> archived.
+    lifecycle::maybe_archive_on_stop(&state, "flagged").await;
+    assert_eq!(db::sessions::is_archived(&state.pool, "flagged").await.unwrap(), Some(true));
+
+    // Unflagged -> untouched.
+    lifecycle::maybe_archive_on_stop(&state, "plain").await;
+    assert_eq!(db::sessions::is_archived(&state.pool, "plain").await.unwrap(), Some(false));
+
+    // Idempotent: a second call on the already-archived row logs no new audit row.
+    let before = audit_count(&state.pool, "flagged").await;
+    lifecycle::maybe_archive_on_stop(&state, "flagged").await;
+    let after = audit_count(&state.pool, "flagged").await;
+    assert_eq!(before, after, "second call must be a no-op (no duplicate audit)");
+}
+
+/// Count `session.archive` audit rows for `target`.
+async fn audit_count(pool: &sqlx::SqlitePool, target: &str) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'session.archive' AND target = ?",
+    )
+    .bind(target)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    n
 }
