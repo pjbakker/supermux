@@ -963,6 +963,10 @@ pub struct CreateInput {
     /// they timed out.
     #[serde(default)]
     pub runtime: Option<String>,
+    /// Stamp the created session so it auto-archives when it stops. Set by the
+    /// scheduler for booted sessions; `None`/`false` for every other caller.
+    #[serde(default)]
+    pub archive_on_stop: Option<bool>,
 }
 
 pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView, AppError> {
@@ -1062,6 +1066,7 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         worktree_repo: String::new(),
         host_id: input.host_id,
         runtime: runtime_kind,
+        archive_on_stop: input.archive_on_stop.unwrap_or(false),
     };
     db::sessions::create(&state.pool, &new).await?;
     let hook_token = gen_hook_token();
@@ -2296,6 +2301,7 @@ mod tests {
             worktree: None,
             host_id: None,
             runtime: None,
+            archive_on_stop: None,
         }
     }
 
