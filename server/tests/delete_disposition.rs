@@ -103,6 +103,7 @@ fn tmux_schedule(id: &str, session: &str) -> Schedule {
         done_action: "notify".to_string(),
         confirm_finish: 0,
         bypass_permissions: 0,
+        archive_on_stop: 0,
         created: now,
         updated: now,
         deleted: None,
