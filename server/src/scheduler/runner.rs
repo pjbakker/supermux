@@ -444,6 +444,7 @@ mod tests {
             done_action: "disable".into(),
             confirm_finish: 0,
             bypass_permissions: 0,
+            archive_on_stop: 0,
             created: 0,
             updated: 0,
             deleted: None,
