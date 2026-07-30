@@ -24,6 +24,7 @@ use crate::error::AppError;
 use crate::files::transport::{FileTransport, LocalFileTransport, SshFileTransport};
 use crate::state::{AppState, SseEvent};
 
+use super::runtime::SessionRuntime;
 use super::status::{self, Mode};
 use super::tmux::Tmux;
 use super::transport::HostId;
@@ -475,9 +476,9 @@ fn should_escape_resume_picker(capture: &str, resume_intended: bool, already_esc
 }
 
 /// Confirm the pane shell is live (and let it print a prompt).
-async fn settle_shell(tmux: &Tmux<'_>) -> bool {
+async fn settle_shell(rt: &dyn SessionRuntime) -> bool {
     for _ in 0..10 {
-        if tmux.exists().await.unwrap_or(false) {
+        if rt.alive().await {
             tokio::time::sleep(Duration::from_millis(150)).await;
             return true;
         }
@@ -499,7 +500,7 @@ async fn settle_shell(tmux: &Tmux<'_>) -> bool {
 /// always work". The trust-dialog gate still runs on both paths (auto-accepting is
 /// non-destructive and needed so a resume in a never-trusted dir doesn't hang).
 async fn wait_for_agent_ready(
-    tmux: &Tmux<'_>,
+    rt: &dyn SessionRuntime,
     state: &AppState,
     name: &str,
     resume_intended: bool,
@@ -508,7 +509,7 @@ async fn wait_for_agent_ready(
     let mut trusted = false;
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        if let Ok(cap) = tmux.capture_pane(40).await {
+        if let Ok(cap) = rt.capture_plain(40).await {
             // Dismiss the first-run BOOT GATES *before* the ready-check. Both the
             // trust dialog and the resume picker draw a numbered menu whose cursor
             // is `❯` — the exact glyph `agent_ui_visible` keys on — so a ready-check
@@ -526,14 +527,14 @@ async fn wait_for_agent_ready(
             if !trusted && at_trust_dialog(&cap) {
                 // Default option is "1. Yes, I trust this folder"; a bare Enter
                 // accepts it (and persists the trust so it never reappears).
-                let _ = tmux.send_key("Enter").await;
+                let _ = rt.send_key("Enter").await;
                 trusted = true;
                 continue;
             }
             if should_escape_resume_picker(&cap, resume_intended, escaped) {
-                let _ = tmux.send_key("Escape").await;
-                let _ = tmux.send_key("Escape").await;
-                let _ = tmux.send_key("C-c").await;
+                let _ = rt.send_key("Escape").await;
+                let _ = rt.send_key("Escape").await;
+                let _ = rt.send_key("C-c").await;
                 let _ = db::sessions::clear_cc(&state.pool, name).await;
                 escaped = true;
                 continue;
@@ -629,6 +630,34 @@ pub(crate) fn broadcast_send(state: &AppState, name: &str, text: &str, at: i64) 
 const STOP_GRACE_POLL: Duration = Duration::from_millis(50);
 const STOP_GRACE_CAP: Duration = Duration::from_millis(1_500);
 
+/// Would typing the launch command now land it in a program that is ALREADY
+/// running in the session's terminal?
+///
+/// | `freshly_spawned` | `shell_is_foreground` | result | why |
+/// |---|---|---|---|
+/// | `true`  | any           | `false` | brand-new terminal: nothing is running |
+/// | `false` | `Some(false)` | `true`  | a program owns the pty — do not type at it |
+/// | `false` | `Some(true)`  | `false` | shell prompt waiting: this is the recovery path (the agent exited, the terminal did not) |
+/// | `false` | `None`        | `false` | backend can not tell (tmux) — historical behaviour, byte-for-byte |
+fn agent_already_running(freshly_spawned: bool, shell_is_foreground: Option<bool>) -> bool {
+    !freshly_spawned && shell_is_foreground == Some(false)
+}
+
+/// Pause between literal text and the `Enter` that submits it, as the session's
+/// backend requires ([`SessionRuntime::submit_gap`]).
+///
+/// MUST be called at every text-then-Enter site. On tmux the gap is `ZERO` and
+/// this compiles down to a branch (no sleep, no timer, and — unlike the DB
+/// `runtime` lookup this replaced — no query while the per-session lock is
+/// held). On the native runtime it is the 50 ms that keeps an Ink TUI from
+/// reading text+`\r` as one paste, turning the submit into a newline.
+async fn submit_gap(rt: &dyn SessionRuntime) {
+    let gap = rt.submit_gap();
+    if !gap.is_zero() {
+        tokio::time::sleep(gap).await;
+    }
+}
+
 async fn require_session(state: &AppState, name: &str) -> Result<Session, AppError> {
     db::sessions::get(&state.pool, name)
         .await?
@@ -663,8 +692,73 @@ pub async fn start(
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
 
-    let s = require_session(state, name).await?;
-    let tmux = Tmux::new(name);
+    let mut s = require_session(state, name).await?;
+    // NATIVE-BY-DEFAULT MIGRATION. The tmux-less runtime is the product default;
+    // a legacy `runtime='tmux'` row upgrades AT THE FIRST FRESH START — i.e. when
+    // its tmux pane is gone, so a live pane (and its scrollback) is never yanked
+    // from under a running agent. Teams stay tmux (Claude renders teammates as
+    // tmux panes) and remote-host sessions stay tmux (a pty holder is local by
+    // definition). The flip is durable (column write) + the runtime cache is
+    // invalidated so `runtime_for` below builds the native backend immediately.
+    // (`force_agent_teams` marks an in-flight team-lead conversion — its start
+    // must stay tmux even though `team_name` is only set by detection later.)
+    // "Fresh start" covers BOTH shapes a restart takes: the tmux session is
+    // fully gone, OR it lingers as a remain-on-exit DEAD pane (the normal
+    // stop→start cycle — `stop` leaves the dead pane for capturability). Only a
+    // pane with a LIVE agent blocks the migration: this start() is then just a
+    // wake/ensure and yanking a running pty is never acceptable.
+    //
+    // Teams are detected PHYSICALLY (>1 live tmux pane), NOT via `team_name`:
+    // with the global agent-teams pref on, Claude writes an IMPLICIT solo team
+    // (`session-<id8>`, members = just the lead, in-process) for every plain
+    // session, and the watcher stamps `team_name` on those rows — a label that
+    // says nothing about tmux panes. Blocking on it froze half the fleet on
+    // tmux (found live: a hand-started single session refused to migrate).
+    // `start_count > 0` scopes the migration to rows that have RUN before (the
+    // legacy fleet being upgraded): a freshly-created row that explicitly chose
+    // tmux (tests, tooling, the team-convert flip) gets its first start on the
+    // runtime it asked for. New rows default to native at create anyway.
+    if s.runtime == crate::sessions::runtime::RUNTIME_TMUX
+        && s.start_count > 0
+        && s.host_id.is_none()
+        && !state.force_agent_teams(name)
+    {
+        let tmux = Tmux::new(name);
+        let texists = tmux.exists().await.unwrap_or(true);
+        // A REAL rendered team = more than one live pane → never migrate it.
+        let multi_pane = texists
+            && tmux
+                .list_pane_ids()
+                .await
+                .map(|p| p.len() > 1)
+                .unwrap_or(true);
+        // Fresh = no session, a dead pane, OR a pane whose foreground process
+        // group is the shell itself (the agent exited back to bash — the shape
+        // `stop` actually leaves behind, since /exit ends claude but not the
+        // pane's bash). Only a pane with a live FOREGROUND AGENT blocks.
+        let mut fresh =
+            !texists || (!multi_pane && tmux.pane_dead().await.unwrap_or(false));
+        if !fresh && !multi_pane {
+            if let Ok(Some(pid)) = tmux.pane_pid().await {
+                fresh = crate::sessions::native::runtime::foreground_pgid(pid) == Some(pid);
+            }
+        }
+        if fresh {
+            if texists {
+                // Kill the dead-pane remnant so the native spawn owns the name.
+                let _ = tmux.kill_session().await;
+            }
+            db::sessions::set_runtime(&state.pool, name, crate::sessions::runtime::RUNTIME_NATIVE)
+                .await?;
+            state.runtime_invalidate(name);
+            s.runtime = crate::sessions::runtime::RUNTIME_NATIVE.to_string();
+            state.pty_invalidate(name);
+            tracing::info!(session = name, "runtime migrated tmux → native on fresh start");
+        }
+    }
+    // Runtime seam: `runtime_for` returns the backend for the row's `runtime`
+    // column, built exactly as `Tmux::new(name)` built it here before.
+    let rt = state.runtime_for(name).await?;
 
     // Rotate the hook token on every start to avoid long-lived env secrets.
     let hook_token = super::gen_hook_token();
@@ -707,7 +801,14 @@ pub async fn start(
         // When teams is enabled, also force `teammateMode:"tmux"` so a
         // lead spawns teammates as split-panes on supermux's socket (not the
         // invisible in-process backend). Gated + Claude-only; non-fatal on error.
-        if agent_teams {
+        //
+        // ALSO runtime-gated: `teammateMode:"tmux"` tells Claude Code to
+        // `split-window` on the tmux server supermux owns. A native session has
+        // no tmux window to split into, so writing that setting would point
+        // Claude at a multiplexer this session doesn't use. Native sessions skip
+        // it (and `teams::start` refuses to convert one, so a native lead can
+        // never exist in the first place).
+        if agent_teams && s.runtime != super::runtime::RUNTIME_NATIVE {
             if let Err(e) = crate::claude_config::install_agent_teams_setting(
                 name,
                 transport.as_ref(),
@@ -731,10 +832,10 @@ pub async fn start(
     let dir = PathBuf::from(&s.dir);
     let shell = user_shell();
 
-    let freshly_spawned = !tmux.exists().await?;
+    let freshly_spawned = !rt.alive().await;
     if freshly_spawned {
-        // A genuinely new tmux pane is about to exist for this name. Drop any
-        // cached live pty stream first: it is bound to a PRIOR (now-dead) pane,
+        // A genuinely new pane/pty is about to exist for this name. Drop any
+        // cached live pty stream: it is bound to a PRIOR (now-dead) pane,
         // and because the new session reuses the same name the stream's liveness
         // poll would never invalidate it on its own. `stop` already does this on
         // the restart path; this also covers a start that follows an external
@@ -743,8 +844,15 @@ pub async fn start(
         // A SERVER restart starts with an empty registry and never hits this
         // `freshly_spawned` branch (it re-attaches to the surviving session), so
         // session-survival is untouched.
+        //
+        // AFTER the spawn, not before: pre-seam the liveness probe was fallible
+        // (`tmux has-session` + `?`) and a probe fault propagated BEFORE anything
+        // was invalidated. `SessionRuntime::alive` is infallible by contract
+        // ("a fault reads as gone"), so a transient probe glitch on a session
+        // that is actually running now lands here — and must not tear down that
+        // live session's cached stream on the way to a spawn that fails.
+        rt.spawn(&dir, &env, &shell).await?;
         state.pty_invalidate(name);
-        tmux.new_session(&dir, &env, &shell).await?;
     }
 
     // BOOTING window (overview UX): mark the session `starting` before
@@ -776,15 +884,42 @@ pub async fn start(
         payload: json!({ "delta": [{ "name": name, "status": "starting" }] }),
     });
 
+    // DOUBLE-LAUNCH GUARD. `start()` on a session whose terminal is already up
+    // skips the spawn but historically still typed the launch command — harmless
+    // on tmux (that path is reached when the pane exists but its program died,
+    // i.e. a bash prompt is waiting for exactly that command), catastrophic when
+    // the program is in fact still RUNNING: `claude --resume …` gets typed into
+    // the live agent's composer.
+    //
+    // The native runtime can reach that state for real — its holder survives a
+    // daemon restart, so a post-deploy Start finds `alive() == true` with Claude
+    // still at the wheel (that path is also why the boot reconcile now probes
+    // native liveness instead of assuming `stopped`).
+    //
+    // See [`agent_already_running`] for the decision table.
+    let already_running =
+        agent_already_running(freshly_spawned, rt.shell_is_foreground().await);
+
     let ready = match s.provider.as_str() {
-        "shell" => settle_shell(&tmux).await,
+        "shell" => settle_shell(rt.as_ref()).await,
+        _ if already_running => {
+            tracing::info!(
+                name = %name,
+                "start: terminal already running its program — not re-typing the launch command",
+            );
+            // A program owning the pty IS the ready condition; poking it with the
+            // boot-gate keys `wait_for_agent_ready` sends would be input into a
+            // live agent.
+            true
+        }
         _ => {
             // Give the new shell a beat, then launch the agent.
             tokio::time::sleep(Duration::from_millis(300)).await;
             let (cmd, resume_intended) = build_launch_command(&state.config, &s);
-            tmux.send_text(&cmd).await?;
-            tmux.send_key("Enter").await?;
-            wait_for_agent_ready(&tmux, state, name, resume_intended).await
+            rt.send_text(&cmd).await?;
+            submit_gap(rt.as_ref()).await;
+            rt.send_key("Enter").await?;
+            wait_for_agent_ready(rt.as_ref(), state, name, resume_intended).await
         }
     };
 
@@ -806,8 +941,9 @@ pub async fn start(
 
     if let Some(p) = prompt {
         if !p.trim().is_empty() {
-            tmux.send_text(p).await?;
-            tmux.send_key("Enter").await?;
+            rt.send_text(p).await?;
+            submit_gap(rt.as_ref()).await;
+            rt.send_key("Enter").await?;
             let (preview, at) = db::sessions::set_last_send(&state.pool, name, p).await?;
             broadcast_send(state, name, &preview, at);
         }
@@ -817,7 +953,7 @@ pub async fn start(
         name: name.to_string(),
         started: true,
         ready,
-        target: tmux.target(),
+        target: rt.target(),
     })
 }
 
@@ -836,9 +972,11 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     let _guard = lock.lock().await;
 
     let s = require_session(state, name).await?;
-    let tmux = Tmux::new(name);
+    // Runtime seam — the graceful-exit nudge, the liveness/dead poll, the PID
+    // hard-kill and the definitive teardown are all backend-agnostic.
+    let rt = state.runtime_for(name).await?;
 
-    if !tmux.exists().await? {
+    if !rt.alive().await {
         db::sessions::set_last_status(&state.pool, name, "stopped").await?;
         broadcast_status(state, name, "stopped");
         emit_board_if_linked(state, name).await;
@@ -852,14 +990,19 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     //    mid-stream buffer.
     match s.provider.as_str() {
         "shell" => {
-            let _ = tmux.send_text("exit").await;
-            let _ = tmux.send_key("Enter").await;
+            let _ = rt.send_text("exit").await;
+            submit_gap(rt.as_ref()).await;
+            let _ = rt.send_key("Enter").await;
         }
         _ => {
-            let _ = tmux.send_key("C-c").await;
+            let _ = rt.send_key("C-c").await;
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let _ = tmux.send_text("/exit").await;
-            let _ = tmux.send_key("Enter").await;
+            let _ = rt.send_text("/exit").await;
+            // Without the gap the agent reads `/exit\r` as a paste and never
+            // submits it — so the graceful exit silently never happens and every
+            // native Stop burns the full `STOP_GRACE_CAP` before the hard kill.
+            submit_gap(rt.as_ref()).await;
+            let _ = rt.send_key("Enter").await;
         }
     }
 
@@ -872,7 +1015,7 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     let deadline = tokio::time::Instant::now() + STOP_GRACE_CAP;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(STOP_GRACE_POLL).await;
-        if !tmux.exists().await.unwrap_or(true) || tmux.pane_dead().await.unwrap_or(false) {
+        if !rt.alive().await || rt.dead().await.unwrap_or(false) {
             graceful = true;
             break;
         }
@@ -880,13 +1023,13 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
 
     // 3. Hard kill if the grace window elapsed (the agent didn't exit on its own).
     if !graceful {
-        if let Ok(Some(pid)) = tmux.pane_pid().await {
+        if let Ok(Some(pid)) = rt.pane_pid().await {
             hard_kill(pid).await;
         }
     }
 
     // 4. Definitive teardown. A failure here is surfaced but status still cleans.
-    if let Err(e) = tmux.kill_session().await {
+    if let Err(e) = rt.kill().await {
         emit_alert(state, name, "error", &format!("stop teardown failed: {e}"));
     }
 
@@ -968,7 +1111,7 @@ pub async fn kill_teammate_pane(
     // discrimination (authoritative when it resolves; the validator falls back
     // to the first-listed pane otherwise, so the lead guard never disarms).
     let live = tmux.list_pane_ids().await?;
-    let lead_pane = super::teams::resolve_lead_pane(name).await;
+    let lead_pane = super::teams::resolve_lead_pane(state, name).await;
     super::teams::validate_teammate_pane(&live, lead_pane.as_deref(), pane_id)?;
 
     let pane = match transport.as_deref() {
@@ -984,9 +1127,9 @@ pub async fn send_text(state: &AppState, name: &str, text: &str) -> Result<(), A
     if !db::sessions::exists(&state.pool, name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
     }
-    let tmux = Tmux::new(name);
+    let rt = state.runtime_for(name).await?;
     // Auto-wake BEFORE taking the lock (start() acquires it itself).
-    if !tmux.exists().await? {
+    if !rt.alive().await {
         start(state, name, None).await?;
     }
 
@@ -1003,11 +1146,17 @@ pub async fn send_text(state: &AppState, name: &str, text: &str) -> Result<(), A
 
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
-    tmux.send_text(text).await?;
+    rt.send_text(text).await?;
+    // Backend-declared gap between the text and its submit (see `submit_gap`).
+    // Kimi overrides it with a larger 200ms one: its TUI's TIMING-based paste
+    // detection swallows an Enter landing within ~150ms of the text (measured
+    // live) — a provider property, independent of which runtime hosts it.
     if is_kimi {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    } else {
+        submit_gap(rt.as_ref()).await;
     }
-    tmux.send_key("Enter").await?;
+    rt.send_key("Enter").await?;
     let (preview, at) = db::sessions::set_last_send(&state.pool, name, text).await?;
     broadcast_send(state, name, &preview, at);
     Ok(())
@@ -1024,11 +1173,11 @@ pub async fn send_keys(state: &AppState, name: &str, key: &str) -> Result<(), Ap
     if !db::sessions::exists(&state.pool, name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
     }
-    let tmux = Tmux::new(name);
-    if !tmux.exists().await? {
+    let rt = state.runtime_for(name).await?;
+    if !rt.alive().await {
         return Err(AppError::Conflict(format!("session '{name}' is not running")));
     }
-    tmux.send_key(key).await?;
+    rt.send_key(key).await?;
     Ok(())
 }
 
@@ -1045,13 +1194,14 @@ pub async fn paste(
     if !db::sessions::exists(&state.pool, name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
     }
-    let tmux = Tmux::new(name);
-    if !tmux.exists().await? {
+    let rt = state.runtime_for(name).await?;
+    if !rt.alive().await {
         return Err(AppError::Conflict(format!("session '{name}' is not running")));
     }
-    tmux.paste_via_buffer(text, true).await?;
+    rt.paste(text, true).await?;
     if submit {
-        tmux.send_key("Enter").await?;
+        submit_gap(rt.as_ref()).await;
+        rt.send_key("Enter").await?;
     }
     let (preview, at) = db::sessions::set_last_send(&state.pool, name, text).await?;
     broadcast_send(state, name, &preview, at);
@@ -1064,12 +1214,12 @@ pub async fn peek(state: &AppState, name: &str, lines: usize) -> Result<String, 
     if !db::sessions::exists(&state.pool, name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
     }
-    let tmux = Tmux::new(name);
-    if !tmux.exists().await? {
+    let rt = state.runtime_for(name).await?;
+    if !rt.alive().await {
         return Ok(String::new());
     }
     let lines = lines.clamp(1, 10_000);
-    Ok(tmux.capture_pane(lines).await?)
+    Ok(rt.capture_plain(lines).await?)
 }
 
 /// Archive (async-job-shaped): returns a `job_id` immediately; the
@@ -1156,11 +1306,11 @@ pub async fn archive(state: &AppState, name: &str) -> Result<String, AppError> {
     let name = name.to_string();
     let job = job_id.clone();
     tokio::spawn(async move {
-        let tmux = Tmux::new(&name);
-        let content = if tmux.exists().await.unwrap_or(false) {
-            tmux.capture_full().await.unwrap_or_default()
-        } else {
-            String::new()
+        // Runtime seam. Best-effort: an unresolvable runtime dumps an empty
+        // archive rather than failing the (already-202'd) job.
+        let content = match state.runtime_for(&name).await {
+            Ok(rt) if rt.alive().await => rt.capture_full().await.unwrap_or_default(),
+            _ => String::new(),
         };
 
         // Filesystem-bound dump runs on the blocking pool.
@@ -1175,7 +1325,11 @@ pub async fn archive(state: &AppState, name: &str) -> Result<String, AppError> {
         })
         .await;
 
-        let _ = tmux.kill_session().await;
+        // Definitive teardown through the seam (best-effort — the archive row
+        // is already flipped and the job already answered 202).
+        if let Ok(rt) = state.runtime_for(&name).await {
+            let _ = rt.kill().await;
+        }
 
         // Nudge both per-session background loops to re-check their guard NOW
         // rather than at their next interval (detector: 2s; steering: 60s):
@@ -1283,13 +1437,13 @@ pub async fn wake(state: &AppState, name: &str) -> Result<StartResult, AppError>
         return Err(AppError::NotFound(format!("session '{name}'")));
     }
     db::sessions::set_hibernated(&state.pool, name, false).await?;
-    let tmux = Tmux::new(name);
-    if tmux.exists().await? {
+    let rt = state.runtime_for(name).await?;
+    if rt.alive().await {
         return Ok(StartResult {
             name: name.to_string(),
             started: false,
             ready: true,
-            target: tmux.target(),
+            target: rt.target(),
         });
     }
     start(state, name, None).await
@@ -1323,8 +1477,8 @@ fn cycle_steps(from: Mode, to: Mode) -> Option<u8> {
 /// Read the session's CURRENT parsed mode from a fresh capture (mode-shift). Read-
 /// only — no lock (mirrors the detector rule for `capture-pane`). Falls
 /// back to `Normal` when the pane can't be captured.
-async fn read_mode(tmux: &Tmux<'_>) -> Mode {
-    match tmux.capture_pane(status::CAPTURE_LINES).await {
+async fn read_mode(rt: &dyn SessionRuntime) -> Mode {
+    match rt.capture_plain(status::CAPTURE_LINES).await {
         Ok(raw) => status::parse_mode(&status::prepare_capture(&raw)),
         Err(_) => Mode::Normal,
     }
@@ -1377,8 +1531,8 @@ pub async fn set_mode(state: &AppState, name: &str, target: Mode) -> Result<SetM
 /// one press at a time toward `target`, re-reading after each press. Capped so a
 /// stuck cycle can never loop forever. Returns the REAL mode it ended on.
 async fn cycle_to(state: &AppState, name: &str, target: Mode) -> Result<SetModeResult, AppError> {
-    let tmux = Tmux::new(name);
-    if !tmux.exists().await? {
+    let rt = state.runtime_for(name).await?;
+    if !rt.alive().await {
         return Err(AppError::Conflict(format!(
             "session '{name}' is not running — start it before switching mode"
         )));
@@ -1387,7 +1541,7 @@ async fn cycle_to(state: &AppState, name: &str, target: Mode) -> Result<SetModeR
     // At most 4 presses: a 3-mode ring needs ≤2 to reach any target, +2 slack for
     // a transient prompt that mis-seats a press (robust, never blind-spam).
     const MAX_PRESSES: u8 = 4;
-    let mut current = read_mode(&tmux).await;
+    let mut current = read_mode(rt.as_ref()).await;
     let mut presses = 0u8;
     while current != target && presses < MAX_PRESSES {
         // Guard: if the live mode ever reads Bypass here, the cycle can't reach a
@@ -1402,13 +1556,13 @@ async fn cycle_to(state: &AppState, name: &str, target: Mode) -> Result<SetModeR
             Some(_) => {
                 let lock = state.lock_for(name);
                 let guard = lock.lock().await;
-                tmux.send_key("BTab").await?;
+                rt.send_key("BTab").await?;
                 drop(guard);
                 presses += 1;
                 // Let the status bar repaint before re-reading (it updates within
                 // a frame or two; the detector cadence is slower so we read here).
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                current = read_mode(&tmux).await;
+                current = read_mode(rt.as_ref()).await;
             }
             None => break, // target not on the cycle (shouldn't happen — Bypass handled above)
         }
@@ -1462,9 +1616,10 @@ async fn relaunch_for_bypass(
     };
 
     // 3. Stop the running agent (best-effort: a not-running session just starts).
-    let tmux = Tmux::new(name);
-    if tmux.exists().await.unwrap_or(false) {
-        stop(state, name).await?;
+    if let Ok(rt) = state.runtime_for(name).await {
+        if rt.alive().await {
+            stop(state, name).await?;
+        }
     }
 
     // 4. Apply the flags + (re-)seed the resume id, then start. set_cc_conversation_id
@@ -1680,6 +1835,7 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            runtime: "tmux".into(),
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session);
@@ -1731,6 +1887,7 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            runtime: "tmux".into(),
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session);
@@ -1783,6 +1940,7 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            runtime: "tmux".into(),
         };
 
         // Fresh: no cc handles → `--name`, not resume-intended.
@@ -1841,6 +1999,7 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            runtime: "tmux".into(),
         };
 
         let (command, _resume) = build_launch_command(&config, &session);
@@ -1884,6 +2043,7 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            runtime: "tmux".into(),
         };
 
         let (command, _resume) = build_launch_command(&config, &session);
@@ -2063,5 +2223,86 @@ mod link_liveness_tests {
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod submit_and_launch_tests {
+    //! Two start/send invariants that are easy to regress and expensive to
+    //! notice: the text→Enter gap (a missing one turns a submit into a newline
+    //! inside the agent's composer) and the double-launch guard (a missing one
+    //! types `claude --resume …` into a RUNNING agent).
+    use super::agent_already_running;
+
+    /// Source of this module's own file, minus its test modules — the scan
+    /// below must not match on its own assertions.
+    fn lifecycle_source() -> &'static str {
+        const SRC: &str = include_str!("lifecycle.rs");
+        let end = SRC.find("\n#[cfg(test)]").unwrap_or(SRC.len());
+        &SRC[..end]
+    }
+
+    /// EVERY "send literal text, then Enter to submit it" site must go through
+    /// [`super::submit_gap`]. There are five (start's launch command, start's
+    /// initial prompt, `send_text`, `paste(submit)`, and both stop nudges), and
+    /// the one that was fixed first — `send_text` — was for months the only one:
+    /// the others silently did not submit on the native runtime, which is how
+    /// Stop ended up always burning the full grace window.
+    ///
+    /// A structural scan rather than five behavioural tests: the alternative
+    /// needs a live pty per site, and this catches the actual failure mode (a
+    /// NEW text→Enter site added without the gap).
+    #[test]
+    fn every_text_then_enter_site_applies_the_backend_submit_gap() {
+        let src = lifecycle_source();
+        let enter = format!("send_key({:?})", "Enter");
+        let mut sites = 0;
+        for (i, _) in src.match_indices(&enter) {
+            let mut start = i.saturating_sub(600);
+            while !src.is_char_boundary(start) {
+                start += 1;
+            }
+            let window = &src[start..i];
+            // The nearest preceding literal-text send, if any. A bare key send
+            // (the trust-dialog Enter in `wait_for_agent_ready`) has none.
+            let text_at = [window.rfind("send_text("), window.rfind(".paste(")]
+                .into_iter()
+                .flatten()
+                .max();
+            let Some(t) = text_at else { continue };
+            sites += 1;
+            assert!(
+                window[t..].contains("submit_gap("),
+                "a text→Enter site (byte {i}) does not apply the backend submit gap:\n{}",
+                &window[t..],
+            );
+        }
+        assert!(
+            sites >= 5,
+            "expected at least 5 text→Enter sites, found {sites} — did the scan stop matching?",
+        );
+    }
+
+    /// The launch command is typed ONLY when nothing is running in the terminal.
+    /// `None` (tmux — it cannot tell) must keep the historical behaviour exactly.
+    #[test]
+    fn the_launch_command_is_never_typed_into_a_running_program() {
+        // Brand-new terminal: always launch, whatever the probe says.
+        assert!(!agent_already_running(true, None));
+        assert!(!agent_already_running(true, Some(false)));
+        assert!(!agent_already_running(true, Some(true)));
+        // Re-start on a live terminal…
+        assert!(
+            agent_already_running(false, Some(false)),
+            "a program owns the pty — typing the launch line would land in it",
+        );
+        assert!(
+            !agent_already_running(false, Some(true)),
+            "shell prompt waiting: this IS the recovery path, the command must be typed",
+        );
+        assert!(
+            !agent_already_running(false, None),
+            "tmux cannot tell, and its behaviour must not change",
+        );
     }
 }

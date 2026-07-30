@@ -273,6 +273,10 @@ pub async fn start_team(
             mcp: None,
             worktree: None,
             host_id: None,
+            // A team LEAD is tmux by definition — Claude renders teammates as
+            // tmux split-window panes, which the native runtime has no analogue
+            // for. EXPLICIT since the create default became native.
+            runtime: Some(crate::sessions::runtime::RUNTIME_TMUX.to_string()),
         },
     )
     .await?;
@@ -399,6 +403,26 @@ pub async fn convert_to_team(
             "session '{name}' uses provider '{}' — only Claude sessions can become teams",
             row.provider
         )));
+    }
+    if row.runtime == crate::sessions::runtime::RUNTIME_NATIVE {
+        // Agent teams is TMUX-only: Claude Code lands teammates as
+        // `tmux split-window` panes (`teammateMode:"tmux"`), and supermux
+        // streams each one by its `%id` — a native session owns a single pty
+        // holder with no window to split. With native as the CREATE DEFAULT this
+        // can't be a refusal (it would make teams unreachable for normal
+        // sessions): the conversion RESTARTS the session anyway (the whole
+        // point — Agent Teams env only applies at process launch), so flip the
+        // runtime back to tmux as part of the same restart. The inverse of the
+        // fresh-start tmux→native migration in `lifecycle::start`, which
+        // deliberately skips team leads (`team_name` is set by then).
+        db::sessions::set_runtime(
+            &state.pool,
+            name,
+            crate::sessions::runtime::RUNTIME_TMUX,
+        )
+        .await?;
+        state.runtime_invalidate(name);
+        tracing::info!(session = name, "runtime flipped native → tmux for team conversion");
     }
 
     // 2. Refuse if the detector already sees this session as a team lead (no double
@@ -644,6 +668,59 @@ mod tests {
         );
     }
 
+    /// Runtime guardrail: a NATIVE session can never become a team lead.
+    /// Claude renders teammates as tmux `split-window` panes, so a session with
+    /// no tmux window has nothing to split — refuse with 409 (well-formed
+    /// request, wrong session state) rather than booting a lead whose teammates
+    /// could never spawn.
+    #[tokio::test]
+    async fn convert_flips_a_native_session_to_tmux() {
+        let (state, _dir) = test_state().await;
+        crate::sessions::create(
+            &state,
+            CreateInput {
+                name: "nativelead".into(),
+                display_name: None,
+                dir: None,
+                desc: None,
+                provider: Some("claude".into()),
+                creator: None,
+                flags: None,
+                bypass_permissions: None,
+                tags: None,
+                branch: None,
+                mcp: None,
+                worktree: None,
+                host_id: None,
+                runtime: Some("native".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let err = convert_to_team(
+            &state,
+            ConvertToTeamInput {
+                name: "nativelead".into(),
+                task: "ship the thing".into(),
+                teammates: None,
+                model: None,
+            },
+        )
+        .await;
+        // With native as the create default, conversion can't be a refusal — it
+        // FLIPS the runtime back to tmux (durably) as part of the restart the
+        // conversion performs anyway. The convert may still fail LATER in this
+        // harness (no real tmux/claude to boot), so the assertion is the flip
+        // itself, which happens before any of that.
+        let _ = err;
+        assert_eq!(
+            db::sessions::runtime_kind(&state.pool, "nativelead").await.unwrap(),
+            Some("tmux".to_string()),
+            "conversion must flip a native session back to the tmux runtime"
+        );
+        crate::sessions::native::forget("nativelead");
+    }
+
     #[tokio::test]
     async fn convert_rejects_empty_task() {
         let (state, _dir) = test_state().await;
@@ -664,6 +741,7 @@ mod tests {
                 mcp: None,
                 worktree: None,
                 host_id: None,
+                runtime: None,
             },
         )
         .await
@@ -701,6 +779,7 @@ mod tests {
                 mcp: None,
                 worktree: None,
                 host_id: None,
+                runtime: None,
             },
         )
         .await
@@ -745,6 +824,7 @@ mod tests {
                 mcp: None,
                 worktree: None,
                 host_id: None,
+                runtime: None,
             },
         )
         .await
