@@ -49,6 +49,7 @@ export function rowToForm(s: ScheduleRow): ScheduleFormValue {
     boot_provider: s.boot_provider || 'claude',
     boot_worktree: s.boot_worktree === 1,
     bypass_permissions: s.bypass_permissions === 1,
+    archive_on_stop: s.archive_on_stop === 1,
     notify,
     done_pattern: s.done_pattern ?? '',
     confirm_finish: s.confirm_finish === 1,
@@ -137,6 +138,7 @@ export function ScheduleEditor({
             done_pattern: input.done_pattern,
             done_action: input.done_action,
             confirm_finish: input.confirm_finish,
+            archive_on_stop: input.archive_on_stop,
           },
         },
         {
