@@ -1918,6 +1918,7 @@ mod build_env_tests {
             team_name: None,
             host_id: None,
             runtime: "tmux".into(),
+            archive_on_stop: 0,
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session);
@@ -2076,6 +2077,7 @@ mod build_env_tests {
             team_name: None,
             host_id: None,
             runtime: "tmux".into(),
+            archive_on_stop: 0,
         };
 
         let (command, _resume) = build_launch_command(&config, &session);

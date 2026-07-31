@@ -1489,6 +1489,7 @@ mod tests {
             worktree: None,
             host_id: None,
             runtime: None,
+            archive_on_stop: None,
         }
     }
 
