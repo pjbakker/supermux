@@ -97,3 +97,45 @@ async fn audit_count(pool: &sqlx::SqlitePool, target: &str) -> i64 {
     .unwrap();
     n
 }
+
+use supermux_server::scheduler::{self, CreateScheduleInput};
+
+#[tokio::test]
+async fn create_defaults_boot_archive_on_stop_off() {
+    let (state, _router, _dir) = setup().await;
+
+    // Boot schedule, flag omitted -> defaults OFF (opt-in, backward compatible).
+    let s = scheduler::create(&state, CreateScheduleInput {
+        title: "reply-trigger".into(),
+        kind: Some("boot".into()),
+        prompt: "do the thing".into(),
+        boot_dir: Some("/tmp".into()),
+        schedule_expr: Some("every 1h".into()),
+        ..Default::default()
+    }).await.unwrap();
+    assert_eq!(s.archive_on_stop, 0, "new boot schedule defaults archive_on_stop off");
+
+    // Boot schedule, explicit ON -> honored.
+    let s2 = scheduler::create(&state, CreateScheduleInput {
+        title: "clean-me-up".into(),
+        kind: Some("boot".into()),
+        prompt: "do the thing".into(),
+        boot_dir: Some("/tmp".into()),
+        schedule_expr: Some("every 1h".into()),
+        archive_on_stop: Some(true),
+        ..Default::default()
+    }).await.unwrap();
+    assert_eq!(s2.archive_on_stop, 1, "explicit on is honored");
+
+    // Non-boot -> clamped off regardless of input.
+    let s3 = scheduler::create(&state, CreateScheduleInput {
+        title: "tmux-job".into(),
+        kind: Some("tmux".into()),
+        command: "/status".into(),
+        session: Some("somesess".into()),
+        schedule_expr: Some("every 1h".into()),
+        archive_on_stop: Some(true),
+        ..Default::default()
+    }).await.unwrap();
+    assert_eq!(s3.archive_on_stop, 0, "clamped off for non-boot kinds");
+}
