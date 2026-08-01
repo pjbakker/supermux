@@ -6,6 +6,12 @@
 //! a silent no-op. Sessions that never get a runtime row exercise the
 //! LEFT JOIN "missing runtime row" branch, which is the case the guard leans on
 //! to close its create-then-boot race.
+//!
+//! The query's `WHEN 'error' THEN 0` arm has no test: `session_runtime`'s CHECK
+//! (migration 0009) rejects `'error'`, so the value cannot be written even by a
+//! raw UPDATE. The arm is there so that adding `error` to the CHECK later does
+//! not silently route dead sessions into the freshness branch, where they would
+//! block their own respawn.
 
 use supermux_server::config::{Config, ProviderDefaults, TlsConfig};
 use supermux_server::state::AppState;
@@ -103,10 +109,28 @@ async fn live_with_prefix_classifies_statuses() {
         Some("Operator--s--reply-1".into())
     );
 
-    // stopped is free
+    // stopped is free, even with dead-fresh activity stamps
     insert_session(&state, "Operator--b--reply-1").await;
     set_status(&state, "Operator--b--reply-1", "stopped").await;
     assert_eq!(db::sessions::live_with_prefix(p, "Operator--b--", 7200).await.unwrap(), None);
+
+    // waiting and unknown are freshness-gated like idle (the ELSE branch)
+    for (id, status) in [("w", "waiting"), ("u", "unknown")] {
+        let name = format!("Operator--{id}--reply-1");
+        insert_session(&state, &name).await;
+        set_status(&state, &name, status).await;
+        assert_eq!(
+            db::sessions::live_with_prefix(p, &format!("Operator--{id}--"), 7200).await.unwrap(),
+            Some(name.clone()),
+            "fresh {status} must read live"
+        );
+        backdate_activity(p, &name, 8000).await;
+        assert_eq!(
+            db::sessions::live_with_prefix(p, &format!("Operator--{id}--"), 7200).await.unwrap(),
+            None,
+            "stale {status} must read free"
+        );
+    }
 
     // fresh idle is live, stale idle is free
     insert_session(&state, "Operator--c--reply-1").await;
@@ -181,4 +205,28 @@ async fn live_with_prefix_matches_prefix_not_substring() {
         db::sessions::live_with_prefix(p, "Op_X--", 7200).await.unwrap(),
         Some("Op_X--reply-1".into())
     );
+}
+
+/// SQLite's default LIKE is ASCII-case-insensitive, so a LIKE-based match would
+/// let two identities that differ only in case share one guard slot and block
+/// each other's spawn for as long as either stays live. The match must be exact.
+#[tokio::test]
+async fn live_with_prefix_is_case_sensitive() {
+    let (state, _router, _dir) = setup().await;
+    let p = &state.pool;
+
+    insert_session(&state, "op-x--reply-1").await;
+    set_status(&state, "op-x--reply-1", "active").await;
+
+    assert_eq!(db::sessions::live_with_prefix(p, "Op-x--", 7200).await.unwrap(), None);
+    assert_eq!(db::sessions::live_with_prefix(p, "OP-X--", 7200).await.unwrap(), None);
+    assert_eq!(
+        db::sessions::live_with_prefix(p, "op-x--", 7200).await.unwrap(),
+        Some("op-x--reply-1".into())
+    );
+
+    // and the differently-cased identity gets its own slot
+    insert_session(&state, "Op-X--reply-1").await;
+    set_status(&state, "Op-X--reply-1", "stopped").await;
+    assert_eq!(db::sessions::live_with_prefix(p, "Op-X--", 7200).await.unwrap(), None);
 }
