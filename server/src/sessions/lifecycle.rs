@@ -906,6 +906,11 @@ async fn emit_board_if_linked(state: &AppState, name: &str) {
 // ── public lifecycle API ────────────────────────────────────────────────────
 
 /// Spawn (or re-attach to) the session's tmux session and launch the agent.
+///
+/// Thin wrapper over [`start_locked`], which runs [`mark_boot_failed`] on every
+/// failure exit before the error propagates. The per-session lock is taken
+/// HERE, not inside, so the failure stamp lands in the same critical section as
+/// the boot it is correcting.
 pub async fn start(
     state: &AppState,
     name: &str,
@@ -914,6 +919,53 @@ pub async fn start(
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
     start_locked(state, name, prompt).await
+}
+
+/// Best-effort: record a failed boot as `stopped` so the row stops reading LIVE.
+///
+/// Without this a failed `start` leaves the runtime status at one of two values,
+/// and `db::sessions::live_with_prefix` reads BOTH as live:
+///   * `''` (the `ensure_runtime` default) when the failure beat the `starting`
+///     write below. Empty falls to the freshness arm, and `created_at` is
+///     seconds old, so the dead row blocks its own prefix for the whole quiet
+///     window (2h by default).
+///   * `starting` for any failure after that write. That one is live
+///     unconditionally, so it blocks forever.
+///
+/// Either way the spawn guard would refuse to respawn the identity whose boot
+/// just died, which is exactly backwards. The status detector cannot repair it
+/// either: it declines to reclassify a session whose runtime is not alive.
+///
+/// `stopped`, not `error`: the `session_runtime` status CHECK (migration 0009)
+/// rejects `error`.
+///
+/// Skipped when the runtime is in fact alive. A failure that leaves the agent
+/// running (a send that did not land, say) belongs to the detector, and writing
+/// `stopped` over a live session would be a lie its next tick has to undo.
+/// Everything here is best-effort: the caller propagates the ORIGINAL error, so
+/// a failed stamp is logged and never raised.
+async fn mark_boot_failed(state: &AppState, name: &str) {
+    // No runtime row means no session to stamp (a start that failed on
+    // `require_session`), and the write would be a silent no-op anyway.
+    match db::sessions::runtime(&state.pool, name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "mark_boot_failed: runtime lookup failed");
+            return;
+        }
+    }
+    if let Ok(rt) = state.runtime_for(name).await {
+        if rt.alive().await {
+            return;
+        }
+    }
+    match db::sessions::set_last_status(&state.pool, name, "stopped").await {
+        Ok(()) => broadcast_status(state, name, "stopped"),
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "mark_boot_failed: could not stamp 'stopped'; the spawn guard may block this prefix until the quiet window elapses")
+        }
+    }
 }
 
 /// Outcome of [`start_if_stopped`]: either we started (carrying `start`'s
@@ -958,7 +1010,26 @@ pub(super) async fn start_if_stopped(
 /// The body of [`start`], assuming the per-session lock is ALREADY held. Split
 /// out so [`start_if_stopped`] can wrap it with an atomic precondition without
 /// re-entering the (non-reentrant) lock.
+///
+/// Every failure exit runs [`mark_boot_failed`] before the error propagates, so
+/// a boot that died never leaves its row reading LIVE to the spawn guard. It
+/// sits here rather than in [`start`] so the auto-heal path
+/// ([`start_if_stopped`]), which calls this directly, is covered too.
 async fn start_locked(
+    state: &AppState,
+    name: &str,
+    prompt: Option<&str>,
+) -> Result<StartResult, AppError> {
+    match start_locked_inner(state, name, prompt).await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            mark_boot_failed(state, name).await;
+            Err(e)
+        }
+    }
+}
+
+async fn start_locked_inner(
     state: &AppState,
     name: &str,
     prompt: Option<&str>,
