@@ -14,6 +14,7 @@
 //! block their own respawn.
 
 use supermux_server::config::{Config, ProviderDefaults, TlsConfig};
+use supermux_server::sessions::{self, CreateInput};
 use supermux_server::state::AppState;
 use supermux_server::{db, http};
 
@@ -85,6 +86,18 @@ async fn backdate_activity(pool: &sqlx::SqlitePool, name: &str, secs_ago: i64) {
         .execute(pool)
         .await
         .unwrap();
+}
+
+/// A guarded create the way the dispatcher sends it: a tmux session (the
+/// native runtime would try to fork a real pty holder) in a throwaway dir.
+fn spawn_input(name: &str, prefix: &str) -> CreateInput {
+    CreateInput {
+        name: name.into(),
+        dir: Some("/tmp".into()),
+        runtime: Some("tmux".into()),
+        unless_live_prefix: Some(prefix.into()),
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -230,4 +243,64 @@ async fn live_with_prefix_is_case_sensitive() {
     insert_session(&state, "Op-X--reply-1").await;
     set_status(&state, "Op-X--reply-1", "stopped").await;
     assert_eq!(db::sessions::live_with_prefix(p, "Op-X--", 7200).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn guard_blocks_create_against_live_session() {
+    let (state, _router, _dir) = setup().await;
+    insert_session(&state, "Operator--x--reply-1").await;
+    set_status(&state, "Operator--x--reply-1", "active").await;
+
+    let err = sessions::create(&state, spawn_input("Operator--x--reply-2", "Operator--x--"))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Operator--x--reply-1"), "409 names the live session: {msg}");
+    // Nothing was created.
+    assert!(!db::sessions::exists(&state.pool, "Operator--x--reply-2").await.unwrap());
+}
+
+#[tokio::test]
+async fn guard_allows_create_when_prefix_is_free() {
+    let (state, _router, _dir) = setup().await;
+    insert_session(&state, "Operator--y--reply-1").await;
+    set_status(&state, "Operator--y--reply-1", "stopped").await;
+
+    let v = sessions::create(&state, spawn_input("Operator--y--reply-2", "Operator--y--"))
+        .await
+        .unwrap();
+    assert_eq!(v.name, "Operator--y--reply-2");
+}
+
+/// An empty prefix matches EVERY session name, so the guard must treat it as
+/// "no guard asked for" rather than "nothing may ever be created". Same for an
+/// absent `unless_live_prefix`.
+#[tokio::test]
+async fn guard_ignores_absent_and_empty_prefix() {
+    let (state, _router, _dir) = setup().await;
+    insert_session(&state, "Operator--q--reply-1").await;
+    set_status(&state, "Operator--q--reply-1", "active").await;
+
+    let v = sessions::create(&state, spawn_input("Operator--q--reply-2", ""))
+        .await
+        .unwrap();
+    assert_eq!(v.name, "Operator--q--reply-2");
+
+    let mut unguarded = spawn_input("Operator--q--reply-3", "");
+    unguarded.unless_live_prefix = None;
+    let v = sessions::create(&state, unguarded).await.unwrap();
+    assert_eq!(v.name, "Operator--q--reply-3");
+}
+
+/// The TOCTOU case the per-prefix lock exists for: without it both cycles read
+/// "no live session" before either INSERT lands, and the operator double-boots.
+#[tokio::test]
+async fn guard_serializes_concurrent_spawns() {
+    let (state, _router, _dir) = setup().await;
+    let (a, b) = tokio::join!(
+        sessions::create(&state, spawn_input("Operator--z--reply-1", "Operator--z--")),
+        sessions::create(&state, spawn_input("Operator--z--reply-2", "Operator--z--")),
+    );
+    let oks = [a.is_ok(), b.is_ok()].iter().filter(|x| **x).count();
+    assert_eq!(oks, 1, "exactly one of two concurrent same-prefix spawns wins");
 }

@@ -72,6 +72,7 @@ fn create_input(name: &str, dir: &std::path::Path) -> CreateInput {
         // inserts the row and spawns the in-memory detector/steering loops.
         runtime: Some("native".to_string()),
         archive_on_stop: None,
+        ..Default::default()
     }
 }
 
