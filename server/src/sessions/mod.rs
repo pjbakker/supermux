@@ -501,7 +501,7 @@ pub async fn purge(state: &AppState, name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CreateInput {
     pub name: String,
     /// Human label for the UI (migration 0019). Free-form; the immutable slug
@@ -551,7 +551,29 @@ pub struct CreateInput {
     /// scheduler for booted sessions; `None`/`false` for every other caller.
     #[serde(default)]
     pub archive_on_stop: Option<bool>,
+    /// Deliver this prompt and start the agent right after create (the
+    /// create + start sequence every scheduler boot already does), so one
+    /// API call replaces the disabled-stub-schedule + run-now pattern.
+    /// Consumed by the HTTP handler, not by [`create`] itself.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Server-side singleton guard: refuse (409) when a non-archived
+    /// session whose name starts with this prefix is still live. Checked
+    /// and inserted under a per-prefix lock, so concurrent spawns with the
+    /// same prefix cannot double-boot. An empty string is treated as absent
+    /// (it would match every session name).
+    #[serde(default)]
+    pub unless_live_prefix: Option<String>,
+    /// Quiet bound for the guard's idle/waiting classification, seconds.
+    /// Default [`GUARD_QUIET_SECS`].
+    #[serde(default)]
+    pub max_quiet_secs: Option<i64>,
 }
+
+/// Default quiet bound for `unless_live_prefix`, seconds: 120 minutes,
+/// proven in production dispatcher use. An idle session that has said nothing
+/// for longer than this no longer blocks a respawn of its identity.
+pub const GUARD_QUIET_SECS: i64 = 7200;
 
 pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView, AppError> {
     let name = input.name.trim().to_string();
@@ -599,6 +621,31 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
                 .into(),
         ));
     }
+    // Spawn guard (`unless_live_prefix`). The lock is taken BEFORE the liveness
+    // check and released only after the INSERT: check-then-insert has to be one
+    // critical section per prefix, or two dispatch cycles racing on the same
+    // identity both read "nothing live" and both boot. An empty prefix is
+    // treated as absent, because it matches every session name: honoring it
+    // would block every create instead of one identity's.
+    let guard_prefix = input
+        .unless_live_prefix
+        .as_deref()
+        .filter(|p| !p.is_empty());
+    let guard_lock = guard_prefix.map(|prefix| state.spawn_guard_for(prefix));
+    // `held` is the critical section; it lives until the explicit `drop` below.
+    let held = match guard_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if let Some(prefix) = guard_prefix {
+        let quiet = input.max_quiet_secs.unwrap_or(GUARD_QUIET_SECS).max(0);
+        if let Some(live) = db::sessions::live_with_prefix(&state.pool, prefix, quiet).await? {
+            return Err(AppError::Conflict(format!(
+                "live session '{live}' matches prefix '{prefix}'"
+            )));
+        }
+    }
+
     if db::sessions::exists(&state.pool, &name).await? {
         return Err(AppError::Conflict(format!(
             "session '{name}' already exists"
@@ -647,6 +694,10 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         archive_on_stop: input.archive_on_stop.unwrap_or(false),
     };
     db::sessions::create(&state.pool, &new).await?;
+    // End of the guarded section: the row exists now, so a concurrent spawn on
+    // the same prefix reads it as live and backs off. Everything below is slow
+    // (runtime setup, loop spawns) and must not be serialized behind this lock.
+    drop(held);
     let hook_token = gen_hook_token();
     db::sessions::ensure_runtime(&state.pool, &name, &hook_token).await?;
     state.hook_tokens.insert(name.clone(), hook_token);
@@ -1490,6 +1541,7 @@ mod tests {
             host_id: None,
             runtime: None,
             archive_on_stop: None,
+            ..Default::default()
         }
     }
 

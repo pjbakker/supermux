@@ -957,6 +957,11 @@ async fn start_handler(
                 host_id: None,
                 // Board-spawned sessions take the default (tmux) runtime.
                 runtime: None,
+                // Prompt delivery and the spawn guard belong to the on-demand
+                // spawn API; this path starts and steers the session itself.
+                prompt: None,
+                unless_live_prefix: None,
+                max_quiet_secs: None,
             };
             crate::sessions::create(&state, create_input).await?;
             // Boot it so the steering deliver-loop has a live pane to talk to.
