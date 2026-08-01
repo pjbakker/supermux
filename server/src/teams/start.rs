@@ -288,6 +288,11 @@ pub async fn start_team(
             // forced a member's to their own; `None` for the owner path).
             company_id: input.company_id,
             archive_on_stop: None,
+            // Team start drives its own boot and briefing; no create-time
+            // prompt, no singleton guard.
+            prompt: None,
+            unless_live_prefix: None,
+            max_quiet_secs: None,
         },
     )
     .await?;
@@ -710,6 +715,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                ..Default::default()
             },
         )
         .await
@@ -762,6 +768,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                ..Default::default()
             },
         )
         .await
@@ -803,6 +810,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                ..Default::default()
             },
         )
         .await
@@ -851,6 +859,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                ..Default::default()
             },
         )
         .await
