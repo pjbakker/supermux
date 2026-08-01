@@ -1,0 +1,229 @@
+//! Prompt-on-create over HTTP (`POST /api/sessions {prompt: "..."}`).
+//!
+//! One call replaces the old "create a disabled stub schedule, then run it now"
+//! dance: the handler creates the row and, when a non-blank prompt is present,
+//! boots the session with that prompt.
+//!
+//! Three contracts are pinned here:
+//!   * no prompt -> byte-identical to the old create (201, no start attempted),
+//!   * a start failure propagates (5xx) and LEAVES the session row behind, so
+//!     the caller can inspect and retry instead of losing the record,
+//!   * the `unless_live_prefix` guard fires before any start, so a 409 means
+//!     nothing was created and the prompt was never delivered.
+//!
+//! These need `lifecycle::start` to fail deterministically without spawning
+//! anything real (this box has both `tmux` and `claude` on PATH, so "it will
+//! fail in CI" is not a safe assumption). They get that from provider `shell`
+//! (skips the `~/.claude/settings.json` hook install, which would touch the
+//! developer's real home) plus a working dir that does not exist: the native
+//! runtime's holder spawn sets that dir as the child's cwd, so the spawn fails
+//! with ENOENT before any process runs.
+//!
+//! That missing dir is also what makes "was a start attempted?" observable at
+//! all. `create` mints the `session_runtime` row itself (`ensure_runtime`,
+//! right after the INSERT), so the presence of that row proves nothing, and a
+//! start that dies inside `spawn` never reaches the `last_status = "starting"`
+//! write. The status code is the signal instead: with a missing dir, 201 means
+//! no start ran and 5xx means one did.
+
+use supermux_server::config::{Config, ProviderDefaults, TlsConfig};
+use supermux_server::state::AppState;
+use supermux_server::{db, http};
+
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
+use tower::ServiceExt; // for `oneshot`
+
+const TOKEN: &str = "spawn-prompt-token";
+
+async fn setup() -> (AppState, axum::Router, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("supermux-spawn-prompt-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = Config {
+        data_dir: dir.clone(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        extra_binds: vec![],
+        extra_origins: vec![],
+        tls: TlsConfig::default(),
+        auth_token: TOKEN.to_string(),
+        provider_defaults: ProviderDefaults::default(),
+        ws: Default::default(),
+        remote_callback_url: None,
+        push_sub: None,
+        github_token: None,
+        statusline_tap: false,
+        isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
+        human_auth: Default::default(),
+    };
+    let pool = db::init(&config).await.expect("db init");
+    let state = AppState::new(pool, config);
+    let app = http::router(state.clone());
+    (state, app, dir)
+}
+
+/// Insert a session row directly, the way `db::sessions::create` does: rows
+/// only, no `session_runtime` (that arrives at start time via `ensure_runtime`).
+async fn insert_session(state: &AppState, name: &str) {
+    let new = db::sessions::NewSession {
+        name: name.to_string(),
+        display_name: name.to_string(),
+        dir: "/tmp".into(),
+        desc: String::new(),
+        provider: "claude".into(),
+        creator: "scheduler".into(),
+        flags: String::new(),
+        tags: "[]".into(),
+        branch: String::new(),
+        mcp: String::new(),
+        worktree: false,
+        worktree_repo: String::new(),
+        host_id: None,
+        company_id: None,
+        runtime: "tmux".into(),
+        model: String::new(),
+        archive_on_stop: false,
+    };
+    db::sessions::create(&state.pool, &new).await.unwrap();
+}
+
+/// Give `name` a runtime row and a status, the way a started session has one.
+/// A bare `set_last_status` without the runtime row is a silent no-op.
+async fn set_status(state: &AppState, name: &str, status: &str) {
+    db::sessions::ensure_runtime(&state.pool, name, "hooktok").await.unwrap();
+    db::sessions::set_last_status(&state.pool, name, status).await.unwrap();
+}
+
+async fn post_sessions(app: &axum::Router, body: Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/sessions")
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
+/// A path that cannot exist, so the runtime spawn fails at cwd resolution.
+fn missing_dir() -> String {
+    format!("/nonexistent-supermux-{}", uuid::Uuid::new_v4())
+}
+
+#[tokio::test]
+async fn create_without_prompt_unchanged() {
+    let (_state, app, _dir) = setup().await;
+    let (status, body) = post_sessions(&app, json!({ "name": "plain-create", "dir": "/tmp" })).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["data"]["name"], "plain-create", "{body}");
+}
+
+/// The control for the two start tests below: same unspawnable dir, no prompt.
+/// A 201 here is what makes their 5xx mean "a start ran", not "the dir is bad".
+#[tokio::test]
+async fn absent_prompt_does_not_start() {
+    let (_state, app, _dir) = setup().await;
+    let (status, body) = post_sessions(
+        &app,
+        json!({ "name": "no-prompt", "dir": missing_dir(), "provider": "shell" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// A prompt that is only whitespace is treated as absent: no start, plain 201.
+#[tokio::test]
+async fn blank_prompt_does_not_start() {
+    let (_state, app, _dir) = setup().await;
+    let (status, body) = post_sessions(
+        &app,
+        json!({
+            "name": "blank-prompt",
+            "dir": missing_dir(),
+            "provider": "shell",
+            "prompt": "   \n"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn prompt_starts_the_session() {
+    let (_state, app, _dir) = setup().await;
+    let (status, _body) = post_sessions(
+        &app,
+        json!({
+            "name": "Operator--t--reply-1",
+            "dir": missing_dir(),
+            "provider": "shell",
+            "prompt": "read the contract and act"
+        }),
+    )
+    .await;
+    // The start is real, so it fails on the missing cwd and the error
+    // propagates. Paired with `absent_prompt_does_not_start` (same dir, 201)
+    // this is proof that the prompt is what triggered a boot.
+    assert!(
+        status.is_server_error(),
+        "a start against a missing dir must surface as 5xx, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_start_failure_keeps_session_row() {
+    let (state, app, _dir) = setup().await;
+    let (status, _body) = post_sessions(
+        &app,
+        json!({
+            "name": "Operator--f--reply-1",
+            "dir": missing_dir(),
+            "provider": "shell",
+            "prompt": "read the contract and act"
+        }),
+    )
+    .await;
+    assert!(
+        !status.is_client_error(),
+        "start may fail in the test env, but never 4xx: {status}"
+    );
+    assert!(
+        db::sessions::exists(&state.pool, "Operator--f--reply-1")
+            .await
+            .unwrap(),
+        "session row survives a failed start"
+    );
+}
+
+#[tokio::test]
+async fn guard_409_over_http() {
+    let (state, app, _dir) = setup().await;
+    insert_session(&state, "Operator--h--reply-1").await;
+    set_status(&state, "Operator--h--reply-1", "active").await;
+    let (status, body) = post_sessions(
+        &app,
+        json!({
+            "name": "Operator--h--reply-2",
+            "dir": "/tmp",
+            "unless_live_prefix": "Operator--h--",
+            "prompt": "should never be delivered"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        !db::sessions::exists(&state.pool, "Operator--h--reply-2")
+            .await
+            .unwrap(),
+        "the guard rejects before the row is created, so the prompt is never delivered"
+    );
+}
