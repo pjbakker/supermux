@@ -1049,11 +1049,30 @@ async fn get_handler(
     Ok(ok(get(&state, &name).await?))
 }
 
+/// `POST /api/sessions`. With a non-blank `prompt` this also boots the session,
+/// so one call does what previously took a disabled stub schedule plus a
+/// run-now. The split of duties is deliberate: [`create`] owns the
+/// `unless_live_prefix` guard (it has to, the check and the INSERT are one
+/// critical section), and this handler owns the boot, which must stay OUTSIDE
+/// that lock.
+///
+/// A blank or whitespace-only prompt counts as absent, so a client that always
+/// sends the field gets exactly the old behaviour when it has nothing to say.
+///
+/// A failed start propagates (5xx) and the session row REMAINS: no rollback.
+/// The row is the record that the spawn was requested, and it is what the
+/// caller retries against; deleting it would also make the guard forget the
+/// identity it just claimed. The returned view is the PRE-start snapshot, so
+/// callers watch the status endpoints for the boot, not this response.
 async fn create_handler(
     State(state): State<AppState>,
-    Json(input): Json<CreateInput>,
+    Json(mut input): Json<CreateInput>,
 ) -> Result<impl IntoResponse, AppError> {
+    let prompt = input.prompt.take().filter(|p| !p.trim().is_empty());
     let v = create(&state, input).await?;
+    if let Some(p) = prompt {
+        lifecycle::start(&state, &v.name, Some(&p)).await?;
+    }
     Ok((StatusCode::CREATED, ok(v)))
 }
 
