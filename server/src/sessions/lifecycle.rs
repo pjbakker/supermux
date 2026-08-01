@@ -729,6 +729,17 @@ pub async fn start(
 /// `stopped` over a live session would be a lie its next tick has to undo.
 /// Everything here is best-effort: the caller propagates the ORIGINAL error, so
 /// a failed stamp is logged and never raised.
+///
+/// A stamped failure also runs the normal stop-time cleanup
+/// ([`maybe_archive_on_stop`]), because a dead row is only half the problem: the
+/// status detector and the steering deliver loop both hang off `exists_active`,
+/// which filters `archived = 0`, so an unarchived dead row keeps two tokio loops
+/// alive for the life of the process. The gate is `archive_on_stop = 1`, i.e.
+/// exactly the scheduler/dispatcher's disposable spawns; human-, board- and
+/// team-created sessions stay visible for inspection. Safe under the per-session
+/// lock `start()` holds around this call for the same reason `stop()`'s call is:
+/// `archive()` takes no session lock and its teardown is async-job-shaped, so it
+/// never waits on this task.
 async fn mark_boot_failed(state: &AppState, name: &str) {
     // No runtime row means no session to stamp (a start that failed on
     // `require_session`), and the write would be a silent no-op anyway.
@@ -746,7 +757,13 @@ async fn mark_boot_failed(state: &AppState, name: &str) {
         }
     }
     match db::sessions::set_last_status(&state.pool, name, "stopped").await {
-        Ok(()) => broadcast_status(state, name, "stopped"),
+        Ok(()) => {
+            broadcast_status(state, name, "stopped");
+            // A failed boot IS a stop, so it gets the same cleanup: disposable
+            // spawns archive themselves, which also ends their detector and
+            // steering loops.
+            maybe_archive_on_stop(state, name).await;
+        }
         Err(e) => {
             tracing::warn!(name = %name, error = %e, "mark_boot_failed: could not stamp 'stopped'; the spawn guard may block this prefix until the quiet window elapses")
         }

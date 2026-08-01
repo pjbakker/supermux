@@ -199,6 +199,69 @@ async fn prompt_start_failure_keeps_session_row() {
     );
 }
 
+/// A failed boot must clean up after itself EXACTLY as far as the session asked
+/// for: an `archive_on_stop` spawn (the dispatcher's disposable sessions) ends
+/// archived, an unflagged one stays visible for inspection.
+///
+/// This is what bounds the dispatcher's retry loop. Without it every failed
+/// boot leaves a permanently visible dead row plus two per-session tokio loops
+/// (the status detector and the steering deliver loop both hang off
+/// `exists_active`, which filters `archived = 0`), and a 5-minute cron that
+/// keeps failing manufactures a new one of those every cycle.
+#[tokio::test]
+async fn failed_boot_archives_a_disposable_spawn() {
+    let (state, app, _dir) = setup().await;
+    let (status, _body) = post_sessions(
+        &app,
+        json!({
+            "name": "Operator--a--reply-1",
+            "dir": missing_dir(),
+            "provider": "shell",
+            "unless_live_prefix": "Operator--a--",
+            "archive_on_stop": true,
+            "prompt": "read the contract and act"
+        }),
+    )
+    .await;
+    assert!(status.is_server_error(), "the boot must have failed: {status}");
+    assert_eq!(
+        db::sessions::is_archived(&state.pool, "Operator--a--reply-1")
+            .await
+            .unwrap(),
+        Some(true),
+        "a flagged spawn whose boot failed must archive itself"
+    );
+    // Archiving is also what frees the prefix here: `live_with_prefix` only
+    // considers `archived = 0` rows.
+    assert_eq!(
+        db::sessions::live_with_prefix(&state.pool, "Operator--a--", 7200)
+            .await
+            .unwrap(),
+        None,
+        "the archived dead row must not block the identity's retry"
+    );
+
+    // The unflagged control: same failure, row stays visible.
+    let (status, _body) = post_sessions(
+        &app,
+        json!({
+            "name": "Operator--b--reply-1",
+            "dir": missing_dir(),
+            "provider": "shell",
+            "prompt": "read the contract and act"
+        }),
+    )
+    .await;
+    assert!(status.is_server_error(), "the boot must have failed: {status}");
+    assert_eq!(
+        db::sessions::is_archived(&state.pool, "Operator--b--reply-1")
+            .await
+            .unwrap(),
+        Some(false),
+        "a session that never asked to be archived stays visible after a failed boot"
+    );
+}
+
 /// The row surviving a failed boot must not lock the identity out of a retry.
 ///
 /// Left alone, the dead row's runtime status is `''` (the failure beat the
