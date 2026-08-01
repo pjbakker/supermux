@@ -193,14 +193,68 @@ async fn prompt_start_failure_keeps_session_row() {
     )
     .await;
     assert!(
-        !status.is_client_error(),
-        "start may fail in the test env, but never 4xx: {status}"
+        status.is_server_error(),
+        "the failed start must surface as 5xx (never 4xx, and never a silent 201): {status}"
     );
     assert!(
         db::sessions::exists(&state.pool, "Operator--f--reply-1")
             .await
             .unwrap(),
         "session row survives a failed start"
+    );
+}
+
+/// The row surviving a failed boot must not lock the identity out of a retry.
+///
+/// Left alone, the dead row's runtime status is `''` (the failure beat the
+/// `starting` write), which `live_with_prefix` reads as live for the whole
+/// quiet window. `lifecycle::start` stamps `stopped` on its error paths so the
+/// prefix frees up immediately and the dispatcher can try again.
+#[tokio::test]
+async fn failed_boot_frees_its_prefix_for_a_retry() {
+    let (state, app, _dir) = setup().await;
+    let (status, _body) = post_sessions(
+        &app,
+        json!({
+            "name": "Operator--r--reply-1",
+            "dir": missing_dir(),
+            "provider": "shell",
+            "unless_live_prefix": "Operator--r--",
+            "prompt": "read the contract and act"
+        }),
+    )
+    .await;
+    assert!(status.is_server_error(), "the boot must have failed: {status}");
+
+    // 7200s = the default quiet window, so this also covers the freshness arm
+    // that a just-created row would otherwise sit inside.
+    assert_eq!(
+        db::sessions::live_with_prefix(&state.pool, "Operator--r--", 7200)
+            .await
+            .unwrap(),
+        None,
+        "a session whose boot failed must not read live"
+    );
+
+    // And the guard agrees: the retry gets past it (it then fails its own boot
+    // on the same missing dir, which is a 5xx, not the guard's 409).
+    let (retry, body) = post_sessions(
+        &app,
+        json!({
+            "name": "Operator--r--reply-2",
+            "dir": missing_dir(),
+            "provider": "shell",
+            "unless_live_prefix": "Operator--r--",
+            "prompt": "read the contract and act"
+        }),
+    )
+    .await;
+    assert_ne!(retry, StatusCode::CONFLICT, "the guard blocked the retry: {body}");
+    assert!(
+        db::sessions::exists(&state.pool, "Operator--r--reply-2")
+            .await
+            .unwrap(),
+        "the retry created its row"
     );
 }
 
