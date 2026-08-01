@@ -532,6 +532,11 @@ async fn execute_boot(state: &AppState, sched: &Schedule) -> JobOutcome {
         // local-session default in `sessions::create`), not tmux. That is why
         // the name above is budgeted against the native socket path.
         runtime: None,
+        // The runner delivers its own opening prompt below, and a schedule's
+        // singleton behaviour is the schedule's own (not the create guard).
+        prompt: None,
+        unless_live_prefix: None,
+        max_quiet_secs: None,
     };
     if let Err(e) = sessions::create(state, input).await {
         return JobOutcome {
