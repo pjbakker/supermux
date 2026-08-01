@@ -541,10 +541,11 @@ pub struct CreateInput {
     #[serde(default)]
     pub bypass_permissions: Option<bool>,
     /// Which terminal backend drives this session (migration 0024): `"tmux"`
-    /// (the default and the whole existing fleet) or `"native"` (the tmux-less
-    /// pty holder). Absent = `"tmux"`, so every existing client body creates
-    /// exactly the session it always did. Anything else is a 400; `"native"`
-    /// combined with a `host_id` is a 400 too (see [`create`]).
+    /// or `"native"` (the tmux-less pty holder). Absent resolves in
+    /// [`create`]: `"native"` for local sessions (the tmux-less runtime is
+    /// the default), `"tmux"` for remote (`host_id`-carrying) sessions, since
+    /// a holder is definitionally local. Anything else is a 400; `"native"`
+    /// combined with a `host_id` is a 400 too.
     #[serde(default)]
     pub runtime: Option<String>,
     /// Stamp the created session so it auto-archives when it stops. Set by the

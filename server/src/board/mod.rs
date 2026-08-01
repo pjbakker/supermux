@@ -955,7 +955,8 @@ async fn start_handler(
                 mcp: None,
                 worktree: spawn.worktree,
                 host_id: None,
-                // Board-spawned sessions take the default (tmux) runtime.
+                // No host_id here, so leaving runtime absent resolves to native (the
+                // local-session default in `sessions::create`), not tmux.
                 runtime: None,
                 // Prompt delivery and the spawn guard belong to the on-demand
                 // spawn API; this path starts and steers the session itself.
