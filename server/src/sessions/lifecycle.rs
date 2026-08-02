@@ -4153,6 +4153,255 @@ mod agent_ready_heuristics_tests {
 }
 
 #[cfg(test)]
+mod deliver_prompt_tests {
+    //! `deliver_prompt` over a scripted [`SessionRuntime`] double.
+    //!
+    //! The whole point of the verify loop is what it does to the TERMINAL: how
+    //! many Enters it presses, and whether it looks at all. So the tests assert
+    //! on the recorded key sends rather than only on the return value. Time is
+    //! paused (`start_paused = true`): the settle and verify sleeps auto-advance
+    //! whenever the runtime is idle, and the fake never blocks, so a nominally
+    //! ~4s window runs instantly.
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use anyhow::{anyhow, Result as AnyResult};
+    use async_trait::async_trait;
+
+    use crate::sessions::runtime::HistoryWindow;
+
+    /// A `SessionRuntime` whose captures are a script and whose input is a log.
+    ///
+    /// `captures` is consumed front-to-back, one entry per `capture_plain`; the
+    /// LAST entry repeats forever, so "the pane looks like this from now on" is
+    /// a one-element tail rather than six copies. An `Err` entry stands for a
+    /// capture round-trip that failed. Everything the delivery path does not
+    /// touch is a trivial stub.
+    struct FakeRuntime {
+        captures: Mutex<Vec<Result<String, String>>>,
+        capture_calls: Mutex<usize>,
+        texts: Mutex<Vec<String>>,
+        keys: Mutex<Vec<String>>,
+    }
+
+    impl FakeRuntime {
+        fn new(captures: Vec<Result<String, String>>) -> Self {
+            Self {
+                captures: Mutex::new(captures),
+                capture_calls: Mutex::new(0),
+                texts: Mutex::new(Vec::new()),
+                keys: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn captures_taken(&self) -> usize {
+            *self.capture_calls.lock().unwrap()
+        }
+
+        fn enters(&self) -> usize {
+            self.keys.lock().unwrap().iter().filter(|k| *k == "Enter").count()
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.texts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SessionRuntime for FakeRuntime {
+        async fn spawn(
+            &self,
+            _dir: &Path,
+            _env: &HashMap<String, String>,
+            _shell: &str,
+        ) -> AnyResult<()> {
+            Ok(())
+        }
+
+        async fn alive(&self) -> bool {
+            true
+        }
+
+        async fn kill(&self) -> AnyResult<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, text: &str) -> AnyResult<()> {
+            self.texts.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        async fn send_key(&self, key: &str) -> AnyResult<()> {
+            self.keys.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+
+        async fn paste(&self, _text: &str, _bracketed: bool) -> AnyResult<()> {
+            Ok(())
+        }
+
+        async fn resize(&self, _cols: u16, _rows: u16) -> AnyResult<()> {
+            Ok(())
+        }
+
+        async fn capture_plain(&self, _lines: usize) -> AnyResult<String> {
+            *self.capture_calls.lock().unwrap() += 1;
+            let mut script = self.captures.lock().unwrap();
+            if script.is_empty() {
+                return Err(anyhow!("capture script exhausted"));
+            }
+            let next = if script.len() == 1 {
+                script[0].clone()
+            } else {
+                script.remove(0)
+            };
+            next.map_err(|e| anyhow!(e))
+        }
+
+        async fn capture_ansi(&self, _lines: usize) -> AnyResult<String> {
+            Ok(String::new())
+        }
+
+        async fn capture_screen_ansi(&self) -> AnyResult<String> {
+            Ok(String::new())
+        }
+
+        async fn capture_full(&self) -> AnyResult<String> {
+            Ok(String::new())
+        }
+
+        async fn seed(&self) -> AnyResult<String> {
+            Ok(String::new())
+        }
+
+        async fn history_window(&self, _end_offset: i64, _count: u32) -> AnyResult<HistoryWindow> {
+            Ok(HistoryWindow {
+                rows: Vec::new(),
+                history_size: 0,
+                start_offset: 0,
+                end_offset: 0,
+                hit_top: true,
+                cols: 0,
+                at_limit: false,
+            })
+        }
+
+        async fn history_meta(&self) -> (u32, u16) {
+            (0, 0)
+        }
+
+        async fn pane_pid(&self) -> AnyResult<Option<u32>> {
+            Ok(None)
+        }
+
+        async fn dead(&self) -> AnyResult<bool> {
+            Ok(false)
+        }
+    }
+
+    /// An idle Claude composer: agent UI visible, nothing running. Used as the
+    /// pre-send sample so a test's real subject is the FIRST verify capture.
+    const IDLE: &str = "❯ \n? for shortcuts";
+
+    /// A shell has no working indicator and echoes every command it runs, so the
+    /// verifier could only ever conclude "stuck", and its retry Enters would go
+    /// into the foreground process's stdin. The prompt is typed and submitted
+    /// once, the pane is never even captured, and the result is unverifiable.
+    /// `ready = true` so the skipped settle gate is covered too.
+    #[tokio::test(start_paused = true)]
+    async fn a_shell_prompt_is_typed_once_and_never_verified() {
+        // What a shell pane actually looks like after the command ran: the
+        // command echoed at the prompt, its output, a fresh prompt. No working
+        // indicator anywhere, and the echo trips the stuck-composer tail match.
+        let rt = FakeRuntime::new(vec![Ok("$ ./deploy.sh\ndeploying…\n$ ".to_string())]);
+        let out = deliver_prompt(&rt, "shell", "./deploy.sh", true).await.unwrap();
+        assert_eq!(out, None, "a shell start is not verifiable");
+        assert_eq!(rt.enters(), 1, "exactly one Enter, never a retry");
+        assert_eq!(rt.captures_taken(), 0, "no settle gate, no verify loop");
+        assert_eq!(rt.texts(), vec!["./deploy.sh".to_string()]);
+    }
+
+    /// The healthy path: the turn starts, the first verify poll sees the working
+    /// footer, and the loop returns immediately without a second Enter.
+    #[tokio::test(start_paused = true)]
+    async fn a_working_indicator_verifies_the_submit_without_a_retry() {
+        let rt = FakeRuntime::new(vec![
+            Ok(IDLE.to_string()),
+            Ok("✻ Thinking… (esc to interrupt · 3s)".to_string()),
+        ]);
+        let out = deliver_prompt(&rt, "claude", "boot now", false).await.unwrap();
+        assert_eq!(out, Some(true));
+        assert_eq!(rt.enters(), 1);
+    }
+
+    /// REGRESSION: the prompt submitted, the agent ran, and it is now parked on
+    /// a permission selector with the prompt still echoed above it. Before the
+    /// waiting arm this read Stuck and the loop pressed Enter into the selector,
+    /// confirming its highlighted default (here: "1. Yes" to a `rm -rf`).
+    #[tokio::test(start_paused = true)]
+    async fn an_approval_selector_stops_the_retry_loop() {
+        let prompt = "clean the build directory";
+        let selector = format!(
+            "❯ {prompt}\n\nBash(rm -rf build/)\nDo you want to proceed?\n❯ 1. Yes\n  2. No"
+        );
+        let rt = FakeRuntime::new(vec![Ok(IDLE.to_string()), Ok(selector)]);
+        let out = deliver_prompt(&rt, "claude", prompt, false).await.unwrap();
+        assert_eq!(out, Some(true), "a selector proves the input was consumed");
+        assert_eq!(
+            rt.enters(),
+            1,
+            "no retry Enter may land on an approval selector",
+        );
+    }
+
+    /// The genuine swallowed-Enter case: the prompt sits in the composer for the
+    /// whole window. Retries are capped, and the give-up is reported as an
+    /// OBSERVED failure (the one case the caller warns about).
+    #[tokio::test(start_paused = true)]
+    async fn a_permanently_stuck_composer_retries_up_to_the_cap_then_gives_up() {
+        let prompt = "boot the operator";
+        let stuck = format!("╭───╮\n│ > {prompt} │\n╰───╯\n? for shortcuts");
+        let rt = FakeRuntime::new(vec![Ok(IDLE.to_string()), Ok(stuck)]);
+        let out = deliver_prompt(&rt, "claude", prompt, false).await.unwrap();
+        assert_eq!(out, Some(false), "observed, and still stuck");
+        assert_eq!(
+            rt.enters(),
+            1 + MAX_EXTRA_ENTERS,
+            "the submit Enter plus exactly MAX_EXTRA_ENTERS retries",
+        );
+    }
+
+    /// Every capture in the window failed, so we never saw the pane at all. That
+    /// is unverifiable, NOT a failure. Reporting Some(false) here would warn on
+    /// starts that were probably fine.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_of_failed_captures_is_unverifiable() {
+        let rt = FakeRuntime::new(vec![Err("capture-pane exploded".to_string())]);
+        let out = deliver_prompt(&rt, "claude", "boot now", false).await.unwrap();
+        assert_eq!(out, None);
+        assert_eq!(rt.enters(), 1, "nothing observed, so nothing to retry against");
+        assert!(rt.captures_taken() > 0, "it did try to look");
+    }
+
+    /// The double-launch guard delivers into an agent that is ALREADY mid-turn.
+    /// The working indicator is on screen before we type, so the first verify
+    /// poll would rubber-stamp a submit it never observed. Deliver, then report
+    /// unverifiable. `ready = true` because that is the path this happens on.
+    #[tokio::test(start_paused = true)]
+    async fn an_already_busy_composer_is_delivered_but_not_verified() {
+        let busy = "❯ \n✻ Thinking… (esc to interrupt · 41s)";
+        let rt = FakeRuntime::new(vec![Ok(busy.to_string())]);
+        let out = deliver_prompt(&rt, "claude", "one more thing", true).await.unwrap();
+        assert_eq!(out, None, "it was already working before we typed");
+        assert_eq!(rt.enters(), 1);
+        assert_eq!(rt.texts(), vec!["one more thing".to_string()]);
+    }
+}
+
+#[cfg(test)]
 mod build_env_tests {
     //! `build_env` injects the per-pane tmux environment. These pin the two
     //! Claude-only escape hatches that fix browser-terminal regressions:
