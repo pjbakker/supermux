@@ -845,6 +845,22 @@ static CODEX_WAITING_BANK: Lazy<Regex> = Lazy::new(|| {
         .unwrap()
 });
 
+/// Is the provider's "turn running" anchor visible in a plain-text capture?
+///
+/// The positive half of prompt-submission verification in
+/// `lifecycle::deliver_prompt`: once a turn is running, the opening prompt's
+/// Enter definitely landed. Reuses the same ACTIVE banks the status detector
+/// anchors on, so the definition of "working" cannot drift between the two.
+///
+/// The provider split mirrors `classify`: codex has its own TUI and its own
+/// bank, everything else reads the Claude banks.
+pub fn working_indicator(provider: &str, capture: &str) -> bool {
+    match provider {
+        "codex" => CODEX_ACTIVE_BANK.is_match(capture),
+        _ => ACTIVE_BANK.is_match(capture),
+    }
+}
+
 /// USER-INTERRUPT marker: the literal prompt Claude Code shows after the user
 /// presses Esc twice mid-turn. Unique enough to pre-empt the turn state
 /// machine (Claude Code doesn't emit a `Stop` hook for user-interrupts, so the
@@ -1563,5 +1579,21 @@ mod tests {
         let raw = "output\n$ \n   \n\n\n";
         let out = prepare_capture(raw);
         assert_eq!(out, "output\n$ ", "trailing blanks dropped, prompt kept last");
+    }
+
+    #[test]
+    fn working_indicator_matches_claude_working_footer() {
+        assert!(working_indicator("claude", "some output\n✶ Unfurling… (esc to interrupt)"));
+        // Spinner-frame line with ellipsis also counts (matches ACTIVE bank).
+        assert!(working_indicator("claude", "✻ Thinking…\n"));
+        assert!(!working_indicator("claude", "❯ \n⏵⏵ bypass permissions on"));
+        // Claude menus say "esc to go back", never "esc to interrupt".
+        assert!(!working_indicator("claude", "1. Yes\n2. No\nesc to go back"));
+    }
+
+    #[test]
+    fn working_indicator_matches_codex() {
+        assert!(working_indicator("codex", "◦ Working (3s • Esc to interrupt)"));
+        assert!(!working_indicator("codex", "› 1. approve\nPress enter to confirm"));
     }
 }
