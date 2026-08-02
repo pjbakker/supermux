@@ -649,17 +649,23 @@ fn submit_state(capture: &str, prompt: &str, provider: &str) -> SubmitState {
     // Enter CONFIRMS the highlighted default option (a `rm -rf`, an edit, a plan
     // approval). Returning Submitted stops the retry loop dead, which is the
     // whole point.
-    if status::waiting_indicator(provider, capture) {
+    //
+    // But the evidence only counts if it is not the PROMPT'S OWN TEXT staring
+    // back at us. The waiting banks are unanchored substrings, so a prompt like
+    // "review the open PRs and approve the safe ones", or one starting
+    // "1. check the queue" (which the composer draws as `❯ 1. check the queue`),
+    // matches its own echo, and a genuinely stuck boot would report a confident
+    // Submitted with zero retries. So the check runs per LINE (no bank pattern
+    // spans a newline: none of them set `(?s)`, and `.` never matches `\n`) and
+    // skips every line that is a fragment of the prompt. Stripping the composer
+    // cursor glyphs in that comparison is what makes it work on the FIRST echoed
+    // line, which starts `❯ ` and would otherwise never look like prompt text.
+    if capture
+        .lines()
+        .any(|line| status::waiting_indicator(provider, line) && !line_is_prompt_echo(line, prompt))
+    {
         return SubmitState::Submitted;
     }
-    // U+2500..U+257F is the whole Unicode box-drawing block, so this covers
-    // every border style a provider might switch to (light, heavy, double,
-    // rounded) instead of hard-coding the two glyphs Claude happens to use.
-    let squash = |s: &str| {
-        s.chars()
-            .filter(|c| !c.is_whitespace() && !matches!(c, '\u{2500}'..='\u{257F}'))
-            .collect::<String>()
-    };
     let cap = squash(capture);
     let tail: String = {
         let p = squash(prompt);
@@ -671,6 +677,39 @@ fn submit_state(capture: &str, prompt: &str, provider: &str) -> SubmitState {
     } else {
         SubmitState::Unknown
     }
+}
+
+/// Drop everything that the composer's own layout inserts into text: ALL
+/// whitespace (it hard-wraps at pane width, at positions we cannot predict) and
+/// every box-drawing glyph. U+2500..U+257F is the whole Unicode box-drawing
+/// block, so this covers every border style a provider might switch to (light,
+/// heavy, double, rounded) instead of hard-coding the two glyphs Claude happens
+/// to use.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '\u{2500}'..='\u{257F}'))
+        .collect()
+}
+
+/// [`squash`] plus the composer CURSOR glyphs. Used only for the prompt-echo
+/// test, where the leading `❯ ` / `> ` on the first drawn line is decoration the
+/// prompt itself never contained.
+fn squash_ext(s: &str) -> String {
+    squash(s)
+        .chars()
+        .filter(|c| !matches!(c, '❯' | '❱' | '>'))
+        .collect()
+}
+
+/// Is `line` nothing more than a piece of `prompt` echoed back onto the screen?
+///
+/// True when the line, stripped of layout, is a substring of the prompt stripped
+/// the same way. That is deliberately loose: the composer breaks the prompt at
+/// unpredictable points, so any single drawn line is some contiguous run of it.
+/// An empty line is never an echo (it is also never waiting evidence).
+fn line_is_prompt_echo(line: &str, prompt: &str) -> bool {
+    let l = squash_ext(line);
+    !l.is_empty() && squash_ext(prompt).contains(&l)
 }
 
 /// Heuristic: are we stuck in Claude's `--resume` session picker?
@@ -2958,6 +2997,50 @@ mod agent_ready_heuristics_tests {
 
         let codex = "› run the deploy script\n› 1. Yes\n› 2. No\nPress enter to confirm";
         assert_eq!(submit_state(codex, prompt, "codex"), SubmitState::Submitted);
+    }
+
+    /// The waiting banks are unanchored substrings, so a PROMPT that happens to
+    /// contain one of their tokens would match its own echo in the composer. A
+    /// stuck boot would then report a confident "submitted" and never retry -
+    /// strictly worse than the bug the waiting arm was added to fix.
+    #[test]
+    fn stuck_prompt_containing_approve_reads_stuck() {
+        let prompt = "Review the open PRs and approve the safe ones.";
+        let cap = "╭──────────────────────────────────────────────────╮\n\
+                   │ > Review the open PRs and approve the safe       │\n\
+                   │   ones.                                          │\n\
+                   ╰──────────────────────────────────────────────────╯\n\
+                   ? for shortcuts";
+        assert_eq!(submit_state(cap, prompt, "claude"), SubmitState::Stuck);
+    }
+
+    /// The same hazard through the SELECTOR pattern rather than a word: a prompt
+    /// that starts with a numbered list is drawn as `❯ 1. …`, which is exactly
+    /// what `❯\s*\d+\.` looks for. Stripping the cursor glyph is what lets the
+    /// echo test recognise that first line as the prompt's own text.
+    #[test]
+    fn stuck_numbered_prompt_reads_stuck() {
+        let prompt = "1. check the queue 2. drain it";
+        let cap = "╭────────────────────────────────────╮\n\
+                   │ ❯ 1. check the queue 2. drain it   │\n\
+                   ╰────────────────────────────────────╯\n\
+                   ? for shortcuts";
+        assert_eq!(submit_state(cap, prompt, "claude"), SubmitState::Stuck);
+    }
+
+    /// …and the echo skip must not swallow a REAL selector that happens to sit
+    /// under an echo of a token-carrying prompt. The selector lines are not
+    /// prompt text, so they still count as evidence the input was consumed.
+    #[test]
+    fn selector_wins_even_when_prompt_mentions_approve() {
+        let prompt = "Review the open PRs and approve the safe ones.";
+        let cap = "❯ Review the open PRs and approve the safe ones.\n\
+                   \n\
+                   Bash(gh pr merge 42 --squash)\n\
+                   Do you want to proceed?\n\
+                   ❯ 1. Yes\n\
+                     2. No";
+        assert_eq!(submit_state(cap, prompt, "claude"), SubmitState::Submitted);
     }
 }
 
