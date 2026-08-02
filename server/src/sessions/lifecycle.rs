@@ -815,10 +815,15 @@ async fn wait_for_agent_ready(
     false
 }
 
-/// Prompt-delivery verification bounds. The whole loop is worst-case
-/// SETTLE_POLLS*300ms + VERIFY_POLLS*500ms ≈ 4s, on top of a boot that already
-/// tolerates a 10s readiness wait; a healthy submit exits on the first poll.
+/// Prompt-delivery verification bounds. The settle gate sleeps BETWEEN captures
+/// only (SETTLE_POLLS captures, so at most SETTLE_POLLS-1 gaps), so the loop is
+/// worst-case 3*SETTLE_POLL + VERIFY_POLLS*VERIFY_POLL = 3.9s, inside the 4.2s
+/// the constants test pins, plus the capture round-trips themselves. That sits
+/// on top of a boot which already tolerates a 10s readiness wait. Note that even
+/// the healthy path pays one VERIFY_POLL (~500ms): the first verify capture is
+/// taken AFTER that sleep, so a submit that landed instantly still costs it.
 const SETTLE_POLLS: usize = 4;
+const SETTLE_POLL: Duration = Duration::from_millis(300);
 const VERIFY_POLLS: usize = 6;
 const VERIFY_POLL: Duration = Duration::from_millis(500);
 const MAX_EXTRA_ENTERS: usize = 3;
@@ -841,7 +846,9 @@ const MAX_EXTRA_ENTERS: usize = 3;
 ///
 /// Send failures propagate (real I/O errors are boot failures, as before).
 /// Verification failure is NOT fatal: returns Ok(false), caller warns and
-/// reports it on `StartResult.prompt_submitted`.
+/// reports it on `StartResult.prompt_submitted`. Never having SEEN the pane
+/// counts as unverified too: if every capture in the window failed we report
+/// false rather than reading the untouched `Unknown` as a cleared composer.
 async fn deliver_prompt(
     rt: &dyn SessionRuntime,
     provider: &str,
@@ -850,7 +857,12 @@ async fn deliver_prompt(
 ) -> Result<bool, AppError> {
     if ready {
         let mut seen = false;
-        for _ in 0..SETTLE_POLLS {
+        for poll in 0..SETTLE_POLLS {
+            // Sleep BEFORE every capture but the first: same gap between
+            // captures as before, without a trailing sleep the loop ends on.
+            if poll > 0 {
+                tokio::time::sleep(SETTLE_POLL).await;
+            }
             let visible = rt
                 .capture_plain(status::CAPTURE_LINES)
                 .await
@@ -860,7 +872,6 @@ async fn deliver_prompt(
                 break;
             }
             seen = visible;
-            tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
 
@@ -870,11 +881,13 @@ async fn deliver_prompt(
 
     let mut extra_enters = 0usize;
     let mut last = SubmitState::Unknown;
+    let mut observed = false;
     for _ in 0..VERIFY_POLLS {
         tokio::time::sleep(VERIFY_POLL).await;
         let Ok(cap) = rt.capture_plain(status::CAPTURE_LINES).await else {
             continue; // capture hiccup: unknown, keep polling
         };
+        observed = true;
         last = submit_state(&cap, prompt, provider);
         match last {
             SubmitState::Submitted => return Ok(true),
@@ -892,8 +905,10 @@ async fn deliver_prompt(
         }
     }
     // Window over. A cleared composer with no working indicator (Unknown)
-    // counts as submitted: the text is gone from the input box.
-    Ok(last == SubmitState::Unknown)
+    // counts as submitted: the text is gone from the input box. But only if we
+    // actually saw the pane at least once: an all-failed capture window has
+    // observed nothing and must not be reported as verified.
+    Ok(observed && last == SubmitState::Unknown)
 }
 
 /// SIGTERM then (after a grace) SIGKILL the pane process group.
@@ -2864,7 +2879,10 @@ mod agent_ready_heuristics_tests {
     fn prompt_verify_constants_are_bounded() {
         // The verify loop runs inside the per-session lock and inside synchronous
         // HTTP handlers: keep worst-case added latency to a few seconds.
-        assert!(SETTLE_POLLS * 2 <= 8, "settle gate must stay under ~2s");
+        assert!(
+            SETTLE_POLLS as u64 * SETTLE_POLL.as_millis() as u64 <= 2000,
+            "settle gate must stay under ~2s",
+        );
         assert_eq!(MAX_EXTRA_ENTERS, 3);
         assert!(VERIFY_POLLS as u64 * VERIFY_POLL.as_millis() as u64 <= 4000);
     }
