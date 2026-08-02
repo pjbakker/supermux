@@ -655,9 +655,11 @@ fn submit_state(capture: &str, prompt: &str, provider: &str) -> SubmitState {
     // "review the open PRs and approve the safe ones", or one starting
     // "1. check the queue" (which the composer draws as `❯ 1. check the queue`),
     // matches its own echo, and a genuinely stuck boot would report a confident
-    // Submitted with zero retries. So the check runs per LINE (no bank pattern
-    // spans a newline: none of them set `(?s)`, and `.` never matches `\n`) and
-    // skips every line that is a fragment of the prompt. Stripping the composer
+    // Submitted with zero retries. So the check runs per LINE and skips every
+    // line that is a fragment of the prompt. The only alternatives that could
+    // span a newline (`❯\s*\d+\.` via `\s*`, and codex's `›` variant) are drawn
+    // on one line by every provider, and a missed waiting match only degrades to
+    // Stuck plus capped retries, the safe direction. Stripping the composer
     // cursor glyphs in that comparison is what makes it work on the FIRST echoed
     // line, which starts `❯ ` and would otherwise never look like prompt text.
     if capture
