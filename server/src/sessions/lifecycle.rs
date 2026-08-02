@@ -627,15 +627,26 @@ enum SubmitState {
 /// Classify whether the opening prompt submitted. Pure over the capture so it
 /// is unit-tested without a terminal, like `should_escape_resume_picker`.
 ///
-/// The tail check strips ALL whitespace from both sides before substring
-/// matching: the composer hard-wraps at pane width, so the on-screen prompt is
-/// broken by newlines (and box padding) at positions we cannot predict.
+/// The tail check strips ALL whitespace AND every box-drawing glyph from both
+/// sides before substring matching: the composer hard-wraps at pane width, so
+/// the on-screen prompt is broken by newlines at positions we cannot predict,
+/// and Claude/Kimi fence each of those wrapped lines with `│` (capped by
+/// `╭─╮`/`╰─╯`) so the border glyphs land INSIDE the text too. Dropping only
+/// whitespace would leave `…bootedbythe││scheduler…`, which never matches the
+/// squashed prompt tail.
 #[allow(dead_code)]
 fn submit_state(capture: &str, prompt: &str, provider: &str) -> SubmitState {
     if status::working_indicator(provider, capture) {
         return SubmitState::Submitted;
     }
-    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    // U+2500..U+257F is the whole Unicode box-drawing block, so this covers
+    // every border style a provider might switch to (light, heavy, double,
+    // rounded) instead of hard-coding the two glyphs Claude happens to use.
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && !matches!(c, '\u{2500}'..='\u{257F}'))
+            .collect::<String>()
+    };
     let cap = squash(capture);
     let tail: String = {
         let p = squash(prompt);
@@ -2703,6 +2714,26 @@ mod agent_ready_heuristics_tests {
         let cap = "❯ You are the Pootjes platform operator, booted by the scheduler.\n\
                    Read prompts/platform.md and operator-session.md next to it,\n\
                    then follow them exactly.\n\
+                   ⏵⏵ bypass permissions on";
+        let prompt = "You are the Pootjes platform operator, booted by the scheduler. Read prompts/platform.md and operator-session.md next to it, then follow them exactly.";
+        assert_eq!(submit_state(cap, prompt, "claude"), SubmitState::Stuck);
+    }
+
+    /// The shape a REAL stuck composer has: Claude/Kimi draw the input as a
+    /// bordered box (see `tests/fixtures/status/claude_idle_prompt.idle.txt`),
+    /// so every wrapped line is fenced by `│` and the whole thing is capped by
+    /// `╭─╮` / `╰─╯`. Squashing whitespace alone leaves those glyphs wedged
+    /// between the words (`...bootedbythe││scheduler...`), which breaks the
+    /// substring match and reads Unknown for exactly the case we exist to
+    /// catch. Pin the bordered shape so the border stripping can't be dropped.
+    #[test]
+    fn submit_state_sees_through_the_composer_box_border() {
+        let cap = "╭──────────────────────────────────────────────────╮\n\
+                   │ > You are the Pootjes platform operator, booted   │\n\
+                   │   by the scheduler. Read prompts/platform.md and  │\n\
+                   │   operator-session.md next to it, then follow     │\n\
+                   │   them exactly.                                   │\n\
+                   ╰──────────────────────────────────────────────────╯\n\
                    ⏵⏵ bypass permissions on";
         let prompt = "You are the Pootjes platform operator, booted by the scheduler. Read prompts/platform.md and operator-session.md next to it, then follow them exactly.";
         assert_eq!(submit_state(cap, prompt, "claude"), SubmitState::Stuck);
