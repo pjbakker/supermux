@@ -606,6 +606,49 @@ fn current_screen_tail(capture: &str) -> String {
     lines[start..].join("\n")
 }
 
+/// Outcome of one prompt-submission check over a plain capture.
+///
+/// Caller-less until the delivery loop lands; `dead_code` is silenced the way
+/// `status::HOOK_FRESH` does it rather than shipping the loop half-tested.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SubmitState {
+    /// A turn is running: the Enter definitely landed.
+    Submitted,
+    /// The prompt text is still on screen with no turn running. Either the
+    /// composer still holds it (the swallowed-Enter bug) or a finished turn
+    /// echoed it into the transcript; the caller resolves the ambiguity by
+    /// pressing Enter again, a no-op in the second case.
+    Stuck,
+    /// Neither marker visible (mid-repaint, cleared screen). Keep polling.
+    Unknown,
+}
+
+/// Classify whether the opening prompt submitted. Pure over the capture so it
+/// is unit-tested without a terminal, like `should_escape_resume_picker`.
+///
+/// The tail check strips ALL whitespace from both sides before substring
+/// matching: the composer hard-wraps at pane width, so the on-screen prompt is
+/// broken by newlines (and box padding) at positions we cannot predict.
+#[allow(dead_code)]
+fn submit_state(capture: &str, prompt: &str, provider: &str) -> SubmitState {
+    if status::working_indicator(provider, capture) {
+        return SubmitState::Submitted;
+    }
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let cap = squash(capture);
+    let tail: String = {
+        let p = squash(prompt);
+        let start = p.char_indices().rev().nth(59).map(|(i, _)| i).unwrap_or(0);
+        p[start..].to_string()
+    };
+    if !tail.is_empty() && cap.contains(&tail) {
+        SubmitState::Stuck
+    } else {
+        SubmitState::Unknown
+    }
+}
+
 /// Heuristic: are we stuck in Claude's `--resume` session picker?
 fn at_resume_picker(capture: &str) -> bool {
     let c = capture.to_lowercase();
@@ -2646,6 +2689,45 @@ mod agent_ready_heuristics_tests {
             pty_ready_for_send(&live),
             "a live composer at the bottom of the current screen still delivers",
         );
+    }
+
+    #[test]
+    fn submit_state_reads_working_indicator_as_submitted() {
+        let cap = "❯ You are the operator, boot now\n✶ Unfurling… (esc to interrupt)";
+        assert_eq!(submit_state(cap, "You are the operator, boot now", "claude"), SubmitState::Submitted);
+    }
+
+    #[test]
+    fn submit_state_flags_wrapped_prompt_tail_as_stuck() {
+        // The composer wraps at pane width; the tail check must survive line breaks.
+        let cap = "❯ You are the Pootjes platform operator, booted by the scheduler.\n\
+                   Read prompts/platform.md and operator-session.md next to it,\n\
+                   then follow them exactly.\n\
+                   ⏵⏵ bypass permissions on";
+        let prompt = "You are the Pootjes platform operator, booted by the scheduler. Read prompts/platform.md and operator-session.md next to it, then follow them exactly.";
+        assert_eq!(submit_state(cap, prompt, "claude"), SubmitState::Stuck);
+    }
+
+    #[test]
+    fn submit_state_is_unknown_when_neither_marker_shows() {
+        // Mid-repaint capture: no working footer, no prompt text.
+        assert_eq!(submit_state("❯ \n? for shortcuts", "You are the operator", "claude"), SubmitState::Unknown);
+    }
+
+    #[test]
+    fn submit_state_transcript_echo_reads_stuck_not_unknown() {
+        // After a fast turn the prompt is echoed in the transcript and the agent
+        // is idle. Indistinguishable from a stuck composer by text alone; we
+        // accept Stuck here because the remedy (a bare Enter) is a no-op on an
+        // idle composer.
+        let cap = "❯ You are the operator, boot now\nDone. Summary posted.\n❯ ";
+        assert_eq!(submit_state(cap, "You are the operator, boot now", "claude"), SubmitState::Stuck);
+    }
+
+    #[test]
+    fn submit_state_short_prompt_is_matched_whole() {
+        assert_eq!(submit_state("❯ hi there", "hi there", "claude"), SubmitState::Stuck);
+        assert_eq!(submit_state("✻ Pondering…", "hi there", "claude"), SubmitState::Submitted);
     }
 }
 
