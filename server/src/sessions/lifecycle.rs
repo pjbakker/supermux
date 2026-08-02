@@ -37,6 +37,11 @@ pub struct StartResult {
     pub started: bool,
     /// The agent UI / shell prompt was observed within the wait-for-ready window.
     pub ready: bool,
+    /// Some(true): the opening prompt was verifiably submitted (a turn started
+    /// or the composer cleared). Some(false): after capped retries the prompt
+    /// still appeared unsubmitted; the session is left running for recovery.
+    /// None: no prompt was delivered by this start.
+    pub prompt_submitted: Option<bool>,
     /// `supermux-<name>` — the tmux target.
     pub target: String,
 }
@@ -607,10 +612,6 @@ fn current_screen_tail(capture: &str) -> String {
 }
 
 /// Outcome of one prompt-submission check over a plain capture.
-///
-/// Caller-less until the delivery loop lands; `dead_code` is silenced the way
-/// `status::HOOK_FRESH` does it rather than shipping the loop half-tested.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum SubmitState {
     /// A turn is running: the Enter definitely landed.
@@ -634,7 +635,6 @@ enum SubmitState {
 /// `╭─╮`/`╰─╯`) so the border glyphs land INSIDE the text too. Dropping only
 /// whitespace would leave `…bootedbythe││scheduler…`, which never matches the
 /// squashed prompt tail.
-#[allow(dead_code)]
 fn submit_state(capture: &str, prompt: &str, provider: &str) -> SubmitState {
     if status::working_indicator(provider, capture) {
         return SubmitState::Submitted;
@@ -813,6 +813,87 @@ async fn wait_for_agent_ready(
         }
     }
     false
+}
+
+/// Prompt-delivery verification bounds. The whole loop is worst-case
+/// SETTLE_POLLS*300ms + VERIFY_POLLS*500ms ≈ 4s, on top of a boot that already
+/// tolerates a 10s readiness wait; a healthy submit exits on the first poll.
+const SETTLE_POLLS: usize = 4;
+const VERIFY_POLLS: usize = 6;
+const VERIFY_POLL: Duration = Duration::from_millis(500);
+const MAX_EXTRA_ENTERS: usize = 3;
+
+/// Type the opening prompt and VERIFY it submitted, retrying the Enter.
+///
+/// Root cause this defends against: `wait_for_agent_ready`'s marker (a `❯`
+/// glyph) can appear before the TUI's input handler has mounted, so the Enter
+/// after the typed prompt is occasionally swallowed and the prompt sits
+/// unsubmitted in the composer forever ("prompted, but not started" - observed
+/// 2026-07-11 and 2026-08-02 on scheduled operator boots).
+///
+/// Three defenses, all bounded:
+///   1. settle gate: only type once the agent UI held across two consecutive
+///      captures (skipped when the boot never reached ready - type best-effort
+///      exactly as before);
+///   2. verify: poll the pane and classify via `submit_state`;
+///   3. retry: on Stuck press Enter again, capped at MAX_EXTRA_ENTERS (a
+///      spurious Enter on an idle or busy composer is a no-op).
+///
+/// Send failures propagate (real I/O errors are boot failures, as before).
+/// Verification failure is NOT fatal: returns Ok(false), caller warns and
+/// reports it on `StartResult.prompt_submitted`.
+async fn deliver_prompt(
+    rt: &dyn SessionRuntime,
+    provider: &str,
+    prompt: &str,
+    ready: bool,
+) -> Result<bool, AppError> {
+    if ready {
+        let mut seen = false;
+        for _ in 0..SETTLE_POLLS {
+            let visible = rt
+                .capture_plain(status::CAPTURE_LINES)
+                .await
+                .map(|c| agent_ui_visible(&c))
+                .unwrap_or(false);
+            if visible && seen {
+                break;
+            }
+            seen = visible;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    rt.send_text(prompt).await?;
+    submit_gap(rt).await;
+    rt.send_key("Enter").await?;
+
+    let mut extra_enters = 0usize;
+    let mut last = SubmitState::Unknown;
+    for _ in 0..VERIFY_POLLS {
+        tokio::time::sleep(VERIFY_POLL).await;
+        let Ok(cap) = rt.capture_plain(status::CAPTURE_LINES).await else {
+            continue; // capture hiccup: unknown, keep polling
+        };
+        last = submit_state(&cap, prompt, provider);
+        match last {
+            SubmitState::Submitted => return Ok(true),
+            SubmitState::Stuck if extra_enters < MAX_EXTRA_ENTERS => {
+                extra_enters += 1;
+                tracing::info!(
+                    provider = %provider,
+                    attempt = extra_enters,
+                    "deliver_prompt: prompt still unsubmitted, pressing Enter again",
+                );
+                rt.send_key("Enter").await?;
+            }
+            SubmitState::Stuck => {} // cap reached, keep observing until the window ends
+            SubmitState::Unknown => {}
+        }
+    }
+    // Window over. A cleared composer with no working indicator (Unknown)
+    // counts as submitted: the text is gone from the input box.
+    Ok(last == SubmitState::Unknown)
 }
 
 /// SIGTERM then (after a grace) SIGKILL the pane process group.
@@ -1348,6 +1429,7 @@ async fn start_locked(
             name: name.to_string(),
             started: true,
             ready,
+            prompt_submitted: None,
             target: rt.target(),
         });
     }
@@ -1367,11 +1449,17 @@ async fn start_locked(
     // in the booting affordance for up to 2s after the agent UI is ready).
     state.wake_detector(name);
 
+    let mut prompt_submitted = None;
     if let Some(p) = prompt {
         if !p.trim().is_empty() {
-            rt.send_text(p).await?;
-            submit_gap(rt.as_ref()).await;
-            rt.send_key("Enter").await?;
+            let submitted = deliver_prompt(rt.as_ref(), &s.provider, p, ready).await?;
+            if !submitted {
+                tracing::warn!(
+                    name = %name,
+                    "start: opening prompt could not be verified as submitted; session left running",
+                );
+            }
+            prompt_submitted = Some(submitted);
             let (preview, at) = db::sessions::set_last_send(&state.pool, name, p).await?;
             broadcast_send(state, name, &preview, at);
         }
@@ -1381,6 +1469,7 @@ async fn start_locked(
         name: name.to_string(),
         started: true,
         ready,
+        prompt_submitted,
         target: rt.target(),
     })
 }
@@ -2769,6 +2858,15 @@ mod agent_ready_heuristics_tests {
     fn submit_state_short_prompt_is_matched_whole() {
         assert_eq!(submit_state("❯ hi there", "hi there", "claude"), SubmitState::Stuck);
         assert_eq!(submit_state("✻ Pondering…", "hi there", "claude"), SubmitState::Submitted);
+    }
+
+    #[test]
+    fn prompt_verify_constants_are_bounded() {
+        // The verify loop runs inside the per-session lock and inside synchronous
+        // HTTP handlers: keep worst-case added latency to a few seconds.
+        assert!(SETTLE_POLLS * 2 <= 8, "settle gate must stay under ~2s");
+        assert_eq!(MAX_EXTRA_ENTERS, 3);
+        assert!(VERIFY_POLLS as u64 * VERIFY_POLL.as_millis() as u64 <= 4000);
     }
 }
 
