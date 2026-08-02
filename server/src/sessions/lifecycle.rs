@@ -37,10 +37,13 @@ pub struct StartResult {
     pub started: bool,
     /// The agent UI / shell prompt was observed within the wait-for-ready window.
     pub ready: bool,
-    /// Some(true): the opening prompt was verifiably submitted (a turn started
-    /// or the composer cleared). Some(false): after capped retries the prompt
-    /// still appeared unsubmitted; the session is left running for recovery.
-    /// None: no prompt was delivered by this start.
+    /// Some(true): the opening prompt was verifiably submitted (a turn started,
+    /// a selector appeared, or the composer cleared). Some(false): after capped
+    /// retries the prompt still appeared unsubmitted; the session is left
+    /// running for recovery. None: no prompt was delivered, OR delivery was not
+    /// verifiable: shell sessions (no agent TUI signals to read), a composer
+    /// that was already busy before we typed, and a verify window in which every
+    /// capture failed.
     pub prompt_submitted: Option<bool>,
     /// `supermux-<name>` — the tmux target.
     pub target: String,
@@ -639,6 +642,16 @@ fn submit_state(capture: &str, prompt: &str, provider: &str) -> SubmitState {
     if status::working_indicator(provider, capture) {
         return SubmitState::Submitted;
     }
+    // A selector / approval prompt on screen PROVES the input was consumed: the
+    // agent took the prompt, ran, and is now parked on a question. Nothing is
+    // working during that wait, and the prompt is usually still echoed above the
+    // selector, so without this arm the classifier reads Stuck and the retry
+    // Enter CONFIRMS the highlighted default option (a `rm -rf`, an edit, a plan
+    // approval). Returning Submitted stops the retry loop dead, which is the
+    // whole point.
+    if status::waiting_indicator(provider, capture) {
+        return SubmitState::Submitted;
+    }
     // U+2500..U+257F is the whole Unicode box-drawing block, so this covers
     // every border style a provider might switch to (light, heavy, double,
     // rounded) instead of hard-coding the two glyphs Claude happens to use.
@@ -840,21 +853,45 @@ const MAX_EXTRA_ENTERS: usize = 3;
 ///   1. settle gate: only type once the agent UI held across two consecutive
 ///      captures (skipped when the boot never reached ready - type best-effort
 ///      exactly as before);
-///   2. verify: poll the pane and classify via `submit_state`;
+///   2. verify: poll the pane and classify via `submit_state` (skipped whenever
+///      the check could not tell anything - see the return values below);
 ///   3. retry: on Stuck press Enter again, capped at MAX_EXTRA_ENTERS (a
 ///      spurious Enter on an idle or busy composer is a no-op).
 ///
 /// Send failures propagate (real I/O errors are boot failures, as before).
-/// Verification failure is NOT fatal: returns Ok(false), caller warns and
-/// reports it on `StartResult.prompt_submitted`. Never having SEEN the pane
-/// counts as unverified too: if every capture in the window failed we report
-/// false rather than reading the untouched `Unknown` as a cleared composer.
+/// Verification failure is NOT fatal.
+///
+/// The return value distinguishes "could not look" from "looked and it is bad",
+/// because the two must not be reported the same way:
+///
+/// * `Ok(None)` - delivered, but NOT verifiable. Three cases: a shell session
+///   (see below), a composer that was already busy before we typed, and a verify
+///   window in which every single capture failed (we never saw the pane, so the
+///   untouched `Unknown` must not be read as a cleared composer).
+/// * `Ok(Some(true))` - verified: a turn started, a selector appeared, or the
+///   window ended with the composer clear.
+/// * `Ok(Some(false))` - observed the whole window and it is still stuck. The
+///   only case the caller warns about.
+///
+/// **Shell sessions are never verified.** Verification is built entirely on agent
+/// TUI signals: a shell has no working indicator and always echoes the command
+/// it just ran, so every classification lands on Stuck. That fires the retry
+/// Enters into the foreground process's stdin and reports a false negative on a
+/// perfectly good start. A shell therefore gets exactly the pre-verification
+/// behaviour - type it, submit it once, report unverifiable.
 async fn deliver_prompt(
     rt: &dyn SessionRuntime,
     provider: &str,
     prompt: &str,
     ready: bool,
-) -> Result<bool, AppError> {
+) -> Result<Option<bool>, AppError> {
+    if provider == "shell" {
+        rt.send_text(prompt).await?;
+        submit_gap(rt).await;
+        rt.send_key("Enter").await?;
+        return Ok(None);
+    }
+
     if ready {
         let mut seen = false;
         for poll in 0..SETTLE_POLLS {
@@ -875,9 +912,28 @@ async fn deliver_prompt(
         }
     }
 
+    // Was the agent ALREADY mid-turn before we typed a single character? The
+    // double-launch guard delivers into a live agent, and then the working
+    // indicator is on screen from the first verify poll onward no matter what
+    // our Enter did - the check would rubber-stamp a submit it never observed.
+    // Deliver, then say so honestly rather than claim a verified true.
+    let pre_busy = rt
+        .capture_plain(status::CAPTURE_LINES)
+        .await
+        .map(|c| status::working_indicator(provider, &c))
+        .unwrap_or(false);
+
     rt.send_text(prompt).await?;
     submit_gap(rt).await;
     rt.send_key("Enter").await?;
+
+    if pre_busy {
+        tracing::info!(
+            provider = %provider,
+            "deliver_prompt: composer was already busy, prompt delivered without verification",
+        );
+        return Ok(None);
+    }
 
     let mut extra_enters = 0usize;
     let mut last = SubmitState::Unknown;
@@ -890,7 +946,7 @@ async fn deliver_prompt(
         observed = true;
         last = submit_state(&cap, prompt, provider);
         match last {
-            SubmitState::Submitted => return Ok(true),
+            SubmitState::Submitted => return Ok(Some(true)),
             SubmitState::Stuck if extra_enters < MAX_EXTRA_ENTERS => {
                 extra_enters += 1;
                 tracing::info!(
@@ -904,11 +960,14 @@ async fn deliver_prompt(
             SubmitState::Unknown => {}
         }
     }
-    // Window over. A cleared composer with no working indicator (Unknown)
-    // counts as submitted: the text is gone from the input box. But only if we
-    // actually saw the pane at least once: an all-failed capture window has
-    // observed nothing and must not be reported as verified.
-    Ok(observed && last == SubmitState::Unknown)
+    // Window over. Never saw the pane at all (every capture errored) - that is
+    // unverifiable, not a failure.
+    if !observed {
+        return Ok(None);
+    }
+    // A cleared composer with no working indicator (Unknown) counts as
+    // submitted: the text is gone from the input box.
+    Ok(Some(last == SubmitState::Unknown))
 }
 
 /// SIGTERM then (after a grace) SIGKILL the pane process group.
@@ -1467,14 +1526,13 @@ async fn start_locked(
     let mut prompt_submitted = None;
     if let Some(p) = prompt {
         if !p.trim().is_empty() {
-            let submitted = deliver_prompt(rt.as_ref(), &s.provider, p, ready).await?;
-            if !submitted {
+            prompt_submitted = deliver_prompt(rt.as_ref(), &s.provider, p, ready).await?;
+            if prompt_submitted == Some(false) {
                 tracing::warn!(
                     name = %name,
                     "start: opening prompt could not be verified as submitted; session left running",
                 );
             }
-            prompt_submitted = Some(submitted);
             let (preview, at) = db::sessions::set_last_send(&state.pool, name, p).await?;
             broadcast_send(state, name, &preview, at);
         }
@@ -2885,6 +2943,21 @@ mod agent_ready_heuristics_tests {
         );
         assert_eq!(MAX_EXTRA_ENTERS, 3);
         assert!(VERIFY_POLLS as u64 * VERIFY_POLL.as_millis() as u64 <= 4000);
+    }
+
+    /// The dangerous ambiguity: the prompt landed, the agent ran, and it is now
+    /// parked on an approval selector. Nothing is working, and the prompt is
+    /// still echoed above the selector, so the tail match alone says Stuck and
+    /// the retry Enter would CONFIRM the highlighted option. A selector is proof
+    /// the input was consumed, so it must read Submitted.
+    #[test]
+    fn submit_state_reads_an_approval_selector_as_submitted() {
+        let prompt = "run the deploy script";
+        let claude = "❯ run the deploy script\n\nBash(./deploy.sh)\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
+        assert_eq!(submit_state(claude, prompt, "claude"), SubmitState::Submitted);
+
+        let codex = "› run the deploy script\n› 1. Yes\n› 2. No\nPress enter to confirm";
+        assert_eq!(submit_state(codex, prompt, "codex"), SubmitState::Submitted);
     }
 }
 
