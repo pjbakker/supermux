@@ -216,19 +216,37 @@ async fn has_clients(tmux_tmpdir: &Path, socket_name: &str) -> Result<bool> {
 /// What a socket probe established. `Unknown` is the honest third answer, and
 /// keeping it separate from `NoServer` is what stops the GC from unlinking a
 /// live server's socket whenever tmux fails for an unrelated reason.
+#[derive(Debug, PartialEq)]
 enum Probe {
     Answers,
     NoServer,
     Unknown(String),
 }
 
+/// Classify a FAILED `list-sessions` from its stderr. Pure, so the wording
+/// rules are testable without tmux.
+///
+/// tmux prints "no server running on X" only for ECONNREFUSED; for every OTHER
+/// errno it falls back to "error connecting to X (<strerror>)". So the second
+/// form is NOT evidence of death by itself: a live server whose socket is
+/// merely unreadable reports "error connecting to X (Permission denied)".
+/// Only the two errnos that genuinely mean "nothing is listening here" count.
+fn classify_probe_stderr(stderr: &str) -> Probe {
+    let lowered = stderr.trim().to_lowercase();
+    let definitive = lowered.ends_with("(no such file or directory)") || lowered.ends_with("(connection refused)");
+    if lowered.contains("no server running") || (lowered.contains("error connecting") && definitive) {
+        Probe::NoServer
+    } else {
+        Probe::Unknown(stderr.trim().to_string())
+    }
+}
+
 /// Is a live server listening on this socket? `list-sessions` never starts a
 /// server (verified against tmux behaviour), so probing is side effect free.
 ///
-/// Only the two messages tmux uses for "nothing is listening here" count as
-/// dead. Anything else (unsafe socket dir permissions, tmux missing, a
-/// timeout, a version whose wording we do not know) is `Unknown` and leaves the
-/// file alone.
+/// Anything short of a definitive "nothing is listening" (unsafe socket dir
+/// permissions, an unreadable socket, tmux missing, a timeout, a version whose
+/// wording we do not know) is `Unknown` and leaves the file alone.
 async fn probe_socket(tmux_tmpdir: &Path, socket_name: &str) -> Probe {
     let out = match tmux_output(tmux_tmpdir, &["-L", socket_name, "list-sessions"]).await {
         Ok(out) => out,
@@ -237,15 +255,7 @@ async fn probe_socket(tmux_tmpdir: &Path, socket_name: &str) -> Probe {
     if out.status.success() {
         return Probe::Answers;
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let lowered = stderr.to_lowercase();
-    // "no server running on <path>"                     - socket present, nobody home
-    // "error connecting to <path> (No such file ...)"    - socket already gone
-    if lowered.contains("no server running") || lowered.contains("error connecting") {
-        Probe::NoServer
-    } else {
-        Probe::Unknown(stderr.trim().to_string())
-    }
+    classify_probe_stderr(&String::from_utf8_lossy(&out.stderr))
 }
 
 /// Is `pid` STILL the tmux server for `socket_name`? Discovery and the signal
@@ -442,6 +452,32 @@ mod tests {
         assert_eq!(socket_arg(&["tmux", "-L", "default"]), None);
         assert_eq!(socket_arg(&["tmux", "attach"]), None);
         assert_eq!(socket_arg(&[]), None);
+    }
+
+    #[test]
+    fn probe_classification_needs_a_definitive_errno() {
+        // ECONNREFUSED on a socket nobody listens on
+        assert_eq!(classify_probe_stderr("no server running on /x\n"), Probe::NoServer);
+        // the socket file is already gone
+        assert_eq!(
+            classify_probe_stderr("error connecting to /x (No such file or directory)\n"),
+            Probe::NoServer
+        );
+        assert_eq!(classify_probe_stderr("error connecting to /x (Connection refused)"), Probe::NoServer);
+        // "error connecting" is tmux's catch-all for every OTHER errno, and a
+        // LIVE server behind an unreadable socket lands here. Unlinking on this
+        // would pull the socket out from under a running server.
+        assert!(matches!(
+            classify_probe_stderr("error connecting to /x (Permission denied)"),
+            Probe::Unknown(_)
+        ));
+        // measured on this box when the socket dir has group/other bits set
+        assert!(matches!(
+            classify_probe_stderr("directory /tmp/x/tmux-1002 has unsafe permissions"),
+            Probe::Unknown(_)
+        ));
+        assert!(matches!(classify_probe_stderr("wat"), Probe::Unknown(_)));
+        assert!(matches!(classify_probe_stderr(""), Probe::Unknown(_)));
     }
 
     #[test]
