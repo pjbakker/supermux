@@ -35,6 +35,14 @@ async fn main() -> anyhow::Result<()> {
         return sessions::native::holder::main(std::env::args().skip(2)).await;
     }
 
+    // Operator maintenance: sweep leaked `claude-swarm-*` agent-team tmux
+    // servers once and exit. `--dry-run` reports without killing anything.
+    // Needs no DB and no listener; `--help`-less by convention (see pty-holder).
+    if std::env::args().nth(1).as_deref() == Some("swarm-reaper") {
+        init_tracing();
+        return sessions::swarm::cli(std::env::args().skip(2)).await;
+    }
+
     init_tracing();
 
     let config = config::load()?;
