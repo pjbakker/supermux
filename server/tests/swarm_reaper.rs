@@ -214,6 +214,37 @@ async fn keeps_socket_files_when_probe_fails() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// tmux reports an unreadable socket as `error connecting to ... (Permission
+/// denied)`, which looks a lot like the message for a socket nobody is
+/// listening on. Here there IS a live server behind it, so treating that as
+/// "dead" would unlink a running server's socket.
+#[tokio::test]
+async fn keeps_live_server_socket_when_unreadable() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let dir = temp_tmpdir();
+    let sockdir = make_socket_dir(&dir);
+    // reapable name that discovery does not match, so the GC probe is the only
+    // thing deciding this file's fate
+    let socket = format!("supermux-sync-test-{}", std::process::id());
+    spawn_swarm_server(&dir, &socket);
+    let path = sockdir.join(&socket);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = swarm::sweep_once(&dir, Duration::ZERO, false).await.unwrap();
+
+    assert!(out.sockets_removed.is_empty(), "unlinked a live server's socket: {:?}", out.sockets_removed);
+    assert!(path.exists(), "live server's socket was unlinked");
+    assert!(!out.errors.is_empty(), "an unreadable socket must be reported");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(server_running(&dir, &socket), "server should have been left alone");
+    kill_leftover(&dir, &socket);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Sweeping one TMUX_TMPDIR must be blind to servers living in another. Without
 /// this the reaper would reach outside its own socket namespace and kill
 /// production servers from a test run.
