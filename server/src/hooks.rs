@@ -936,6 +936,14 @@ fn force_stopped(state: &AppState, session: &str) {
     let state = state.clone();
     let session = session.to_string();
     tokio::spawn(async move {
+        // SessionEnd means the lead agent is exiting right now: capture its
+        // pid while it is still the pane's foreground job, then let the
+        // teardown task wait out its death and reap the team's tmux server.
+        if let Ok(rt) = state.runtime_for(&session).await {
+            if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                crate::sessions::swarm::spawn_teardown_for_lead(pid);
+            }
+        }
         if let Err(e) =
             db::sessions::set_last_status(&state.pool, &session, Status::Stopped.as_str()).await
         {

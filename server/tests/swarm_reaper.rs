@@ -4,10 +4,76 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use supermux_server::config::{Config, ProviderDefaults, TlsConfig};
 use supermux_server::sessions::swarm::{self, SweepOutcome};
+use supermux_server::state::AppState;
+use supermux_server::{db, http};
+
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
+use tower::ServiceExt; // for `oneshot`
+
+const TOKEN: &str = "secret-test-token-swarm";
 
 fn tmux_available() -> bool {
     which::which("tmux").is_ok()
+}
+
+/// `tests/lifecycle.rs`'s fixture, extended with the `AppState` itself so the
+/// e2e test below can reach `runtime_for` / `lifecycle::stop` directly.
+async fn test_app() -> (AppState, axum::Router, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("supermux-swarm-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = Config {
+        data_dir: dir.clone(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        extra_binds: vec![],
+        extra_origins: vec![],
+        tls: TlsConfig::default(),
+        auth_token: TOKEN.to_string(),
+        provider_defaults: ProviderDefaults::default(),
+        ws: Default::default(),
+        swarm_reaper: Default::default(),
+        remote_callback_url: None,
+        push_sub: None,
+        github_token: None,
+        statusline_tap: false,
+        isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
+        human_auth: Default::default(),
+    };
+    let pool = db::init(&config).await.expect("db init");
+    let state = AppState::new(pool, config);
+    (state.clone(), http::router(state), dir)
+}
+
+async fn send(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+    let req = match body {
+        Some(b) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            builder.body(Body::from(b.to_string())).unwrap()
+        }
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
 }
 
 fn temp_tmpdir() -> PathBuf {
@@ -413,6 +479,77 @@ async fn scopes_sweep_to_its_own_tmpdir() {
     kill_leftover(&elsewhere, &socket);
     let _ = std::fs::remove_dir_all(&elsewhere);
     let _ = std::fs::remove_dir_all(&swept);
+}
+
+/// End-to-end: stopping a session tears down the swarm server named after the
+/// pane's foreground process. Uses the same AppState + real-tmux setup as
+/// `tests/lifecycle.rs` (its `test_app()` fixture and its HTTP create+start
+/// pattern), only handing back the `AppState` too so the test can read the
+/// pane's foreground pid and call `lifecycle::stop` directly.
+///
+/// The fake swarm server is spawned under the TMUX_TMPDIR the TEST PROCESS
+/// resolves, because that is exactly what `spawn_teardown_for_lead` reads when
+/// `stop()` fires it.
+#[tokio::test]
+async fn stop_tears_down_swarm_server_of_foreground_pid() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let (state, app, dir) = test_app().await;
+    let name = format!("swarm{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "name": name, "provider": "shell", "dir": "/tmp", "runtime": "tmux" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = send(&app, Method::POST, &format!("/api/sessions/{name}/start"), None).await;
+    assert_eq!(status, StatusCode::OK, "start body: {body}");
+
+    // Put a foreground job in the pane so `lead_pid_of` resolves to something
+    // other than the shell itself (that is what stands in for the lead agent).
+    let rt = state.runtime_for(&name).await.unwrap();
+    rt.send_text("cat").await.unwrap();
+    rt.send_key("Enter").await.unwrap();
+    let mut lead = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        lead = swarm::lead_pid_of(rt.as_ref()).await;
+        if lead.is_some() {
+            break;
+        }
+    }
+    let lead = lead.expect("foreground pid of the pane's cat");
+    drop(rt);
+
+    let tmpdir = std::env::var_os("TMUX_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let socket = format!("claude-swarm-{lead}");
+    spawn_swarm_server(&tmpdir, &socket);
+    assert!(server_running(&tmpdir, &socket));
+
+    supermux_server::sessions::lifecycle::stop(&state, &name).await.unwrap();
+
+    // stop kills the pane -> cat dies -> the teardown task kills the swarm server
+    let mut gone = false;
+    for _ in 0..80 {
+        if !server_running(&tmpdir, &socket) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    kill_leftover(&tmpdir, &socket); // belt and suspenders on failure
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &format!("supermux-{name}")])
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(gone, "swarm server survived session stop");
 }
 
 #[test]
