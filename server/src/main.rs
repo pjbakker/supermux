@@ -203,6 +203,9 @@ async fn main() -> anyhow::Result<()> {
     // live session row pointing at them. Cheap no-op while no remote hosts
     // are registered.
     sessions::spawn_reaper(state.host_pool.clone());
+    // Reap leaked Claude agent-team tmux servers (claude-swarm-<pid> sockets).
+    // First tick is immediate: also the boot sweep after a crash or OOM kill.
+    sessions::swarm::spawn_reaper(state.clone());
 
     let app = http::router(state);
 

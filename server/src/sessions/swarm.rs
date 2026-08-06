@@ -496,6 +496,73 @@ pub async fn lead_pid_of(rt: &dyn crate::sessions::runtime::SessionRuntime) -> O
     (fg != shell).then_some(fg)
 }
 
+/// Periodic safety net: sweep on a config cadence. The FIRST tick fires
+/// immediately (tokio interval semantics), which doubles as the boot sweep
+/// that reclaims servers orphaned by a supermux crash or OOM kill.
+pub fn spawn_reaper(state: crate::state::AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let cfg = state.config.swarm_reaper.clone();
+        if !cfg.enabled {
+            tracing::info!("swarm reaper disabled by config");
+            return;
+        }
+        let grace = Duration::from_secs(cfg.grace_secs);
+        let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs.max(60)));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tracing::info!(
+            grace_secs = cfg.grace_secs,
+            interval_secs = cfg.interval_secs,
+            "swarm reaper started"
+        );
+        loop {
+            tick.tick().await;
+            // TMUX_TMPDIR is set process-wide in main.rs before any task spawns
+            let dir = std::env::var_os("TMUX_TMPDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            match sweep_once(&dir, grace, false).await {
+                Ok(out) => {
+                    for e in &out.errors {
+                        tracing::warn!(error = %e, "swarm sweep item failed");
+                    }
+                    if out.killed.is_empty() && out.sockets_removed.is_empty() {
+                        continue;
+                    }
+                    // durable trail for a destructive background action
+                    let detail = serde_json::json!({
+                        "killed": out.killed,
+                        "sockets_removed": out.sockets_removed.len(),
+                        "kept": out.kept.len(),
+                    });
+                    if let Err(e) =
+                        crate::db::audit::log(&state.pool, "reaper", "swarm.sweep", "swarm", detail)
+                            .await
+                    {
+                        tracing::warn!(error = %e, "swarm sweep audit write failed");
+                    }
+                    if !out.killed.is_empty() {
+                        let _ = state.sse_tx.send(crate::state::SseEvent {
+                            event: "alerts".to_string(),
+                            // Operator-level alert, not scoped to any company:
+                            // leaked agent-team servers belong to the host.
+                            company_id: None,
+                            payload: serde_json::json!({
+                                "level": "info",
+                                "source": "reaper",
+                                "detail": format!(
+                                    "swarm reaper: killed {} stale agent-team tmux server(s)",
+                                    out.killed.len()
+                                ),
+                            }),
+                        });
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "swarm reaper sweep failed"),
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
