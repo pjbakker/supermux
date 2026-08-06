@@ -26,6 +26,7 @@ pub mod recall;
 pub mod resumable;
 pub mod status;
 pub mod steering;
+pub mod swarm;
 pub mod teams;
 pub mod tmux;
 pub mod transport;
