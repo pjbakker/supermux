@@ -57,6 +57,7 @@ impl Drop for Env {
 
 async fn mk_state(base: &Path) -> AppState {
     let config = crate::config::Config {
+        swarm_reaper: Default::default(),
         data_dir: base.join("data"),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],

@@ -3868,6 +3868,7 @@ mod build_env_tests {
             auth_token: "t".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -4652,6 +4653,7 @@ mod link_liveness_tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -4739,6 +4741,7 @@ mod stale_resume_tests {
         let dir = std::env::temp_dir().join(format!("supermux-stale-resume-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = Config {
+            swarm_reaper: Default::default(),
             data_dir: dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             extra_binds: vec![],
@@ -5009,6 +5012,7 @@ mod write_runtime_tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,

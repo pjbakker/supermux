@@ -29,6 +29,7 @@ async fn new_state() -> (AppState, PathBuf) {
     let dir = std::env::temp_dir().join(format!("supermux-wf-chain-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.clone(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],

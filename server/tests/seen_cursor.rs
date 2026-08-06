@@ -46,6 +46,7 @@ fn temp_config() -> (Config, PathBuf) {
         auth_token: BEARER.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,

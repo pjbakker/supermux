@@ -37,6 +37,7 @@ const FAKE_EMAIL: &str = "tester@icloud.com";
 
 fn test_config(data_dir: &Path) -> Config {
     Config {
+        swarm_reaper: Default::default(),
         data_dir: data_dir.to_path_buf(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],

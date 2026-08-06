@@ -414,3 +414,21 @@ async fn scopes_sweep_to_its_own_tmpdir() {
     let _ = std::fs::remove_dir_all(&elsewhere);
     let _ = std::fs::remove_dir_all(&swept);
 }
+
+#[test]
+fn swarm_reaper_config_defaults() {
+    let cfg = supermux_server::config::SwarmReaperConfig::default();
+    assert!(cfg.enabled);
+    assert_eq!(cfg.grace_secs, 7200);
+    assert_eq!(cfg.interval_secs, 1800);
+}
+
+#[test]
+fn swarm_reaper_config_partial_toml() {
+    // a partial block keeps the other defaults (RawConfig convention)
+    let raw: supermux_server::config::SwarmReaperConfig =
+        toml::from_str("grace_secs = 60").unwrap();
+    assert!(raw.enabled);
+    assert_eq!(raw.grace_secs, 60);
+    assert_eq!(raw.interval_secs, 1800);
+}

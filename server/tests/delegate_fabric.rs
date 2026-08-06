@@ -73,6 +73,7 @@ async fn spawn_harness() -> Harness {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
