@@ -672,14 +672,6 @@ fn force_stopped(state: &AppState, session: &str) {
     let state = state.clone();
     let session = session.to_string();
     tokio::spawn(async move {
-        // SessionEnd means the lead agent is exiting right now: capture its
-        // pid while it is still the pane's foreground job, then let the
-        // teardown task wait out its death and reap the team's tmux server.
-        if let Ok(rt) = state.runtime_for(&session).await {
-            if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
-                crate::sessions::swarm::spawn_teardown_for_lead(pid);
-            }
-        }
         if let Err(e) =
             db::sessions::set_last_status(&state.pool, &session, Status::Stopped.as_str()).await
         {
@@ -703,6 +695,17 @@ fn force_stopped(state: &AppState, session: &str) {
             event: "sessions".to_string(),
             payload: json!({ "delta": [{ "name": session, "status": Status::Stopped.as_str() }] }),
         });
+        // AFTER the status flip: SessionEnd means the lead agent is exiting right
+        // now, so capture its pid while it is still the pane's foreground job and
+        // let the teardown task wait out its death and reap the team's tmux
+        // server. This forks tmux, and the tile flip must not wait on that; the
+        // agent takes far longer than these few ms to actually leave the pane, and
+        // the teardown polls for its death anyway.
+        if let Ok(rt) = state.runtime_for(&session).await {
+            if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                crate::sessions::swarm::spawn_teardown_for_lead(pid);
+            }
+        }
         crate::sessions::lifecycle::maybe_archive_on_stop(&state, &session).await;
     });
 }

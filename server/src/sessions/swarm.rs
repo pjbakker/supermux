@@ -187,10 +187,16 @@ const TMUX_TIMEOUT: Duration = Duration::from_secs(10);
 /// status; `Err` only when it could not be run or did not come back in time.
 /// Callers that must distinguish "tmux says no server" from "we learned
 /// nothing" need that split, so the exit status is NOT folded in here.
+///
+/// `LC_ALL=C` is not cosmetic: `classify_probe_stderr` matches tmux's English
+/// wording plus the C-locale `strerror` text. On a host with a localized locale
+/// every probe would otherwise fall through to `Unknown`, so no socket file
+/// would ever be garbage-collected and no socketless server ever reaped.
 async fn tmux_output(tmux_tmpdir: &Path, args: &[&str]) -> Result<std::process::Output> {
     let bin = which::which("tmux").context("tmux not on PATH")?;
     let run = tokio::process::Command::new(bin)
         .env("TMUX_TMPDIR", tmux_tmpdir)
+        .env("LC_ALL", "C")
         .args(args)
         .kill_on_drop(true) // do not leave a hung client behind on timeout
         .output();
@@ -208,9 +214,28 @@ async fn run_tmux(tmux_tmpdir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Are any tmux clients attached to this socket's server?
+///
+/// `Err` means "we did not learn anything", which every caller reads as Keep.
+/// The ONE failure that is still an answer is tmux reporting that nothing is
+/// listening on the socket at all: no listener means no attached client, so
+/// `Ok(false)`. That case is the socketless server (its socket file was
+/// deleted, or never made it): no tmux client can reach it, yet it is still a
+/// live process holding memory, and the pid-verified escalation inside
+/// `kill_server` can take it down. Without this the clients check would error
+/// forever and both callers would keep such a server for good.
 async fn has_clients(tmux_tmpdir: &Path, socket_name: &str) -> Result<bool> {
-    let out = run_tmux(tmux_tmpdir, &["-L", socket_name, "list-clients"]).await?;
-    Ok(!out.trim().is_empty())
+    let out = tmux_output(tmux_tmpdir, &["-L", socket_name, "list-clients"]).await?;
+    if out.status.success() {
+        return Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match classify_probe_stderr(&stderr) {
+        Probe::NoServer => Ok(false),
+        // anything else (unreadable socket, unsafe dir permissions, unknown
+        // wording) is not an answer: stay on the Keep side
+        _ => anyhow::bail!("tmux list-clients on {socket_name}: {}", stderr.trim()),
+    }
 }
 
 /// What a socket probe established. `Unknown` is the honest third answer, and
@@ -223,8 +248,9 @@ enum Probe {
     Unknown(String),
 }
 
-/// Classify a FAILED `list-sessions` from its stderr. Pure, so the wording
-/// rules are testable without tmux.
+/// Classify a FAILED tmux client call (`list-sessions`, `list-clients`) from
+/// its stderr. Pure, so the wording rules are testable without tmux. Callers
+/// run tmux under `LC_ALL=C` so this English matching holds on any host.
 ///
 /// tmux prints "no server running on X" only for ECONNREFUSED; for every OTHER
 /// errno it falls back to "error connecting to X (<strerror>)". So the second
@@ -264,7 +290,17 @@ async fn probe_socket(tmux_tmpdir: &Path, socket_name: &str) -> Probe {
 /// an unrelated process in between. Re-reading the live argv makes each bare-pid
 /// signal target the process we actually decided to kill, not whoever inherited
 /// its number.
+///
+/// The uid check is part of that: a recycled pid can land on a process of a
+/// different user, and signalling one of those is never ours to do (it would
+/// also just fail with EPERM). Discovery already filters on uid, so this keeps
+/// the same rule on the signalling side.
 fn still_our_server(pid: u32, socket_name: &str) -> bool {
+    let Ok(me) = std::fs::metadata("/proc/self") else { return false };
+    let Ok(theirs) = std::fs::metadata(format!("/proc/{pid}")) else { return false };
+    if theirs.uid() != me.uid() {
+        return false;
+    }
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return false };
     let argv: Vec<&str> = cmdline
         .split(|b| *b == 0)
@@ -391,9 +427,14 @@ pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> R
                 }
             }
             if !dry_run {
+                // ENOENT is the goal state, not a failure: a targeted teardown
+                // or a second CLI run may have unlinked the same file between
+                // our probe and this call.
                 if let Err(e) = std::fs::remove_file(f.path()) {
-                    out.errors.push(format!("{name}: unlink failed: {e}"));
-                    continue;
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        out.errors.push(format!("{name}: unlink failed: {e}"));
+                        continue;
+                    }
                 }
             }
             out.sockets_removed.push(name);
@@ -416,8 +457,11 @@ async fn gc_socket_file(tmux_tmpdir: &Path, socket_name: &str) {
     }
     match probe_socket(tmux_tmpdir, socket_name).await {
         Probe::NoServer => {
+            // same as the sweep's GC: an already-gone file is the goal state
             if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!(socket = %socket_name, error = %e, "swarm teardown: socket unlink failed");
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(socket = %socket_name, error = %e, "swarm teardown: socket unlink failed");
+                }
             }
         }
         // something still answers there: not ours to remove
@@ -490,6 +534,22 @@ pub fn spawn_teardown_for_lead(lead_pid: u32) {
 /// The pane's foreground process-group leader, i.e. the running agent's PID.
 /// `None` when the pane sits at the shell prompt (fg pgid == the shell) or the
 /// pane is already gone. This is the pid agent teams name their socket after.
+///
+/// **Assumption: the lead agent runs in the window's FIRST pane.** A
+/// session-targeted `pane_pid()` is `tmux list-panes -t <session>` and takes the
+/// first line, i.e. the pane with the lowest index. Agent Teams renders
+/// teammates as `split-window` panes of the same window, and a split is always
+/// inserted after the current pane, so the lead keeps index 0 and the first
+/// line is its shell. `teams::resolve_lead_pane` exists for the input path, but
+/// it cannot help here: `tmux list-panes -t %id` resolves a pane target to its
+/// WINDOW and lists every pane of it (measured), so pinning the runtime to the
+/// resolved lead pane returns the first pane's pid all the same.
+///
+/// If the assumption is ever broken (panes swapped, the original lead pane
+/// killed) we read a teammate's pid, the derived socket name matches no server,
+/// and the targeted teardown simply finds nothing to do. The periodic sweep
+/// then reaps the real server once it passes the grace period, so the cost is
+/// bounded by grace + one sweep interval, never a wrong kill.
 pub async fn lead_pid_of(rt: &dyn crate::sessions::runtime::SessionRuntime) -> Option<u32> {
     let shell = rt.pane_pid().await.ok().flatten()?;
     let fg = crate::sessions::native::runtime::foreground_pgid(shell)?;
@@ -507,11 +567,14 @@ pub fn spawn_reaper(state: crate::state::AppState) -> tokio::task::JoinHandle<()
             return;
         }
         let grace = Duration::from_secs(cfg.grace_secs);
-        let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs.max(60)));
+        // clamped: a config asking for a tighter cadence than 60s does not get one
+        let effective_interval_secs = cfg.interval_secs.max(60);
+        let mut tick = tokio::time::interval(Duration::from_secs(effective_interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tracing::info!(
             grace_secs = cfg.grace_secs,
             interval_secs = cfg.interval_secs,
+            effective_interval_secs,
             "swarm reaper started"
         );
         loop {
@@ -528,11 +591,15 @@ pub fn spawn_reaper(state: crate::state::AppState) -> tokio::task::JoinHandle<()
                     if out.killed.is_empty() && out.sockets_removed.is_empty() {
                         continue;
                     }
-                    // durable trail for a destructive background action
-                    let detail = serde_json::json!({
-                        "killed": out.killed,
-                        "sockets_removed": out.sockets_removed.len(),
-                        "kept": out.kept.len(),
+                    // Durable trail for a destructive background action: the whole
+                    // outcome, names and all (`SweepOutcome` is Serialize for
+                    // exactly this), so a later "what happened to my team server"
+                    // can be answered from the row alone.
+                    let detail = serde_json::to_value(&out).unwrap_or_else(|e| {
+                        serde_json::json!({
+                            "killed": out.killed,
+                            "detail_serialize_failed": e.to_string(),
+                        })
                     });
                     if let Err(e) =
                         crate::db::audit::log(&state.pool, "reaper", "swarm.sweep", "swarm", detail)
@@ -612,7 +679,12 @@ pub async fn cli<I: Iterator<Item = String>>(argv: I) -> Result<()> {
     for name in &out.sockets_removed {
         println!("{} {name}  (stale socket file)", if args.dry_run { "WOULD-RM   " } else { "REMOVED    " });
     }
-    if out.kept.is_empty() && out.killed.is_empty() && out.sockets_removed.is_empty() {
+    // only when the sweep truly had nothing to report, errors included
+    if out.kept.is_empty()
+        && out.killed.is_empty()
+        && out.sockets_removed.is_empty()
+        && out.errors.is_empty()
+    {
         println!("nothing to do: no claude-swarm servers or stale sockets found");
     }
     if !out.errors.is_empty() {

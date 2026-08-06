@@ -144,6 +144,55 @@ async fn reaps_server_with_dead_lead() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A server whose socket FILE is gone can no longer be reached by any tmux
+/// client, so `list-clients` fails. That must NOT read as "keep forever":
+/// nothing can be attached to a server nothing can connect to, so the sweep
+/// proceeds and the pid-verified escalation inside `kill_server` takes the
+/// process down. Discovery finds it because it scans argv, not socket files.
+#[tokio::test]
+async fn reaps_server_whose_socket_file_is_gone() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let dir = temp_tmpdir();
+    let socket = format!("claude-swarm-{}", dead_pid());
+    spawn_swarm_server(&dir, &socket);
+    // the server process keeps running; only the door to it is removed
+    std::fs::remove_file(swarm::socket_dir(&dir).join(&socket)).unwrap();
+    let server_pid = swarm::discover_servers(&dir)
+        .into_iter()
+        .find(|s| s.socket_name == socket)
+        .map(|s| s.server_pid)
+        .expect("server still discovered by argv after its socket file went away");
+
+    let out = swarm::sweep_once(&dir, Duration::ZERO, false).await.unwrap();
+
+    assert!(
+        out.killed.contains(&socket),
+        "killed: {:?} kept: {:?} errors: {:?}",
+        out.killed,
+        out.kept,
+        out.errors
+    );
+    let mut gone = false;
+    for _ in 0..20 {
+        if !swarm::pid_alive(server_pid) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !gone {
+        // no socket left to kill-server through, so clean up by pid
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &server_pid.to_string()])
+            .status();
+    }
+    assert!(gone, "socketless server survived the sweep");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn dry_run_reports_but_kills_nothing() {
     if !tmux_available() {
@@ -393,8 +442,10 @@ async fn teardown_for_lead_keeps_socket_file_when_probe_fails() {
 ///
 /// The wait loop gives up BEFORE discovery, so no tmux server is needed here;
 /// what the test has to prove is that the call really waited out the deadline
-/// instead of falling through, hence the elapsed-time assertion. The stale
-/// socket file is the second guard: reaching the GC at all would unlink it.
+/// instead of falling through, hence the elapsed-time assertion. That assertion
+/// is the only real discriminator: the socket file also survives a fall-through,
+/// because under paused time the GC's probe would hit its timeout and skip the
+/// file anyway. It stays asserted as a cheap "nothing was touched" check.
 #[tokio::test(start_paused = true)]
 async fn teardown_for_lead_defers_while_lead_is_alive() {
     let dir = temp_tmpdir();
