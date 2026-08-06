@@ -322,6 +322,37 @@ async fn teardown_for_lead_keeps_socket_file_when_probe_fails() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The defer path: a lead that never dies within TEARDOWN_LEAD_WAIT must end in
+/// `Ok(false)` with nothing killed and nothing unlinked, leaving the server to
+/// the periodic sweep. `start_paused` auto-advances the clock whenever the task
+/// is idle, so the full 30s wait costs no real time.
+///
+/// The wait loop gives up BEFORE discovery, so no tmux server is needed here;
+/// what the test has to prove is that the call really waited out the deadline
+/// instead of falling through, hence the elapsed-time assertion. The stale
+/// socket file is the second guard: reaching the GC at all would unlink it.
+#[tokio::test(start_paused = true)]
+async fn teardown_for_lead_defers_while_lead_is_alive() {
+    let dir = temp_tmpdir();
+    let sockdir = make_socket_dir(&dir);
+    // our own process: guaranteed alive for the whole test
+    let lead = std::process::id();
+    let path = sockdir.join(format!("claude-swarm-{lead}"));
+    std::fs::write(&path, b"").unwrap();
+
+    let started = tokio::time::Instant::now();
+    let killed = swarm::teardown_for_lead(&dir, lead).await.unwrap();
+    let waited = started.elapsed();
+
+    assert!(!killed, "must never kill while the lead is still alive");
+    assert!(
+        waited >= Duration::from_secs(30),
+        "must wait out TEARDOWN_LEAD_WAIT before deferring, waited {waited:?}"
+    );
+    assert!(path.exists(), "deferring must not touch the socket file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A clients check that cannot be answered (here: an unreadable socket, so
 /// every tmux client call fails) is not permission to kill. The teardown backs
 /// off and leaves the server to the sweep, which re-evaluates it later.
