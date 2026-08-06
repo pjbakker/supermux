@@ -1181,6 +1181,10 @@ pub async fn delete(state: &AppState, name: &str) -> Result<(), AppError> {
     // never block deleting the row.
     let is_native = !state.is_tmux_runtime(name).await;
     if let Ok(rt) = state.runtime_for(name).await {
+        // capture before the kill; teardown waits for the lead to die
+        if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+            crate::sessions::swarm::spawn_teardown_for_lead(pid);
+        }
         let _ = rt.kill().await;
     }
     // A native session owns a directory under the data dir (spool, `meta.json`,
