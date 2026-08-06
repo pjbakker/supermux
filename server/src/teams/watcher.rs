@@ -681,11 +681,15 @@ fn host_cwd_candidates(team: &Team) -> Vec<&str> {
     cwds
 }
 
-/// How many live claude sessions a cwd-based host attribution has to choose
-/// from. `match_host_by_cwd` returns the FIRST match in list order (pinned, then
-/// most recently sent to) with no liveness preference, so a count above 1 means
-/// the winner was decided by sort order, not by evidence. Pure, so the
-/// ambiguity policy is unit-testable apart from the DB.
+/// How many claude sessions a cwd-based host attribution has to choose from.
+/// Counts every NON-ARCHIVED claude session on the team's cwd, stopped ones
+/// included: the caller feeds it `db::sessions::list` (archived rows excluded,
+/// running and stopped alike), and counting the stopped siblings is the whole
+/// point, since a stopped session is exactly what can win the pick and be handed
+/// a running lead's team. `match_host_by_cwd` returns the FIRST match in list
+/// order (pinned, then most recently sent to) with no liveness preference, so a
+/// count above 1 means the winner was decided by list order, not by evidence.
+/// Pure, so the ambiguity policy is unit-testable apart from the DB.
 fn cwd_host_match_count<'a>(team: &Team, sessions: impl Iterator<Item = SessionRef<'a>>) -> usize {
     let candidates = host_cwd_candidates(team);
     if candidates.is_empty() {
@@ -1607,10 +1611,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The ambiguity measure behind the guard: only live claude sessions whose
-    /// dir matches the team's host cwd count, normalization matches the resolver
-    /// (trailing slash, case), and a team with no cwd candidates at all counts 0
-    /// (its host came from a stronger signal, so it is not ambiguous).
+    /// The ambiguity measure behind the guard: every non-archived claude session
+    /// on the team's host cwd counts, stopped ones included (a stopped sibling is
+    /// exactly what can win the pick); non-claude sessions do not. Normalization
+    /// matches the resolver (trailing slash, case), and a team with no cwd
+    /// candidates at all counts 0 (its host came from a stronger signal, so it is
+    /// not ambiguous).
     #[test]
     fn cwd_host_match_count_counts_only_claude_sessions_on_the_team_cwd() {
         let dir = "/home/p/projects/mobsters-united";
