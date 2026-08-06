@@ -38,6 +38,7 @@ pub mod status;
 /// the `PreToolUse` payload that raises the in-chat "take the wheel" card.
 pub mod takeover_ask;
 pub mod steering;
+pub mod swarm;
 pub mod teams;
 pub mod tmux;
 pub mod transport;
