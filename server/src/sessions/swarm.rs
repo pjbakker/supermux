@@ -402,6 +402,100 @@ pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> R
     Ok(out)
 }
 
+/// How long the targeted teardown waits for the lead to actually die after a
+/// session stop (the pane kill and the agent's exit are asynchronous).
+const TEARDOWN_LEAD_WAIT: Duration = Duration::from_secs(30);
+
+/// Unlink a leftover socket FILE, but only on a conclusive "nothing is
+/// listening here". Same rule as the sweep's GC: an inconclusive probe is not
+/// evidence of death, and the file may still belong to a running server.
+async fn gc_socket_file(tmux_tmpdir: &Path, socket_name: &str) {
+    let path = socket_dir(tmux_tmpdir).join(socket_name);
+    if !path.exists() {
+        return;
+    }
+    match probe_socket(tmux_tmpdir, socket_name).await {
+        Probe::NoServer => {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(socket = %socket_name, error = %e, "swarm teardown: socket unlink failed");
+            }
+        }
+        // something still answers there: not ours to remove
+        Probe::Answers => {}
+        Probe::Unknown(why) => {
+            tracing::warn!(socket = %socket_name, why, "swarm teardown: socket probe inconclusive, leaving file");
+        }
+    }
+}
+
+/// Tear down the `claude-swarm-<lead_pid>` server after its lead died.
+/// Waits briefly for the lead to disappear; if it never does, leaves the
+/// server to the periodic sweep rather than kill a live team. Returns whether
+/// a server was killed.
+pub async fn teardown_for_lead(tmux_tmpdir: &Path, lead_pid: u32) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + TEARDOWN_LEAD_WAIT;
+    while pid_alive(lead_pid) {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::debug!(lead_pid, "swarm teardown: lead still alive, deferring to sweep");
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let socket_name = format!("{SOCKET_PREFIX}{lead_pid}");
+    let Some(srv) = discover_servers(tmux_tmpdir)
+        .into_iter()
+        .find(|s| s.socket_name == socket_name)
+    else {
+        // no server: still GC a stale socket file if one lingers
+        gc_socket_file(tmux_tmpdir, &socket_name).await;
+        return Ok(false);
+    };
+    // A human attached to inspect the team keeps it alive; the sweep handles it
+    // later. A clients check that FAILS is not an answer either: same rule as
+    // the sweep, an unanswered question never justifies a kill here.
+    match has_clients(tmux_tmpdir, &socket_name).await {
+        Ok(false) => {}
+        Ok(true) => {
+            tracing::info!(socket = %socket_name, "swarm teardown: clients attached, skipping");
+            return Ok(false);
+        }
+        Err(e) => {
+            tracing::warn!(socket = %socket_name, error = %e, "swarm teardown: clients check failed, deferring to sweep");
+            return Ok(false);
+        }
+    }
+    kill_server(tmux_tmpdir, &socket_name, srv.server_pid).await?;
+    gc_socket_file(tmux_tmpdir, &socket_name).await;
+    Ok(true)
+}
+
+/// Fire-and-forget wrapper for the session-end paths: must never block or
+/// fail a stop/archive/delete. TMUX_TMPDIR is process-wide (set in main.rs);
+/// its absence (tests, bare dev runs) falls back to tmux's default /tmp.
+pub fn spawn_teardown_for_lead(lead_pid: u32) {
+    let dir = std::env::var_os("TMUX_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    tokio::spawn(async move {
+        match teardown_for_lead(&dir, lead_pid).await {
+            Ok(true) => {
+                tracing::info!(lead_pid, "tore down agent-team tmux server for ended session")
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(lead_pid, error = %e, "agent-team teardown failed"),
+        }
+    });
+}
+
+/// The pane's foreground process-group leader, i.e. the running agent's PID.
+/// `None` when the pane sits at the shell prompt (fg pgid == the shell) or the
+/// pane is already gone. This is the pid agent teams name their socket after.
+pub async fn lead_pid_of(rt: &dyn crate::sessions::runtime::SessionRuntime) -> Option<u32> {
+    let shell = rt.pane_pid().await.ok().flatten()?;
+    let fg = crate::sessions::native::runtime::foreground_pgid(shell)?;
+    (fg != shell).then_some(fg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

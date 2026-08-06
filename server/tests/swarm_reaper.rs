@@ -245,6 +245,113 @@ async fn keeps_live_server_socket_when_unreadable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The targeted teardown runs at session end for ONE known lead pid, so it must
+/// hit exactly that lead's server and leave every other team alone.
+#[tokio::test]
+async fn teardown_for_lead_kills_matching_server() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let dir = temp_tmpdir();
+    let lead = dead_pid();
+    let socket = format!("claude-swarm-{lead}");
+    spawn_swarm_server(&dir, &socket);
+    // unrelated server that must survive
+    let other = format!("claude-swarm-{}", std::process::id());
+    spawn_swarm_server(&dir, &other);
+
+    let killed = swarm::teardown_for_lead(&dir, lead).await.unwrap();
+
+    assert!(killed);
+    assert!(!server_running(&dir, &socket), "target server must be gone");
+    assert!(server_running(&dir, &other), "unrelated server must survive");
+    kill_leftover(&dir, &other);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn teardown_for_lead_noop_when_no_server() {
+    let dir = temp_tmpdir();
+    let killed = swarm::teardown_for_lead(&dir, dead_pid()).await.unwrap();
+    assert!(!killed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No server left, but the socket file lingers: teardown garbage-collects it,
+/// same rule as the sweep, only on a conclusive "nothing is listening".
+#[tokio::test]
+async fn teardown_for_lead_gcs_stale_socket_file() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let dir = temp_tmpdir();
+    let sockdir = make_socket_dir(&dir);
+    let lead = dead_pid();
+    let path = sockdir.join(format!("claude-swarm-{lead}"));
+    std::fs::write(&path, b"").unwrap();
+
+    let killed = swarm::teardown_for_lead(&dir, lead).await.unwrap();
+
+    assert!(!killed, "no server was running, so nothing was killed");
+    assert!(!path.exists(), "stale socket file should have been removed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An inconclusive probe (here: a socket dir tmux refuses to use) is not
+/// evidence that the server is gone, so the file stays put.
+#[tokio::test]
+async fn teardown_for_lead_keeps_socket_file_when_probe_fails() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let dir = temp_tmpdir();
+    let sockdir = swarm::socket_dir(&dir);
+    std::fs::create_dir_all(&sockdir).unwrap();
+    std::fs::set_permissions(&sockdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let lead = dead_pid();
+    let path = sockdir.join(format!("claude-swarm-{lead}"));
+    std::fs::write(&path, b"").unwrap();
+
+    let killed = swarm::teardown_for_lead(&dir, lead).await.unwrap();
+
+    assert!(!killed);
+    assert!(path.exists(), "unlinked a socket file on an inconclusive probe");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A clients check that cannot be answered (here: an unreadable socket, so
+/// every tmux client call fails) is not permission to kill. The teardown backs
+/// off and leaves the server to the sweep, which re-evaluates it later.
+#[tokio::test]
+async fn teardown_for_lead_keeps_server_when_clients_check_fails() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let dir = temp_tmpdir();
+    let sockdir = make_socket_dir(&dir);
+    let lead = dead_pid();
+    let socket = format!("claude-swarm-{lead}");
+    spawn_swarm_server(&dir, &socket);
+    // discovery reads the process table, so the server is still found; only the
+    // tmux client calls (list-clients, kill-server) break on this
+    let path = sockdir.join(&socket);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let killed = swarm::teardown_for_lead(&dir, lead).await.unwrap();
+
+    assert!(!killed, "killed a server whose clients check never answered");
+    assert!(path.exists(), "socket file was unlinked on an inconclusive probe");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(server_running(&dir, &socket), "server should have been left alone");
+    kill_leftover(&dir, &socket);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Sweeping one TMUX_TMPDIR must be blind to servers living in another. Without
 /// this the reaper would reach outside its own socket namespace and kill
 /// production servers from a test run.
