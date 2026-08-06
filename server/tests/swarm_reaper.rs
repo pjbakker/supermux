@@ -481,6 +481,45 @@ async fn scopes_sweep_to_its_own_tmpdir() {
     let _ = std::fs::remove_dir_all(&swept);
 }
 
+/// Everything the e2e test below creates OUTSIDE this process: a real
+/// `supermux-<name>` tmux session whose pane runs `cat`, a fake swarm server,
+/// and the fixture's data dir. Unlike every other test here it cannot use a
+/// throwaway TMUX_TMPDIR (it has to match what `spawn_teardown_for_lead`
+/// resolves), so a leak lands in the operator's own socket dir. Worse, a
+/// leaked `cat` keeps the fake lead pid ALIVE, and both the targeted teardown
+/// and the periodic sweep refuse to reap a server whose lead still lives, so
+/// the stray would need manual cleanup forever. Hence a Drop guard: every exit
+/// path cleans up, panicking asserts included.
+struct E2eCleanup {
+    tmux_tmpdir: PathBuf,
+    /// Set once the lead pid is known and the fake server exists.
+    socket: Option<String>,
+    session: String,
+    data_dir: PathBuf,
+}
+
+impl Drop for E2eCleanup {
+    fn drop(&mut self) {
+        // Kill the pane FIRST: that ends `cat`, so the lead pid is dead by the
+        // time anything looks at the swarm server.
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &format!("supermux-{}", self.session)])
+            .output();
+        if let Some(socket) = &self.socket {
+            kill_leftover(&self.tmux_tmpdir, socket);
+        }
+        let _ = std::fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+/// `/proc/<pid>/comm`, used to confirm the captured foreground pid really is
+/// the `cat` we asked for.
+fn comm_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 /// End-to-end: stopping a session tears down the swarm server named after the
 /// pane's foreground process. Uses the same AppState + real-tmux setup as
 /// `tests/lifecycle.rs` (its `test_app()` fixture and its HTTP create+start
@@ -498,6 +537,17 @@ async fn stop_tears_down_swarm_server_of_foreground_pid() {
     }
     let (state, app, dir) = test_app().await;
     let name = format!("swarm{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let tmpdir = std::env::var_os("TMUX_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    // Armed BEFORE the session is created, so even a half-finished `start`
+    // leaves nothing behind.
+    let mut cleanup = E2eCleanup {
+        tmux_tmpdir: tmpdir.clone(),
+        socket: None,
+        session: name.clone(),
+        data_dir: dir,
+    };
 
     let (status, _) = send(
         &app,
@@ -518,7 +568,14 @@ async fn stop_tears_down_swarm_server_of_foreground_pid() {
     let mut lead = None;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        lead = swarm::lead_pid_of(rt.as_ref()).await;
+        // A shell-init child can hold the foreground pgid for a moment; naming
+        // the fake socket after one of those would leave a lead that dies on
+        // its own, so the test would pass without proving anything. Only the
+        // `cat` we asked for stands in for the lead agent.
+        lead = match swarm::lead_pid_of(rt.as_ref()).await {
+            Some(pid) if comm_of(pid).as_deref() == Some("cat") => Some(pid),
+            _ => None,
+        };
         if lead.is_some() {
             break;
         }
@@ -526,10 +583,8 @@ async fn stop_tears_down_swarm_server_of_foreground_pid() {
     let lead = lead.expect("foreground pid of the pane's cat");
     drop(rt);
 
-    let tmpdir = std::env::var_os("TMUX_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
     let socket = format!("claude-swarm-{lead}");
+    cleanup.socket = Some(socket.clone());
     spawn_swarm_server(&tmpdir, &socket);
     assert!(server_running(&tmpdir, &socket));
 
@@ -544,11 +599,8 @@ async fn stop_tears_down_swarm_server_of_foreground_pid() {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    kill_leftover(&tmpdir, &socket); // belt and suspenders on failure
-    let _ = std::process::Command::new("tmux")
-        .args(["kill-session", "-t", &format!("supermux-{name}")])
-        .output();
-    let _ = std::fs::remove_dir_all(&dir);
+    // `cleanup` handles the pane, the fake server and the data dir on the way
+    // out, whether this assert fires or not.
     assert!(gone, "swarm server survived session stop");
 }
 
