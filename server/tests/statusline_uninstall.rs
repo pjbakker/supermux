@@ -69,6 +69,7 @@ async fn uninstall_reports_the_truth_and_keeps_the_sidecar_when_it_removed_nothi
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: Default::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
