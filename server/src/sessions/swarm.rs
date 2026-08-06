@@ -16,14 +16,16 @@
 //!     clients, server older than a grace period. A live PID is never trusted
 //!     as "active" (PID recycling); it only ever means "keep", the safe side.
 
-use std::path::Path;
+use anyhow::{Context, Result};
+use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const SOCKET_PREFIX: &str = "claude-swarm-";
 
 /// Socket names this module is allowed to garbage-collect stale FILES for.
 /// `supermux-sync-test-*` are leftovers from this crate's own tmux tests.
-#[allow(dead_code)]
 fn is_reapable_socket_name(name: &str) -> bool {
     name.starts_with(SOCKET_PREFIX) || name.starts_with("supermux-sync-test-")
 }
@@ -81,6 +83,218 @@ pub fn decide(lead_alive: bool, has_clients: bool, age: Option<Duration>, grace:
         Some(_) => Verdict::Keep("younger-than-grace"),
         None => Verdict::Keep("age-unknown"),
     }
+}
+
+/// tmux appends `tmux-<uid>` to TMUX_TMPDIR; sockets live in that subdir.
+pub fn socket_dir(tmux_tmpdir: &Path) -> PathBuf {
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
+    tmux_tmpdir.join(format!("tmux-{uid}"))
+}
+
+#[derive(Debug)]
+pub struct SwarmServer {
+    pub server_pid: u32,
+    pub socket_name: String,
+    pub lead_pid: u32,
+    pub age: Option<Duration>,
+}
+
+/// `Some(name)` when argv is a tmux invocation on a claude-swarm socket.
+/// (The daemonized tmux server keeps the spawning client's argv, so matching
+/// `tmux ... -L claude-swarm-<pid> ...` finds servers even after their socket
+/// file was deleted, which is why we scan processes and not socket files.)
+fn socket_arg<'a>(argv: &[&'a str]) -> Option<&'a str> {
+    let first = Path::new(argv.first()?).file_name()?.to_str()?;
+    if first != "tmux" {
+        return None;
+    }
+    argv.windows(2)
+        .find(|w| w[0] == "-L" && w[1].starts_with(SOCKET_PREFIX))
+        .map(|w| w[1])
+}
+
+/// TMUX_TMPDIR from a process's environment. Readable only for own-uid
+/// processes, which is also the only set we may kill. Absent var means tmux's
+/// compiled default, /tmp.
+fn tmpdir_of(pid: u32) -> PathBuf {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+    environ
+        .split(|b| *b == 0)
+        .find_map(|kv| {
+            std::str::from_utf8(kv)
+                .ok()?
+                .strip_prefix("TMUX_TMPDIR=")
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// All live claude-swarm tmux servers of OUR uid whose TMUX_TMPDIR matches
+/// `tmux_tmpdir`. The tmpdir match keeps a sweep scoped to its own socket
+/// namespace (and keeps the test suite from ever seeing production servers).
+pub fn discover_servers(tmux_tmpdir: &Path) -> Vec<SwarmServer> {
+    let mut found = Vec::new();
+    let Ok(me) = std::fs::metadata("/proc/self") else { return found };
+    let my_uid = me.uid();
+    let canon = std::fs::canonicalize(tmux_tmpdir).unwrap_or_else(|_| tmux_tmpdir.to_path_buf());
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else { return found };
+    for entry in proc_dir.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.uid() != my_uid {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else { continue };
+        let argv: Vec<&str> = cmdline
+            .split(|b| *b == 0)
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let Some(sock) = socket_arg(&argv) else { continue };
+        let Some(lead_pid) = parse_lead_pid(sock) else { continue };
+        let theirs = tmpdir_of(pid);
+        let theirs = std::fs::canonicalize(&theirs).unwrap_or(theirs);
+        if theirs != canon {
+            continue;
+        }
+        found.push(SwarmServer {
+            server_pid: pid,
+            socket_name: sock.to_string(),
+            lead_pid,
+            age: process_age(pid),
+        });
+    }
+    found
+}
+
+async fn run_tmux(tmux_tmpdir: &Path, args: &[&str]) -> Result<String> {
+    let bin = which::which("tmux").context("tmux not on PATH")?;
+    let out = tokio::process::Command::new(bin)
+        .env("TMUX_TMPDIR", tmux_tmpdir)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("running tmux {args:?}"))?;
+    if !out.status.success() {
+        anyhow::bail!("tmux {:?}: {}", args, String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+async fn has_clients(tmux_tmpdir: &Path, socket_name: &str) -> Result<bool> {
+    let out = run_tmux(tmux_tmpdir, &["-L", socket_name, "list-clients"]).await?;
+    Ok(!out.trim().is_empty())
+}
+
+/// kill-server, then escalate to SIGTERM/SIGKILL on the server process if it
+/// survives (covers a wedged server or a server whose socket file is gone,
+/// where the tmux client cannot connect at all).
+async fn kill_server(tmux_tmpdir: &Path, socket_name: &str, server_pid: u32) -> Result<()> {
+    let _ = run_tmux(tmux_tmpdir, &["-L", socket_name, "kill-server"]).await;
+    for _ in 0..10 {
+        if !pid_alive(server_pid) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    let pid = Pid::from_raw(server_pid as i32);
+    let _ = kill(pid, Signal::SIGTERM);
+    for _ in 0..10 {
+        if !pid_alive(server_pid) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let _ = kill(pid, Signal::SIGKILL);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    if pid_alive(server_pid) {
+        anyhow::bail!("server pid {server_pid} survived SIGKILL");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct SweepOutcome {
+    pub killed: Vec<String>,
+    pub kept: Vec<(String, &'static str)>,
+    pub sockets_removed: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// One full sweep: evaluate every live swarm server against the kill rules,
+/// then garbage-collect socket FILES that no live server answers on. With
+/// `dry_run` every decision is reported and nothing is touched.
+pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> Result<SweepOutcome> {
+    let mut out = SweepOutcome::default();
+    let servers = discover_servers(tmux_tmpdir);
+
+    for srv in &servers {
+        let lead_alive = pid_alive(srv.lead_pid);
+        // clients only matter when the lead is dead; skip the subprocess otherwise
+        let clients = if lead_alive {
+            false
+        } else {
+            match has_clients(tmux_tmpdir, &srv.socket_name).await {
+                Ok(c) => c,
+                Err(e) => {
+                    out.errors.push(format!("{}: clients check failed: {e}", srv.socket_name));
+                    out.kept.push((srv.socket_name.clone(), "clients-check-failed"));
+                    continue;
+                }
+            }
+        };
+        match decide(lead_alive, clients, srv.age, grace) {
+            Verdict::Keep(why) => {
+                tracing::debug!(socket = %srv.socket_name, why, "swarm sweep: keeping server");
+                out.kept.push((srv.socket_name.clone(), why));
+            }
+            Verdict::Kill => {
+                tracing::info!(
+                    socket = %srv.socket_name,
+                    server_pid = srv.server_pid,
+                    lead_pid = srv.lead_pid,
+                    age_secs = srv.age.map(|a| a.as_secs()),
+                    dry_run,
+                    "swarm sweep: reaping stale agent-team tmux server"
+                );
+                if !dry_run {
+                    if let Err(e) = kill_server(tmux_tmpdir, &srv.socket_name, srv.server_pid).await {
+                        out.errors.push(format!("{}: kill failed: {e}", srv.socket_name));
+                        continue;
+                    }
+                }
+                out.killed.push(srv.socket_name.clone());
+            }
+        }
+    }
+
+    // Stale socket FILES: anything matching our patterns that no live server
+    // answers on. `list-sessions` does not auto-start a server, so probing is
+    // side-effect free. Servers kept above still answer and are skipped.
+    let kept_names: HashSet<&str> = out.kept.iter().map(|(n, _)| n.as_str()).collect();
+    if let Ok(rd) = std::fs::read_dir(socket_dir(tmux_tmpdir)) {
+        for f in rd.flatten() {
+            let Some(name) = f.file_name().to_str().map(str::to_owned) else { continue };
+            if !is_reapable_socket_name(&name) || kept_names.contains(name.as_str()) {
+                continue;
+            }
+            if run_tmux(tmux_tmpdir, &["-L", &name, "list-sessions"]).await.is_ok() {
+                continue; // a live server we did not discover: leave it alone
+            }
+            if !dry_run {
+                if let Err(e) = std::fs::remove_file(f.path()) {
+                    out.errors.push(format!("{name}: unlink failed: {e}"));
+                    continue;
+                }
+            }
+            out.sockets_removed.push(name);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
