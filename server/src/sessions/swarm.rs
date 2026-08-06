@@ -560,6 +560,70 @@ pub fn spawn_reaper(state: crate::state::AppState) -> tokio::task::JoinHandle<()
     })
 }
 
+#[derive(Debug, Default)]
+struct CliArgs {
+    dry_run: bool,
+    grace: Option<Duration>,
+}
+
+impl CliArgs {
+    fn parse<I: Iterator<Item = String>>(mut it: I) -> Result<Self> {
+        let mut args = CliArgs::default();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--dry-run" => args.dry_run = true,
+                "--grace-secs" => {
+                    let v = it
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .context("--grace-secs needs a number of seconds")?;
+                    args.grace = Some(Duration::from_secs(v));
+                }
+                other => anyhow::bail!(
+                    "swarm-reaper: unexpected argument {other:?} (known: --dry-run, --grace-secs N)"
+                ),
+            }
+        }
+        Ok(args)
+    }
+}
+
+/// `supermux-server swarm-reaper [--dry-run] [--grace-secs N]`: one sweep,
+/// human-readable report on stdout, non-zero exit when any item errored.
+/// Runs without DB or listener; safe alongside a live daemon (the sweep is
+/// idempotent and both sides only ever kill servers that met the rules).
+pub async fn cli<I: Iterator<Item = String>>(argv: I) -> Result<()> {
+    let args = CliArgs::parse(argv)?;
+    // mirror the daemon's TMUX_TMPDIR resolution: env override, else <data_dir>/tmux
+    let dir = match std::env::var_os("TMUX_TMPDIR") {
+        Some(d) => PathBuf::from(d),
+        None => crate::config::load()?.data_dir.join("tmux"),
+    };
+    let grace = args.grace.unwrap_or(Duration::from_secs(
+        crate::config::SwarmReaperConfig::default().grace_secs,
+    ));
+    let out = sweep_once(&dir, grace, args.dry_run).await?;
+    for (name, why) in &out.kept {
+        println!("KEEP        {name}  ({why})");
+    }
+    for name in &out.killed {
+        println!("{} {name}", if args.dry_run { "WOULD-KILL " } else { "KILLED     " });
+    }
+    for name in &out.sockets_removed {
+        println!("{} {name}  (stale socket file)", if args.dry_run { "WOULD-RM   " } else { "REMOVED    " });
+    }
+    if out.kept.is_empty() && out.killed.is_empty() && out.sockets_removed.is_empty() {
+        println!("nothing to do: no claude-swarm servers or stale sockets found");
+    }
+    if !out.errors.is_empty() {
+        for e in &out.errors {
+            eprintln!("ERROR {e}");
+        }
+        anyhow::bail!("{} error(s) during sweep", out.errors.len());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +715,16 @@ mod tests {
         assert!(pid_alive(std::process::id()));
         // PID 4194304+ is above the default pid_max; can never exist
         assert!(!pid_alive(4_294_967_290));
+    }
+
+    #[test]
+    fn cli_args_parse() {
+        let a = CliArgs::parse(["--dry-run".to_string()].into_iter()).unwrap();
+        assert!(a.dry_run);
+        assert_eq!(a.grace, None);
+        let a = CliArgs::parse(["--grace-secs".to_string(), "60".to_string()].into_iter()).unwrap();
+        assert_eq!(a.grace, Some(Duration::from_secs(60)));
+        assert!(CliArgs::parse(["--bogus".to_string()].into_iter()).is_err());
+        assert!(CliArgs::parse(["--grace-secs".to_string()].into_iter()).is_err());
     }
 }
