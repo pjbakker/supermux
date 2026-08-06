@@ -114,19 +114,29 @@ fn socket_arg<'a>(argv: &[&'a str]) -> Option<&'a str> {
 }
 
 /// TMUX_TMPDIR from a process's environment. Readable only for own-uid
-/// processes, which is also the only set we may kill. Absent var means tmux's
-/// compiled default, /tmp.
-fn tmpdir_of(pid: u32) -> PathBuf {
-    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
-    environ
-        .split(|b| *b == 0)
-        .find_map(|kv| {
-            std::str::from_utf8(kv)
-                .ok()?
-                .strip_prefix("TMUX_TMPDIR=")
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+/// processes, which is also the only set we may kill.
+///
+/// `None` means we could not observe the environment at all (unreadable, or
+/// empty as the kernel reports for a zombie). That must NOT collapse into the
+/// default: an unobservable process would then match a sweep of /tmp and be
+/// killed on no evidence. Only a successfully read environment that simply
+/// lacks the variable falls back to tmux's compiled default, /tmp.
+fn tmpdir_of(pid: u32) -> Option<PathBuf> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    if environ.is_empty() {
+        return None;
+    }
+    Some(
+        environ
+            .split(|b| *b == 0)
+            .find_map(|kv| {
+                std::str::from_utf8(kv)
+                    .ok()?
+                    .strip_prefix("TMUX_TMPDIR=")
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| PathBuf::from("/tmp")),
+    )
 }
 
 /// All live claude-swarm tmux servers of OUR uid whose TMUX_TMPDIR matches
@@ -154,7 +164,7 @@ pub fn discover_servers(tmux_tmpdir: &Path) -> Vec<SwarmServer> {
             .collect();
         let Some(sock) = socket_arg(&argv) else { continue };
         let Some(lead_pid) = parse_lead_pid(sock) else { continue };
-        let theirs = tmpdir_of(pid);
+        let Some(theirs) = tmpdir_of(pid) else { continue };
         let theirs = std::fs::canonicalize(&theirs).unwrap_or(theirs);
         if theirs != canon {
             continue;
@@ -169,14 +179,29 @@ pub fn discover_servers(tmux_tmpdir: &Path) -> Vec<SwarmServer> {
     found
 }
 
-async fn run_tmux(tmux_tmpdir: &Path, args: &[&str]) -> Result<String> {
+/// A tmux client talking to a wedged server can block in connect() forever.
+/// Every call below is bounded so one sick server cannot stall the whole sweep.
+const TMUX_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Raw tmux invocation. `Ok` whenever tmux actually ran and exited, whatever its
+/// status; `Err` only when it could not be run or did not come back in time.
+/// Callers that must distinguish "tmux says no server" from "we learned
+/// nothing" need that split, so the exit status is NOT folded in here.
+async fn tmux_output(tmux_tmpdir: &Path, args: &[&str]) -> Result<std::process::Output> {
     let bin = which::which("tmux").context("tmux not on PATH")?;
-    let out = tokio::process::Command::new(bin)
+    let run = tokio::process::Command::new(bin)
         .env("TMUX_TMPDIR", tmux_tmpdir)
         .args(args)
-        .output()
-        .await
-        .with_context(|| format!("running tmux {args:?}"))?;
+        .kill_on_drop(true) // do not leave a hung client behind on timeout
+        .output();
+    match tokio::time::timeout(TMUX_TIMEOUT, run).await {
+        Ok(res) => res.with_context(|| format!("running tmux {args:?}")),
+        Err(_) => anyhow::bail!("tmux {:?} timed out after {:?}", args, TMUX_TIMEOUT),
+    }
+}
+
+async fn run_tmux(tmux_tmpdir: &Path, args: &[&str]) -> Result<String> {
+    let out = tmux_output(tmux_tmpdir, args).await?;
     if !out.status.success() {
         anyhow::bail!("tmux {:?}: {}", args, String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -188,13 +213,68 @@ async fn has_clients(tmux_tmpdir: &Path, socket_name: &str) -> Result<bool> {
     Ok(!out.trim().is_empty())
 }
 
+/// What a socket probe established. `Unknown` is the honest third answer, and
+/// keeping it separate from `NoServer` is what stops the GC from unlinking a
+/// live server's socket whenever tmux fails for an unrelated reason.
+enum Probe {
+    Answers,
+    NoServer,
+    Unknown(String),
+}
+
+/// Is a live server listening on this socket? `list-sessions` never starts a
+/// server (verified against tmux behaviour), so probing is side effect free.
+///
+/// Only the two messages tmux uses for "nothing is listening here" count as
+/// dead. Anything else (unsafe socket dir permissions, tmux missing, a
+/// timeout, a version whose wording we do not know) is `Unknown` and leaves the
+/// file alone.
+async fn probe_socket(tmux_tmpdir: &Path, socket_name: &str) -> Probe {
+    let out = match tmux_output(tmux_tmpdir, &["-L", socket_name, "list-sessions"]).await {
+        Ok(out) => out,
+        Err(e) => return Probe::Unknown(e.to_string()),
+    };
+    if out.status.success() {
+        return Probe::Answers;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lowered = stderr.to_lowercase();
+    // "no server running on <path>"                     - socket present, nobody home
+    // "error connecting to <path> (No such file ...)"    - socket already gone
+    if lowered.contains("no server running") || lowered.contains("error connecting") {
+        Probe::NoServer
+    } else {
+        Probe::Unknown(stderr.trim().to_string())
+    }
+}
+
+/// Is `pid` STILL the tmux server for `socket_name`? Discovery and the signal
+/// escalation below are separated by seconds of waiting, and a sweep can sit
+/// behind other servers for much longer, so the pid may have been recycled onto
+/// an unrelated process in between. Re-reading the live argv makes each bare-pid
+/// signal target the process we actually decided to kill, not whoever inherited
+/// its number.
+fn still_our_server(pid: u32, socket_name: &str) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+    let argv: Vec<&str> = cmdline
+        .split(|b| *b == 0)
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .filter(|s| !s.is_empty())
+        .collect();
+    socket_arg(&argv) == Some(socket_name)
+}
+
 /// kill-server, then escalate to SIGTERM/SIGKILL on the server process if it
 /// survives (covers a wedged server or a server whose socket file is gone,
-/// where the tmux client cannot connect at all).
+/// where the tmux client cannot connect at all). Every escalation step
+/// re-verifies the pid first: a pid that is dead OR no longer this server means
+/// the job is done, never a reason to signal.
 async fn kill_server(tmux_tmpdir: &Path, socket_name: &str, server_pid: u32) -> Result<()> {
+    let gone = || !pid_alive(server_pid) || !still_our_server(server_pid, socket_name);
+
     let _ = run_tmux(tmux_tmpdir, &["-L", socket_name, "kill-server"]).await;
     for _ in 0..10 {
-        if !pid_alive(server_pid) {
+        if gone() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -202,16 +282,22 @@ async fn kill_server(tmux_tmpdir: &Path, socket_name: &str, server_pid: u32) -> 
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     let pid = Pid::from_raw(server_pid as i32);
+    if gone() {
+        return Ok(());
+    }
     let _ = kill(pid, Signal::SIGTERM);
     for _ in 0..10 {
-        if !pid_alive(server_pid) {
+        if gone() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    if gone() {
+        return Ok(());
+    }
     let _ = kill(pid, Signal::SIGKILL);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    if pid_alive(server_pid) {
+    if !gone() {
         anyhow::bail!("server pid {server_pid} survived SIGKILL");
     }
     Ok(())
@@ -272,9 +358,10 @@ pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> R
         }
     }
 
-    // Stale socket FILES: anything matching our patterns that no live server
-    // answers on. `list-sessions` does not auto-start a server, so probing is
-    // side-effect free. Servers kept above still answer and are skipped.
+    // Stale socket FILES: anything matching our patterns that tmux positively
+    // reports nothing is listening on. Unlinking is only ever justified by a
+    // conclusive "dead" answer, since the file may belong to a running server we
+    // never discovered. Servers kept above still answer and are skipped.
     let kept_names: HashSet<&str> = out.kept.iter().map(|(n, _)| n.as_str()).collect();
     if let Ok(rd) = std::fs::read_dir(socket_dir(tmux_tmpdir)) {
         for f in rd.flatten() {
@@ -282,8 +369,16 @@ pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> R
             if !is_reapable_socket_name(&name) || kept_names.contains(name.as_str()) {
                 continue;
             }
-            if run_tmux(tmux_tmpdir, &["-L", &name, "list-sessions"]).await.is_ok() {
-                continue; // a live server we did not discover: leave it alone
+            match probe_socket(tmux_tmpdir, &name).await {
+                Probe::NoServer => {}
+                // a live server we did not discover: leave it alone
+                Probe::Answers => continue,
+                // learned nothing, so we have no licence to unlink
+                Probe::Unknown(why) => {
+                    tracing::warn!(socket = %name, why, "swarm sweep: socket probe inconclusive, leaving file");
+                    out.errors.push(format!("{name}: socket probe inconclusive: {why}"));
+                    continue;
+                }
             }
             if !dry_run {
                 if let Err(e) = std::fs::remove_file(f.path()) {
@@ -335,6 +430,26 @@ mod tests {
         assert!(matches!(decide(false, false, Some(h * 3), h * 2), Verdict::Kill));
         // exactly at the grace boundary kills (>=)
         assert!(matches!(decide(false, false, Some(h), h), Verdict::Kill));
+    }
+
+    #[test]
+    fn socket_arg_matches_only_tmux_on_a_swarm_socket() {
+        assert_eq!(socket_arg(&["tmux", "-L", "claude-swarm-42", "new-session"]), Some("claude-swarm-42"));
+        assert_eq!(socket_arg(&["/usr/bin/tmux", "-L", "claude-swarm-42"]), Some("claude-swarm-42"));
+        // not tmux, not ours to touch even on a matching socket name
+        assert_eq!(socket_arg(&["vim", "-L", "claude-swarm-42"]), None);
+        // some other tmux server sharing the box
+        assert_eq!(socket_arg(&["tmux", "-L", "default"]), None);
+        assert_eq!(socket_arg(&["tmux", "attach"]), None);
+        assert_eq!(socket_arg(&[]), None);
+    }
+
+    #[test]
+    fn still_our_server_rejects_wrong_and_dead_pids() {
+        // our own process is not a tmux server on that socket
+        assert!(!still_our_server(std::process::id(), "claude-swarm-1"));
+        // a pid that cannot exist reads as gone, never as a signal target
+        assert!(!still_our_server(4_294_967_290, "claude-swarm-1"));
     }
 
     #[test]
