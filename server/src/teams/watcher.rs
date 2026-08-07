@@ -1426,6 +1426,10 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                archive_on_stop: None,
+                prompt: None,
+                unless_live_prefix: None,
+                max_quiet_secs: None,
             },
         )
         .await
