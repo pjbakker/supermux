@@ -858,6 +858,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                ..Default::default()
             },
         )
         .await
@@ -903,6 +904,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                ..Default::default()
             },
         )
         .await
@@ -968,6 +970,7 @@ mod tests {
             worktree: None,
             host_id: None,
             runtime: None,
+            ..Default::default()
         };
         crate::sessions::create(&state, mk("old-host", "/old")).await.unwrap();
         crate::sessions::create(&state, mk("new-host", "/new")).await.unwrap();
