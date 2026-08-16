@@ -263,14 +263,26 @@ export interface RecallEntry {
   ok?: boolean
 }
 
-/** Mirrored from `Kind` in `server/src/sessions/recall.rs`. `'prompt'`,
- *  `'command'`, and `'teammate'` are user-initiated and shown by default;
- *  the rest are harness/tool events surfaced only when the "Show system
+/** Mirrored from `Kind` in `server/src/sessions/recall.rs`. The user-initiated
+ *  kinds — shown by default and the only ones that reach the chat transcript —
+ *  are `'prompt'`, `'command'`, `'teammate'`, `'delegation'` and `'schedule'`:
+ *  somebody deliberately asked for each of them (a schedule is the owner's own
+ *  request, made earlier). Keep this list in step with `Kind::is_user_initiated`
+ *  — the rest are harness/tool events surfaced only when the "Show system
  *  events" toggle is on. */
 export type RecallEntryKind =
   | 'prompt'
   | 'command'
   | 'teammate'
+  // A prompt another session delegated here: `agents/delegate.rs` wraps the
+  // delivery in `<supermux-delegation from="…">` and `recall.rs` classifies it.
+  // `label` carries the sending session's name.
+  | 'delegation'
+  // A prompt one of this session's own schedules fired: `scheduler/runner.rs`
+  // wraps the delivery in `<supermux-schedule id="…" title="…">`. `label` carries
+  // the schedule's title, and the schedule is its own SPEAKER in the transcript —
+  // a 03:00 fire is not the owner typing at 03:00.
+  | 'schedule'
   | 'notification'
   | 'system'
   | 'tool'

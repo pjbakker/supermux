@@ -15,6 +15,9 @@
  *              arrival — and then the message in the COLLEAGUE's own face
  *   system     a centred `SystemLine` with the named thing as a `SystemEntity`
  *   divider    a centred `SystemLine` carrying the relative clock
+ *   harness    a centred `SystemLine` for a row of the audit ledger — what this
+ *              session delegated, renamed or scheduled — with the colleague it
+ *              went to as a navigable `MentionChip`
  *
  * TWO INJECTED CAPABILITIES, both deliberate:
  *   · `rawUrl` — turning a path into a fetchable URL lives in `filesApi`, which
@@ -36,6 +39,8 @@ import * as React from 'react'
 
 import { SessionMark, type MarkPin } from '../../brand/marks'
 import { cn } from '../../lib/utils'
+
+import type { HarnessEvent } from '../../lib/api/harness'
 
 import type { ChatItem } from './entries'
 import { harnessNotice } from './entries'
@@ -83,6 +88,12 @@ export interface TranscriptItemProps {
   rawUrl?: (path: string) => string
   /** Seed → identity pin, when a roster has assigned one. */
   pinFor?: (seed: string) => MarkPin | undefined
+  /**
+   * Go to another session. The chip in a harness line ("Delegated to ●x") is a
+   * NAVIGATION affordance (master plan §13.1) and this is its destination; omit
+   * it and the chip is inert, which is what the bench and the tests render.
+   */
+  onOpenSession?: (slug: string) => void
 }
 
 const EMPTY_INDEX: ReadonlyMap<string, string> = new Map()
@@ -119,12 +130,32 @@ export const TranscriptItem = React.memo(function TranscriptItem(
 ) {
   const { node } = props
   if (node.kind === 'divider') return <SystemLine>{node.label}</SystemLine>
+  if (node.kind === 'harness') {
+    return (
+      <HarnessLine
+        ev={node.ev}
+        names={props.names}
+        pinFor={props.pinFor}
+        onOpenSession={props.onOpenSession}
+      />
+    )
+  }
 
   const { item, speaker, grouped, showGutter, sender } = node
   if (speaker === 'system') return <SystemRow item={item} labels={props.labels} />
   if (speaker === 'me') return <UserRow {...props} item={item} grouped={grouped} />
   if (sender !== undefined || speaker.startsWith('teammate:')) {
     return <TeammateRow {...props} item={item} grouped={grouped} sender={sender ?? ''} />
+  }
+  if (speaker.startsWith('schedule:')) {
+    return (
+      <ScheduleRow
+        {...props}
+        item={item}
+        grouped={grouped}
+        title={speaker.slice('schedule:'.length)}
+      />
+    )
   }
   return (
     <AgentRow
@@ -294,6 +325,63 @@ function TeammateRow({
   )
 }
 
+/* ── a schedule ──────────────────────────────────────────────────────────── */
+
+/**
+ * A schedule fired this (master plan §13.3): which schedule, said once above the
+ * prompt, in the same arrival grammar a colleague gets.
+ *
+ * The schedule is the SPEAKER, not a hat on the owner's bubble — a 03:00 prompt
+ * with the owner's face on it is the transcript telling a lie about who was
+ * awake. There is no mark in the gutter because a schedule has no identity mark
+ * to hang: `⏱` (the one sanctioned glyph, matching the scheduler's own chips)
+ * plus the title carries it, and the divider is where that belongs anyway.
+ *
+ * The prompt text arrives already stripped of the machine-generated confirm
+ * footer (`recall.rs::strip_confirm_footer`), so the multi-line curl block that
+ * used to land in chat is gone before it ever reaches this component.
+ */
+function ScheduleRow({
+  item,
+  grouped,
+  title,
+  ...rest
+}: TranscriptItemProps & { item: ChatItem; grouped: boolean; title: string }) {
+  if (item.type !== 'user') return null
+  return (
+    <>
+      {!grouped && (
+        <ArrivalDivider>
+          {title ? (
+            <>
+              <span>Sent by schedule</span>
+              <span className="font-medium text-ink">
+                <span aria-hidden="true">⏱ </span>
+                {title}
+              </span>
+            </>
+          ) : (
+            <span>Sent by a schedule</span>
+          )}
+        </ArrivalDivider>
+      )}
+      <MessageRow grouped={grouped}>
+        <Bubble surface={rest.surface}>
+          <Prose
+            text={item.text}
+            self={rest.name}
+            mentions={rest.mentions}
+            pinFor={rest.pinFor}
+            surface={rest.surface}
+            rawUrl={rest.rawUrl}
+          />
+          {item.truncated && <ClippedMarker />}
+        </Bubble>
+      </MessageRow>
+    </>
+  )
+}
+
 /* ── the harness ─────────────────────────────────────────────────────────── */
 
 function SystemRow({
@@ -322,6 +410,82 @@ function SystemRow({
         <>
           <SystemSep />
           <SystemEntity>{subject.length > 72 ? `${subject.slice(0, 72)}…` : subject}</SystemEntity>
+        </>
+      )}
+    </SystemLine>
+  )
+}
+
+/* ── the ledger ──────────────────────────────────────────────────────────── */
+
+export interface HarnessLineProps {
+  ev: HarnessEvent
+  /** Slug → what that session is CALLED (the chip shows a colleague, not a row). */
+  names?: ReadonlyMap<string, string>
+  pinFor?: (seed: string) => MarkPin | undefined
+  onOpenSession?: (slug: string) => void
+}
+
+/**
+ * One row of the harness ledger, as a centred sentence.
+ *
+ * This is the transcript becoming a MANAGEMENT LOG: what this session set in
+ * motion and what the harness did to it, in the place where it happened, and
+ * surviving a reload because it is read from `audit_log` rather than from a
+ * live frame (`lib/api/harness.ts`).
+ *
+ * Four sentences, one per surfaced action. There is deliberately no default
+ * branch: `grouping.ts` drops any action this file has no copy for, so an
+ * unworded event ships dark instead of printing "System event ·" over a blob of
+ * JSON. `⏱` is the one sanctioned glyph in UI copy, and it is here for the same
+ * reason the scheduler's own chips carry it — a schedule has no identity mark.
+ */
+export function HarnessLine({ ev, names, pinFor, onOpenSession }: HarnessLineProps) {
+  if (ev.action === 'session.delegate') {
+    // `target` is the session this went TO; the seed is always the slug, so
+    // this chip and that session's face are the same pigment.
+    const to = ev.target
+    return (
+      <SystemLine>
+        Delegated to{' '}
+        <MentionChip
+          seed={to}
+          pin={pinFor?.(to)}
+          name={names?.get(to)}
+          onClick={onOpenSession ? () => onOpenSession(to) : undefined}
+        />
+      </SystemLine>
+    )
+  }
+  if (ev.action === 'session.rename') {
+    // Only a session renaming ITSELF reaches here (`grouping.ts` suppresses the
+    // owner's own renames), so the subject of the sentence is the session.
+    const to = typeof ev.detail.to === 'string' ? ev.detail.to : ''
+    if (!to) return null
+    return (
+      <SystemLine>
+        Renamed itself to <SystemEntity>{to}</SystemEntity>
+      </SystemLine>
+    )
+  }
+  const created = ev.action === 'schedule.create'
+  // A failed fire is management log, not a toast: the same sentence, in the
+  // calm-orange status ink. Never a red bubble, never a banner.
+  const failed = !created && typeof ev.detail.status === 'string' && ev.detail.status !== 'ok'
+  const title = typeof ev.detail.title === 'string' ? ev.detail.title.trim() : ''
+  return (
+    <SystemLine className={failed ? 'text-status-error' : undefined}>
+      {created ? 'Created schedule' : 'Ran schedule'}
+      {title && (
+        <>
+          <SystemSep />
+          {/* No `onClick` yet — the Schedules sheet that would receive it is a
+              later slice, and `SystemEntity` degrades to plain emphasis by
+              design rather than offering a dead affordance. */}
+          <SystemEntity>
+            <span aria-hidden="true">⏱ </span>
+            {title}
+          </SystemEntity>
         </>
       )}
     </SystemLine>

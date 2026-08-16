@@ -39,7 +39,7 @@ pub use transport::{HostId, Transport, LOCAL as LOCAL_TRANSPORT};
 use std::collections::HashMap;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 // Routing constructors are fully-qualified (`axum::routing::get`) to avoid a name
@@ -82,6 +82,11 @@ pub fn router_for(state: AppState) -> Router {
         .route("/api/sessions/{name}/paste", post(paste_handler))
         .route("/api/sessions/{name}/peek", get(peek_handler))
         .route("/api/sessions/{name}/recall", get(recall::handler))
+        // ── the per-session harness-event feed ──
+        // Replayable provenance for everything the harness did TO or FROM this
+        // session (delegations, renames, schedule fires). SSE only says "look
+        // again"; this is what survives a reload.
+        .route("/api/sessions/{name}/events", get(events_handler))
         // ── chat data plane backlog (fase A2) ──
         // The live path is the WS (`/ws/sessions/{name}/chat`, registered in
         // `ws::router_for`); these two are the bearer-protected reads it cannot
@@ -470,6 +475,83 @@ async fn ensure_session(state: &AppState, name: &str) -> Result<(), AppError> {
     } else {
         Err(AppError::NotFound(format!("session '{name}'")))
     }
+}
+
+// ── the harness-event feed ───────────────────────────────────────────────────
+
+/// Hard ceiling on one `GET /api/sessions/{name}/events` page.
+const EVENTS_LIMIT_MAX: i64 = 200;
+/// What a client gets when it names no `limit`.
+const EVENTS_LIMIT_DEFAULT: i64 = 100;
+
+fn events_limit_default() -> i64 {
+    EVENTS_LIMIT_DEFAULT
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    /// EXCLUSIVE cursor: return rows with a strictly greater id. `0` (the
+    /// default) means "from the beginning".
+    #[serde(default)]
+    pub since_id: i64,
+    #[serde(default = "events_limit_default")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EventsResponse {
+    /// Ascending by id — the client appends, it never re-sorts.
+    pub events: Vec<crate::db::runtime_state::AuditEntry>,
+}
+
+/// `GET /api/sessions/{name}/events?since_id=&limit=` — the session's harness
+/// events, oldest first.
+///
+/// The transcript's system lines are rendered from THIS, not from SSE: SSE has
+/// no replay, so anything that only existed as a live frame would vanish on
+/// reload. `detail` is passed through as the JSON *string* the ledger stores;
+/// the client parses it once.
+async fn events_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<EventsQuery>,
+) -> Result<Json<Envelope<EventsResponse>>, AppError> {
+    ensure_session(&state, &name).await?;
+    let limit = q.limit.clamp(1, EVENTS_LIMIT_MAX);
+    let events =
+        db::audit::events_for_session(&state.pool, &name, q.since_id.max(0), limit).await?;
+    Ok(ok(EventsResponse { events }))
+}
+
+/// Fire the `harness` SSE tick for a surfaced audit entry.
+///
+/// `sessions` lists every session whose feed this entry belongs to — a
+/// delegation is news to both ends, a rename only to the renamed one. Clients
+/// use it purely to decide whether to refetch; the entry rides along so a
+/// listener that is already up to date needs no round-trip.
+pub fn emit_harness(state: &AppState, sessions: &[&str], entry: &crate::db::runtime_state::AuditEntry) {
+    let _ = state.sse_tx.send(crate::state::SseEvent {
+        event: "harness".into(),
+        payload: json!({ "sessions": sessions, "entry": entry }),
+    });
+}
+
+/// Write a surfaced audit row and fire its `harness` tick in one step.
+///
+/// Every action in [`db::audit::SURFACED_ACTIONS`] should go through here:
+/// splitting the ledger write from the echo is how a feed silently stops
+/// updating live while still being correct after a reload.
+pub async fn audit_harness(
+    state: &AppState,
+    actor: &str,
+    action: &str,
+    target: &str,
+    detail: serde_json::Value,
+    sessions: &[&str],
+) -> sqlx::Result<()> {
+    let entry = db::audit::log_entry(&state.pool, actor, action, target, detail).await?;
+    emit_harness(state, sessions, &entry);
+    Ok(())
 }
 
 // ── public API (reused by the lifecycle module) ──────────────────────────────
@@ -928,7 +1010,31 @@ pub async fn config_patch(
         // the label to the slug (so the UI never shows a blank title).
         let label = v.trim();
         let value = if label.is_empty() { current.as_str() } else { label };
+        // Read the label we are replacing BEFORE the write, so the audit row can
+        // say what it was. An empty stored label means "the slug" (see `view`),
+        // so normalise both sides before comparing — otherwise clearing an
+        // already-empty label would audit as a rename that changed nothing.
+        let previous = db::sessions::get(&state.pool, &current)
+            .await?
+            .map(|s| s.display_name)
+            .unwrap_or_default();
+        let previous = if previous.is_empty() { current.clone() } else { previous };
         db::sessions::set_display_name(&state.pool, &current, value).await?;
+        if previous != value {
+            // Ledger row + `harness` tick: the transcript renders a rename only
+            // when an AGENT did it (a line telling the owner what they typed two
+            // seconds ago is ceremony), but the row is written either way so the
+            // feed stays a complete history.
+            let _ = audit_harness(
+                state,
+                "user",
+                "session.rename",
+                &current,
+                json!({ "from": previous, "to": value }),
+                &[current.as_str()],
+            )
+            .await;
+        }
         changed = true;
     }
     if let Some(v) = patch.desc {
@@ -1867,6 +1973,84 @@ mod tests {
         assert_eq!(row.runtime, "tmux");
         let rt = state.runtime_for("legacy").await.expect("resolves");
         assert_eq!(rt.target(), "supermux-legacy");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn relabel(display_name: &str) -> ConfigInput {
+        ConfigInput {
+            rename: None,
+            display_name: Some(display_name.into()),
+            desc: None,
+            dir: None,
+            branch: None,
+            mcp: None,
+            tags: None,
+            toggle_pin: None,
+            toggle_auto_continue: None,
+        }
+    }
+
+    /// The rename line is an attribution claim, so the ledger row behind it has
+    /// to be exact: the label it replaced, the label it set, and NO row at all
+    /// when nothing moved (a "renamed from X to X" line in a transcript is a
+    /// lie about an event that never happened).
+    #[tokio::test]
+    async fn a_label_change_audits_its_real_from_and_to_and_a_no_op_audits_nothing() {
+        let (state, dir) = test_state().await;
+        create(&state, input("web-ui")).await.expect("create");
+        let feed = |state: AppState| async move {
+            db::audit::events_for_session(&state.pool, "web-ui", 0, 50).await.unwrap()
+        };
+
+        // Clearing an already-empty label resets it to the slug — the value the
+        // UI was already showing. Nothing changed, so nothing is claimed.
+        config_patch(&state, "web-ui", relabel("   ")).await.expect("no-op relabel");
+        assert!(feed(state.clone()).await.is_empty(), "a no-op clear must not audit a rename");
+
+        config_patch(&state, "web-ui", relabel("Web UI")).await.expect("relabel");
+        let events = feed(state.clone()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, "session.rename");
+        assert_eq!(events[0].actor, "user");
+        assert_eq!(events[0].target, "web-ui");
+        let detail: serde_json::Value = serde_json::from_str(&events[0].detail).unwrap();
+        // An empty stored label reads as the slug everywhere else in the UI, so
+        // that — not "" — is what it was renamed FROM.
+        assert_eq!(detail["from"], "web-ui");
+        assert_eq!(detail["to"], "Web UI");
+
+        // Setting the same label again is not a second rename.
+        config_patch(&state, "web-ui", relabel("Web UI")).await.expect("idempotent relabel");
+        assert_eq!(feed(state.clone()).await.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The feed is a per-session read: an unknown name is a 404, not an empty
+    /// page that reads as "this session had no harness events".
+    #[tokio::test]
+    async fn the_events_feed_404s_on_an_unknown_session_and_clamps_its_limit() {
+        let (state, dir) = test_state().await;
+        create(&state, input("web-ui")).await.expect("create");
+
+        let err = events_handler(
+            State(state.clone()),
+            Path("nope".into()),
+            Query(EventsQuery { since_id: 0, limit: EVENTS_LIMIT_DEFAULT }),
+        )
+        .await
+        .err()
+        .expect("an unknown session must not return a page");
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+
+        // A negative cursor and an absurd limit are clamped, never passed to SQL.
+        let out = events_handler(
+            State(state.clone()),
+            Path("web-ui".into()),
+            Query(EventsQuery { since_id: -5, limit: 100_000 }),
+        )
+        .await
+        .expect("known session");
+        assert!(out.0.data.events.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
