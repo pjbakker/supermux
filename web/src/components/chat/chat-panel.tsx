@@ -30,7 +30,13 @@ import { useSessions } from '@/hooks/use-sessions'
 import { agentsApi, commandsApi, filesApi, sessionsApi } from '@/lib/api'
 import { restSessionInput, type SessionInput } from '@/lib/session-input'
 
+import { useRosterMarks } from '@/hooks/use-roster-marks'
+
 import { detailFor, topAttention } from './attention'
+import { ConnectionNote } from './connection-note'
+import { TruncationProvider } from './truncation'
+import { isPlaneDown } from './connection'
+import { useChatPresentation } from './use-chat-ws'
 import {
   jumpVisible,
   restoredScrollTop,
@@ -181,6 +187,25 @@ export default function ChatPanel({
   // is subtracted from are server-stamped (`latency.ts`).
   const nowBucketMs = Math.floor(serverNowMs() / 30_000) * 30_000
 
+  // ── the data plane, said out loud (fase A6 T2) ─────────────────────────────
+  //
+  // `tail.state` was read by NOTHING before A6 — the server computed staleness,
+  // the socket mapped it, the hook exposed it, and the surface rendered
+  // `reconnecting` and `no_hooks` identically to `live`. One clock, the
+  // bucketed server clock the rest of this surface already ticks on, so the
+  // ceiling costs no timer of its own.
+  const connection = useChatPresentation(tail, nowBucketMs)
+  const planeDown = isPlaneDown(connection)
+
+  // ── one identity per session, across both surfaces (fase A6 T4.3) ──────────
+  //
+  // `pinFor` has been threaded through the whole renderer since A3 and was
+  // supplied ONLY by the dev benches, so a session wore one face on the roster
+  // and a different one in chat — the exact seam a user notices the day chat
+  // becomes the default. B2 landed the persisted column (`0027_session_mark_pin`)
+  // and the provider that dedupes it; this is the missing call.
+  const { pinFor } = useRosterMarks()
+
   // Desktop board or phone board — the boards are two compositions, not one at
   // two widths (see `conversation.tsx`). The viewport decides unless the mount
   // point already knows (the mobile seam does — see `surface` above); the query
@@ -310,6 +335,9 @@ export default function ChatPanel({
     receipt: session?.last_send_text
       ? { text: session.last_send_text, atS: session.last_send_at ?? 0 }
       : null,
+    // A6 T2.5 — do not manufacture "undelivered" out of a silence the dead
+    // socket is itself causing.
+    planeDown,
   })
   // ── The `@`-hand-off plane (fase B4 T4) ────────────────────────────────────
   // A draft that OPENS with `@colleague` is a hand-off, not a message, and the
@@ -410,8 +438,16 @@ export default function ChatPanel({
     }
   }, [pendingItems, dismissPending])
 
+  // A6 T4.2 — the seam a clipped row uses to ask for the rest of itself.
+  // Memoised on the three values it carries so a re-render that changed
+  // neither does not invalidate every transcript row.
+  const truncation = React.useMemo(
+    () => ({ fetching: tail.fetching, failed: tail.fetchFailed, request: tail.retryFull }),
+    [tail.fetching, tail.fetchFailed, tail.retryFull],
+  )
+
   return (
-    <>
+    <TruncationProvider value={truncation}>
     <ChatConversation
       // The surface IS the panel's root element, so it keeps the panel's
       // long-standing test id — the renderer-switch e2e asserts on it.
@@ -434,7 +470,15 @@ export default function ChatPanel({
       overlay={overlay}
       surface={phone ? 'phone' : 'desktop'}
       headerLeading={headerLeading}
-      headerTrailing={headerTrailing}
+      // The honesty chip rides in the header's own trailing slot rather than
+      // over the transcript: nothing is broken, so nothing should move.
+      headerTrailing={
+        <>
+          <ConnectionNote state={connection} onRetry={tail.redial} />
+          {headerTrailing}
+        </>
+      }
+      pinFor={pinFor}
       isError={tail.isError}
       isLoading={tail.isLoading}
       rawUrl={filesApi.rawUrl}
@@ -526,6 +570,6 @@ export default function ChatPanel({
       />
       </React.Suspense>
     )}
-    </>
+    </TruncationProvider>
   )
 }

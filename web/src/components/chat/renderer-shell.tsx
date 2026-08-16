@@ -76,7 +76,7 @@ import { motion, useReducedMotion } from 'framer-motion'
 // Relative, not `@/`: this module is rendered by `bun test`
 // (`tests/unit/chat-renderer-shell.test.tsx`), whose resolver reads the root
 // tsconfig.json — which carries no `paths`. Same reason as `chat-surface.tsx`.
-import { eases } from '../../lib/springs'
+import { motionOff, tweens } from '../../lib/springs'
 
 import { retain, type Retention } from './retention'
 
@@ -84,7 +84,10 @@ import { retain, type Retention } from './retention'
  *  from `lib/springs.ts` — the same source and the same idiom the other
  *  same-cell swaps in this folder use (`live-layer.tsx`'s `SwapCell`,
  *  `composer.tsx`, `header-pill.tsx`). No literal `cubic-bezier(` anywhere. */
-const FADE_S = 0.18
+// A6/T6.2 — was a private `FADE_S = 0.18`. The renderer crossfade is the
+// same-cell swap the whole folder already performs, so it now takes the
+// shared 0.26s `tweens.swap`. The 80ms it gains buys the two renderers one
+// motion language instead of two that nearly match.
 
 export interface RendererShellProps {
   /** The session. Also the `key` the call sites pass — invariant 8. */
@@ -236,6 +239,15 @@ function Pane({
       // behaviour is newer than some of the screen readers this app runs under.
       inert={!visible}
       aria-hidden={!visible}
+      // A6/T6.6 — offscreen surfaces pause. Both renderers stay MOUNTED across
+      // the toggle (that is the whole point of the retention model), so exactly
+      // one of them is always invisible and, before A6, still running every
+      // ambient CSS loop it owns: `.sm-blip` (the typing wave), `.sm-spin` (2.4s
+      // per running receipt line) and one `.sm-breathe` per face in the gutter.
+      // `[data-offscreen]` in globals.css sets `animation-play-state: paused`
+      // for the whole subtree — paused, not `none`, so a toggle back resumes at
+      // the frame it left rather than restarting every loop in unison.
+      data-offscreen={visible ? undefined : ''}
       // Both panes occupy the SAME cell, so the box neither moves nor resizes
       // when the occupant changes. `minHeight: 0` keeps a flex/grid child from
       // refusing to shrink, which is what would silently change the terminal's
@@ -253,7 +265,7 @@ function Pane({
               transitionEnd: { visibility: 'hidden' },
             }
       }
-      transition={{ duration: reduce ? 0 : FADE_S, ease: eases.inOut }}
+      transition={reduce ? motionOff : tweens.swap}
     >
       {children}
     </motion.div>

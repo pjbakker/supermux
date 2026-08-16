@@ -177,6 +177,45 @@ export const CONNECTION = {
   offline: 'Offline — tap to retry',
 } as const
 
+/**
+ * Subagents, said out loud (fase A6 T4.1).
+ *
+ * The chat surface does not render subagent turns — that is a decision (a
+ * subagent voice would be a new chat primitive, and the vocabulary is closed),
+ * not an oversight. What A6 would not accept is the state it found: during a
+ * five-way `Task` fan-out the surface showed a spinner and a bare `· N
+ * subagents` and nothing else, while the terminal showed the work — with no
+ * statement anywhere that the content was deliberately elsewhere.
+ *
+ * A count is not a statement. This is.
+ */
+export const SUBAGENTS = {
+  /** Appended to the working row's clause when a fan-out is running. */
+  elsewhere: 'their work shows in the terminal',
+} as const
+
+/**
+ * The chat data plane's four words, and no surface may invent a fifth
+ * (fase A6 T2.6). The same vocabulary is the type in
+ * `components/chat/connection.ts`, and the contract is written out in
+ * `BRAND.md` §6f.
+ *
+ * `live` has no copy on purpose: the healthy state is silence. A chip that
+ * says "Live" on every screen is wallpaper within a day, and then the day it
+ * says something else nobody reads it.
+ */
+export const CHAT_CONNECTION = {
+  reconnecting: { label: 'Reconnecting…', why: 'Reconnecting' },
+  stale: { label: 'Not up to date', why: 'No update for a while' },
+  offline: { label: 'Offline', why: 'The live connection gave up — tap to try again' },
+} as const
+
+/** The half of the sentence that is the same in all three, said once. It is
+ *  also the half that matters most: the server's contract is that the
+ *  transcript STAYS, and a user who is not told that reads a stale transcript
+ *  as a current one. */
+export const CHAT_CONNECTION_STAYS = '. What is on screen stays, but it is not up to date.'
+
 // ── Toast presets (short, neutral confirmations) ──────────────────────────────
 
 export const TOAST = {

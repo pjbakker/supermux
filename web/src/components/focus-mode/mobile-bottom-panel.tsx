@@ -545,6 +545,13 @@ function SessionPill({
   return (
     <motion.button
       type="button"
+      // §0.1 #36 — the listbox that had no options. A6 pulled the defect
+      // forward and fixed it as `role="option"`; B3 landed first and fixed the
+      // SAME defect from the other end, by making the parent a `tablist`
+      // (see `:472-481`). B3's is the better shape — these pills switch a
+      // view, which is what a tab is — so its resolution wins wholesale and
+      // A6's is dropped: an `option` inside a `tablist` is invalid, and two
+      // half-fixes would have been worse than either whole one.
       role="tab"
       aria-selected={isCurrent}
       data-vr-session-name={session.name}
@@ -555,7 +562,6 @@ function SessionPill({
       aria-label={`Switch to ${displayLabel(session)} — ${STATUS_LABEL[session.status]}${
         isCurrent ? ' (current)' : ''
       }`}
-      aria-current={isCurrent || undefined}
       className={cn(
         'flex h-11 shrink-0 snap-start items-center gap-2 rounded-xl px-3 text-[14px] font-medium',
         isCurrent

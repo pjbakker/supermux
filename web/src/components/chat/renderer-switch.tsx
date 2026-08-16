@@ -35,7 +35,7 @@ import { useId } from 'react'
 // Relative, not `@/`: this module is rendered by `bun test`
 // (`tests/unit/chat-header.test.tsx`), whose resolver reads the root
 // tsconfig.json — which carries no `paths`. Same reason as `chat-surface.tsx`.
-import { springs } from '../../lib/springs'
+import { motionOff, springs } from '../../lib/springs'
 import { cn } from '../../lib/utils'
 
 import type { Renderer, RendererPref } from './renderer-pref'
@@ -169,7 +169,7 @@ export function RendererSwitch({
             className={cn(
               'relative h-full min-w-0 rounded-full font-medium tracking-[-0.05px]',
               glyph ? 'grid flex-none place-items-center px-2' : SIZE[size].cell,
-              'transition-colors duration-[120ms]',
+              'sm-t-hover',
               selected ? 'text-ink' : 'text-ink-3 hover:text-ink-2',
             )}
           >
@@ -179,7 +179,7 @@ export function RendererSwitch({
                 // One id, one cell: framer moves the capsule from the old button
                 // to the new one instead of cross-fading three of them.
                 layoutId={cellId}
-                transition={reduce ? { duration: 0 } : springs.snappy}
+                transition={reduce ? motionOff : springs.snappy}
                 className="absolute inset-0 rounded-full bg-fill-soft-2"
               />
             )}

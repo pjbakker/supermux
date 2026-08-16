@@ -77,7 +77,7 @@ import { createPortal } from 'react-dom'
 import { FocusScope } from '@radix-ui/react-focus-scope'
 
 import { cn } from '@/lib/utils'
-import { springs, eases } from '@/lib/springs'
+import { eases, motionOff, springs, tweens } from '@/lib/springs'
 import { useKeyboardViewport } from '@/hooks/use-keyboard-viewport'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { buildAttachmentPrompt } from '@/lib/api/files'
@@ -544,7 +544,7 @@ function TextareaSkeleton({ reduce }: { reduce: boolean }) {
           className="pointer-events-none absolute inset-y-0 -left-1/3 w-1/3 bg-gradient-to-r from-transparent via-foreground/8 to-transparent"
           initial={{ x: 0 }}
           animate={{ x: '420%' }}
-          transition={{ duration: 1.6, repeat: Infinity, ease: 'linear' }}
+          transition={tweens.shimmer}
           data-vr="edit-sheet-skeleton-shimmer"
         />
       )}
@@ -787,7 +787,7 @@ export function EditorBody({
         enterKeyHint="enter"
         initial={{ opacity: reduce ? 1 : 0 }}
         animate={{ opacity: textareaIn ? 1 : 0 }}
-        transition={reduce ? { duration: 0 } : { duration: 0.12, ease: eases.out }}
+        transition={reduce ? motionOff : { duration: 0.12, ease: eases.out }}
         className={cn(
           // System (sans) font — the editor is prose, not code. font-size 16px
           // (iOS no-zoom floor); leading 1.4 = ~22.4px visual line-height = the
@@ -897,7 +897,7 @@ export function DiscardConfirmSheet({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            transition={reduce ? { duration: 0 } : { duration: 0.18, ease: eases.out }}
+            transition={reduce ? motionOff : { duration: 0.18, ease: eases.out }}
             onClick={onCancel}
             aria-hidden
           />
@@ -905,7 +905,7 @@ export function DiscardConfirmSheet({
             initial={{ opacity: 0, y: reduce ? 0 : 24 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: reduce ? 0 : 24 }}
-            transition={reduce ? { duration: 0.12 } : springs.snippetSlide}
+            transition={reduce ? tweens.hover : springs.snippetSlide}
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="edit-discard-title"
