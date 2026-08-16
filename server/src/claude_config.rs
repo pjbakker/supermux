@@ -167,11 +167,33 @@ async fn install_hooks_at_path(transport: &dyn FileTransport, path: &Path) -> Re
     atomic_write_settings(transport, path, &root).await
 }
 
+/// The LOCAL settings file path (`$CLAUDE_CONFIG_DIR/settings.json`, else
+/// `~/.claude/settings.json`). Exposed for the opt-in statusline tap
+/// ([`crate::sessions::chat::statusline`]), which edits the SAME file through
+/// the SAME atomic-write core rather than growing a second, subtly-different
+/// settings writer.
+pub(crate) fn local_settings_path() -> PathBuf {
+    claude_config_dir().join("settings.json")
+}
+
+/// Atomic JSON write through `transport` — the shared temp-sibling + rename
+/// core, exposed for the statusline tap's settings file and its sidecar.
+pub(crate) async fn atomic_write_json(
+    transport: &dyn FileTransport,
+    path: &Path,
+    root: &Value,
+) -> Result<()> {
+    atomic_write_settings(transport, path, root).await
+}
+
 /// Read + parse the settings file at `path` via the transport. Returns an
 /// empty JSON object when the file does not exist or is empty. Returns Err
 /// for a present-but-unparseable file (we NEVER clobber a real user's
 /// settings we failed to understand) or for a top-level non-object root.
-async fn read_settings_or_empty(transport: &dyn FileTransport, path: &Path) -> Result<Value> {
+pub(crate) async fn read_settings_or_empty(
+    transport: &dyn FileTransport,
+    path: &Path,
+) -> Result<Value> {
     // `FileTransport::exists` is DEFINITIVE: `Ok(false)` only when the
     // transport proved the file is absent. An indeterminate answer is an
     // `Err` and aborts the install — never an empty object.
@@ -279,19 +301,26 @@ fn sibling_tmp(path: &Path) -> PathBuf {
 }
 
 /// Per-settings-path write lock. The merge is read→modify→write, so two
-/// concurrent installs against the same file both read the pre-state and the
+/// concurrent writers against the same file both read the pre-state and the
 /// second rename discards the first one's merge (e.g. the teams task's
 /// `teammateMode` + `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` silently vanishing
 /// because a scheduled session's hook install landed after it). Holding this
 /// mutex across the whole sequence makes the merge atomic with respect to
 /// other supermux writers in this process.
 ///
+/// `pub(crate)` because the hook install is no longer the only writer of this
+/// file: the A2 statusline tap ([`crate::sessions::chat::statusline`]) also
+/// does a read→modify→write of `~/.claude/settings.json`, and `install_hooks`
+/// fires on EVERY session start from independent tasks. Without a shared lock
+/// an install/uninstall of the tap that overlaps a hook install loses one of
+/// the two merges — either supermux's hooks or the user's own `statusLine`.
+///
 /// Keyed by path string so unrelated files (local vs. a remote's
 /// `.claude/settings.json`) never block each other. Note the key is the path
 /// only — for remote transports two different hosts share the same relative
 /// path, so they serialise with each other; installs are sub-second and rare,
 /// so the extra contention is not worth a host-aware key.
-fn settings_write_lock(path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn settings_write_lock(path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
