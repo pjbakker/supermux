@@ -97,6 +97,23 @@ export interface ChatTail {
   agent: string
   /** CC-clock ms of the newer of the two entries. */
   ts: number
+  /** Entries this store has published, in the SEQ domain (`Inner.next_seq`
+   *  server-side) — not `ring.len()`, which saturates at RING_CAP = 500 and is
+   *  a window rather than a total. `reset()` keeps it monotonic across `/clear`
+   *  and `--resume`, which is exactly what a seen-cursor wants.
+   *
+   *  ONLY comparable against a cursor recorded under the same `epoch`. Absent on
+   *  a pre-B2 server. */
+  entry_count?: number
+  /** Newest ring entry's timestamp — Claude Code's clock, DISPLAY ONLY. The
+   *  unread comparison runs on the server clock (`activity_at`); CC's stamp can
+   *  trail arrival by tens of seconds. */
+  last_entry_ts?: number
+  /** The chat store's creation stamp (server clock, ms). A store is created and
+   *  dropped many times a day per session and `entry_count` restarts at 0 each
+   *  time — so a changed epoch means "the count is a new counter", and the row
+   *  degrades to a dot rather than showing a wrong number. */
+  epoch?: number
 }
 
 /** The fields the SSE `sessions` delta / the `GET /api/sessions` list carry for
@@ -156,6 +173,13 @@ export interface ApiSession {
   tags?: string[]
   /** Pin + activity drive the sort. */
   pinned?: boolean
+  /** The session's FROZEN identity mark, `"<silhouette>:<hue>"` — written only
+   *  when the user rerolls a face (fase B2 T8, migration `mark_pin`). Absent for
+   *  every session that has never been rerolled, which is almost all of them:
+   *  assignment stays derived (`lib/roster-marks.ts`), and this column exists
+   *  only so an explicit choice outlives a reload. Unparseable values decode to
+   *  `undefined` and the derived face is used. */
+  mark_pin?: string | null
   /** tmux session alive AND a child process exists. */
   running?: boolean
   /** Epoch seconds — last send / last started. */
@@ -360,6 +384,11 @@ export interface SessionConfigPatch {
   tags?: string[]
   toggle_pin?: boolean
   toggle_auto_continue?: boolean
+  /** Freeze this session's identity mark (migration 0027), as
+   *  `"<silhouette>:<hue>"`. `''` CLEARS the override and returns the session to
+   *  its derived face. Written only by the reroll affordance — assignment stays
+   *  derived (`lib/roster-marks.ts`). */
+  mark_pin?: string
 }
 
 /** Result of `POST /api/sessions/{name}/mode` (mode-shift). `mode` is the mode

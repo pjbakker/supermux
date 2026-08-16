@@ -4,7 +4,6 @@ import {
   FolderClosed,
   LayoutGrid,
   Settings as SettingsIcon,
-  SquareKanban,
   Terminal,
   type LucideIcon,
 } from 'lucide-react'
@@ -30,6 +29,11 @@ import { useStandaloneMode } from '@/hooks/use-standalone-mode'
 import { useSseStatus } from '@/hooks/use-sse'
 import { useSseConnectionLink } from '@/hooks/use-connection-link'
 import { useUpdateBadge, type UpdateBadgeState } from '@/hooks/use-update-badge'
+import {
+  RosterMarksProvider,
+  useRosterMarksProvider,
+} from '@/hooks/use-roster-marks'
+import { AttentionProvider, useAttentionProvider } from '@/hooks/use-attention'
 
 interface NavItem {
   to: string
@@ -58,15 +62,16 @@ const NAV: NavItem[] = [
   // Terminal glyph (>_) matches the abstract-geometric rest of the rail and
   // names what focus mode IS — sitting inside a terminal session.
   { to: '/focus', label: 'Focus', icon: Terminal, desktopOnly: true },
-  { to: '/board', label: 'Board', icon: SquareKanban },
   { to: '/files', label: 'Files', icon: FolderClosed },
   // Hosts registry AND the scheduler both moved into Settings (rare-use config
   // doesn't need a primary-nav slot). `/hosts` → /settings#hosts and
   // `/scheduler` → /settings#schedules (App.tsx) so old bookmarks land in the
   // right section. Settings therefore carries the onboarding tour's step-3
   // anchor, which used to point at the Scheduler item.
-  // Nav is at FIVE items after B1; Board leaves in B2, gated on the issue read
-  // surface.
+  // Nav is at FOUR items after B2: the Board page left once issues became
+  // reachable from the session that owns them (and from the team card). The
+  // deletion keyed on `to === '/board'`, never on an index — one removal, both
+  // surfaces (SideNav + BottomNav).
   {
     to: '/settings',
     label: 'Settings',
@@ -287,7 +292,18 @@ export function Layout() {
   // route can raise a <ShellOverlay> without prop-drilling and without a
   // body-level portal (which could not be bounded by the column).
   const [attachOverlayHost, overlayHostValue] = useShellOverlayProvider()
+  // The roster's faces, assigned ONCE for the whole app (fase B2 T2). Dedupe is
+  // a property of the roster, not of a row, so it cannot live in the row — and
+  // it is mounted here, above every route, because the palette, the pickers and
+  // the focus strip all draw marks outside the overview's tree.
+  const rosterMarks = useRosterMarksProvider()
+  // The attention tiers (fase B2 T5), for the same reason: the rows that draw a
+  // tier sit five layers under the surface that owns the roster, and the header
+  // rollup needs the same answer the rows got.
+  const attention = useAttentionProvider()
   return (
+    <RosterMarksProvider value={rosterMarks}>
+    <AttentionProvider value={attention}>
     <ShellOverlayProvider value={overlayHostValue}>
     <div
       className="flex h-full w-full"
@@ -328,5 +344,7 @@ export function Layout() {
       <ArchivedSheet open={archivedOpen} onOpenChange={setArchivedOpen} />
     </div>
     </ShellOverlayProvider>
+    </AttentionProvider>
+    </RosterMarksProvider>
   )
 }

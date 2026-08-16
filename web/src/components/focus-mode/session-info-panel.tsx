@@ -45,6 +45,9 @@ import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
 import { useToast } from '@/components/ui/use-toast'
 import { useSession, useSessionGit } from '@/hooks/use-sessions'
 import { useSchedules } from '@/hooks/use-scheduler'
+import { useSessionConfig } from '@/hooks/use-session-config'
+import { IssueList } from '@/components/issues/issue-list'
+import { IssueSurface } from '@/components/issues/issue-surface'
 import {
   describeSchedule,
   formatRunTime,
@@ -76,6 +79,11 @@ export interface SessionInfoPanelProps {
    *  `goSession` (mobile) / select handler (desktop) so the panel doesn't own
    *  routing. */
   onNavigate: (name: string) => void
+  /** Open with the name editor already in edit mode (fase B2 T7). The kebab's
+   *  "Rename" item uses it so rename is reachable everywhere the name shows,
+   *  WITHOUT a second rename path: it is the same `<NameEditor>` and the same
+   *  `use-rename-session` hook, just already focused. */
+  autoEditName?: boolean
 }
 
 /**
@@ -88,6 +96,7 @@ export function SessionInfoPanel({
   onOpenChange,
   triggerRef,
   onNavigate,
+  autoEditName,
 }: SessionInfoPanelProps) {
   const isMobile = useMediaQuery('(pointer: coarse)')
 
@@ -106,6 +115,7 @@ export function SessionInfoPanel({
             name={name}
             onNavigate={onNavigate}
             onClose={() => onOpenChange(false)}
+            autoEditName={autoEditName}
           />
         </div>
       </ResponsiveSheet>
@@ -132,6 +142,7 @@ export function SessionInfoPanel({
             name={name}
             onNavigate={onNavigate}
             onClose={() => onOpenChange(false)}
+            autoEditName={autoEditName}
           />
         </div>
       </PopoverContent>
@@ -145,13 +156,19 @@ function PanelBody({
   name,
   onNavigate,
   onClose,
+  autoEditName,
 }: {
   name: string
   onNavigate: (name: string) => void
   onClose: () => void
+  autoEditName?: boolean
 }) {
   const { session } = useSession(name)
   const clone = useCloneSession()
+  const [issuesOpen, setIssuesOpen] = React.useState(false)
+  // Which row was clicked — the overlay opens on THAT issue rather than on a
+  // list the user has already read.
+  const [openIssueId, setOpenIssueId] = React.useState<string | null>(null)
   const { toast } = useToast()
 
   const dir = session?.dir?.trim() || ''
@@ -180,6 +197,7 @@ function PanelBody({
         <NameEditor
           name={name}
           displayName={displayLabel(session ?? { name })}
+          autoEdit={autoEditName}
         />
       </PaneSection>
 
@@ -206,10 +224,66 @@ function PanelBody({
         )}
       </PaneSection>
 
+      {/* Standing instructions — the `desc` column, wired end to end server-side
+          since long before B2 with no control anywhere in the app (fase B2 T7).
+          Framed per §10: DURABLE rules live on the agent, tasks live in the
+          message. That distinction is the whole reason the field is worth
+          surfacing — otherwise it is just a second place to type a prompt. */}
+      <PaneSection label="Standing instructions">
+        <DescEditor name={name} desc={session?.desc ?? ''} />
+      </PaneSection>
+
+      {/* Tags — searchable since forever (`overview.tsx`'s `matches()`), and
+          rendered on the list row at the ladder's tier 4. This is where they are
+          set. */}
+      <PaneSection label="Tags">
+        <TagsEditor name={name} tags={session?.tags ?? []} />
+      </PaneSection>
+
       {/* Settings */}
       <PaneSection label="Settings">
         <SettingsRows session={session} name={name} />
       </PaneSection>
+
+      {/* Issues (fase B2 T10) — the section that did not exist. Before B2 a user
+          in focus mode could not tell that a card was linked to their session at
+          all, even though the agent had been reporting onto it with
+          `/supermux-task` the whole time. The list is inline (the common case is
+          one or two rows); the full read surface — detail, comments, reply —
+          opens in the shell overlay. */}
+      <PaneSection label="Issues">
+        <div className="flex flex-col gap-2">
+          <IssueList
+            session={name}
+            onOpen={(issue) => {
+              setOpenIssueId(issue.id)
+              setIssuesOpen(true)
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => {
+              setOpenIssueId(null)
+              setIssuesOpen(true)
+            }}
+            data-vr="open-issue-surface"
+            className="self-start rounded-md px-1 py-1 text-xs text-primary hover:underline"
+          >
+            Open issues →
+          </button>
+        </div>
+      </PaneSection>
+      <IssueSurface
+        open={issuesOpen}
+        onOpenChange={setIssuesOpen}
+        initialIssueId={openIssueId}
+        session={name}
+        title={displayLabel(session ?? { name })}
+        onFocusSession={(target) => {
+          setIssuesOpen(false)
+          onNavigate(target)
+        }}
+      />
 
       {/* Schedules */}
       <PaneSection label="Schedules">
@@ -332,15 +406,18 @@ function InfoRow({
 function NameEditor({
   name,
   displayName,
+  autoEdit,
 }: {
   /** Immutable slug — shown read-only beneath the label. */
   name: string
   /** Current display label (= slug when never customised). */
   displayName: string
+  /** Start in edit mode — the kebab's "Rename" entry point (fase B2 T7). */
+  autoEdit?: boolean
 }) {
   const rename = useRenameSession()
   const { toast } = useToast()
-  const [editing, setEditing] = React.useState(false)
+  const [editing, setEditing] = React.useState(Boolean(autoEdit))
   const [draft, setDraft] = React.useState(displayName)
   const inputRef = React.useRef<HTMLInputElement | null>(null)
   // Enter fires commit AND then blurs the input (→ a second commit); this guard
@@ -661,6 +738,113 @@ function CopyableMono({
         )}
       </button>
       {trailing}
+    </div>
+  )
+}
+
+/**
+ * The session's standing instructions (`desc`).
+ *
+ * A textarea that commits on blur, not on every keystroke: the config PATCH
+ * invalidates the sessions query, and doing that per character would refetch the
+ * whole roster while the user types.
+ */
+function DescEditor({ name, desc }: { name: string; desc: string }) {
+  const { setDesc, pending } = useSessionConfig()
+  const [draft, setDraft] = React.useState(desc)
+  // Re-seed when the row lands / changes underneath us, but never while the
+  // field is focused — that would eat what the user is typing.
+  const focused = React.useRef(false)
+  React.useEffect(() => {
+    if (!focused.current) setDraft(desc)
+  }, [desc])
+
+  const commit = () => {
+    focused.current = false
+    const next = draft.trim()
+    if (next === (desc ?? '').trim()) return
+    void setDesc(name, next)
+  }
+
+  return (
+    <textarea
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onFocus={() => {
+        focused.current = true
+      }}
+      onBlur={commit}
+      disabled={pending}
+      rows={3}
+      placeholder="Durable rules for this agent — always run the unit suite, never touch main…"
+      aria-label="Standing instructions"
+      data-vr="session-desc"
+      className="w-full resize-y rounded-md border border-input bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-ring"
+    />
+  )
+}
+
+/**
+ * Tag chips + an add field. Comma or Enter commits; the ✕ on a chip removes it.
+ * Tags are a SET — duplicates and blanks are dropped rather than rejected with
+ * an error, because there is nothing for the user to fix.
+ */
+function TagsEditor({ name, tags }: { name: string; tags: string[] }) {
+  const { setTags, pending } = useSessionConfig()
+  const [draft, setDraft] = React.useState('')
+
+  const commit = (raw: string) => {
+    const next = raw
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean)
+    if (next.length === 0) return
+    const merged = [...new Set([...tags, ...next])]
+    if (merged.length === tags.length) return
+    setDraft('')
+    void setTags(name, merged)
+  }
+
+  const remove = (tag: string) => void setTags(name, tags.filter((t) => t !== tag))
+
+  return (
+    <div className="flex flex-col gap-2" data-vr="session-tags">
+      {tags.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {tags.map((tag) => (
+            <span
+              key={tag}
+              className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[11px] leading-none text-muted-foreground"
+            >
+              {tag}
+              <button
+                type="button"
+                onClick={() => remove(tag)}
+                disabled={pending}
+                aria-label={`Remove tag ${tag}`}
+                className="grid size-4 place-items-center rounded-full hover:bg-foreground/10 hover:text-foreground"
+              >
+                <span aria-hidden>×</span>
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => commit(draft)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ',') {
+            e.preventDefault()
+            commit(draft)
+          }
+        }}
+        disabled={pending}
+        placeholder="Add a tag…"
+        aria-label="Add a tag"
+        className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-ring"
+      />
     </div>
   )
 }

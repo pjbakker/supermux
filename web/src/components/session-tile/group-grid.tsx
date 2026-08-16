@@ -79,25 +79,29 @@ import {
   ChevronRight,
   Check,
   MessageSquare,
+  Mail,
+  Pin,
+  PencilLine,
 } from 'lucide-react'
 
 import { springs, tweens } from '@/lib/springs'
+import { useAttentionContext } from '@/hooks/use-attention'
+import { useSessionConfig, pinnedBoundary } from '@/hooks/use-session-config'
 import {
   removeCollapsed,
   useCollapsibleGroups,
 } from '@/lib/collapsible-group'
 import { useSessionActions } from '@/hooks/use-session-actions'
+import { useOverviewLayout } from '@/hooks/use-overview-layout'
 import { SessionInfoPanel } from '@/components/focus-mode/session-info-panel'
 import { useNavigateMorph } from '@/components/view-transitions/morph'
 import {
   bucketSessionsByLayout,
   defaultGroupSortMode,
   hasImplicitUngrouped,
-  readGroupSortMode,
-  removeGroupSortMode,
+  groupSortMode,
   sortSessionsByMode,
   UNGROUPED_GROUP_ID,
-  writeGroupSortMode,
   type GroupSortMode,
   type LayoutItem,
 } from '@/lib/overview-layout'
@@ -267,60 +271,29 @@ function layoutFromSections(sections: ReadonlyArray<Section>): LayoutItem[] {
 }
 
 // ── Per-group sort modes — local hook that hydrates from localStorage and
-//    persists writes. Stored under `supermux:overview:group-sort:<id>`. ──
-
+/**
+ * Per-group sort, from the SERVER pref blob (fase B2 T9).
+ *
+ * This used to read and write `supermux:overview:group-sort:<groupId>` in
+ * localStorage. It now reads `overview_layout.groupSort` — the blob that already
+ * exists, is already allowlisted, and already reconciles across tabs through the
+ * SSE `prefs` event. `server/src/prefs.rs` is unchanged, and so is
+ * `use-sessions.ts`'s dispatch: no new key, no new race.
+ *
+ * The one-time migration of existing localStorage values lives in
+ * `useOverviewLayout` (`migrateLegacyGroupSort`), so a user's settings move with
+ * them instead of being silently reset.
+ */
 function useGroupSortModes(
   groupIds: ReadonlyArray<string>,
 ): [ReadonlyMap<string, GroupSortMode>, (id: string, mode: GroupSortMode) => void] {
-  // The state shape is a Map<groupId, GroupSortMode> so we can lookup O(1)
-  // while rendering. Lazy initial state: read all known ids once on mount.
-  const [modes, setModes] = React.useState<Map<string, GroupSortMode>>(() => {
+  const { layout, setGroupSort } = useOverviewLayout()
+  const modes = React.useMemo(() => {
     const m = new Map<string, GroupSortMode>()
-    for (const id of groupIds) m.set(id, readGroupSortMode(id))
+    for (const id of groupIds) m.set(id, groupSortMode(layout, id))
     return m
-  })
-
-  // When the set of group ids changes (group added / removed), pull the modes
-  // for the new ids from localStorage. Run as an effect (not in render) so we
-  // don't violate React state rules; the lookup is cheap. The setModes call
-  // here is conditional (only fires when ids actually changed → returns same
-  // ref otherwise) so it can't loop; the strict rule's blanket warning is a
-  // false positive for prop-reconciling effects.
-  React.useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setModes((prev) => {
-      let changed = false
-      const next = new Map(prev)
-      for (const id of groupIds) {
-        if (!next.has(id)) {
-          next.set(id, readGroupSortMode(id))
-          changed = true
-        }
-      }
-      // Drop modes for groups that no longer exist so the map doesn't grow.
-      const live = new Set(groupIds)
-      for (const id of next.keys()) {
-        if (!live.has(id)) {
-          next.delete(id)
-          changed = true
-        }
-      }
-      return changed ? next : prev
-    })
-  }, [groupIds])
-
-  const set = React.useCallback((id: string, mode: GroupSortMode) => {
-    setModes((prev) => {
-      const next = new Map(prev)
-      next.set(id, mode)
-      return next
-    })
-    // Persist via the shared helper — consolidate localStorage keying so
-    // every key flows through `groupSortKey()`.
-    writeGroupSortMode(id, mode)
-  }, [])
-
-  return [modes, set]
+  }, [groupIds, layout])
+  return [modes, setGroupSort]
 }
 
 // ── Live-region announcements (a11y mandate) ──────────────────────────────────
@@ -508,6 +481,10 @@ export function GroupGrid({
   }, [layoutItems, filteredSessions])
 
   const [groupSortModes, setGroupSortMode] = useGroupSortModes(groupIds)
+  // Deleting a group has to drop its sort mode too — the key now lives in the
+  // SERVER blob, so leaving dead entries there is worse than leaving them in
+  // one browser's localStorage was.
+  const { clearGroupSort } = useOverviewLayout()
 
   // ── Per-group COLLAPSE state ─────────────────────────────────────────────
   // Mirrors the focus-mode strip's collapse contract (chevron left of title,
@@ -1108,10 +1085,10 @@ export function GroupGrid({
                       onDelete={() => {
                         // Remove the group header; sessions inside it survive
                         // (the reconciler floats them into Ungrouped). Also
-                        // drop the per-group sort-mode + collapsed
-                        // localStorage rows so dead keys don't accumulate
-                        // (hygiene + the matching collapse-row cleanup).
-                        removeGroupSortMode(section.groupId)
+                        // drop the per-group sort mode (now a key in the SERVER
+                        // blob — fase B2 T9, so the hygiene matters more, not
+                        // less) and the collapsed localStorage row.
+                        clearGroupSort(section.groupId)
                         removeCollapsed('overview', section.groupId)
                         const next = layoutItems.filter(
                           (it) =>
@@ -1560,10 +1537,25 @@ function GroupSection({
           </div>
         ) : (
           <div className="flex flex-col gap-1.5">
-            {section.sessions.map((sess) => (
+            {section.sessions.map((sess, rowIdx) => (
+              <React.Fragment key={sess.name}>
+                {/* The pinned block's boundary (fase B2 T7): a 0.5px separator
+                    and NO "Pinned" header — the boundary is visible, the label
+                    is not needed (§12.4). `pinnedBoundary` returns null when
+                    there is nothing to separate (no pins, all pins, or a
+                    manual order that is not pinned-first), so this renders
+                    exactly when it means something. */}
+                {pinnedBoundary(section.sessions) === rowIdx && (
+                  <div
+                    aria-hidden
+                    data-vr="pinned-hairline"
+                    className="my-0.5 h-px bg-hairline"
+                  />
+                )}
               <SortableRow
                 key={sess.name}
                 session={sess}
+                sizeTier={sizeTier}
                 groupSortMode={section.sortMode}
                 isDragging={isDragging}
                 draggingKind={draggingKind}
@@ -1577,6 +1569,7 @@ function GroupSection({
                   onMoveSessionToGroup(sess.name, destGroupId)
                 }
               />
+              </React.Fragment>
             ))}
             {/* End-of-list drop slot — row-view twin of the tile-view bar
                 above. Without it the list view had NO visual for "drop at
@@ -1723,6 +1716,7 @@ function SortableTileSlot({
 
 function SortableRow({
   session,
+  sizeTier,
   groupSortMode,
   isDragging,
   draggingKind,
@@ -1735,6 +1729,9 @@ function SortableRow({
   onMoveToGroup,
 }: {
   session: ApiSession
+  /** The overview density tier — drives the row's FACT LADDER (preview at 2,
+   *  tokens at 3, tag chips at 4), not its geometry. */
+  sizeTier: OverviewSize
   groupSortMode: GroupSortMode
   isDragging: boolean
   draggingKind: 'group' | 'session' | null
@@ -1824,7 +1821,7 @@ function SortableRow({
         </svg>
       </button>
       <div className="min-w-0 flex-1">
-        <SessionRow session={toTileSession(session)} />
+        <SessionRow session={toTileSession(session)} sizeTier={sizeTier} />
       </div>
       {/* Gap 2 — the "Move to ▸" kebab is the a11y alt path for the row
           view too. Tiny hover-revealed button (≥44pt via padding) so the
@@ -1835,6 +1832,7 @@ function SortableRow({
         sessionStatus={session.status}
         sessionProvider={session.provider}
         sessionHostId={session.host_id}
+        sessionPinned={session.pinned}
         currentGroupId={currentGroupId}
         allSections={allSections}
         onMoveToGroup={onMoveToGroup}
@@ -1932,6 +1930,7 @@ function SessionTileWrapper({
         sessionStatus={session.status}
         sessionProvider={session.provider}
         sessionHostId={session.host_id}
+        sessionPinned={session.pinned}
         currentGroupId={currentGroupId}
         allSections={allSections}
         onMoveToGroup={onMoveToGroup}
@@ -1991,6 +1990,7 @@ function TileMoveToKebab({
   sessionStatus,
   sessionProvider,
   sessionHostId,
+  sessionPinned,
   currentGroupId,
   allSections,
   onMoveToGroup,
@@ -2002,6 +2002,8 @@ function TileMoveToKebab({
   /** Fase A5 — the two fields `flag.ts`'s eligibility guard reads. */
   sessionProvider: string
   sessionHostId?: number | null
+  /** Drives the Pin/Unpin label — the item is never "Pin" on a pinned row. */
+  sessionPinned?: boolean
   currentGroupId: string
   allSections: ReadonlyArray<Section>
   onMoveToGroup: (destGroupId: string) => void
@@ -2045,11 +2047,20 @@ function TileMoveToKebab({
   const setRendererPref = useUI((st) => st.setRendererPref)
   const showRenderer = chatExperiment && rendererEligible
 
+  // Attention (fase B2 T5) — the kebab is where "Mark unread" lives.
+  const { markUnread, enabled: attentionEnabled } = useAttentionContext()
+  // The phantom fields' controls (fase B2 T7). `pinned` has driven `smartSort`
+  // and the focus strip's ordering since long before B2 with NO way to set it.
+  const { togglePin, pending: configPending } = useSessionConfig()
+
   // Session info — the SAME panel the focus-page title-click opens,
   // hosted here for overview parity. Desktop = anchored Popover (we pass
   // `infoAnchorRef` as the trigger), mobile = bottom Sheet (the panel forks
   // internally; no anchor needed for the touch path through the kebab).
   const [infoOpen, setInfoOpen] = React.useState(false)
+  // "Rename" opens the SAME panel with the name editor already focused — one
+  // rename path (`use-rename-session` + `<NameEditor>`), not a second one.
+  const [renameOpen, setRenameOpen] = React.useState(false)
   const infoAnchorRef = React.useRef<HTMLButtonElement>(null)
   const navigateMorph = useNavigateMorph()
 
@@ -2116,6 +2127,45 @@ function TileMoveToKebab({
           >
             <Info className="size-4" aria-hidden />
             <span>Info</span>
+          </DropdownMenuItem>
+          {/* Mark unread (fase B2 T5) — drops the seen-cursor so the row lights
+              up again. The counterpart of "opening a session marks it read", and
+              the only way to UN-read something: without it the tier model is a
+              one-way street and a session you glanced at is silenced forever.
+              Hidden when the tiers are killed off — an item that does nothing is
+              worse than an absent one. */}
+          {attentionEnabled && (
+            <DropdownMenuItem
+              data-vr="tile-mark-unread"
+              onSelect={() => markUnread(sessionName)}
+            >
+              <Mail className="size-4" aria-hidden />
+              <span>Mark unread</span>
+            </DropdownMenuItem>
+          )}
+          {/* Pin (fase B2 T7) — `smartSort` orders by it and nothing could set
+              it. Optimistic through `useSessionConfig`; the config PATCH emits
+              no SSE, so the hook's invalidate is what moves the row. */}
+          {/* Rename — reachable everywhere the name shows (§10), reusing the
+              info panel's own editor rather than growing a second path. */}
+          <DropdownMenuItem
+            data-vr="tile-rename"
+            disabled={busy}
+            onSelect={() => {
+              setRenameOpen(true)
+              setInfoOpen(true)
+            }}
+          >
+            <PencilLine className="size-4" aria-hidden />
+            <span>Rename</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            data-vr="tile-pin"
+            disabled={busy || configPending}
+            onSelect={() => void togglePin(sessionName, sessionPinned)}
+          >
+            <Pin className="size-4" aria-hidden />
+            <span>{sessionPinned ? 'Unpin' : 'Pin'}</span>
           </DropdownMenuItem>
           {canStop && (
             <DropdownMenuItem
@@ -2227,8 +2277,12 @@ function TileMoveToKebab({
       <SessionInfoPanel
         name={sessionName}
         open={infoOpen}
-        onOpenChange={setInfoOpen}
+        onOpenChange={(open) => {
+          setInfoOpen(open)
+          if (!open) setRenameOpen(false)
+        }}
         triggerRef={infoAnchorRef}
+        autoEditName={renameOpen}
         onNavigate={(name) => {
           setInfoOpen(false)
           navigateMorph(`/focus/${name}`)

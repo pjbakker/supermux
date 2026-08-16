@@ -12,7 +12,6 @@ import { useRendererPrefsSync } from '@/hooks/use-renderer-prefs-sync'
 import { ConnectionOverlay } from '@/components/connection/connection-overlay'
 import { Overview } from '@/routes/overview'
 import { Focus, FocusEntry } from '@/routes/focus'
-import { Board } from '@/routes/board'
 import { Files } from '@/routes/files'
 // Settings is entry-lazy: it is a cold administrative surface, and its eager
 // import tipped the hero-path bundle over the 200 KB gz budget (#67 red).
@@ -47,6 +46,11 @@ const DevTeams = import.meta.env.DEV
 // six states, the 63-token matrix and a live blink/breathe strip.
 const DevMarks = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-marks'))
+  : null
+// Roster bench (fase B2): one row at three densities × six mark states × three
+// attention tiers, the tile at four overview tiers, both themes on one page.
+const DevRoster = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-roster'))
   : null
 // Chat-surface primitive bench (fase B0): the approved board rebuilt out of the
 // shipped primitives, plus every variant it has no room for, in both themes.
@@ -124,7 +128,13 @@ export default function App() {
                     back to the first live session, then overview. */}
                 <Route path="/focus" element={<FocusEntry />} />
                 <Route path="/focus/:name" element={<Focus />} />
-                <Route path="/board" element={<Board />} />
+                {/* The Board PAGE is gone (fase B2 T11) — issues live in session
+                    detail and on the team card now. The API, its public iCal
+                    route, the `/api/hook/board/*` edge and the `supermux-task`
+                    skill are all UNCHANGED. Redirect rather than 404 so a
+                    bookmark lands somewhere honest — the same pattern /scheduler
+                    and /hosts use. */}
+                <Route path="/board" element={<Navigate to="/" replace />} />
                 <Route path="/files/:name?" element={<Files />} />
                 {/* Scheduler moved into Settings → Schedules (B1 T8: a route
                     whose 5-column table did not earn a primary-nav slot).
@@ -216,6 +226,16 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <DevMarks />
+                    </Suspense>
+                  }
+                />
+              )}
+              {DevRoster && (
+                <Route
+                  path="/dev/roster"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevRoster />
                     </Suspense>
                   }
                 />
