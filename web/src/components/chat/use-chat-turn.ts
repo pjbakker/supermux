@@ -1,8 +1,12 @@
-// The A1 turn state machine, lifted verbatim out of `chat-panel.tsx`
-// (fase A3 T1). This is BEHAVIOUR, not presentation: the turn anchor and its
-// priority rule, the supersede gate, the bounded teardown, the zero-debounce
-// turn-end refetch and the 1s live-layer ticker. Nothing here decides what
-// anything looks like — `chat-panel.tsx` / `chat-surface.tsx` own that.
+// The turn state machine, lifted verbatim out of `chat-panel.tsx` (fase A3 T1)
+// and re-pointed at the A2 socket. This is BEHAVIOUR, not presentation: the
+// turn anchor and its priority rule, the supersede gate, the bounded teardown
+// and the 1s live-layer ticker. Nothing here decides what anything looks
+// like — `chat-panel.tsx` / `chat-surface.tsx` own that.
+//
+// Data plane: `use-chat-ws` (the A2 chat WebSocket). The A1 `/recall?chat=true`
+// poll it replaced also had a zero-debounce refetch on the turn-end edge; a
+// pushed transcript has nothing to refetch, so that effect is gone with it.
 //
 // Layer model (a0-findings §1): the TRANSCRIPT is the confirming layer
 // (batch-flushed, prose p50 31s); the LIVE layer is the status flip + hook
@@ -15,14 +19,11 @@
 
 import * as React from 'react'
 
-import type { UseQueryResult } from '@tanstack/react-query'
-
-import type { RecallResponse } from '@/lib/api'
 import type { TileSession } from '@/components/session-tile/types'
 
 import { newestAgentTs, toDisplayList, type ChatEntry, type ChatItem } from './entries'
 import { useChatBacklog, type ChatBacklog } from './use-chat-backlog'
-import { useChatTail } from './use-chat-tail'
+import { useChatWs, type ChatWireView } from './use-chat-ws'
 import { useReceiptOverlay, type OverlayLine } from './use-receipt-overlay'
 import { serverNowMs } from './latency'
 
@@ -52,23 +53,28 @@ export interface ChatTurn {
   showProvisional: boolean
   /** Hook-driven receipt overlay lines for this turn. */
   overlay: OverlayLine[]
-  /** The `/recall?chat=true` query itself (loading/error/refetch). */
-  tail: UseQueryResult<RecallResponse>
-  /** Pages BELOW the tail's window, and the affordance state for them
+  /** The chat WebSocket's view of the data plane (loading / error / state). */
+  tail: ChatWireView
+  /** Pages BELOW the socket's window, and the affordance state for them
    *  (daily-driver QA #3). */
   backlog: ChatBacklog
 }
 
 export function useChatTurn(name: string, session: TileSession | null): ChatTurn {
   const active = session?.status === 'active'
-  const tail = useChatTail(name, true)
-  // The tail is a WINDOW; this is the window plus whatever the user has paged
-  // in under it, newest-first and deduped (QA #3). Every rule below reads the
-  // NEWEST end of the list, which back-pagination never touches — an older page
-  // cannot change the turn anchor, the supersede gate or the confirmed clock.
-  // Memoised inside the hook, so `toDisplayList` is not recomputed on the 1s
-  // live-layer tick.
-  const backlog = useChatBacklog(name, tail.data)
+  // The A2 socket: seeded once, then pushed. It replaces the A1 poll — there
+  // is nothing left to refetch on the turn-end edge, because the confirming
+  // batch arrives as `entry` frames the moment the tailer reads it (the
+  // zero-debounce turn-end refetch that used to close that gap is gone with
+  // the poll it was compensating for).
+  const tail = useChatWs(name, true)
+  // The socket's window is a WINDOW; this is that window plus whatever the user
+  // has paged in above it, newest-first and deduped (QA #3), adapted once.
+  // Every rule below reads the NEWEST end of the list, which back-pagination
+  // never touches — an older page cannot change the turn anchor, the supersede
+  // gate or the confirmed clock. Memoised inside the hook, so `toDisplayList`
+  // is not recomputed on the 1s live-layer tick.
+  const backlog = useChatBacklog(name, tail)
   const entries = backlog.entries
   const items = React.useMemo(() => toDisplayList(entries), [entries])
   const lastConfirmedTs = entries.length > 0 ? entries[0].ts : 0
@@ -114,13 +120,6 @@ export function useChatTurn(name: string, session: TileSession | null): ChatTurn
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (!active && (confirmedCaughtUp || turnStranded)) setTurnStart(null)
   }, [active, confirmedCaughtUp, turnStranded])
-
-  // Turn end → confirm NOW (zero debounce; the mid-turn debounce only exists
-  // to coalesce delta bursts).
-  const refetch = tail.refetch
-  React.useEffect(() => {
-    if (!active && turnStart != null) void refetch()
-  }, [active, turnStart, refetch])
 
   // 1s live-layer ticker: a prose-only turn produces NO deltas and NO
   // refetches, so every time-gated piece below (showProvisional, elapsed,

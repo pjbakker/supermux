@@ -19,8 +19,9 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 import {
   bridges,
+  chatCursor,
+  cursorConversation,
   healedBlock,
-  historyCursor,
   jumpVisible,
   mergeOlder,
   oldestCursor,
@@ -32,6 +33,8 @@ import {
 } from '../../src/components/chat/backlog'
 import { ChatConversation } from '../../src/components/chat/conversation'
 import type { ChatEntry, ChatItem } from '../../src/components/chat/entries'
+import { toChatEntries } from '../../src/components/chat/wire-entries'
+import type { WireEntry } from '../../src/components/chat/wire'
 import type { TileSession } from '../../src/components/session-tile/types'
 
 const NAME = 'release-train'
@@ -46,28 +49,124 @@ const entry = (uuid: string, over: Partial<ChatEntry> = {}): ChatEntry => ({
   ...over,
 })
 
+/** A wire entry as `/chat/history` and the seed frame carry it — the cursor
+ *  arithmetic reads `offset` and `agent_id`, and nothing else. */
+const at = (offset: number, over: { agent_id?: string } = {}) => ({
+  uuid: `u${offset}`,
+  offset,
+  ...over,
+})
+
 describe('the history cursor', () => {
-  // `encode_cursor` in `server/src/sessions/recall.rs` is `session_id:uuid` —
-  // the pair, not the bare uuid, because Project scope can hold the same uuid
-  // in two files.
-  test('is the server’s own (sessionId, uuid) pair', () => {
-    expect(historyCursor(entry('u1', { sessionId: 'conv-a' }))).toBe('conv-a:u1')
+  // `HistoryCursor::format` in `server/src/sessions/chat/ws.rs` is
+  // `<conversation_id>:<offset>` — a byte position in the main transcript, and
+  // the conversation it is a position IN, because a cursor that outlives a
+  // `/clear` must be a 409 rather than bytes from a different conversation.
+  test('is the server’s own (conversation, offset) pair', () => {
+    expect(chatCursor('conv-a', 4096)).toBe('conv-a:4096')
   })
 
-  test('an entry with no sessionId still produces the server’s empty-sid form', () => {
-    expect(historyCursor({ uuid: 'u1' })).toBe(':u1')
+  test('the conversation id is read back out of a cursor the server stamped', () => {
+    expect(cursorConversation('conv-a:4096')).toBe('conv-a')
+    // `HistoryCursor::parse` uses `rsplit_once`, so an id containing a colon
+    // still round-trips.
+    expect(cursorConversation('conv:a:4096')).toBe('conv:a')
+  })
+
+  test('a malformed cursor names no conversation, so nothing can be fetched', () => {
+    expect(cursorConversation(null)).toBeNull()
+    expect(cursorConversation('no-colon')).toBeNull()
+    expect(cursorConversation(':4096')).toBeNull()
+    expect(cursorConversation('conv-a:')).toBeNull()
   })
 
   test('nothing to page from → no cursor, so the hook cannot fetch a garbage page', () => {
-    expect(oldestCursor([])).toBeNull()
+    expect(oldestCursor('conv-a', [])).toBeNull()
   })
 
-  // THE anti-gap rule. The tail window slides as new entries land, so the
-  // `nextBefore` the seed handed us goes stale within a turn; paging from the
-  // OLDEST ENTRY ON SCREEN can never leave a hole between the two windows.
+  test('no conversation known yet → no cursor either', () => {
+    expect(oldestCursor(null, [at(10)])).toBeNull()
+  })
+
+  // THE anti-gap rule, unchanged from the poll: the `nextBefore` the seed handed
+  // us describes the boundary as it was when the frame was sent, and paging from
+  // the OLDEST ENTRY ON SCREEN can never leave a hole between the two windows.
   test('the next page is asked for from the oldest entry currently on screen', () => {
-    const newestFirst = [entry('n1'), entry('n2'), entry('o9', { sessionId: 'conv-b' })]
-    expect(oldestCursor(newestFirst)).toBe('conv-b:o9')
+    const newestFirst = [at(900), at(500), at(120)]
+    expect(oldestCursor('conv-a', newestFirst)).toBe('conv-a:120')
+  })
+
+  // `seed_page` (ws.rs) skips subagent entries when it picks `next_before` for
+  // exactly this reason: `history_page` resolves the cursor against the MAIN
+  // transcript, while a subagent entry's offset is a position in its own file.
+  // Handing one out pages from an unrelated byte.
+  test('a subagent entry is never used as the cursor', () => {
+    const newestFirst = [at(900), at(500), at(4, { agent_id: 'sub-1' })]
+    expect(oldestCursor('conv-a', newestFirst)).toBe('conv-a:500')
+  })
+
+  test('a window of nothing but subagent turns has no position to page from', () => {
+    expect(oldestCursor('conv-a', [at(9, { agent_id: 'sub-1' })])).toBeNull()
+  })
+})
+
+/**
+ * THE TWO ORDERS. The socket holds its window OLDEST-first (the order the seed
+ * arrives in and live frames extend); every rule in `backlog.ts` is written
+ * NEWEST-first; and `toChatEntries` reads oldest-first and answers newest-first.
+ * `use-chat-backlog` is where all three meet, so a reversal dropped or applied
+ * twice there silently reorders a conversation rather than throwing — which is
+ * the failure this describe exists to make loud.
+ */
+describe('paging in the wire domain', () => {
+  const wire = (offset: number, text: string): WireEntry => ({
+    seq: offset,
+    uuid: `u${offset}`,
+    kind: 'assistant',
+    ts_ms: NOW,
+    offset,
+    oversize: false,
+    truncated: false,
+    body: { text },
+  })
+
+  // The hook's exact pipeline: reverse the window, merge the block under it,
+  // reverse back, adapt.
+  const paged = (socketWindow: WireEntry[], older: WireEntry[]): string[] =>
+    toChatEntries(mergeOlder(socketWindow.slice().reverse(), older).slice().reverse()).map(
+      (e) => e.text,
+    )
+
+  test('the window alone comes out newest-first', () => {
+    // oldest-first, as the socket holds it
+    expect(paged([wire(10, 'old'), wire(20, 'mid'), wire(30, 'new')], [])).toEqual([
+      'new',
+      'mid',
+      'old',
+    ])
+  })
+
+  // A page fetched below the window belongs UNDER it — i.e. later in the
+  // newest-first list the renderer draws top to bottom.
+  test('an older page lands below the window, and the run stays contiguous', () => {
+    const socketWindow = [wire(30, 'c'), wire(40, 'd')]
+    // `/chat/history` answers oldest-first; the hook reverses it to newest-first
+    const page = [wire(20, 'b'), wire(10, 'a')].slice() // already newest-first here
+    expect(paged(socketWindow, page)).toEqual(['d', 'c', 'b', 'a'])
+  })
+
+  // Two pages, the second older than the first — appended to the block in fetch
+  // order, which is what keeps the whole run in transcript order.
+  test('a second, older page extends the run downward', () => {
+    const socketWindow = [wire(50, 'e')]
+    const block = [wire(40, 'd'), wire(30, 'c'), wire(20, 'b'), wire(10, 'a')]
+    expect(paged(socketWindow, block)).toEqual(['e', 'd', 'c', 'b', 'a'])
+  })
+
+  test('a page that overlaps the window never doubles a message', () => {
+    const socketWindow = [wire(20, 'b'), wire(30, 'c')]
+    const page = [wire(20, 'b'), wire(10, 'a')]
+    expect(paged(socketWindow, page)).toEqual(['c', 'b', 'a'])
   })
 })
 

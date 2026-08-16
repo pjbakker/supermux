@@ -8,9 +8,14 @@
 export interface ChatEntry {
   uuid: string
   ts: number
-  /** The transcript file this entry came from. Half of the server's history
-   *  cursor (`backlog.ts`, `encode_cursor` in `recall.rs`) — the uuid alone
-   *  cannot address an entry across a project-scope read. */
+  /** The transcript file this entry came from.
+   *
+   *  VESTIGIAL. It was half of the A1 poll's history cursor (`encode_cursor` in
+   *  `recall.rs`, `<session_id>:<uuid>`); the surface now pages the A2 backlog,
+   *  whose cursor is `<conversation_id>:<offset>` and is computed in the WIRE
+   *  domain before this shape exists (`backlog.ts`, `use-chat-backlog.ts`).
+   *  `toChatEntries` does not populate it and nothing reads it — kept only
+   *  because the display model is the frozen A1 shape. */
   sessionId?: string
   text: string
   reply?: string

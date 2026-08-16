@@ -7,22 +7,59 @@
  * because a wrong one shows up as "the page jumped" or "the history has a hole
  * in it" rather than as an exception.
  *
- * WHICH ENDPOINT. `/recall?chat=true` — the same route the tail already reads,
- * which has carried `hasMore` + `nextBefore` since fase A1 (measured on the live
- * instance: a 60-entry page in 20 ms). The A2 route `/chat/history` pages the
- * same transcript but speaks `WireEntry`, a shape no client module has an
- * adapter for yet; paging in a second wire format would mean two display models
- * for one conversation. When the A2 socket lands, this module's callers change
- * their fetch and keep every rule below.
+ * WHICH ENDPOINT. `/api/sessions/{name}/chat/history` — the A2 backlog route,
+ * which pages the same transcript the socket seeds from and speaks the same
+ * `WireEntry`. This is the change QA #3 wrote itself against: it paged
+ * `/recall?chat=true` because that was the tail's own route and `WireEntry` had
+ * no adapter yet, and said in as many words that when the A2 socket landed its
+ * callers would change their fetch and keep every rule below. The socket has
+ * landed (`use-chat-ws.ts`), `wire-entries.ts` is the adapter, and every rule
+ * below is kept — only the cursor's SPELLING moved, because the two routes
+ * address an entry differently:
  *
- * WHY THE CURSOR IS RECOMPUTED, never remembered. The tail window is the newest
- * N entries and it SLIDES: five new entries during a turn move its oldest entry
- * five newer, so a `nextBefore` captured at seed time now points INSIDE the
- * window and the five entries between the two would belong to no page at all.
- * Paging from the oldest entry currently on screen (`oldestCursor`) makes that
- * hole unrepresentable.
+ *   · `/recall`       `<session_id>:<uuid>`      (`encode_cursor`, recall.rs)
+ *   · `/chat/history` `<conversation_id>:<offset>` (`HistoryCursor`, ws.rs)
+ *
+ * Paging in ONE wire format is the point either way: the merged list is
+ * `WireEntry` end to end and `toChatEntries` adapts it once, so the seam and
+ * the window can never disagree about what a message is.
+ *
+ * WHY THE CURSOR IS RECOMPUTED, never remembered. Unchanged, and for the same
+ * reason: `nextBefore` describes the page boundary as it was when the frame was
+ * sent, and paging from the oldest entry currently ON SCREEN is what makes a
+ * hole between the two windows unrepresentable. It costs nothing here — a byte
+ * offset is a stable address, so the recomputed cursor is exact rather than a
+ * best effort.
+ *
+ * WHY THE OFFSET MUST COME FROM A MAIN-TRANSCRIPT ENTRY. `history_page` resolves
+ * the cursor against the main JSONL and nothing else, while a subagent entry's
+ * `offset` is a position in its OWN file. `seed_page` (ws.rs) skips subagent
+ * entries when it picks `next_before` for exactly this reason; `oldestCursor`
+ * mirrors that rule, because handing out a subagent offset pages from an
+ * unrelated byte of the main transcript.
  */
-import type { ChatEntry } from './entries'
+
+/** The half of `WireEntry` the cursor arithmetic reads. */
+export interface CursorRef {
+  offset: number
+  /** Present = this entry came from a subagent file, so its offset is not a
+   *  position in the main transcript. */
+  agent_id?: string
+}
+
+/**
+ * What the merge and the seam need of an entry, and all they need: an identity.
+ *
+ * Generic on purpose. These rules are about the SHAPE of a paged conversation —
+ * two lists, one order, no duplicates, no hole — and none of them cares whether
+ * it is holding wire entries or display entries. The hook works in `WireEntry`
+ * (that is what `/chat/history` returns, and adapting once at the end is what
+ * keeps the window and the block from ever disagreeing); the tests reach the
+ * same functions with `ChatEntry`. Neither is privileged.
+ */
+export interface Identified {
+  uuid: string
+}
 
 /**
  * How many entries an older page asks for.
@@ -60,34 +97,47 @@ export const JUMP_AWAY_PX = 240
  */
 export const BRIDGE_MAX_PAGES = 5
 
-/** What `oldestCursor` needs of an entry — the server's cursor pair. */
-export interface CursorRef {
-  uuid: string
-  sessionId?: string
+/**
+ * The `before=` cursor for a position in a conversation: `HistoryCursor::format`
+ * in `server/src/sessions/chat/ws.rs`, mirrored.
+ *
+ * The conversation id is half of it on purpose, and the server enforces that:
+ * a cursor whose id is not the session's current `cc_conversation_id` is a 409,
+ * never bytes from a different conversation at the same offset. That is what
+ * makes a `/clear`, a `--resume` or a restart under a paged-back reader a
+ * re-seed instead of a silent splice.
+ */
+export function chatCursor(conversationId: string, offset: number): string {
+  return `${conversationId}:${offset}`
 }
 
-/**
- * The `before=` cursor for an entry: `encode_cursor` in
- * `server/src/sessions/recall.rs`, mirrored.
- *
- * The PAIR, not the bare uuid: project-scope reads merge several JSONLs whose
- * mtime order can change under concurrent writes, and the uuid alone would let
- * a cursor match the wrong file. A missing `sessionId` still produces the
- * server's own empty-sid form rather than a bare uuid, which its `decode_cursor`
- * rejects outright (it requires the `:`).
- */
-export function historyCursor(entry: CursorRef): string {
-  return `${entry.sessionId ?? ''}:${entry.uuid}`
+/** The conversation id the server stamped into a cursor it handed us, so the
+ *  client never has to guess at it. `null` for anything malformed — the same
+ *  answer `HistoryCursor::parse` gives. */
+export function cursorConversation(cursor: string | null): string | null {
+  if (!cursor) return null
+  const at = cursor.lastIndexOf(':')
+  if (at <= 0 || at === cursor.length - 1) return null
+  return cursor.slice(0, at)
 }
 
 /**
  * The cursor for the page BELOW everything currently on screen, from a
  * newest-first list. `null` when there is nothing to page from — an empty
- * transcript must never produce a fetch.
+ * transcript, an unknown conversation, or a window holding nothing but
+ * subagent turns must never produce a fetch.
  */
-export function oldestCursor(entries: readonly CursorRef[]): string | null {
-  const oldest = entries[entries.length - 1]
-  return oldest ? historyCursor(oldest) : null
+export function oldestCursor(
+  conversationId: string | null,
+  entries: readonly CursorRef[],
+): string | null {
+  if (!conversationId) return null
+  // Newest-first, so the LAST main entry is the oldest one on screen.
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]
+    if (e.agent_id == null) return chatCursor(conversationId, e.offset)
+  }
+  return null
 }
 
 /**
@@ -102,13 +152,13 @@ export function oldestCursor(entries: readonly CursorRef[]): string | null {
  * `use-chat-turn` (which re-runs on the 1s live-layer ticker) keeps its identity
  * and `toDisplayList` is not recomputed once a second for nothing.
  */
-export function mergeOlder(
-  tail: readonly ChatEntry[],
-  older: readonly ChatEntry[],
-): ChatEntry[] {
-  if (older.length === 0) return tail as ChatEntry[]
+export function mergeOlder<T extends Identified>(
+  tail: readonly T[],
+  older: readonly T[],
+): T[] {
+  if (older.length === 0) return tail as T[]
   const seen = new Set<string>()
-  const out: ChatEntry[] = []
+  const out: T[] = []
   for (const e of tail) {
     if (seen.has(e.uuid)) continue
     seen.add(e.uuid)
@@ -141,7 +191,7 @@ export function mergeOlder(
  * hole can be drawn.
  */
 export function seamOpen(
-  tail: readonly CursorRef[],
+  tail: readonly Identified[],
   block: { anchor: string | null; count: number },
 ): boolean {
   if (block.count === 0 || block.anchor == null) return false
@@ -155,7 +205,7 @@ export function seamOpen(
  * dropped entries first; once it contains the anchor it also reaches the entry
  * directly above the block, and `mergeOlder` dedupes the overlap away.
  */
-export function bridges(fill: readonly CursorRef[], anchor: string | null): boolean {
+export function bridges(fill: readonly Identified[], anchor: string | null): boolean {
   if (anchor == null) return false
   return fill.some((e) => e.uuid === anchor)
 }
@@ -173,13 +223,13 @@ export function bridges(fill: readonly CursorRef[], anchor: string | null): bool
  *    can never delete history the reader has already paged in. The anchor stays
  *    stale, so the next tail tick tries again.
  */
-export function healedBlock(
-  fill: readonly ChatEntry[],
-  block: readonly ChatEntry[],
+export function healedBlock<T extends Identified>(
+  fill: readonly T[],
+  block: readonly T[],
   bridged: boolean,
-): ChatEntry[] | null {
+): T[] | null {
   if (fill.length === 0) return null
-  return bridged ? mergeOlder(fill, block) : (fill as ChatEntry[])
+  return bridged ? mergeOlder(fill, block) : (fill as T[])
 }
 
 /** The scroll region as it was the instant the older page was asked for. */
