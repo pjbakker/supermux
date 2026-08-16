@@ -34,6 +34,7 @@ import { ChatComposer } from '@/components/chat/composer'
 import { ChatConversation, PHONE_QUERY } from '@/components/chat/conversation'
 import { toDisplayList } from '@/components/chat/entries'
 import { EntityPickerView } from '@/components/chat/entity-picker'
+import { handoffLabel, readDelegateIntent } from '@/components/chat/delegate-intent'
 import { atRows, slashRows } from '@/components/chat/slash'
 import type { ComposerHandle } from '@/components/chat/use-composer'
 import { entryLabels } from '@/components/chat/grouping'
@@ -126,6 +127,11 @@ export default function DevChatLive() {
  * poll. No `rawUrl` on purpose: there is no server behind this page, so the
  * captured frame renders B0's honest warm placeholder instead of a broken image.
  */
+/** A destination that exists but goes nowhere — see the `onOpen*` props below.
+ *  Module-level so it is referentially stable and cannot break the transcript's
+ *  memo boundary (`transcript-item.tsx`'s doc). */
+const NOOP = () => {}
+
 function Surface({
   state,
   nowMs,
@@ -158,9 +164,20 @@ function Surface({
       labels={labels}
       mentions={MENTIONS}
       names={NAMES}
+      events={state.events}
+      // The chips are LIVE on the bench (fase B4 T3.6): a screenshot of an
+      // inert chip proves nothing about the interactive variant, and the two
+      // render different elements. The handlers go nowhere — this page has no
+      // router — but the affordance is the thing under review.
+      onOpenSession={NOOP}
+      onOpenSchedule={NOOP}
       nowMs={nowMs}
       turnStart={state.turnAgo != null ? nowMs - state.turnAgo * 1000 : null}
       overlay={state.overlay}
+      // The page's ONE clock (`nowMs`), not `Date.now()`: a screenshot is a
+      // single moment, and the pill has a give-up window that a per-render
+      // clock would make time-dependent.
+      handoff={state.handoffTo ? { to: state.handoffTo, atMs: nowMs } : null}
       pinFor={pinFor}
       surface={surface}
       isError={state.isError}
@@ -233,6 +250,14 @@ function BenchComposer({
     submit: noop,
     stop: noop,
     insert: noop,
+    // The send control's hand-off relabel (fase B4 T4.4) — derived from the
+    // fixture's own draft through the SHIPPED rule, so a bench that says
+    // "Hand to ●Patch" is one the composer would also say it on.
+    handoff: (() => {
+      const intent = readDelegateIntent(spec.draft, MENTIONS, name)
+      return intent ? { to: intent.to, label: handoffLabel(intent.to, NAMES) } : null
+    })(),
+    handoffPending: null,
     picker: {
       open: spec.picker != null,
       kind: spec.picker?.kind ?? '@',
@@ -254,6 +279,7 @@ function BenchComposer({
       surface={surface}
       active={state.session.status === 'active'}
       onOpenTerminal={noop}
+      onSchedule={spec.schedulable ? noop : undefined}
       pickerData={{
         files: TRACKED_FILES,
         commands: BENCH_COMMANDS,

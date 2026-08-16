@@ -14,6 +14,7 @@
  */
 import { describe, expect, test } from 'bun:test'
 
+import { readDelegateIntent } from '../../src/components/chat/delegate-intent'
 import { toDisplayList } from '../../src/components/chat/entries'
 import { mentionSegments } from '../../src/components/chat/grouping'
 import {
@@ -76,14 +77,50 @@ describe('coverage: every state the surface can be in', () => {
     expect(req?.summary).toContain('cargo publish')
   })
 
-  test('delegation has BOTH ends: an arrival in the transcript, a target in the activity', () => {
+  test('delegation has BOTH ends: an arrival in the transcript, a dispatch in flight', () => {
     const s = byId.get('delegation')!
     expect(s.entries.some((e) => e.kind === 'teammate' && e.label === 'patch')).toBe(true)
-    // The pill only draws when the activity names a session that EXISTS.
+    // The pill is drawn by a real DISPATCH now (fase B4 T5), not by grepping
+    // the activity string — so the state has to carry one, and it has to name
+    // a session that exists.
+    expect(s.handoffTo).toBe('patch')
+    expect(MENTIONS.get(s.handoffTo!)).toBe('patch')
+    // The activity is deliberately kept AND deliberately names Patch: this is
+    // the positive twin of the regression guard in `chat-surface.test.tsx`,
+    // where the same sentence with no dispatch behind it draws nothing.
     const named = mentionSegments(s.session.activity ?? '', MENTIONS, s.session.name).find(
       (seg) => 'seed' in seg,
     )
     expect(named).toBeDefined()
+  })
+
+  test('harness carries one ledger row for EVERY sentence HarnessLine can say', () => {
+    // Four surfaced actions, four sentences — and the failed fire, which is the
+    // only one with a tone of its own. A bench state missing one of them is a
+    // screenshot that cannot review the thing it is named after.
+    const s = byId.get('harness')!
+    const actions = (s.events ?? []).map((e) => e.action)
+    expect(actions).toEqual([
+      'session.delegate',
+      'session.rename',
+      'schedule.create',
+      'schedule.run',
+    ])
+    expect((s.events ?? []).some((e) => e.detail.status === 'error')).toBe(true)
+    // Every chip in those sentences has to be able to NAME something: a
+    // delegation with no target, or a schedule with no title, renders a
+    // sentence with nothing in it.
+    for (const e of s.events ?? []) {
+      if (e.action === 'session.delegate') expect(e.target.length).toBeGreaterThan(0)
+      if (e.action.startsWith('schedule.')) {
+        expect(String(e.detail.title ?? '').length).toBeGreaterThan(0)
+        expect(e.target).toMatch(/^SCHED-/)
+      }
+    }
+    // The rows have to be INSIDE the transcript's window, or the log renders
+    // above the conversation instead of inside it.
+    const oldest = Math.min(...s.entries.map((e) => e.ts))
+    for (const e of s.events ?? []) expect(e.ts).toBeGreaterThan(oldest)
   })
 
   test('error is a failed run said calmly — the failure is in the outcome', () => {
@@ -132,6 +169,51 @@ describe('coverage: every state the surface can be in', () => {
     expect(rows.every((r) => r.value.startsWith('@'))).toBe(true)
   })
 
+  test('the hand-off states are ones the shipped RULE would actually produce', () => {
+    // A bench that merely LOOKS like a relabelled send control is worth
+    // nothing. `handoff` must read as an intent through `readDelegateIntent`,
+    // and — the important half — `handoff-sent` must NOT, because its draft is
+    // empty: a receipt with the control still saying "Hand to" would be a
+    // screenshot of a state the app cannot be in.
+    const armed = byId.get('handoff')!.composer!
+    expect(readDelegateIntent(armed.draft, MENTIONS, 'release-train')).toEqual({
+      to: 'patch',
+      prompt: 'can you re-run the export test on fix/money?',
+    })
+    expect(armed.notice).toBeUndefined()
+
+    const sent = byId.get('handoff-sent')!.composer!
+    expect(sent.draft).toBe('')
+    expect(readDelegateIntent(sent.draft, MENTIONS, 'release-train')).toBeNull()
+    expect(sent.notice).toEqual({ kind: 'handoff-sent', detail: 'Patch' })
+
+    // The failure branch's whole claim: the sentence survived.
+    const failed = byId.get('handoff-failed')!.composer!
+    expect(failed.draft).toBe(armed.draft)
+    expect(failed.notice?.kind).toBe('handoff-failed')
+    expect(failed.notice?.detail?.length).toBeGreaterThan(0)
+  })
+
+  test('the schedule affordance carries a draft, and the draft SURVIVES it', () => {
+    // T9.1/T9.2: the clock's whole job is to hand the current draft over as the
+    // prompt, and to leave the composer exactly as it was. A state with an
+    // empty draft would screenshot the affordance doing nothing, and one whose
+    // draft vanished would screenshot the bug.
+    const c = byId.get('schedule-draft')!.composer!
+    expect(c.schedulable).toBe(true)
+    expect(c.draft.trim().length).toBeGreaterThan(0)
+    expect(c.notice).toBeUndefined()
+    // It is a MESSAGE, not a hand-off and not a command: the clock must not be
+    // reviewed on top of a relabelled send button or a refusal banner.
+    expect(readDelegateIntent(c.draft, MENTIONS, 'release-train')).toBeNull()
+    expect(classifySlash(c.draft)).toBe('pass')
+    // No other state draws it, so every pre-B4 board still screenshots the
+    // composer it was approved against.
+    expect(states.filter((s) => s.composer?.schedulable).map((s) => s.id)).toEqual([
+      'schedule-draft',
+    ])
+  })
+
   test('slash shows a refusal the classifier actually makes', () => {
     const c = byId.get('slash')!.composer!
     expect(classifySlash(c.draft)).toBe('picker')
@@ -173,6 +255,10 @@ describe('coverage: every state the surface can be in', () => {
       'composing',
       'slash',
       'refused',
+      'handoff',
+      'handoff-sent',
+      'handoff-failed',
+      'schedule-draft',
       'panel',
     ])
   })

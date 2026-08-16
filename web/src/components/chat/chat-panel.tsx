@@ -27,7 +27,7 @@ import { useNavigate } from 'react-router-dom'
 import type { TileSession } from '@/components/session-tile/types'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useSessions } from '@/hooks/use-sessions'
-import { commandsApi, filesApi, sessionsApi } from '@/lib/api'
+import { agentsApi, commandsApi, filesApi, sessionsApi } from '@/lib/api'
 import { restSessionInput, type SessionInput } from '@/lib/session-input'
 
 import { detailFor, topAttention } from './attention'
@@ -48,7 +48,21 @@ import { usePendingSends } from './use-pending-sends'
 import { displayNames, entryLabels, mentionIndex } from './grouping'
 import { useChatTurn } from './use-chat-turn'
 import { ProvisionalTail } from './provisional-tail'
+import type { ScheduleRef } from './transcript-item'
 import { exposeLatency, latencySummary, serverNowMs } from './latency'
+
+/**
+ * LAZY, and it is budget-load-bearing (fase B4 T8).
+ *
+ * The sheet pulls in the whole scheduler editor — the form, the recurrence
+ * builder, the fire log, the session picker. Imported statically it landed 8 KB
+ * gz in the HERO path, for a modal nobody has opened yet. It is only ever
+ * mounted while `open`, so the chunk is fetched at the moment of the tap, which
+ * is the same trade the `@`/`/` picker makes (`composer.tsx`).
+ */
+const SessionSchedulesSheet = React.lazy(
+  () => import('@/components/session-schedules/session-schedules-sheet'),
+)
 
 const FOLLOW_THRESHOLD_PX = 48
 
@@ -125,8 +139,36 @@ export default function ChatPanel({
   // panel — the data plane — is where the router is allowed to be reached.
   const navigate = useNavigate()
   const openSession = React.useCallback(
-    (slug: string) => navigate(`/focus/${encodeURIComponent(slug)}`),
-    [navigate],
+    (slug: string) => {
+      // Navigating to where you already are is a route morph that redraws the
+      // whole surface and loses the scroll position — for a click whose only
+      // honest answer is "you are looking at it" (fase B4 T3.2).
+      if (!slug || slug === name) return
+      navigate(`/focus/${encodeURIComponent(slug)}`)
+    },
+    [name, navigate],
+  )
+  // The `⏱` chip's destination (fase B4 T8.5): this session's own Schedules
+  // sheet, scrolled to the schedule when the ledger row knows its id. NOT a
+  // route — the sheet exists whether or not B1's scheduler fold landed, and
+  // that independence is §0.6's whole rule.
+  const [scheduleSheet, setScheduleSheet] = React.useState<{
+    scheduleId: string | null
+    create: boolean
+    draft?: string
+  } | null>(null)
+  const openSchedule = React.useCallback(
+    (ref: ScheduleRef) => setScheduleSheet({ scheduleId: ref.id ?? null, create: false }),
+    [],
+  )
+  const closeScheduleSheet = React.useCallback(() => setScheduleSheet(null), [])
+  // The human path (fase B4 T9): the composer's clock opens the SAME sheet in
+  // create mode with the draft carried over as the prompt. §13.3 calls this
+  // "the trivial human path" and it stays trivial — no new form, no new
+  // endpoint, and the draft is COPIED so cancelling costs nothing.
+  const scheduleDraft = React.useCallback(
+    (draft: string) => setScheduleSheet({ scheduleId: null, create: true, draft: draft.trim() }),
+    [],
   )
   // The wire labels `ChatItem` deliberately does not carry: the slash name of a
   // command, the teammate id of an arrival, the subject of a system event.
@@ -269,12 +311,31 @@ export default function ChatPanel({
       ? { text: session.last_send_text, atS: session.last_send_at ?? 0 }
       : null,
   })
+  // ── The `@`-hand-off plane (fase B4 T4) ────────────────────────────────────
+  // A draft that OPENS with `@colleague` is a hand-off, not a message, and the
+  // send control says so before Enter is pressed. Dispatch is a real
+  // `POST /api/agents/delegate` — the same endpoint an agent's curl uses — with
+  // `actor: 'human'`, so the ledger records the owner rather than attributing
+  // their instruction to their own agent (`lib/api/agents.ts` is explicit that
+  // this is labelling, not authentication).
+  //
+  // The index is the one this panel already derives for the chips: a name that
+  // is not a live session can never become a recipient.
+  const handoff = React.useMemo(
+    () => ({
+      mentions,
+      names,
+      send: (to: string, prompt: string) => agentsApi.delegate({ from: name, to, prompt }),
+    }),
+    [mentions, name, names],
+  )
   const composer = useComposer({
     name,
     input: pending.input,
     peek,
     active: session?.status === 'active',
     dialogCard,
+    handoff,
   })
 
   // ── What the `@`/`/` popover offers (fase A4 T9) ───────────────────────────
@@ -350,6 +411,7 @@ export default function ChatPanel({
   }, [pendingItems, dismissPending])
 
   return (
+    <>
     <ChatConversation
       // The surface IS the panel's root element, so it keeps the panel's
       // long-standing test id — the renderer-switch e2e asserts on it.
@@ -362,6 +424,11 @@ export default function ChatPanel({
       names={names}
       events={events}
       onOpenSession={openSession}
+      onOpenSchedule={openSchedule}
+      // The handoff pill's ONLY source (fase B4 T5): a POST this client made
+      // and the ledger has not confirmed yet. The activity-string heuristic
+      // that used to draw it is gone — see `live-layer.tsx::pendingHandoff`.
+      handoff={composer.handoffPending}
       nowMs={nowBucketMs}
       turnStart={turnStart}
       overlay={overlay}
@@ -412,6 +479,7 @@ export default function ChatPanel({
           // ride the shared query this component already subscribes to, the
           // same rule as `mentions`/`names`.
           pickerData={pickerData}
+          onSchedule={scheduleDraft}
           // The dogfood number — DEV BUILDS ONLY (daily-driver QA #9).
           //
           // It shipped unconditionally and printed `hook→UI p50 9 ms (n=3)`
@@ -440,5 +508,24 @@ export default function ChatPanel({
         />
       }
     />
+    {/* Mounted only while it is open: the sheet subscribes to the scheduler
+        stream and the schedules query, and neither should be running for every
+        session anybody happens to be looking at. */}
+    {scheduleSheet && (
+      // No fallback: the sheet's own shell IS the loading state once it lands,
+      // and a spinner for a chunk that arrives in one frame from cache would be
+      // the only thing most people ever see of it.
+      <React.Suspense fallback={null}>
+      <SessionSchedulesSheet
+        session={name}
+        open
+        onClose={closeScheduleSheet}
+        scheduleId={scheduleSheet.scheduleId}
+        createOnOpen={scheduleSheet.create}
+        draftPrompt={scheduleSheet.draft}
+      />
+      </React.Suspense>
+    )}
+    </>
   )
 }

@@ -50,7 +50,7 @@ import { buildTranscript } from './grouping'
 import { SessionHeaderPill } from './header-pill'
 import { LiveLayer } from './live-layer'
 import { deliveryLine, type PendingSend } from './pending'
-import { TranscriptItem } from './transcript-item'
+import { TranscriptItem, type ScheduleRef } from './transcript-item'
 import { Bubble, DownIcon, MessageRow, SystemLine } from './ui'
 import type { OverlayLine } from './use-receipt-overlay'
 
@@ -152,6 +152,16 @@ export interface ChatConversationProps {
   events?: readonly HarnessEvent[]
   /** Go to another session — the destination of a harness line's chip. */
   onOpenSession?: (slug: string) => void
+  /** Open this session's Schedules sheet — the destination of a `⏱` chip
+   *  (fase B4 T3/T8). Omit and the chip stays plain emphasis. */
+  onOpenSchedule?: (ref: ScheduleRef) => void
+  /**
+   * A hand-off this client dispatched and the ledger has not confirmed yet
+   * (fase B4 T5) — the ONLY thing that draws the handoff pill. The pill
+   * resolves into the durable `Delegated to ●x` line the moment a matching
+   * `session.delegate` row lands in `events`; see `live-layer.tsx`.
+   */
+  handoff?: { to: string; atMs: number } | null
   /** SERVER-clock ms, bucketed by the caller — the dividers' relative clock. */
   nowMs: number
   /** SERVER-clock ms anchor for the running turn; null = no live turn. */
@@ -263,6 +273,8 @@ export function ChatConversation({
   names,
   events,
   onOpenSession,
+  onOpenSchedule,
+  handoff,
   nowMs,
   turnStart,
   overlay,
@@ -326,6 +338,10 @@ export function ChatConversation({
     !dialogResolved &&
     !attention &&
     !session?.permission_request &&
+    // A hand-off in flight is conversation too (fase B4 T5): the pill is on
+    // screen, and "No conversation yet." printed directly above it is the same
+    // lie the pending-echo case fixed.
+    !handoff &&
     !(session?.status === 'active' && turnStart != null)
 
   // The room the floating composer needs, MEASURED (daily-driver QA #12).
@@ -458,6 +474,7 @@ export function ChatConversation({
               rawUrl={rawUrl}
               pinFor={pinFor}
               onOpenSession={onOpenSession}
+              onOpenSchedule={onOpenSchedule}
             />
           ))}
 
@@ -483,7 +500,9 @@ export function ChatConversation({
             session={session}
             turnStart={turnStart}
             overlay={overlay}
-            mentions={mentions}
+            handoff={handoff}
+            events={events}
+            names={names}
             pinFor={pinFor}
             surface={phone ? 'phone' : 'desktop'}
             provisional={provisional}

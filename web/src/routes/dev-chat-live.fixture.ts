@@ -31,6 +31,7 @@ import type { AttentionCause } from '../components/chat/attention'
 import { applyLatch, dialogCardView, type DialogCardView } from '../components/chat/dialog-answer'
 import { readLens } from '../components/chat/peek-lens'
 import type { ChatEntry } from '../components/chat/entries'
+import type { HarnessEvent } from '../lib/api/harness'
 import type { PendingSend } from '../components/chat/pending'
 import type { MentionableSession } from '../components/chat/slash'
 import type { ComposerNotice } from '../components/chat/use-composer'
@@ -226,6 +227,52 @@ const ARRIVAL_DRAFTS: readonly Draft[] = [
 ]
 
 /**
+ * The four harness sentences, as ledger rows (fase B4 T3.6).
+ *
+ * One of each surfaced action, in the order a real afternoon produces them, so
+ * a single screenshot shows every sentence `HarnessLine` can say — including
+ * the failed fire, which is the one that has a tone of its own. `ts` is seconds
+ * (the ledger's unit), interleaved with the transcript rather than stacked at
+ * the end, because "the log lives where it happened" is the whole claim.
+ */
+function harnessEvents(nowSec: number): readonly HarnessEvent[] {
+  return [
+    {
+      id: 101,
+      ts: nowSec - 520,
+      actor: 'user',
+      action: 'session.delegate',
+      target: 'patch',
+      detail: { from: RELEASE_TRAIN },
+    },
+    {
+      id: 102,
+      ts: nowSec - 430,
+      actor: `agent:${RELEASE_TRAIN}`,
+      action: 'session.rename',
+      target: RELEASE_TRAIN,
+      detail: { from: 'Release', to: 'Release Train' },
+    },
+    {
+      id: 103,
+      ts: nowSec - 300,
+      actor: `agent:${RELEASE_TRAIN}`,
+      action: 'schedule.create',
+      target: 'SCHED-1a2b3c4d',
+      detail: { session: RELEASE_TRAIN, title: 'Nightly release watch', kind: 'tmux' },
+    },
+    {
+      id: 104,
+      ts: nowSec - 150,
+      actor: 'scheduler',
+      action: 'schedule.run',
+      target: 'SCHED-1a2b3c4d',
+      detail: { session: RELEASE_TRAIN, title: 'Nightly release watch', status: 'error' },
+    },
+  ]
+}
+
+/**
  * The evidence the Attention card shows — the a0 Bash-permission frame, ANSI
  * intact, so the bench's mini-view and the lens' fixtures are the same bytes
  * (T10's rule). Truecolour on purpose: the mini-view's whole claim is that it
@@ -318,6 +365,22 @@ export interface LiveState {
   /** The tail query failed. */
   isError?: boolean
   /**
+   * A hand-off this client dispatched and the ledger has not confirmed (fase
+   * B4 T5) — the only thing that draws the pill now that the activity-string
+   * heuristic is gone. A SLUG here rather than the `{to, atMs}` the surface
+   * takes: `atMs` is a client clock, and the bench stamps it at render so the
+   * pill is never accidentally expired in a screenshot.
+   */
+  handoffTo?: string
+  /**
+   * This session's harness ledger (fase B4) — the rows that become the centred
+   * management-log sentences, merged into the same ts-ordered stream the
+   * messages are in. The bench feeds them as WIRE rows for the same reason it
+   * feeds `ChatEntry`: `grouping.ts` decides which ones become lines, and a
+   * bench that hand-built the lines would skip that decision.
+   */
+  events?: readonly HarnessEvent[]
+  /**
    * The LIVE composer, in a fixed state (fase A4 T9).
    *
    * Present → the bench mounts the real `<ChatComposer>` with a static handle
@@ -334,6 +397,9 @@ export interface LiveState {
     picker?: { kind: '@' | '/'; query: string }
     /** The refusal banner, pre-raised. */
     notice?: ComposerNotice
+    /** Draw the schedule affordance (fase B4 T9). Off by default so every
+     *  pre-B4 state screenshots the composer it was approved against. */
+    schedulable?: boolean
   }
   /** P10 echoes, in their three states (fase A4 T4). */
   pending?: readonly PendingSend[]
@@ -478,6 +544,24 @@ export function liveStates(nowMs: number): LiveState[] {
       }),
       entries: build(ARRIVAL_DRAFTS, nowSec),
       turnAgo: 31,
+      // The pill is drawn by a DISPATCH now, not by the activity string above
+      // (fase B4 T5). The activity is kept precisely because it names Patch:
+      // this state is the regression guard's positive twin, and the negative
+      // one — the same sentence with no dispatch behind it — lives in
+      // `chat-interactive.test.tsx`.
+      handoffTo: 'patch',
+    },
+    {
+      id: 'harness',
+      title: 'Harness log — the four ledger sentences, every chip live',
+      board: 'master plan §13.1 (the transcript as a management log)',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        status: 'idle',
+      }),
+      entries: build(RELEASE_DRAFTS, nowSec),
+      events: harnessEvents(nowSec),
     },
     {
       id: 'error',
@@ -691,6 +775,83 @@ export function liveStates(nowMs: number): LiveState[] {
       },
     },
     {
+      id: 'handoff',
+      title: 'Hand-off — the send control says where the words are going',
+      board: 'master plan §13.2 (the composer hands work over)',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        status: 'idle',
+      }),
+      entries: release,
+      composer: {
+        // The MOMENT THAT MATTERS in T4: the draft opens with `@patch`, so
+        // Enter no longer sends here — and the control has already relabelled
+        // to "Hand to Patch". The whole safety argument is that this is visible
+        // BEFORE the key is pressed, which makes it a screenshot.
+        draft: '@patch can you re-run the export test on fix/money?',
+      },
+    },
+    {
+      id: 'handoff-sent',
+      title: 'Hand-off — the receipt, naming who has it now',
+      board: 'master plan §13.2 (the receipt)',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        status: 'idle',
+      }),
+      entries: release,
+      composer: {
+        // The box is empty because the hand-off landed: the draft is cleared on
+        // SUCCESS only. The durable `Delegated to ●Patch` line arrives in the
+        // transcript a tick later from the ledger — this banner is the
+        // immediate answer, not a second copy of it.
+        draft: '',
+        notice: { kind: 'handoff-sent', detail: 'Patch' },
+      },
+    },
+    {
+      id: 'handoff-failed',
+      title: 'Hand-off — refused, with the sentence still in the box',
+      board: 'master plan §13.2 (the failure branch)',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        status: 'idle',
+      }),
+      entries: release,
+      composer: {
+        // The draft is STILL THERE, and that is the thing under review: a
+        // hand-off that 500s must never eat the user's text. The server's own
+        // sentence is the detail — it is written to be read.
+        draft: '@patch can you re-run the export test on fix/money?',
+        notice: {
+          kind: 'handoff-failed',
+          detail: 'prompt may not contain supermux wrapper markup',
+        },
+      },
+    },
+    {
+      id: 'schedule-draft',
+      title: 'Schedule — the composer offers to run this later instead of now',
+      board: 'master plan §13.3 (the trivial human path)',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        status: 'idle',
+      }),
+      entries: release,
+      composer: {
+        // The clock beside `+`. A draft is present because the affordance's
+        // whole point is that it carries one over — and the draft STAYS after
+        // the sheet opens (T9.2), which is why this state screenshots the
+        // composer rather than the sheet.
+        draft: 'check whether the nightly release job went green',
+        schedulable: true,
+      },
+    },
+    {
       id: 'panel',
       title: 'Panel — a full-screen TUI screen is up, so the send is refused and named',
       board: 'daily-driver QA #1',
@@ -842,6 +1003,7 @@ export const STATE_IDS = [
   'provisional',
   'permission',
   'delegation',
+  'harness',
   'error',
   'offline',
   'patch',
@@ -853,6 +1015,10 @@ export const STATE_IDS = [
   'composing',
   'slash',
   'refused',
+  'handoff',
+  'handoff-sent',
+  'handoff-failed',
+  'schedule-draft',
   'panel',
   'dialog-live',
   'answering',
