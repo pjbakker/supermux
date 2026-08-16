@@ -30,6 +30,12 @@ import {
   parseQuickKeys,
   QUICK_KEYS_PREF_KEY,
 } from '@/components/focus-mode/quick-keys'
+import { SESSION_RENDERER_QUERY_KEY } from '@/hooks/use-renderer-prefs-sync'
+import {
+  parseRendererPrefsOrNull,
+  SESSION_RENDERER_PREF_KEY,
+  type RendererState,
+} from '@/components/chat/renderer-pref'
 
 export const SESSIONS_KEY = ['sessions'] as const
 
@@ -208,6 +214,15 @@ export function useSessions(): UseSessionsResult {
             qc.setQueryData<string[]>(
               QUICK_KEYS_QUERY_KEY,
               parseQuickKeys(p.value as string | null).selected,
+            )
+          } else if (p.key === SESSION_RENDERER_PREF_KEY && valueIsStr) {
+            // Fase A5 — the renderer preference changed on a peer tab / device.
+            // `use-renderer-prefs-sync` reconciles it into the UI store, skipping
+            // any session the user is mid-change on (local wins for what you are
+            // looking at; the peer wins otherwise).
+            qc.setQueryData<RendererState | null>(
+              SESSION_RENDERER_QUERY_KEY,
+              parseRendererPrefsOrNull(p.value as string | null),
             )
           }
         }
