@@ -3612,6 +3612,7 @@ mod build_env_tests {
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            config_dir: String::new(),
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session);
@@ -3674,6 +3675,7 @@ mod build_env_tests {
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            config_dir: String::new(),
         };
 
         // Fresh: no cc handles → `--name`, not resume-intended.
@@ -3739,6 +3741,7 @@ mod build_env_tests {
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            config_dir: String::new(),
         };
 
         let (command, _resume) = build_launch_command(&config, &session);
@@ -3790,6 +3793,7 @@ mod build_env_tests {
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            config_dir: String::new(),
         }
     }
 

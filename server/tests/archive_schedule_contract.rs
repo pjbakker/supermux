@@ -74,6 +74,7 @@ fn new_session(name: &str, dir: &std::path::Path) -> db::sessions::NewSession {
         host_id: None,
         runtime: "native".to_string(),
         archive_on_stop: false,
+        config_dir: String::new(),
     }
 }
 

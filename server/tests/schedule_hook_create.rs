@@ -94,6 +94,7 @@ async fn make_session(h: &Harness, name: &str) -> String {
             host_id: None,
             runtime: "native".to_string(),
             archive_on_stop: false,
+            config_dir: String::new(),
         },
     )
     .await

@@ -1,0 +1,24 @@
+-- migrations/0100_session_config_dir.sql
+-- Per-session Claude config dir: which Claude login a session boots on.
+--
+-- A dispatched session can be pointed at a second account by exporting
+-- CLAUDE_CONFIG_DIR in its launch line. The chosen directory is stored here so
+-- the launch builder, the Resume picker and recall all read one value.
+--
+-- The empty string is the "daemon default" sentinel (the server process's own
+-- $CLAUDE_CONFIG_DIR, else ~/.claude), so every existing row keeps exactly
+-- today's behaviour and no call site changes meaning.
+--
+-- NOT NULL + DEFAULT '' keeps `sessions::create`'s explicit column list, the
+-- test-only `insert_minimal` and `duplicate`'s SELECT-INSERT valid without
+-- touching a single existing statement. No CHECK constraint: the path rules
+-- (absolute, existing directory, charset) are validated in `sessions::create`,
+-- which can answer 400 with the reason. A CHECK here would turn a future rule
+-- change into a schema migration.
+--
+-- Numbering: upstream main is at 0029, and origin/feat/grok-mode has already
+-- taken 0030 and 0031, so this fork-local migration sits in a high slot (0100)
+-- that upstream will not reach for a long time. sqlx orders purely by version
+-- and tolerates gaps (0006 is already skipped), and a later upstream 0032-0099
+-- still applies normally on a DB that already has 0100.
+ALTER TABLE sessions ADD COLUMN config_dir TEXT NOT NULL DEFAULT '';
