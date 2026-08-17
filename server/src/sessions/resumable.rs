@@ -7,10 +7,12 @@
 //! cheap metadata the picker needs.
 //!
 //! ── Where Claude stores conversations (verified empirically on this host) ──
-//! `~/.claude/projects/<ENCODED_CWD>/<conversation-uuid>.jsonl` — one JSONL
-//! file per conversation. The filename UUID IS the resume id: it equals the
-//! `sessionId` field inside the transcript, and `claude --resume <uuid>` (the
-//! launch builder already turns `cc_conversation_id` into `--resume <id>`).
+//! `<config dir>/projects/<ENCODED_CWD>/<conversation-uuid>.jsonl` — one JSONL
+//! file per conversation. The config dir is the session's own `config_dir` when
+//! set, else the daemon default (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). The
+//! filename UUID IS the resume id: it equals the `sessionId` field inside the
+//! transcript, and `claude --resume <uuid>` (the launch builder already turns
+//! `cc_conversation_id` into `--resume <id>`).
 //!
 //! ── Path encoding (verified both directions against real dirs) ──
 //! Claude maps the *resolved* absolute working dir to the project folder name
@@ -62,12 +64,17 @@ pub struct Resumable {
     pub message_count: usize,
 }
 
-/// Resolve Claude's config directory: `$CLAUDE_CONFIG_DIR` (Claude Code's own
-/// override — also what tests target) else `$HOME/.claude`. Mirrors
-/// [`crate::claude_config`]'s resolver so the two stay in lockstep. We read
-/// transcripts from the SERVICE user's HOME (the server already runs with HOME
-/// set).
-pub(crate) fn claude_config_dir() -> PathBuf {
+/// Resolve the Claude config directory for a SESSION: its own `config_dir`
+/// (migration 0030) when set, else the daemon default: `$CLAUDE_CONFIG_DIR`
+/// (Claude Code's own override, also what tests target) else `$HOME/.claude`.
+/// A session booted on a second account writes its transcripts under that
+/// account's dir, so the Resume picker and recall have to look there or they
+/// silently show an empty history.
+pub(crate) fn claude_config_dir_for(session_config_dir: &str) -> PathBuf {
+    let own = session_config_dir.trim();
+    if !own.is_empty() {
+        return PathBuf::from(own);
+    }
     if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {
         let d = d.trim();
         if !d.is_empty() {
@@ -88,26 +95,30 @@ pub fn encode_project_dir(abs_dir: &str) -> String {
         .collect()
 }
 
-/// Resolve a session's working dir to its `~/.claude/projects/<encoded>` folder.
-/// The cwd is symlink-canonicalized first (Claude records the resolved path);
-/// if canonicalization fails (dir gone), we encode the raw dir as a fallback.
-pub(crate) fn project_dir_for(dir: &str) -> PathBuf {
+/// Resolve a session's working dir to its `<config dir>/projects/<encoded>`
+/// folder. The cwd is symlink-canonicalized first (Claude records the resolved
+/// path); if canonicalization fails (dir gone), we encode the raw dir as a
+/// fallback. `session_config_dir` is the session's own `config_dir` column, or
+/// the empty string for the daemon default.
+pub(crate) fn project_dir_for(session_config_dir: &str, dir: &str) -> PathBuf {
     let resolved = std::fs::canonicalize(dir)
         .ok()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| dir.to_string());
-    claude_config_dir()
+    claude_config_dir_for(session_config_dir)
         .join("projects")
         .join(encode_project_dir(&resolved))
 }
 
 /// Enumerate resumable Claude conversations for a working dir, newest-first.
+/// Transcripts are read under `session_config_dir` when the session carries one,
+/// else under the daemon's config dir.
 ///
 /// Returns an empty list (never an error) when the dir has no project folder or
 /// no transcripts — the picker just hides Resume. Per-file read/parse failures
 /// are skipped rather than failing the whole listing.
-pub fn list_for_dir(dir: &str) -> Vec<Resumable> {
-    let proj = project_dir_for(dir);
+pub fn list_for_dir(session_config_dir: &str, dir: &str) -> Vec<Resumable> {
+    let proj = project_dir_for(session_config_dir, dir);
     list_in_project_dir(&proj)
 }
 
@@ -320,6 +331,31 @@ mod tests {
         assert_eq!(
             encode_project_dir("/Users/me/my-cool-project"),
             "-Users-me-my-cool-project"
+        );
+    }
+
+    /// A session's own config dir wins over the daemon default, so a session
+    /// booted on a second account finds ITS transcripts. An empty value falls
+    /// back to the daemon default, which is every existing session.
+    #[test]
+    fn a_sessions_config_dir_wins_over_the_daemon_default() {
+        let account = temp_dir();
+        let work = temp_dir();
+        let resolved = std::fs::canonicalize(&work).unwrap();
+        let encoded = encode_project_dir(&resolved.to_string_lossy());
+        let expected = account.join("projects").join(&encoded);
+
+        assert_eq!(
+            project_dir_for(&account.to_string_lossy(), &work.to_string_lossy()),
+            expected
+        );
+
+        // No per-session dir: the daemon default, which is never under the
+        // account dir we just made up.
+        let fallback = project_dir_for("", &work.to_string_lossy());
+        assert_eq!(
+            fallback,
+            claude_config_dir_for("").join("projects").join(&encoded)
         );
     }
 

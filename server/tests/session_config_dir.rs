@@ -4,7 +4,8 @@
 //! directory is stored and echoed on the view; anything else is a 400 that
 //! leaves NO row behind; an absent field keeps the old behaviour exactly.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use supermux_server::config::{Config, ProviderDefaults, TlsConfig};
 use supermux_server::state::AppState;
@@ -183,5 +184,135 @@ async fn bad_config_dirs_are_refused_with_400_and_no_row() {
     }
 
     let _ = std::fs::remove_dir_all(file_dir);
+    let _ = std::fs::remove_dir_all(data);
+}
+
+/// Same encoding Claude (and `resumable.rs`) use: every `/` and `.` -> `-`.
+fn encode(abs: &str) -> String {
+    abs.chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Seed `<config_dir>/projects/<encoded cwd>/<id>.jsonl` and return the folder.
+fn seed_transcript(config_dir: &Path, cwd: &Path, id: &str, lines: &[String]) -> PathBuf {
+    let resolved = std::fs::canonicalize(cwd).unwrap();
+    let proj = config_dir
+        .join("projects")
+        .join(encode(&resolved.to_string_lossy()));
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut f = std::fs::File::create(proj.join(format!("{id}.jsonl"))).unwrap();
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+    proj
+}
+
+/// The Resume picker reads the SESSION's config dir. Without this, a session
+/// dispatched onto the second account offers an empty Resume list even though
+/// its transcripts exist: just under the other account.
+#[tokio::test]
+async fn resume_picker_reads_the_sessions_config_dir() {
+    let (_state, app, data) = setup().await;
+    let account = temp_dir("resume-account");
+    let work = temp_dir("resume-work");
+    seed_transcript(
+        &account,
+        &work,
+        "11111111-0000-0000-0000-000000000001",
+        &[json!({"type": "ai-title", "aiTitle": "Second account chat"}).to_string()],
+    );
+
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "name": "resume-second",
+            "dir": work.to_string_lossy(),
+            "provider": "claude",
+            "config_dir": account.to_string_lossy(),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        "/api/sessions/resume-second/resumable",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["data"][0]["summary"], "Second account chat", "{body}");
+
+    let _ = std::fs::remove_dir_all(account);
+    let _ = std::fs::remove_dir_all(work);
+    let _ = std::fs::remove_dir_all(data);
+}
+
+/// Recall walks the same folder, so project-scope history is visible for a
+/// session on the second account too.
+#[tokio::test]
+async fn recall_reads_the_sessions_config_dir() {
+    let (_state, app, data) = setup().await;
+    let account = temp_dir("recall-account");
+    let work = temp_dir("recall-work");
+    seed_transcript(
+        &account,
+        &work,
+        "22222222-0000-0000-0000-000000000002",
+        &[
+            json!({
+                "type": "user",
+                "uuid": "u-1",
+                "timestamp": "2026-08-17T10:00:00Z",
+                "isSidechain": false,
+                "message": {"role": "user", "content": "ship the capacity board"},
+            })
+            .to_string(),
+            json!({
+                "type": "assistant",
+                "uuid": "a-1",
+                "timestamp": "2026-08-17T10:00:05Z",
+                "isSidechain": false,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "on it"}]},
+            })
+            .to_string(),
+        ],
+    );
+
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "name": "recall-second",
+            "dir": work.to_string_lossy(),
+            "provider": "claude",
+            "config_dir": account.to_string_lossy(),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        "/api/sessions/recall-second/recall?scope=project",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["data"]["entries"].as_array().expect("entries array");
+    assert!(
+        entries.iter().any(|e| e["text"] == "ship the capacity board"),
+        "recall must read the session's config dir: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(account);
+    let _ = std::fs::remove_dir_all(work);
     let _ = std::fs::remove_dir_all(data);
 }
