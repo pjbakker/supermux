@@ -44,6 +44,7 @@ import type { SessionStatus } from '../../lib/api'
 import { motionOff, tweens } from '../../lib/springs'
 import { cn } from '../../lib/utils'
 import { modeChipLabel } from '../focus-mode/mode-labels'
+import { usageTitle, worstWindow } from '../../lib/rate-limits'
 import { StatusDot } from '../session-tile/status-dot'
 import type { TileSession } from '../session-tile/types'
 
@@ -262,6 +263,19 @@ export function SessionHeaderPill({
                   busy states keep the spinner the boot window needs. It carries
                   the `--status-*` family and never the accent (contract C7). */}
               {status && <StatusDot status={status} />}
+              {/* THE CONDITION, BESIDE THE STATUS — and never instead of it.
+                  A limit-hit session's status IS `idle`: the turn ended
+                  normally, Claude Code just cannot start another one. The dot
+                  keeps telling the truth about the turn; this chip tells the
+                  truth about the session, which is the half the header was
+                  missing entirely (verify matrix finding 1, 05-chat-limits.png).
+                  It also covers the transcript-less case the wire plane cannot:
+                  a startup wedge has no transcript to read at all. */}
+              {session?.blocked && <BlockedChip blocked={session.blocked} />}
+              {!session?.blocked && session?.limit_warning && (
+                <WarningChip text={session.limit_warning} />
+              )}
+              {!session?.blocked && <UsageChip session={session} />}
               {/* THE TRAILING CLUSTER, and on the phone it STACKS.
                   The mode chip used to sit beside the renderer switch, and the
                   two together took 187px of a 342px row: `ipc` in bypass mode
@@ -301,3 +315,74 @@ export function SessionHeaderPill({
 }
 
 export default SessionHeaderPill
+
+/**
+ * The header's blocked chip — one word, and the terminal's own sentence on hover.
+ *
+ * Deliberately NOT the roster's `<BlockedBadge>`: this bar's whole structural
+ * promise is that nothing in it can change the header's height (see the file
+ * header), and the roster badge carries its own padding and line-height for a
+ * denser row. Same token, same orange, same honesty; different metrics.
+ */
+function BlockedChip({
+  blocked,
+}: {
+  blocked: { kind: string; text: string; detail?: string; wedge?: string }
+}) {
+  return (
+    <span
+      data-testid="chat-header-blocked"
+      role="status"
+      title={[blocked.text, blocked.detail].filter(Boolean).join(' — ')}
+      className="shrink-0 whitespace-nowrap rounded-full bg-status-error/15 px-2 py-[3px] text-[11.5px] font-semibold leading-[16px] text-status-error"
+    >
+      {blocked.kind === 'limit' ? 'Limit reached' : 'Blocked'}
+    </span>
+  )
+}
+
+/**
+ * The usage gauge — the one signal that arrives BEFORE the block.
+ *
+ * Drawn here rather than imported from the roster's `<UsageChip>` on purpose,
+ * and it is not a style preference: `session-tile/activity-status` pulls the
+ * recovery ladder and its motion with it, and importing it from this file put
+ * those modules on the boundary between the entry chunk and the lazy chat chunk
+ * — +2.5 KB gz of re-chunking for a nine-line span. The arithmetic is shared
+ * (`lib/rate-limits`), which is the part that has to agree; the pixels are this
+ * bar's, whose whole structural promise is that nothing in it changes the
+ * header's height.
+ */
+function UsageChip({ session }: { session: TileSession | null }) {
+  const worst = worstWindow(session?.rate_limits ?? undefined)
+  if (!worst) return null
+  return (
+    <span
+      data-testid="chat-header-usage"
+      role="status"
+      title={usageTitle(session?.rate_limits ?? undefined)}
+      className={cn(
+        'shrink-0 whitespace-nowrap rounded-full px-2 py-[3px] text-[11.5px] font-semibold leading-[16px] tabular-nums',
+        worst.hot ? 'bg-status-error/15 text-status-error' : 'bg-fill-soft text-ink-2',
+      )}
+    >
+      {worst.label} {Math.round(worst.pct)}%
+    </span>
+  )
+}
+
+/** The quiet half: Claude Code's own ≥70 % footer line, which exists on NO other
+ *  plane (it is never written to the transcript). A chip, not a block — the
+ *  session still works, and saying otherwise would be the opposite error. */
+function WarningChip({ text }: { text: string }) {
+  return (
+    <span
+      data-testid="chat-header-limit-warning"
+      role="status"
+      title={text}
+      className="shrink-0 whitespace-nowrap rounded-full bg-status-waiting/12 px-2 py-[3px] text-[11.5px] font-medium leading-[16px] text-status-waiting"
+    >
+      Nearing limit
+    </span>
+  )
+}
