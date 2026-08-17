@@ -7,7 +7,7 @@
 //! cheap metadata the picker needs.
 //!
 //! ── Where Claude stores conversations (verified empirically on this host) ──
-//! `<config dir>/projects/<ENCODED_CWD>/<conversation-uuid>.jsonl` — one JSONL
+//! `<config dir>/projects/<ENCODED_CWD>/<conversation-uuid>.jsonl`: one JSONL
 //! file per conversation. The config dir is the session's own `config_dir` when
 //! set, else the daemon default (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). The
 //! filename UUID IS the resume id: it equals the `sessionId` field inside the

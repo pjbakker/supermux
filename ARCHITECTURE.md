@@ -138,9 +138,9 @@ For a sweep by hand there is `supermux-server swarm-reaper [--dry-run] [--grace-
 
 ## Database
 
-`server/migrations/0001..0018_*.sql` — applied at startup. Highlights:
+`server/migrations/0001..0030_*.sql` — applied at startup. Highlights:
 
-- `sessions` + `session_runtime` — the source-of-truth row per tmux session; ANSI-capture preview lives in `runtime`.
+- `sessions` + `session_runtime` — the source-of-truth row per tmux session; ANSI-capture preview lives in `runtime`. `sessions.config_dir` (migration 0030) pins which Claude login a session boots on: it is exported as `CLAUDE_CONFIG_DIR` in the launch line for the `claude` provider, and the Resume picker and recall read that account's transcripts. Empty means the daemon default (`$CLAUDE_CONFIG_DIR` of the server process, else `~/.claude`).
 - `issues` + `acceptance_items` + `issue_links` + `issue_tags` + `boards` + `delegations` — the board.
 - `schedules` + `schedule_runs` + `schedule_run_keys` — scheduler + idempotency.
 - `audit_log` — every mutation. Append-only.
@@ -150,6 +150,13 @@ For a sweep by hand there is `supermux-server swarm-reaper [--dry-run] [--grace-
 - `skills`, `tracked_files`, `kbd_groups`, `snippets` — supporting stores.
 
 Migrations are forward-only. Schema changes go in a new file `00NN_<name>.sql`.
+
+A session with its own `config_dir` still gets its status hooks from the DAEMON's
+config dir: `claude_config::install_hooks` writes one `settings.json`, the one
+the server process resolves. A second account therefore needs its `settings.json`
+symlinked to the first account's file, which is how the second login is set up.
+Without that symlink the session still runs, but status detection falls back to
+the regex and pty heartbeat path instead of the hooks.
 
 ---
 
