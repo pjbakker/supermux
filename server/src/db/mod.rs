@@ -171,6 +171,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The production claim behind migration 0030: a row that already existed
+    /// when the column was added keeps today's behaviour. Apply the chain up to
+    /// 0029, insert a session through the pre-0030 column set, then apply the
+    /// rest and read the value back. `DEFAULT ''` is what makes a legacy row
+    /// mean "daemon default"; a NULL there would break every consumer that
+    /// calls `config_dir.trim()`.
+    #[tokio::test]
+    async fn a_row_created_before_0030_backfills_to_the_empty_config_dir() {
+        use sqlx::migrate::Migrate;
+        use sqlx::{sqlite::SqliteConnection, Connection};
+        let dir = std::env::temp_dir().join(format!("supermux-mig0030-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.db");
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect");
+        let migrator = sqlx::migrate!("./migrations");
+        conn.ensure_migrations_table().await.unwrap();
+        for m in migrator.iter().filter(|m| m.version < 30) {
+            conn.apply(m).await.expect("pre-0030 migration applies");
+        }
+        // The pre-0030 column set: `config_dir` does not exist yet to bind.
+        sqlx::query(
+            "INSERT INTO sessions (name, dir, provider, created_at)
+             VALUES ('legacy', '/tmp', 'claude', 0)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        migrator
+            .run(&mut conn)
+            .await
+            .expect("0030 applies over an existing row");
+        let config_dir: String =
+            sqlx::query_scalar("SELECT config_dir FROM sessions WHERE name = 'legacy'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            config_dir, "",
+            "an existing row must backfill to the daemon default"
+        );
+
+        conn.close().await.ok();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Regression for the 0015 prod crash: the runtime opens the DB with
     /// `foreign_keys=ON` (see [`init`]), and SQLite REFUSES
     /// `ALTER TABLE ... ADD COLUMN ... REFERENCES ... DEFAULT '<non-null>'` under
