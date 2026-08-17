@@ -1897,6 +1897,7 @@ mod tests {
                 runtime: "native".into(),
                 model: String::new(),
                 company_id: None,
+                config_dir: String::new(),
             },
         )
         .await

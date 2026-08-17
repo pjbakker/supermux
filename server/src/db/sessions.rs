@@ -121,6 +121,13 @@ pub struct Session {
     /// [`crate::bot_memory`] / [`crate::sessions::connector_config`].
     #[serde(default)]
     pub role_id: Option<String>,
+    /// Which Claude login this session boots on (migration 0041): the directory
+    /// exported as `CLAUDE_CONFIG_DIR` in the launch line. The empty string
+    /// means "use the daemon default", which is every pre-0041 row and every
+    /// session created without the field. Validated on create
+    /// (`sessions::valid_config_dir`), never mutated afterwards.
+    #[serde(default)]
+    pub config_dir: String,
 }
 
 /// A row of the `session_runtime` table (ephemeral, persisted across restarts).
@@ -425,6 +432,11 @@ pub struct NewSession {
     /// (empty = provider default). Mirrors `runtime`: carried end-to-end so the
     /// create path persists it in one INSERT.
     pub model: String,
+    /// The session's Claude config dir (migration 0041), or the empty string
+    /// for the daemon default. Validated by `sessions::create` BEFORE it reaches
+    /// here, so this is already an absolute path over `[A-Za-z0-9._/-]` that
+    /// exists on disk.
+    pub config_dir: String,
 }
 
 /// Insert a full session config row. `created_at` is set to now.
@@ -433,8 +445,8 @@ pub async fn create(pool: &SqlitePool, s: &NewSession) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO sessions
             (name, display_name, dir, desc, provider, creator, flags, tags, branch, mcp,
-             worktree, worktree_repo, host_id, company_id, runtime, model, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             worktree, worktree_repo, host_id, company_id, runtime, model, config_dir, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.name)
     .bind(&s.display_name)
@@ -452,6 +464,7 @@ pub async fn create(pool: &SqlitePool, s: &NewSession) -> sqlx::Result<()> {
     .bind(s.company_id)
     .bind(&s.runtime)
     .bind(&s.model)
+    .bind(&s.config_dir)
     .bind(now)
     .execute(pool)
     .await?;
@@ -520,10 +533,10 @@ pub async fn duplicate(pool: &SqlitePool, src: &str, new_name: &str) -> sqlx::Re
         "INSERT INTO sessions
             (name, display_name, dir, desc, provider, flags, pinned, auto_continue, auto_continue_msg,
              rate_limit_resume_text, tags, creator, branch, worktree, worktree_repo, mcp,
-             host_id, company_id, runtime, notif, mark_pin, model, memory, skills, created_at)
+             host_id, company_id, runtime, notif, mark_pin, model, memory, skills, config_dir, created_at)
          SELECT ?, ?, dir, desc, provider, flags, 0, auto_continue, auto_continue_msg,
                 rate_limit_resume_text, tags, creator, branch, worktree, worktree_repo, mcp,
-                host_id, company_id, runtime, notif, mark_pin, model, memory, skills, ?
+                host_id, company_id, runtime, notif, mark_pin, model, memory, skills, config_dir, ?
          FROM sessions WHERE name = ?",
     )
     .bind(new_name)

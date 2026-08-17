@@ -120,8 +120,8 @@ mod tests {
             .unwrap()
             .get("n");
         assert_eq!(
-            applied, 38,
-            "expected thirty-eight applied migrations (0001-0005, 0007-0024, 0026-0040)"
+            applied, 39,
+            "expected thirty-nine applied migrations (0001-0005, 0007-0024, 0026-0041)"
         );
 
         // 0037 applied cleanly: the new nullable company_id column exists and a
@@ -183,6 +183,57 @@ mod tests {
             None,
             "a fresh account backfills to NULL company_id (HQ/global)"
         );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `config_dir` (migration 0041) threads NewSession -> INSERT -> row, and a
+    /// duplicate inherits it, so a cloned session boots on the same account.
+    /// An unset value reads back as the empty string, which every consumer
+    /// treats as "use the daemon default".
+    #[tokio::test]
+    async fn config_dir_survives_create_and_duplicate() {
+        let (pool, dir) = test_pool().await;
+
+        let mut new = sessions::NewSession {
+            name: "acct".into(),
+            display_name: "acct".into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "claude".into(),
+            creator: String::new(),
+            flags: String::new(),
+            tags: "[]".into(),
+            branch: String::new(),
+            mcp: String::new(),
+            worktree: false,
+            worktree_repo: String::new(),
+            host_id: None,
+            company_id: None,
+            runtime: "native".into(),
+            model: String::new(),
+            config_dir: "/home/agent/.claude-second".into(),
+        };
+        sessions::create(&pool, &new).await.unwrap();
+
+        let row = sessions::get(&pool, "acct").await.unwrap().unwrap();
+        assert_eq!(row.config_dir, "/home/agent/.claude-second");
+
+        sessions::duplicate(&pool, "acct", "acct-copy").await.unwrap();
+        let copy = sessions::get(&pool, "acct-copy").await.unwrap().unwrap();
+        assert_eq!(
+            copy.config_dir, "/home/agent/.claude-second",
+            "a duplicate must boot on the same account as its source"
+        );
+
+        // Unset is the empty string, never NULL: the column is NOT NULL DEFAULT ''.
+        new.name = "plain".into();
+        new.display_name = "plain".into();
+        new.config_dir = String::new();
+        sessions::create(&pool, &new).await.unwrap();
+        let plain = sessions::get(&pool, "plain").await.unwrap().unwrap();
+        assert_eq!(plain.config_dir, "");
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
@@ -338,6 +389,7 @@ mod tests {
             company_id: Some(acme),
             runtime: "native".into(),
             model: String::new(),
+            config_dir: String::new(),
         };
         sessions::create(&pool, &ns).await.unwrap();
         let got = sessions::get(&pool, "bot-a").await.unwrap().unwrap();
@@ -365,6 +417,7 @@ mod tests {
             company_id: None,
             runtime: "native".into(),
             model: String::new(),
+            config_dir: String::new(),
         };
         sessions::create(&pool, &main).await.unwrap();
         let got_main = sessions::get(&pool, "main-a").await.unwrap().unwrap();

@@ -1119,6 +1119,7 @@ mod tests {
                 runtime: "native".to_string(),
                 model: String::new(),
                 company_id: Some(company.id),
+                config_dir: String::new(),
             },
         )
         .await

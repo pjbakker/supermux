@@ -79,6 +79,7 @@ fn new_session(name: &str, dir: &std::path::Path) -> db::sessions::NewSession {
         runtime: "native".to_string(),
         model: String::new(),
         company_id: None,
+        config_dir: String::new(),
     }
 }
 

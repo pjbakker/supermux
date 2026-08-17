@@ -1321,6 +1321,9 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         company_id: input.company_id,
         runtime: runtime_kind,
         model,
+        // Empty = the daemon default Claude config dir. The API field that lets
+        // a caller pick another account lands in a later step.
+        config_dir: String::new(),
     };
     db::sessions::create(&state.pool, &new).await?;
     let hook_token = gen_hook_token();
