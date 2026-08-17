@@ -807,7 +807,7 @@ pub async fn tail_for_push(state: &AppState, row: &db::sessions::Session) -> Opt
             return Some(tail);
         }
     }
-    let path = crate::sessions::resumable::project_dir_for(&row.dir)
+    let path = crate::sessions::resumable::project_dir_for(&row.config_dir, &row.dir)
         .join(format!("{}.jsonl", row.cc_conversation_id));
     if row.cc_conversation_id.is_empty() {
         return None;

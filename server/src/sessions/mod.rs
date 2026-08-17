@@ -2129,8 +2129,9 @@ async fn resumable_handler(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("session '{name}'")))?;
     let dir = s.dir.clone();
+    let config_dir = s.config_dir.clone();
     // Filesystem scan can touch large transcripts → off the async runtime.
-    let list = tokio::task::spawn_blocking(move || resumable::list_for_dir(&dir))
+    let list = tokio::task::spawn_blocking(move || resumable::list_for_dir(&config_dir, &dir))
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("resumable scan join failed: {e}")))?;
     Ok(Json(json!({ "ok": true, "data": list })))

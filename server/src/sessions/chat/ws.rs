@@ -125,7 +125,7 @@ async fn eligible_row(state: &AppState, name: &str) -> Result<db::sessions::Sess
 /// with no pointer yet resolves to a path that cannot exist, which every reader
 /// below treats as "empty", never as an error.
 fn transcript_path(row: &db::sessions::Session) -> PathBuf {
-    resumable::project_dir_for(&row.dir).join(format!("{}.jsonl", row.cc_conversation_id))
+    resumable::project_dir_for(&row.config_dir, &row.dir).join(format!("{}.jsonl", row.cc_conversation_id))
 }
 
 // ── the history cursor ──────────────────────────────────────────────────────
@@ -861,7 +861,7 @@ pub async fn entry_handler(
     let row = eligible_row(&state, &name).await?;
     // A6 T4.1 — the whole conversation, not just the main transcript. A 404
     // from here now means "no such entry", which is what a 404 should mean.
-    let project_dir = resumable::project_dir_for(&row.dir);
+    let project_dir = resumable::project_dir_for(&row.config_dir, &row.dir);
     let conv = row.cc_conversation_id.clone();
     let wanted = uuid.clone();
     let found =
