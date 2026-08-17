@@ -7,7 +7,7 @@
 //! cheap metadata the picker needs.
 //!
 //! ── Where Claude stores conversations (verified empirically on this host) ──
-//! `<config dir>/projects/<ENCODED_CWD>/<conversation-uuid>.jsonl` — one JSONL
+//! `<config dir>/projects/<ENCODED_CWD>/<conversation-uuid>.jsonl`: one JSONL
 //! file per conversation. The config dir is the session's own `config_dir` when
 //! set, else the daemon default (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). The
 //! filename UUID IS the resume id: it equals the `sessionId` field inside the
@@ -65,7 +65,7 @@ pub struct Resumable {
 }
 
 /// Resolve the Claude config directory for a SESSION: its own `config_dir`
-/// (migration 0100) when set, else the daemon default: `$CLAUDE_CONFIG_DIR`
+/// (migration 0041) when set, else the daemon default: `$CLAUDE_CONFIG_DIR`
 /// (Claude Code's own override, also what tests target) else `$HOME/.claude`.
 /// A session booted on a second account writes its transcripts under that
 /// account's dir, so the Resume picker and recall have to look there or they
