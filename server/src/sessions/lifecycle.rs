@@ -109,6 +109,65 @@ pub fn effective_remote_callback_url(config: &crate::config::Config, scheme: &st
     format!("{scheme}://{}", config.bind)
 }
 
+/// Environment variables an agent CLI exports to mark its OWN child processes as
+/// nested runs — poison for a supermux pane, and never legitimate in one.
+///
+/// **The failure this exists for.** Start supermux from inside a Claude Code
+/// session (a routine thing for this user: an agent deploying or dogfooding the
+/// server) and the daemon's environ carries `CLAUDE_CODE_CHILD_SESSION=1`,
+/// `CLAUDECODE=1`, `CLAUDE_CODE_SESSION_ID=…`. Every pane it spawns inherits
+/// them — `Command::envs` ADDS to the parent environment, it does not replace
+/// it — so every `claude` we launch believes it is a nested child of the agent
+/// that happened to start the daemon. It prints "⚠ Transcript saving is off —
+/// inherited CLAUDE_CODE_CHILD_SESSION marker", writes no `.jsonl`, and with no
+/// transcript the ENTIRE chat plane (recall, the tailer, the chat renderer) has
+/// nothing to read. A whole verification wave was invalidated by exactly this.
+///
+/// `CLAUDE_CODE_MESSAGING_TOKEN`/`_SOCKET` are on the list for a second reason:
+/// they are a live credential + channel belonging to the parent agent, and
+/// handing them to every pane we spawn hands every session a way to talk on it.
+///
+/// Production runs as a systemd daemon, so none of this is a shipping default —
+/// but it is a real hazard whenever supermux is started by hand from an agent
+/// pane, and the fix is one scrub at startup.
+///
+/// The list is deliberately CONSERVATIVE: only markers an agent exports about
+/// ITSELF. supermux's own per-pane `CLAUDE_CODE_*` injections (see
+/// [`build_env`]) are re-set for every pane and must not be listed here.
+pub const AGENT_NESTING_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+];
+
+/// Remove [`AGENT_NESTING_ENV`] from THIS process's environment, returning the
+/// names that were actually present.
+///
+/// Called once at startup (`main`), before anything can spawn: scrubbing the
+/// daemon's own environ is what makes every downstream spawn path clean at once
+/// — the native holder, the tmux server, hook curls, the `$EDITOR` bridge — with
+/// no per-path list to keep in sync. The native spawn ALSO drops them from the
+/// child (`native::runtime::spawn`), so a var set after boot cannot reach a pane
+/// either.
+///
+/// Safe here: `main` is single-threaded at this point, the same place that
+/// already sets `TMUX_TMPDIR`.
+pub fn scrub_inherited_agent_env() -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    for key in AGENT_NESTING_ENV {
+        if std::env::var_os(key).is_some() {
+            std::env::remove_var(key);
+            removed.push(*key);
+        }
+    }
+    removed
+}
+
 /// Per-session tmux env. Excludes the dashboard bearer by construction.
 ///
 /// `agent_teams` gates the experimental Claude Code Agent Teams feature:
@@ -1157,20 +1216,73 @@ pub async fn kill_teammate_pane(
     Ok(())
 }
 
-/// Send literal text followed by Enter. Auto-wakes a stopped session.
-pub async fn send_text(state: &AppState, name: &str, text: &str) -> Result<(), AppError> {
-    send_text_with_preview(state, name, text, None).await
+/// Refuse text that would forge one of supermux's own transcript wrappers.
+///
+/// One rule, one message, shared by every untrusted-text delivery path — the
+/// same `agents::delegate::wrapper_markup` the delegate endpoint and the
+/// schedule hook already answer 400 with, so "may I write this string" has a
+/// single answer everywhere. See [`send_text`] for why this is a provenance
+/// question rather than an escaping one.
+fn reject_wrapper_markup(text: &str) -> Result<(), AppError> {
+    if crate::agents::delegate::wrapper_markup(text) {
+        return Err(AppError::BadRequest(
+            "text may not contain supermux wrapper markup — <supermux-delegation> and \
+             <supermux-schedule> are provenance claims only the harness may write"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
-/// [`send_text`], but the string recorded as the session's `last_send_text` can
-/// differ from the string typed into the pty.
+/// Send literal text followed by Enter. Auto-wakes a stopped session.
 ///
-/// Harness-authored deliveries wrap the payload (`<supermux-delegation>`, and
-/// Task 10's schedule tag). That wrapper is machinery for the receiving agent's
-/// transcript — it must never surface as the send preview the roster renders
-/// (`last-send-recall.tsx`) or as the text `receiptClaims` matches against.
+/// **This is the UNTRUSTED-TEXT door, and it is where wrapper forgery is
+/// stopped.** Everything that is not the harness itself arrives here: the chat
+/// composer and `POST /api/sessions/{name}/send`, the steering deliver loop, a
+/// schedule's `command:` follow-up, a boot job's second line, the board
+/// dispatcher. `<supermux-delegation>` / `<supermux-schedule>` are supermux's
+/// own PROVENANCE claims — `recall.rs::classify_prompt_body` and the chat
+/// renderer read them back as "Message from ●someone" / "Sent by schedule ⏱" —
+/// so a caller that could type one would be forging authenticated arrivals.
+///
+/// Until now the guard lived only in `agents::delegate` and `scheduler::hook`,
+/// i.e. in two of the three writers, and the parity corpus recorded the gap as
+/// if it were the design ("the forgery is stopped where it is written"). It was
+/// not: an ordinary send — typed into the real composer, no privileges — put a
+/// fake `Message from ●ceo-root` divider in another agent's transcript. In a
+/// product whose premise is agents talking to agents, that gives fabricated
+/// provenance to injected instructions, and the realistic attacker is not a
+/// hostile human but one agent echoing web/tool content into another session.
+///
+/// The refusal is server-side and at the FUNNEL, not per handler, so a new
+/// endpoint cannot reintroduce the hole by forgetting a check. The one caller
+/// allowed to write a wrapper is the harness itself, through
+/// [`send_harness_text`] — named so the exception is visible at the call site.
+///
+/// KNOWN RESIDUE, recorded rather than papered over: raw keystrokes on the pty
+/// WebSocket are the user's own keyboard and are not filtered, so a person can
+/// still type a wrapper into their own pane. That is a user forging a label in
+/// their own transcript, not one session forging provenance in another's.
+pub async fn send_text(state: &AppState, name: &str, text: &str) -> Result<(), AppError> {
+    reject_wrapper_markup(text)?;
+    send_harness_text(state, name, text, None).await
+}
+
+/// [`send_text`] for HARNESS-AUTHORED deliveries: no wrapper-markup guard, and
+/// the string recorded as `last_send_text` can differ from the string typed
+/// into the pty.
+///
+/// Two callers, both of which build supermux's own transcript wrappers with
+/// `agents::delegate::wrap_delegation` / the schedule tag after refusing
+/// forgeable markup in the untrusted parts (`from`, `prompt`, `title`):
+/// `agents::delegate` and `scheduler::runner`. `tests/archive_schedule_contract.rs`
+/// pins that list — a third caller is a review question, not a refactor.
+///
+/// The wrapper is machinery for the receiving agent's transcript: it must never
+/// surface as the send preview the roster renders (`last-send-recall.tsx`) or as
+/// the text `receiptClaims` matches against, hence `preview_text`.
 /// `preview: None` keeps the old behaviour (preview == what was sent).
-pub async fn send_text_with_preview(
+pub async fn send_harness_text(
     state: &AppState,
     name: &str,
     text: &str,
@@ -1243,12 +1355,17 @@ pub async fn send_keys(state: &AppState, name: &str, key: &str) -> Result<(), Ap
 }
 
 /// Paste `text` via a tmux buffer (bracketed). When `submit`, append Enter.
+///
+/// Carries [`send_text`]'s wrapper guard: `POST /api/sessions/{name}/paste` puts
+/// caller-supplied bytes on the same pty and into the same transcript, so
+/// exempting it would leave the forgery one endpoint away.
 pub async fn paste(
     state: &AppState,
     name: &str,
     text: &str,
     submit: bool,
 ) -> Result<(), AppError> {
+    reject_wrapper_markup(text)?;
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
 
@@ -1982,6 +2099,54 @@ mod build_env_tests {
             github_token: None,
             statusline_tap: false,
             extra_origins: Vec::new(),
+        }
+    }
+
+    /// The startup scrub, which is what makes the TMUX and hook-curl spawn
+    /// paths clean too (the native one enforces the same rule at the spawn).
+    ///
+    /// Serialised on the process-wide test lock: it mutates the environment.
+    #[tokio::test]
+    async fn the_startup_scrub_drops_inherited_nesting_markers_and_nothing_else() {
+        let _serial = crate::sessions::native::test_serial().await;
+        // A daemon started from inside a Claude Code pane.
+        for key in AGENT_NESTING_ENV {
+            std::env::set_var(key, "1");
+        }
+        // Something supermux itself sets per pane — must survive.
+        std::env::set_var("CLAUDE_CODE_FORCE_SYNC_OUTPUT", "1");
+
+        let mut removed = scrub_inherited_agent_env();
+        removed.sort_unstable();
+        let mut expected = AGENT_NESTING_ENV.to_vec();
+        expected.sort_unstable();
+        assert_eq!(removed, expected, "the scrub must report what it removed");
+
+        for key in AGENT_NESTING_ENV {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "{key} survived the scrub — every pane would inherit it",
+            );
+        }
+        assert!(
+            std::env::var_os("CLAUDE_CODE_FORCE_SYNC_OUTPUT").is_some(),
+            "the scrub must not touch supermux's own CLAUDE_CODE_* injections",
+        );
+        // Idempotent, and honest about a clean environment.
+        assert!(scrub_inherited_agent_env().is_empty());
+        std::env::remove_var("CLAUDE_CODE_FORCE_SYNC_OUTPUT");
+    }
+
+    /// `build_env`'s own injections must never overlap the scrub list, or the
+    /// scrub would silently disarm a per-pane escape hatch.
+    #[test]
+    fn the_scrub_list_and_the_injected_env_are_disjoint() {
+        let env = build_env(&cfg(), "s", "tok", "claude", true, None);
+        for key in AGENT_NESTING_ENV {
+            assert!(
+                !env.contains_key(*key),
+                "{key} is both injected and scrubbed — pick one",
+            );
         }
     }
 
