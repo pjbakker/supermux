@@ -1292,7 +1292,7 @@ pub(crate) fn dead_resume_link(s: &db::sessions::Session) -> Option<&str> {
     if conv.is_empty() {
         return None;
     }
-    if crate::sessions::resumable::project_dir_for(&s.dir)
+    if crate::sessions::resumable::project_dir_for(&s.config_dir, &s.dir)
         .join(format!("{conv}.jsonl"))
         .exists()
     {
@@ -3048,7 +3048,7 @@ mod recovery_tests {
                 .as_nanos(),
         ));
         std::env::set_var("CLAUDE_CONFIG_DIR", &root);
-        let proj = crate::sessions::resumable::project_dir_for(session_dir);
+        let proj = crate::sessions::resumable::project_dir_for("", session_dir);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join(format!("{conv}.jsonl")), b"{}\n").unwrap();
         root
@@ -3748,7 +3748,7 @@ mod recovery_tests {
         assert_eq!(heal_attempts("stale"), 0, "nothing was spawned");
 
         // Put the conversation where claude would look for it: now it heals.
-        let proj = crate::sessions::resumable::project_dir_for("/tmp");
+        let proj = crate::sessions::resumable::project_dir_for("", "/tmp");
         std::fs::write(proj.join("conv-gone.jsonl"), b"{}\n").unwrap();
         reset_heal_state("stale");
         assert_eq!(

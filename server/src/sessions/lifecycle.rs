@@ -4908,7 +4908,7 @@ mod stale_resume_tests {
     fn with_transcript(session_dir: &str, conv: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("supermux-cc-lc-{}", uuid::Uuid::new_v4()));
         std::env::set_var("CLAUDE_CONFIG_DIR", &root);
-        let proj = crate::sessions::resumable::project_dir_for(session_dir);
+        let proj = crate::sessions::resumable::project_dir_for("", session_dir);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join(format!("{conv}.jsonl")), b"{}\n").unwrap();
         root
