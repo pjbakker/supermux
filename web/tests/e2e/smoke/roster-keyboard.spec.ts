@@ -189,6 +189,203 @@ test.describe('roster keyboard + actions', () => {
     ).toHaveCount(0)
   })
 
+  test('the roving tabindex holds in ALL FOUR modes, and the kebab is not a stop', async ({
+    page,
+  }) => {
+    // It shipped in ONE of the four: tiles/smart. List view carried an extra
+    // `div[tabindex=0]` per row (framer-motion makes a `whileTap` element
+    // focusable), and BOTH custom modes had no provider at all — measured
+    // `{0: 22, -1: 0}` on an 11-session roster with every arrow inert, because
+    // `tile.tsx` falls back to a literal `0` outside a provider. The ⋯ trigger
+    // was a peer stop on top of that, so a 40-session roster was 41 stops.
+    await page.addInitScript(injectGlobals(backend.token))
+    await page.goto(backend.baseUrl)
+    await expect(page.getByRole('button', { name: /rk-alpha/ }).first()).toBeVisible()
+
+    const panel = page.locator('[data-vr="display-controls"]')
+    const setMode = async (view: 'Tiles' | 'List', sort: 'Smart' | 'Custom') => {
+      await page.getByRole('button', { name: 'Display options' }).click()
+      await expect(panel).toBeVisible()
+      await panel.getByRole('button', { name: view, exact: true }).click()
+      await panel.getByRole('button', { name: new RegExp(`^${sort} `) }).click()
+      await page.keyboard.press('Escape')
+      await expect(panel).toBeHidden()
+    }
+
+    for (const view of ['Tiles', 'List'] as const) {
+      for (const sort of ['Smart', 'Custom'] as const) {
+        const mode = `${view}/${sort}`
+        await setMode(view, sort)
+        await expect(page.locator(`${ROSTER_LIST} [data-roving-item]`).first()).toBeVisible()
+
+        const shape = await page.evaluate((sel) => {
+          const lists = [...document.querySelectorAll(sel)].filter(
+            (l) => l.querySelectorAll('[data-roving-item]').length > 0,
+          )
+          return {
+            lists: lists.map((l) => ({
+              items: l.querySelectorAll('[data-roving-item]').length,
+              stops: l.querySelectorAll('[data-roving-item][tabindex="0"]').length,
+            })),
+            // Every stray stop the roster used to grow: the framer tap wrapper
+            // (`whileTap` makes an element focusable) and the ⋯ trigger. Both
+            // are inside the list, so both are counted here.
+            //
+            // dnd-kit's own drag handles are EXCLUDED and stay in the tab
+            // order: in custom mode they are the only keyboard path to reorder
+            // a roster (`KeyboardSensor` is wired), so taking their stop away
+            // would trade one a11y defect for a worse one.
+            strays: lists.reduce(
+              (n, l) =>
+                n +
+                [...l.querySelectorAll<HTMLElement>('[tabindex="0"]')].filter(
+                  (el) =>
+                    !el.hasAttribute('data-roving-item') &&
+                    el.getAttribute('aria-roledescription') !== 'sortable',
+                ).length,
+              0,
+            ),
+            kebabsInTabOrder: [
+              ...document.querySelectorAll<HTMLElement>('[data-vr="tile-kebab"]'),
+            ].filter((el) => el.tabIndex >= 0).length,
+          }
+        }, ROSTER_LIST)
+
+        expect(shape.lists.length, `${mode}: the sessions are in a role=list`).toBeGreaterThan(0)
+        for (const list of shape.lists) {
+          expect(list.items, `${mode}: more than one row`).toBeGreaterThan(1)
+          expect(list.stops, `${mode}: exactly one tab stop for the list`).toBe(1)
+        }
+        expect(shape.strays, `${mode}: no stray tab stops inside the list`).toBe(0)
+        expect(shape.kebabsInTabOrder, `${mode}: the ⋯ trigger is not a tab stop`).toBe(0)
+
+        // …and the arrows move, which is the half that was inert in custom mode.
+        await page.evaluate((sel) => {
+          document.querySelector<HTMLElement>(`${sel} [data-roving-item]`)?.focus()
+        }, ROSTER_LIST)
+        const first = await focusedName(page)
+        expect(first, `${mode}: a roster item took focus`).not.toBeNull()
+        await page.keyboard.press('ArrowDown')
+        expect(await focusedName(page), `${mode}: ArrowDown moved`).not.toBe(first)
+        await page.keyboard.press('Home')
+        expect(await focusedName(page), `${mode}: Home came back`).toBe(first)
+      }
+    }
+  })
+
+  test('Shift+F10 on the focused row opens its action menu', async ({ page }) => {
+    // The replacement for the kebab's own tab stop: the platform's own
+    // secondary-action keys on the row that already owns the tab stop.
+    await page.addInitScript(injectGlobals(backend.token))
+    await page.goto(backend.baseUrl)
+    await expect(page.getByRole('button', { name: /rk-alpha/ }).first()).toBeVisible()
+
+    await page.evaluate((sel) => {
+      document.querySelector<HTMLElement>(`${sel} [data-roving-item]`)?.focus()
+    }, ROSTER_LIST)
+    await page.keyboard.press('Shift+F10')
+    await expect(page.getByRole('menuitem', { name: 'Mark unread' })).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByRole('menuitem', { name: 'Mark unread' })).toBeHidden()
+  })
+
+  test('in the tile grid ArrowDown moves DOWN a row, not right one item', async ({
+    page,
+  }) => {
+    // The grid pattern the roving module cites, and the half that shipped as
+    // `±1` on every arrow: in a multi-column roster ArrowDown was byte-identical
+    // to ArrowRight, so reaching the tile visually below took one press per
+    // column. Asserted as GEOMETRY (the landing tile is lower and roughly in the
+    // same column), never as an index, because the index is what was wrong.
+    await page.setViewportSize({ width: 760, height: 900 })
+    await page.addInitScript(injectGlobals(backend.token))
+    await page.goto(backend.baseUrl)
+    await expect(page.getByRole('button', { name: /rk-alpha/ }).first()).toBeVisible()
+
+    const boxes = async () =>
+      page.evaluate((sel) => {
+        const items = [...document.querySelectorAll<HTMLElement>(`${sel} [data-roving-item]`)]
+        return items.map((el) => {
+          const r = el.getBoundingClientRect()
+          return { name: el.getAttribute('data-roving-item'), top: r.top, left: r.left }
+        })
+      }, ROSTER_LIST)
+
+    const grid = await boxes()
+    expect(grid.length, 'four seeded tiles').toBeGreaterThan(3)
+    const columns = grid.filter((b) => Math.abs(b.top - grid[0]!.top) <= 4).length
+    expect(columns, 'the 760px viewport wraps the grid into rows').toBeGreaterThan(1)
+    expect(columns, '…and is not one flat row').toBeLessThan(grid.length)
+
+    await page.evaluate((sel) => {
+      document.querySelector<HTMLElement>(`${sel} [data-roving-item]`)?.focus()
+    }, ROSTER_LIST)
+    await page.keyboard.press('ArrowDown')
+
+    const landed = await focusedName(page)
+    const first = grid[0]!
+    const target = grid.find((b) => b.name === landed)
+    expect(target, 'ArrowDown landed on a roster tile').toBeTruthy()
+    expect(target!.top, 'the landing tile is on a LOWER visual row').toBeGreaterThan(first.top)
+    expect(
+      Math.abs(target!.left - first.left),
+      'and in the same column — not simply the next item',
+    ).toBeLessThan(4)
+  })
+
+  test('Mark unread lights the row up, and the cursor survives the next load', async ({
+    page,
+  }) => {
+    // The two halves of "Mark unread is a no-op end to end":
+    //   (a) the RENDER — clicking the item must light the row up in this frame,
+    //       not on the next unrelated invalidation. Asserted on the row the
+    //       click acted on, with a short timeout, because "it appears when you
+    //       pin something else" is exactly what shipped.
+    //   (b) the STORAGE — the roster's prune effect split the NUL-joined roster
+    //       signature on a space, so `live` was one NUL-joined string that
+    //       matched no session name, every cursor was judged dead and the whole
+    //       map was rewritten to `{}` on the first render after boot.
+    await page.addInitScript(injectGlobals(backend.token))
+    await page.goto(backend.baseUrl)
+    await expect(page.getByRole('button', { name: /rk-alpha/ }).first()).toBeVisible()
+
+    const row = page.locator(`[data-roving-item="${SESSIONS[0]}"]`)
+    const dot = row.locator('[data-vr="tile-attention-dot"]')
+    await expect(dot, 'the row starts quiet').toHaveCount(0)
+
+    await page
+      .locator(`[data-vr="tile-kebab"][data-vr-session-name="${SESSIONS[0]}"]`)
+      .click()
+    await page.getByRole('menuitem', { name: 'Mark unread' }).click()
+
+    await expect(dot, 'the dot arrives on the click, not on the next re-render').toHaveAttribute(
+      'data-attention-kind',
+      'unread',
+      { timeout: 2_000 },
+    )
+
+    // …and the cursor is still there after a reload — the prune must drop only
+    // cursors whose session is really gone.
+    await page.reload()
+    await expect(page.getByRole('button', { name: /rk-alpha/ }).first()).toBeVisible()
+    await expect
+      .poll(
+        () =>
+          page.evaluate((name) => {
+            const raw = localStorage.getItem('supermux:seen')
+            if (!raw) return null
+            const map = JSON.parse(raw) as Record<string, { unread?: boolean }>
+            return map[name]?.unread ?? null
+          }, SESSIONS[0]),
+        { message: 'the prune keeps a live session’s cursor' },
+      )
+      .toBe(true)
+    await expect(dot, 'and the row is still unread after the reload').toHaveAttribute(
+      'data-attention-kind',
+      'unread',
+    )
+  })
+
   test('the Display popover offers only controls that decide something', async ({
     page,
   }) => {
@@ -210,7 +407,24 @@ test.describe('roster keyboard + actions', () => {
     await open()
     await panel.getByRole('button', { name: 'List', exact: true }).click()
     await expect(panel.getByText('Row detail')).toBeVisible()
-    await expect(panel.getByRole('button', { name: 'More row detail' })).toBeEnabled()
+    //     The rung ladder itself is content-bounded (finding 46): the list's
+    //     top rungs add token counts and tag chips, and on a roster where no
+    //     session has either, raising the density rendered a byte-identical
+    //     row — a last step that changes nothing reads as broken. So the "+"
+    //     is reachable here, and where it can no longer add a fact it is
+    //     disabled WITH the reason, never silently inert.
+    const moreDetail = panel.getByRole('button', { name: 'More row detail' })
+    await expect(moreDetail).toBeEnabled()
+    // Walk it to its ceiling: either it reaches the ladder's top rung, or it
+    // stops early WITH the reason on screen. What it may never do is stop
+    // silently, which is what "tier 4 was identical to tier 3" looked like.
+    for (let i = 0; i < 3 && (await moreDetail.isEnabled()); i++) await moreDetail.click()
+    if (await moreDetail.isDisabled()) {
+      await expect(
+        panel.getByText(/More detail would add/),
+        'a disabled last step says why',
+      ).toBeVisible()
+    }
 
     // …and it is still called Density in tiles: one number, two honest names.
     await panel.getByRole('button', { name: 'Tiles', exact: true }).click()
