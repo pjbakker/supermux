@@ -161,6 +161,7 @@ async fn make_session(state: &AppState, name: &str) {
             worktree: None,
             host_id: None,
             runtime: Some("tmux".into()),
+            config_dir: None,
             ..Default::default()
         },
     )

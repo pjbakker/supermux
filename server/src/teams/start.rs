@@ -278,6 +278,8 @@ pub async fn start_team(
             // tmux split-window panes, which the native runtime has no analogue
             // for. EXPLICIT since the create default became native.
             runtime: Some(crate::sessions::runtime::RUNTIME_TMUX.to_string()),
+            // Boots on the daemon default Claude login.
+            config_dir: None,
             // Team start drives its own boot and briefing; no create-time
             // prompt, no singleton guard.
             prompt: None,
@@ -701,6 +703,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: Some("native".into()),
+                config_dir: None,
                 archive_on_stop: None,
                 ..Default::default()
             },
@@ -753,6 +756,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -793,6 +797,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -840,6 +845,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                config_dir: None,
                 ..Default::default()
             },
         )

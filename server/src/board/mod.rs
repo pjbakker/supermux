@@ -958,6 +958,8 @@ async fn start_handler(
                 // No host_id here, so leaving runtime absent resolves to native (the
                 // local-session default in `sessions::create`), not tmux.
                 runtime: None,
+                // Boots on the daemon default Claude login.
+                config_dir: None,
                 // Prompt delivery and the spawn guard belong to the on-demand
                 // spawn API; this path starts and steers the session itself.
                 prompt: None,

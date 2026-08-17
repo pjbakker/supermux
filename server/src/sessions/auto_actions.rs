@@ -2526,6 +2526,7 @@ mod boot_reconcile_tests {
             worktree: None,
             host_id: None,
             runtime: Some("native".into()),
+            config_dir: None,
             archive_on_stop: None,
             ..Default::default()
         };
@@ -2727,6 +2728,7 @@ mod dead_holder_tests {
             worktree: None,
             host_id: None,
             runtime: Some("native".into()),
+            config_dir: None,
             archive_on_stop: None,
             ..Default::default()
         };

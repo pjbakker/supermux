@@ -1188,6 +1188,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -1234,6 +1235,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -1301,6 +1303,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                config_dir: None,
                 archive_on_stop: None,
                 ..Default::default()
             },
@@ -1369,6 +1372,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                config_dir: None,
                 archive_on_stop: None,
                 ..Default::default()
             },
@@ -1448,6 +1452,7 @@ mod tests {
             worktree: None,
             host_id: None,
             runtime: None,
+            config_dir: None,
             ..Default::default()
         };
         crate::sessions::create(&state, mk("old-host", "/old")).await.unwrap();
