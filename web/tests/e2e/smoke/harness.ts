@@ -34,6 +34,19 @@ export interface Backend {
   vitePort: number
   /** Temp data dir (SUPERMUX_DATA_DIR) for this backend. */
   dataDir: string
+  /**
+   * The `$CLAUDE_CONFIG_DIR` this backend was actually booted with — where it
+   * reads `teams/<name>/config.json` from.
+   *
+   * SEED TEAMS HERE, never at `join(dataDir, 'claude')`. Playwright loads every
+   * spec file into the worker before running any of them, and
+   * `chat-renderer-switch.spec.ts` sets `process.env.CLAUDE_CONFIG_DIR ??= …`
+   * at MODULE scope — so from the first file load onward every backend in the
+   * run inherits that dir, and a team written under `dataDir` is written
+   * somewhere the server never looks. Two specs seeded a team that way and
+   * passed in isolation while covering nothing in a full run.
+   */
+  claudeConfigDir: string
   /** Stop the binary (SIGTERM); resolves once it exits. */
   killBackend(): Promise<void>
   /** Boot a fresh binary on the SAME port + data dir (reconnect test). */
@@ -144,6 +157,8 @@ function spawnBackend(opts: {
   port: number
   dataDir: string
   token: string
+  /** Resolved by `startBackend` — see `Backend.claudeConfigDir`. */
+  claudeConfigDir: string
   /** Extra environment for the BACKEND process only.
    *
    *  It exists for the one spec that has to control what the launcher finds on
@@ -179,7 +194,7 @@ function spawnBackend(opts: {
       // `resume-picker-hover-pin.spec.ts` deliberately seed their own config
       // root before booting, and stomping on it would break the two specs that
       // already got this right.
-      CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? join(opts.dataDir, 'claude'),
+      CLAUDE_CONFIG_DIR: opts.claudeConfigDir,
       SUPERMUX_BIND: `127.0.0.1:${opts.port}`,
       SUPERMUX_AUTH_TOKEN: opts.token,
       RUST_LOG: process.env.RUST_LOG ?? 'warn',
@@ -225,12 +240,20 @@ function killProc(child: ChildProcess | null): Promise<void> {
 export async function startBackend(opts?: {
   /** Extra environment for the backend process only — see `spawnBackend`. */
   env?: Record<string, string>
+  /** Override `$CLAUDE_CONFIG_DIR` for this backend — see `Backend.claudeConfigDir`. */
+  claudeConfigDir?: string
 }): Promise<Backend> {
   const bin = binaryPath()
   const backendPort = await freePort()
   const vitePort = await freePort()
   const token = `e2e-${Math.random().toString(36).slice(2)}-${Date.now()}`
   const dataDir = mkdtempSync(join(tmpdir(), 'supermux-e2e-'))
+  // Resolved ONCE and handed back on `Backend`, so a spec that seeds a team can
+  // write where the server will actually read. Explicit option wins; else the
+  // ambient env (the two specs that deliberately seed a config root before
+  // booting); else this backend's own temp dir.
+  const claudeConfigDir =
+    opts?.claudeConfigDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(dataDir, 'claude')
   const backendUrl = `http://127.0.0.1:${backendPort}`
   const baseUrl = `http://127.0.0.1:${vitePort}`
 
@@ -239,6 +262,7 @@ export async function startBackend(opts?: {
     port: backendPort,
     dataDir,
     token,
+    claudeConfigDir,
     env: opts?.env,
   })
   await waitForHealth(backendUrl)
@@ -265,13 +289,21 @@ export async function startBackend(opts?: {
     backendPort,
     vitePort,
     dataDir,
+    claudeConfigDir,
     async killBackend() {
       await killProc(backend)
       backend = null
     },
     async restartBackend() {
       if (backend) await killProc(backend)
-      backend = spawnBackend({ bin, port: backendPort, dataDir, token, env: opts?.env })
+      backend = spawnBackend({
+        bin,
+        port: backendPort,
+        dataDir,
+        token,
+        claudeConfigDir,
+        env: opts?.env,
+      })
       await waitForHealth(backendUrl, 30_000)
     },
     async dispose() {
@@ -362,9 +394,77 @@ export function api(backend: Backend) {
 }
 
 /**
+ * WHERE THE TERMINAL IS SCROLLED — measured in BUFFER ROWS.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * xterm 6.0 moved the viewport onto a VS Code scrollable element, so
+ * `.xterm-viewport`'s `scrollHeight - clientHeight` is permanently 0 and its
+ * `scroll` event never fires. `use-live-term.ts` documents this twice — and
+ * five specs went on polling that dead metric, all of them failing with
+ * `Received: 0` while the screenshot showed a terminal correctly filled with
+ * `seq 1 600`. Phone scroll physics (touch drag, fling, momentum), tap-vs-swipe,
+ * jump-to-bottom and mouse-tracking-on therefore had no automated cover at all.
+ *
+ * The live signal is the one the product itself reads: `buffer.active.viewportY`
+ * (the buffer line at the top of the view) against `baseY` (what that line is
+ * when pinned to the bottom). Reached through the dev-only `__xtermForTests`
+ * handle `use-live-term.ts` parks on the terminal container.
+ *
+ *   · `viewportY` behaves exactly like the old `scrollTop`: it DECREASES as you
+ *     reveal history, so every direction assertion reads the same as before;
+ *   · `up`   = rows above the live bottom (0 = pinned, the jump-to-bottom
+ *     button's own condition);
+ *   · `max`  = how far up there is to go (the old `scrollHeight - clientHeight`,
+ *     in rows).
+ */
+export async function xtermScroll(
+  page: Page,
+): Promise<{ viewportY: number; baseY: number; up: number; max: number }> {
+  return page.evaluate(() => {
+    const host = document.querySelector('.xterm')?.parentElement as
+      | (HTMLElement & { __xtermForTests?: { buffer: { active: { viewportY: number; baseY: number } } } })
+      | null
+    const term = host?.__xtermForTests
+    if (!term) throw new Error('no xterm instance on the page (dev build only)')
+    const { viewportY, baseY } = term.buffer.active
+    return { viewportY, baseY, up: baseY - viewportY, max: baseY }
+  })
+}
+
+/**
+ * Scroll the buffer by `lines` (negative = up into history), the way the
+ * product's own touch-drag does (`use-live-term.ts` converts a drag to
+ * `term.scrollLines`).
+ *
+ * Preferred over `Shift+PageUp` when the spec does NOT want the terminal
+ * focused: paging needs focus, and blurring afterwards closes the soft keyboard,
+ * which resizes the viewport, which refits xterm and re-pins it to the bottom —
+ * silently undoing the scroll the spec just performed.
+ */
+export async function xtermScrollLines(page: Page, lines: number): Promise<void> {
+  await page.evaluate((n) => {
+    const host = document.querySelector('.xterm')?.parentElement as
+      | (HTMLElement & { __xtermForTests?: { scrollLines: (n: number) => void } })
+      | null
+    host?.__xtermForTests?.scrollLines(n)
+  }, lines)
+}
+
+/** Scroll the terminal to the live bottom, the way the product does. */
+export async function xtermToBottom(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const host = document.querySelector('.xterm')?.parentElement as
+      | (HTMLElement & { __xtermForTests?: { scrollToBottom: () => void } })
+      | null
+    host?.__xtermForTests?.scrollToBottom()
+  })
+}
+
+/**
  * Dispatch a REAL one-finger vertical touch-drag of `totalPx` pixels (positive =
- * finger DOWN = reveal history → scrollTop decreases) over `steps` `touchmove`s
- * on `selector`, then return `.xterm-viewport` scrollTop before/after.
+ * finger DOWN = reveal history → the viewport moves UP into history) over
+ * `steps` `touchmove`s on `selector`, then return the terminal's buffer
+ * position (`buffer.active.viewportY`) before/after — see `xtermScroll` for why
+ * this is not `.xterm-viewport.scrollTop`.
  *
  * CROSS-ENGINE. Blink honours `new TouchEvent({ touches: [new Touch(...)] })`,
  * but WebKit silently drops the `touches` sequence (length 0 in the listener),
@@ -384,7 +484,10 @@ export async function touchDragY(
   return page.evaluate(
     async ({ selector, totalPx, steps }) => {
       const screen = document.querySelector(selector) as HTMLElement
-      const vp = document.querySelector('.xterm-viewport') as HTMLElement
+      const host = document.querySelector('.xterm')?.parentElement as
+        | (HTMLElement & { __xtermForTests?: { buffer: { active: { viewportY: number } } } })
+        | null
+      const at = () => host?.__xtermForTests?.buffer.active.viewportY ?? -1
       const r = screen.getBoundingClientRect()
       const x = r.left + r.width / 2
       const startY = r.top + r.height * 0.3
@@ -431,7 +534,7 @@ export async function touchDragY(
           }),
         )
       }
-      const before = vp.scrollTop
+      const before = at()
       fire('touchstart', startY)
       const step = totalPx / steps
       for (let i = 1; i <= steps; i++) {
@@ -442,7 +545,7 @@ export async function touchDragY(
       await new Promise((res) =>
         requestAnimationFrame(() => requestAnimationFrame(() => res(null))),
       )
-      return { before, after: vp.scrollTop, method }
+      return { before, after: at(), method }
     },
     { selector, totalPx, steps },
   )

@@ -20,7 +20,10 @@
 //   2. move the pointer OFF the card (neutral corner) → assert BOTH the picker
 //      AND the stopped-peek Resume trigger stay mounted (the pin holds — the
 //      regression guard). Pre-fix this is exactly when everything unmounted.
-//   3. pick the seeded conversation → the tmux command carries `--resume <id>`.
+//   3. pick the seeded conversation → the launched command carries
+//      `--resume <id>` (read from the native holder's own argv, plus
+//      `/api/sessions/{name}/peek` — both runtime-agnostic; the default runtime
+//      is native, not tmux).
 //   4. (no-degradation) after the picker closes, the surface collapses again.
 
 import { execFileSync } from 'node:child_process'
@@ -67,17 +70,28 @@ function seedConversation(
   writeFileSync(join(proj, `${id}.jsonl`), lines.join('\n') + '\n')
 }
 
-/** Capture the tmux pane content for a session. Empty string if no pane yet. */
-function capturePane(sessionName: string): string {
+/**
+ * The evidence that a resume really launched: the process table plus the
+ * session's visible terminal.
+ *
+ * NOT `tmux capture-pane` any more. A session created without an explicit
+ * `runtime` defaults to NATIVE (`sessions/mod.rs`), so there is no pane named
+ * `supermux-<name>` and this shelled out to "can't find pane" on every poll.
+ *
+ * The process table is the durable half: the launch line is typed into the
+ * holder's `/bin/bash`, so `claude --resume <CONV_ID>` shows up as a running
+ * process, and `CONV_ID` is a per-spec UUID. `peek` reads the visible 80×24
+ * grid, which the Claude TUI repaints within a second or two — useful for the
+ * banner check below, useless for the echoed command.
+ */
+async function capturePane(backend: Backend, sessionName: string): Promise<string> {
+  let table = ''
   try {
-    return execFileSync(
-      'tmux',
-      ['capture-pane', '-p', '-t', `supermux-${sessionName}`],
-      { encoding: 'utf8' },
-    )
+    table = execFileSync('ps', ['-eo', 'args'], { encoding: 'utf8' })
   } catch {
-    return ''
+    /* no process table (unlikely) */
   }
+  return `${table}\n${await api(backend).peek(sessionName, 200)}`
 }
 
 /** The resume reached the spawn iff the pane echoes `claude --resume <id>` OR
@@ -85,8 +99,12 @@ function capturePane(sessionName: string): string {
  *  machine where it's installed and clears the echoed shell line — its trust
  *  prompt / workspace banner is then the only proof the launch ran). Either
  *  means the picked id reached the launch builder. */
-function resumeLaunched(sessionName: string, id: string): boolean {
-  const out = capturePane(sessionName)
+async function resumeLaunched(
+  backend: Backend,
+  sessionName: string,
+  id: string,
+): Promise<boolean> {
+  const out = await capturePane(backend, sessionName)
   if (out.includes(`--resume ${id}`)) return true
   // claude TUI took over: its first-run banner / trust prompt is visible.
   return /Accessing workspace|trust this folder|Claude Code/i.test(out)
@@ -123,7 +141,12 @@ test.describe('resume picker — overview tile hover-pin (fix/resume-hover)', ()
     }
   })
 
-  test('Resume picker survives mouse-leave-to-picker, then resumes', async ({
+  // `@needs-claude`: the final poll asserts a real `claude --resume <id>` launch
+  // (or the TUI banner), which needs the `claude` CLI on PATH — absent on a
+  // hosted runner. CI excludes it via `--grep-invert`; it still runs in the
+  // un-filtered local `bun run test:e2e:smoke`. The hover-pin regression logic
+  // it guards is UI-only, but the assertion at the end is claude-dependent.
+  test('@needs-claude Resume picker survives mouse-leave-to-picker, then resumes', async ({
     page,
   }) => {
     test.setTimeout(60_000)
@@ -189,9 +212,9 @@ test.describe('resume picker — overview tile hover-pin (fix/resume-hover)', ()
     // The pick reached the spawn — the launch carries `--resume <id>` (proving
     // the picker was usable end-to-end after the mouse-leave).
     await expect
-      .poll(() => resumeLaunched(SESSION, CONV_ID), {
+      .poll(() => resumeLaunched(backend, SESSION, CONV_ID), {
         timeout: 20_000,
-        message: 'tmux pane should show the resumed claude launch',
+        message: 'the session terminal should show the resumed claude launch',
       })
       .toBe(true)
 

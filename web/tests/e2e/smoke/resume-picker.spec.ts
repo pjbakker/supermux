@@ -61,20 +61,42 @@ function seedConversation(
   writeFileSync(join(proj, `${id}.jsonl`), lines.join('\n') + '\n')
 }
 
-/** Capture the tmux pane content for a session and check for a needle. The
- *  launch builder echoes `claude --resume <id>` into the pane when tmux runs the
- *  shell line. */
-function paneContains(sessionName: string, needle: string): boolean {
+/**
+ * Did the launch really carry `--resume <CONV_ID>`?
+ *
+ * NOT `tmux capture-pane -t supermux-<name>` any more. A session created
+ * without an explicit `runtime` defaults to NATIVE (`sessions/mod.rs`), so
+ * there is no tmux pane to capture: every poll logged "can't find pane" until
+ * it timed out, and this spec — the only end-to-end proof that the picked
+ * conversation id reaches the launch — had not run in a fase.
+ *
+ * THE PROCESS TABLE, not the screen. Measured: the native holder's own argv is
+ * `pty-holder --session <name> … -- /bin/bash` (the launch line is TYPED into
+ * that shell, so it never appears there), and by the time the first poll lands
+ * the Claude TUI has already repainted over the echoed command — `peek` returns
+ * `Welcome to Claude Code v2.1.233` and nothing else, because it reads the
+ * visible 80×24 grid and not the scrollback. What IS durable is the launched
+ * process itself: `claude --resume <CONV_ID>` is running, and `CONV_ID` is a
+ * per-spec UUID, so a match anywhere in the table is unambiguous.
+ *
+ * `peek` is kept as a second read for the tmux runtime and for the window
+ * before the TUI takes over, where the echoed command line is still on screen.
+ */
+function processTableHas(needle: string): boolean {
   try {
-    const out = execFileSync(
-      'tmux',
-      ['capture-pane', '-p', '-t', `supermux-${sessionName}`],
-      { encoding: 'utf8' },
-    )
-    return out.includes(needle)
+    return execFileSync('ps', ['-eo', 'args'], { encoding: 'utf8' }).includes(needle)
   } catch {
     return false
   }
+}
+
+async function paneContains(
+  backend: Backend,
+  sessionName: string,
+  needle: string,
+): Promise<boolean> {
+  if (processTableHas(needle)) return true
+  return (await api(backend).peek(sessionName, 200)).includes(needle)
 }
 
 const CONV_ID = 'abcdef01-2345-6789-abcd-ef0123456789'
@@ -113,7 +135,8 @@ async function teardown(fx: Fixture | undefined): Promise<void> {
 }
 
 /** Drive: create stopped session in the seeded dir → open Resume → pick the
- *  conversation → assert the tmux command carries `--resume <CONV_ID>`. */
+ *  conversation → assert the launched command carries `--resume <CONV_ID>`,
+ *  read back through the server rather than through tmux (see `paneContains`). */
 async function runResumeFlow(
   page: Page,
   fx: Fixture,
@@ -145,11 +168,11 @@ async function runResumeFlow(
   await expect(row).toBeVisible()
   await row.click()
 
-  // The launched tmux command carries the picked conversation id.
+  // The launched command carries the picked conversation id.
   await expect
-    .poll(() => paneContains(name, `--resume ${CONV_ID}`), {
+    .poll(() => paneContains(fx.backend, name, `--resume ${CONV_ID}`), {
       timeout: 20_000,
-      message: 'tmux pane should show `claude --resume <id>`',
+      message: 'the launch should carry `claude --resume <id>`',
     })
     .toBe(true)
 }
@@ -163,7 +186,11 @@ test.describe('resume picker — desktop (chromium)', () => {
     await teardown(fx)
   })
 
-  test('Resume lists conversations and resumes with --resume <id>', async ({
+  // `@needs-claude`: the assertion is that the launch carries `claude --resume
+  // <id>`, which requires the real `claude` CLI on PATH. A hosted runner has
+  // none, so this can only be red there — CI excludes it via `--grep-invert`;
+  // it still runs in the un-filtered local `bun run test:e2e:smoke`.
+  test('@needs-claude Resume lists conversations and resumes with --resume <id>', async ({
     page,
   }) => {
     test.setTimeout(60_000)
@@ -217,7 +244,9 @@ test.describe('resume picker — mobile (touch / Vaul sheet)', () => {
     await teardown(fx)
   })
 
-  test('Resume works via the Vaul bottom sheet', async ({ page }) => {
+  // `@needs-claude` — same as the desktop resume test: asserts a real `claude
+  // --resume <id>` launch, absent on a hosted runner. Local-only via the grep.
+  test('@needs-claude Resume works via the Vaul bottom sheet', async ({ page }) => {
     test.setTimeout(60_000)
     await runResumeFlow(page, fx, 'resume-mobile', 'responsive-sheet')
   })

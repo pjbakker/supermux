@@ -13,12 +13,13 @@
  *
  * Usage:  bun run perf:size   (or  node scripts/size-budget.mjs)
  */
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { gzipSync } from 'node:zlib'
+import { brotliCompressSync, constants, gzipSync } from 'node:zlib'
 
 const KB = 1024
-const DIST = join(import.meta.dirname, '..', 'dist', 'assets')
+const DIST_ROOT = join(import.meta.dirname, '..', 'dist')
+const DIST = join(DIST_ROOT, 'assets')
 
 // Budgets in bytes (gzipped).
 // HERO-PATH gate (new, strict): the ENTRY chunk is what every cold load pays
@@ -261,6 +262,26 @@ const BUDGET_ENTRY_JS = 160 * KB
 // 239 at wave-3b integration (#93 + #94 on one tree): the two streams above
 // were measured against different parents; together they measure 233.91.
 // measured×1.02 policy: 233.91 × 1.02 = 238.59 -> 239. Entry gate unchanged.
+//
+// 239 HELD at fix/w4-infra-a11y: measured 237.10 on this branch rebased onto
+// `main` at 084b522 (the chat-theme lane), against 236.5x for that parent
+// alone — this lane's own cost is +0.51 KB and it fits inside the standing
+// ceiling, so the ceiling does not move. (The rule this ledger has followed
+// since the fix-wave-1 ratchet: a ceiling tracks real cost, and a PR that fits
+// under the current one does not get to raise it "while it is here".) The
+// ENTRY gate is the one worth watching — 159.06 / 160 KB, 99%, i.e. 0.94 KB of
+// headroom left across ALL lanes. The next additive change to the hero path
+// should code-split rather than spend. This lane's share of it:
+//   ~0.35 KB  `components/a11y/turn-announcer.tsx` + its mount in the focus
+//             route + the third claim in `live-region-owner.ts`. This is the
+//             turn announcement for the DEFAULT (terminal) renderer, which had
+//             none: instrumented over a real 75 s turn, the announcement
+//             timeline was empty. It sits on the hero path because the focus
+//             route is where a turn happens, and the chat chunk is lazy.
+//   ~0.16 KB  `teammate-chip.tsx`'s stretched activation button (the fix for a
+//             serious `nested-interactive`) and one `data-testid`.
+// The turn announcer is on the hero path because the focus route is where a
+// turn happens and the chat chunk is lazy; the chip fix is unavoidable markup.
 const BUDGET_APP_JS = 239 * KB
 const BUDGET_CSS = 30 * KB
 
@@ -338,6 +359,70 @@ for (const { label, actual, budget } of checks) {
     `${ok ? '✓' : '✗'} ${label.padEnd(14)} ${fmt(actual)} / ${fmt(budget)} budget (${pct}%)`,
   )
   if (!ok) failed = true
+}
+
+// ── COLD-LOAD HERO PATH (reported, NOT gated) ────────────────────────────────
+//
+// The gates above police the ENTRY CHUNK. That is the right thing to hold
+// tight, but it is not what a first-time visitor pays. Before the browser can
+// paint anything it also pulls index.html, every `modulepreload`ed vendor
+// chunk, both stylesheets, and the two `-core` font faces — and "vendor chunks
+// are cached independently" is true of the SECOND visit and false of the one
+// that FCP measures.
+//
+// Measured on a CDP Fast-3G preset (1.6 Mbps, 562.5 ms RTT), cache cleared,
+// DPR 1: FCP 3.82 s (unthrottled control 0.38 s), and the first tile carrying a
+// real session name at 4.78 s. The number below is what that 3.8 s is made of.
+// Brotli, because that is what the binary negotiates (`static_assets.rs`) —
+// except woff2, which is a Brotli container already and ships as-is.
+//
+// Reported rather than gated, deliberately: a gate needs a defensible number
+// and this one has never had an argued budget. Put it in the PR body, argue
+// reductions against it. The obvious candidates are the vendor chunks that the
+// OVERVIEW does not need — `vendor-framer` and most of `vendor-xterm` are
+// terminal-route weight sitting on the roster's critical path.
+function brSize(path) {
+  return brotliCompressSync(readFileSync(path), {
+    params: { [constants.BROTLI_PARAM_QUALITY]: 11 },
+  }).length
+}
+
+const indexHtml = join(DIST_ROOT, 'index.html')
+if (existsSync(indexHtml)) {
+  const html = readFileSync(indexHtml, 'utf8')
+  const hero = [{ what: 'index.html', bytes: brSize(indexHtml) }]
+
+  // Everything index.html tells the browser to fetch before first paint:
+  // the entry module, every modulepreload, and every stylesheet.
+  const refs = new Set()
+  for (const m of html.matchAll(/(?:href|src)="(\/assets\/[^"]+)"/g)) refs.add(m[1])
+  for (const ref of [...refs].sort()) {
+    const path = join(DIST_ROOT, ref.replace(/^\//, ''))
+    if (existsSync(path)) hero.push({ what: ref.replace('/assets/', ''), bytes: brSize(path) })
+  }
+
+  // The two unrestricted `-core` faces. The full patched faces are
+  // `unicode-range`-scoped to PUA glyphs and are NOT on this path (see
+  // `tests/unit/first-load-weight.test.ts`), so they are correctly absent.
+  const fontsDir = join(DIST_ROOT, 'fonts')
+  if (existsSync(fontsDir)) {
+    for (const name of readdirSync(fontsDir).sort()) {
+      if (!name.endsWith('-core.woff2')) continue
+      // woff2 IS a brotli container — the server never re-compresses it, so
+      // neither does this.
+      hero.push({ what: `fonts/${name}`, bytes: statSync(join(fontsDir, name)).size })
+    }
+  }
+
+  const heroTotal = hero.reduce((s, h) => s + h.bytes, 0)
+  console.log('\nCold-load hero path (brotli on the wire, first visit, empty cache):')
+  for (const h of hero) console.log(`  ${h.what.padEnd(36)} ${fmt(h.bytes)}`)
+  console.log(`  ${'—'.repeat(36)} ${'—'.repeat(9)}`)
+  console.log(`  ${'cold-load total (not gated)'.padEnd(36)} ${fmt(heroTotal)}`)
+  console.log(
+    '  ↑ what a first-time phone visitor downloads before the first tile.\n' +
+      '    Not a gate — a number to argue reductions against in the PR body.\n',
+  )
 }
 
 if (failed) {

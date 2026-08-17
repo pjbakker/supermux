@@ -432,7 +432,7 @@ import * as path from 'node:path'
 import { ChatMarkdown } from '../../src/components/chat/markdown/chat-markdown'
 import { toDisplayList, type ChatEntry } from '../../src/components/chat/entries'
 import { buildTranscript, entryLabels } from '../../src/components/chat/grouping'
-import { TranscriptItem } from '../../src/components/chat/transcript-item'
+import { ProseText, TranscriptItem } from '../../src/components/chat/transcript-item'
 
 /** One assistant message, through the frozen A1 model and the T3 shaping. */
 function assistantBubble(body: string): string {
@@ -515,12 +515,19 @@ describe('the lazy boundary', () => {
 
 describe('the Suspense fallback', () => {
   test('is the message itself, at the bubble’s own metrics', () => {
-    const html = assistantBubble('Ran `cargo check` on the workspace.\nClean.')
-    // No markdown chunk in a static render → the raw source, whitespace kept,
-    // so the block occupies the same height the typeset version will.
+    // The Suspense fallback IS `ProseText` (transcript-item.tsx). Render it
+    // directly rather than through `TranscriptItem`'s lazy boundary: whether
+    // renderToStaticMarkup shows the fallback or the resolved `ChatMarkdown`
+    // depends on whether any earlier test in the shared process already
+    // resolved the lazy import — order-dependent, and the reason this used to
+    // pass alone but fail in a full-suite run once CI started running it.
+    const html = renderToStaticMarkup(
+      <ProseText text={'Ran `cargo check` on the workspace.\nClean.'} mentions={KNOWN} />,
+    )
+    // The raw source, whitespace kept, so the block occupies the same height
+    // the typeset version will — no spinner, no skeleton, no empty box.
     expect(html).toContain('whitespace-pre-wrap')
     expect(text(html)).toContain('Ran `cargo check` on the workspace. Clean.')
-    // Nothing typeset yet — and no spinner, no skeleton, no empty box.
     expect(html).not.toContain('<p class=')
   })
 

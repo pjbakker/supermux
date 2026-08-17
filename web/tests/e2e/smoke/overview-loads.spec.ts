@@ -6,7 +6,7 @@
 // This proves the whole boot path holds together: binary → /api/sessions →
 // TanStack Query → tile/empty-state render.
 
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { expect, test } from '@playwright/test'
@@ -19,6 +19,15 @@ test.describe('overview loads', () => {
     backend = await startBackend()
   })
   test.afterEach(async () => {
+    // Unseed. `claudeConfigDir` can be SHARED across the whole run (see
+    // `Backend.claudeConfigDir`), so a team left on disk is visible to every
+    // spec that boots after this one — and this file's own first assertion is
+    // "a fresh backend must see no teams".
+    if (backend)
+      rmSync(join(backend.claudeConfigDir, 'teams', 'smoke-squad'), {
+        recursive: true,
+        force: true,
+      })
     await backend?.dispose()
   })
 
@@ -55,12 +64,17 @@ test.describe('overview loads', () => {
 
     // 3. Reload → at least one tile. The tile is a role=button with an
     //    aria-label "<title> — <status>"; the session name is the title.
+    //
+    //    ANCHORED AT THE START, deliberately. A bare /smoke-tile/ used to match
+    //    exactly one thing; the tile then grew a kebab labelled "More actions
+    //    for smoke-tile", so the same locator matched two buttons and every
+    //    assertion below died on a strict-mode violation. The tile's label
+    //    BEGINS with the session name and the kebab's does not, which is the
+    //    stable distinction between "the tile" and "a control on the tile".
     await page.reload()
-    const tile = page.getByRole('button', { name: /smoke-tile/ })
+    const tile = page.getByRole('button', { name: /^smoke-tile\b/ })
     await expect(tile).toBeVisible()
-    expect(await page.getByRole('button', { name: /smoke-tile/ }).count()).toBeGreaterThanOrEqual(
-      1,
-    )
+    expect(await tile.count(), 'exactly one tile, not the tile plus its kebab').toBe(1)
 
     // The empty state must be gone now that a session exists.
     await expect(
@@ -86,7 +100,13 @@ test.describe('overview loads', () => {
     }).then((r) => r.json())
     expect(before.data, 'a fresh backend must see no teams').toEqual([])
 
-    const teamDir = join(backend.dataDir, 'claude', 'teams', 'smoke-squad')
+    // `backend.claudeConfigDir`, NOT `join(dataDir, 'claude')`: Playwright loads
+    // every spec into the worker before running any, and
+    // `chat-renderer-switch.spec.ts` pins `$CLAUDE_CONFIG_DIR` at module scope
+    // — so from the first file load on, every backend reads teams from THAT
+    // dir. Seeding under `dataDir` wrote somewhere the server never looks, and
+    // this test passed alone and failed in a full run for that reason alone.
+    const teamDir = join(backend.claudeConfigDir, 'teams', 'smoke-squad')
     mkdirSync(teamDir, { recursive: true })
     writeFileSync(
       join(teamDir, 'config.json'),
