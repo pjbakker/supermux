@@ -60,12 +60,14 @@ import { RendererShell } from '@/components/chat/renderer-shell'
 import { useChatRenderer } from '@/components/chat/use-chat-renderer'
 import {
   chatPaneActive,
+  paneIsDead,
   terminalPaneMounts,
   type ChatRenderer,
 } from '@/components/chat/seam'
 import { useRenderer } from '@/components/chat/use-renderer-pref'
 import { togglePref } from '@/components/chat/renderer-pref'
 import { composerSessionInput } from '@/components/chat/composer-draft'
+import { useArmComposerFocus } from '@/components/chat/arm-composer-focus'
 
 // Lazy: the chat renderer is its own chunk — nothing chat-related may land in
 // the entry bundle (perf budget; master plan Global Constraints).
@@ -303,7 +305,10 @@ export function DesktopSplit({
   // session. `termGone` renders the same stopped surface the row-driven branch
   // does, and clears itself the moment the session runs again.
   const { gone: termGone, onTermState } = useTerminalGone(status)
-  const stopped = status === 'stopped' || termGone
+  // …and `holder_died` is the THIRD way to learn the same thing — the only one
+  // that reaches a chat surface, which has no terminal socket to hear the 4404
+  // on. See `chat/seam.ts`'s `paneIsDead`.
+  const stopped = paneIsDead(status, termGone, current?.error?.type)
 
   // Fase A1 chat renderer — the DESKTOP seam. The mobile one landed in A5
   // (routes/focus/mobile.tsx) and shares this file's decision verbatim, via
@@ -481,6 +486,12 @@ export function DesktopSplit({
     // see above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name, chatActive])
+
+  // …and the CHAT direction of the same arming. Without it a toggle to Chat
+  // left `document.activeElement` on `<body>`, so the surface the user just
+  // asked for swallowed its leading characters and handed the first `t` to the
+  // global renderer hotkey. See `chat/arm-composer-focus.ts`.
+  useArmComposerFocus(name, chatActive)
 
   const handleTermReady = React.useCallback((t: UseLiveTermResult) => {
     termRef.current = t
