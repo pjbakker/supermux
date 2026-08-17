@@ -339,6 +339,8 @@ async fn execute_boot(state: &AppState, sched: &Schedule) -> JobOutcome {
         prompt: None,
         unless_live_prefix: None,
         max_quiet_secs: None,
+        // Boots on the daemon default Claude login.
+        config_dir: None,
     };
     if let Err(e) = sessions::create(state, input).await {
         return JobOutcome {

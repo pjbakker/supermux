@@ -1430,6 +1430,7 @@ mod tests {
                 prompt: None,
                 unless_live_prefix: None,
                 max_quiet_secs: None,
+                config_dir: None,
             },
         )
         .await
