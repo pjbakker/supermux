@@ -121,9 +121,9 @@ The board hook protocol and the scheduler's watch mode both subscribe to the sam
 
 ## Database
 
-`server/migrations/0001..0041_*.sql` — applied at startup. Highlights:
+`server/migrations/0001..0041_*.sql`, applied at startup. Highlights:
 
-- `sessions` + `session_runtime` — the source-of-truth row per tmux session; ANSI-capture preview lives in `runtime`. `sessions.config_dir` (migration 0041) pins which Claude login a session boots on: it is exported as `CLAUDE_CONFIG_DIR` in the launch line for the `claude` provider, and the Resume picker and recall read that account's transcripts. Empty means the daemon default (`$CLAUDE_CONFIG_DIR` of the server process, else `~/.claude`).
+- `sessions` + `session_runtime`: the source-of-truth row per tmux session; ANSI-capture preview lives in `runtime`. `sessions.config_dir` (migration 0041) pins which Claude login a session boots on: it is exported as `CLAUDE_CONFIG_DIR` in the launch line of every session that launches `claude`, and the Resume picker and recall read that account's transcripts. Empty means the daemon default (`$CLAUDE_CONFIG_DIR` of the server process, else `~/.claude`). Local sessions only: a `config_dir` together with a `host_id` is a 400.
 - `issues` + `acceptance_items` + `issue_links` + `issue_tags` + `boards` + `delegations` — the board.
 - `schedules` + `schedule_runs` + `schedule_run_keys` — scheduler + idempotency.
 - `audit_log` — every mutation. Append-only.
@@ -140,6 +140,25 @@ the server process resolves. A second account therefore needs its `settings.json
 symlinked to the first account's file, which is how the second login is set up.
 Without that symlink the session still runs, but status detection falls back to
 the regex and pty heartbeat path instead of the hooks.
+
+The hooks are not the only daemon-scoped surface. Everything supermux installs
+or edits resolves the DAEMON's config dir from the server process environment,
+never the session's column, so a session on a second account does not inherit:
+
+- **Slash commands.** `agents/skills.rs` writes them to
+  `$CLAUDE_CONFIG_DIR/commands` of the server process, so a second-account
+  session sees none of the supermux-installed commands.
+- **MCP servers.** `claude_tools/atomic.rs` and `claude_tools/mcp.rs` edit the
+  daemon account's `.claude.json`, so supermux-managed MCP servers are missing
+  from the second account.
+- **Teammate scanning.** `teams/scan.rs` reads the daemon's teams/tasks files.
+  This one is currently unreachable: team start hard-codes `config_dir: None`,
+  so every teammate session runs on the daemon account anyway.
+
+Symlinking `commands/` and the MCP config into the second account is the same
+remedy as for `settings.json`. Without it the session works, it just lacks the
+supermux-installed extras, which is worth knowing before debugging it as
+"supermux is broken".
 
 ---
 
