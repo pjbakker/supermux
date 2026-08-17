@@ -639,7 +639,18 @@ pub async fn tick(
     // tick still re-captures within its cadence and its live tail keeps refreshing
     // on the overview (otherwise the preview freezes for the whole duration of the
     // agent's work — the reported mobile/desktop bug).
-    if status::should_skip_capture_within(last_pty, held, last_capture_at.elapsed(), tier) {
+    // …but NEVER skip while the persisted row says `stopped` and this detector
+    // still holds something else. That disagreement has exactly one cause: an
+    // external writer flipped the row without a reason — the pty reader's
+    // stream-dead path, which persists `stopped` ~100 ms after a holder dies and
+    // then rings this loop. Skipping there is what stretched "status says
+    // stopped, error says nothing" — a crash rendered as a deliberate Stop —
+    // from a tick into seconds. The capture the skip saves is precisely the one
+    // that would find `rt.alive() == false` and stamp the reason.
+    let row_says_dead = persisted == Some(Status::Stopped) && held != Status::Stopped;
+    if !row_says_dead
+        && status::should_skip_capture_within(last_pty, held, last_capture_at.elapsed(), tier)
+    {
         return Ok(held);
     }
 
@@ -676,10 +687,28 @@ pub async fn tick(
     // `Ok(false)` arm). A failed `claude --resume` leaves a bash prompt on the
     // pty, so "the terminal is alive" is true and meaningless — clearing on it
     // is precisely what turned a ghost session green again one tick after the
-    // heal admitted failure. While that latch is set the badge only clears on
-    // real evidence: a PROGRAM owning the pty (`shell_is_foreground() == false`)
-    // is the agent back at the wheel.
-    if !heal_failed_pending(name) || rt.shell_is_foreground().await == Some(false) {
+    // heal admitted failure.
+    //
+    // THE RELEASE CONDITION IS AGENT EVIDENCE, NOT "A PROGRAM IS RUNNING". This
+    // used to also clear on `shell_is_foreground() == Some(false)`, on the
+    // assumption that a failed resume always drops to bash. It does not:
+    // `claude --resume '<stale name>'` does not exit, it sits in claude's
+    // interactive Resume picker — which IS a program, so the escape hatch fired
+    // on the very next ~2s tick and the honest `resume failed: <link>` badge
+    // never reached a single client. A CLAUDE latch now only opens on a capture
+    // that shows the provider's own UI (`lifecycle::agent_at_the_wheel`, which
+    // excludes the picker and the trust dialog), deferred to the capture this
+    // tick is about to take (below).
+    //
+    // The strict rule is scoped to the provider that needs it
+    // (`agent_evidence_required`): every other provider's failed restart really
+    // does leave a shell, and their "agent UI" is a bash prompt nothing can
+    // match — so applying it to them would latch a badge that could never
+    // clear.
+    let heal_latched = heal_failed_pending(name) && agent_evidence_required(name);
+    if !heal_failed_pending(name)
+        || (!heal_latched && rt.shell_is_foreground().await == Some(false))
+    {
         clear_holder_death_badge(state, name);
     }
 
@@ -756,6 +785,17 @@ pub async fn tick(
     *last_capture_at = Instant::now();
     let capture = status::prepare_capture(&raw_ansi);
     let capture_ansi = status::prepare_capture_ansi(&raw_ansi);
+
+    // The claude latch, released on AGENT evidence (see the alive branch above).
+    // This is the first point in the tick where a capture exists, so it is the
+    // first point where "the agent is back" can be answered honestly.
+    if heal_latched && crate::sessions::lifecycle::agent_at_the_wheel(&capture) {
+        tracing::info!(
+            name = %name,
+            "the agent is at the wheel again after a failed heal — clearing the terminal-died badge",
+        );
+        clear_holder_death_badge(state, name);
+    }
 
     // Whether this session's Claude hooks are live (we have seen ≥1 hook POST).
     // A hooked session is authoritative off the turn state machine + content bank,
@@ -1208,13 +1248,49 @@ fn heal_is_supported(s: &db::sessions::Session) -> bool {
     if !s.cc_session_name.trim().is_empty() {
         return true;
     }
-    let conv = s.cc_conversation_id.trim();
-    if conv.is_empty() {
+    if s.cc_conversation_id.trim().is_empty() {
+        // No link at all: a restart cannot LOSE a place it never had, but it
+        // also cannot RESTORE one, so the automatic layer declines. The
+        // auto-wake seam reads this case differently (see [`dead_resume_link`]).
         return false;
     }
-    crate::sessions::resumable::project_dir_for(&s.dir)
+    dead_resume_link(s).is_none()
+}
+
+/// The conversation id this row still points at whose transcript is no longer on
+/// disk — i.e. a link that `claude --resume` will answer with "No conversation
+/// found with session ID: …" before EXITING, leaving a bash prompt wearing the
+/// session's name.
+///
+/// Split out of [`heal_is_supported`] because the two callers need different
+/// answers for one of its cases. Both refuse a PROVABLY dead link. But
+/// `heal_is_supported` also refuses a claude row with NO link at all (an
+/// automatic restart there is a fresh session, which is not a heal), while
+/// [`crate::sessions::lifecycle::send_harness_text`]'s auto-wake must allow it:
+/// starting a claude session that has never had a conversation is the ordinary
+/// first send, and it loses nothing. So the seam asks this narrower question —
+/// "is the row pointing at something that is gone?" — and `None` means "waking
+/// it is honest".
+pub(crate) fn dead_resume_link(s: &db::sessions::Session) -> Option<&str> {
+    if s.provider != "claude" {
+        return None;
+    }
+    // A `cc_session_name` link resolves through claude's own name index, which
+    // we do not own — it is left to the post-restart readiness proof.
+    if !s.cc_session_name.trim().is_empty() {
+        return None;
+    }
+    let conv = s.cc_conversation_id.trim();
+    if conv.is_empty() {
+        return None;
+    }
+    if crate::sessions::resumable::project_dir_for(&s.dir)
         .join(format!("{conv}.jsonl"))
         .exists()
+    {
+        return None;
+    }
+    Some(conv)
 }
 
 /// Attempt ONE automatic recovery of `name` after its terminal died.
@@ -1383,7 +1459,10 @@ pub async fn auto_heal(state: &AppState, name: &str, reason: &str) -> Heal {
 /// (~2s) and the ghost went green again. Cleared the moment a program actually
 /// owns the pty again (the alive tick probes it), on a successful heal, and on a
 /// manual recovery.
-static HEAL_FAILED: once_cell::sync::Lazy<dashmap::DashMap<String, ()>> =
+/// The value is "releasing this latch needs AGENT evidence" — true for the
+/// provider whose failed resume does not drop to a shell (see
+/// [`agent_evidence_required`]).
+static HEAL_FAILED: once_cell::sync::Lazy<dashmap::DashMap<String, bool>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 /// Is `name` sitting on a heal that came back without its agent?
@@ -1391,10 +1470,27 @@ fn heal_failed_pending(name: &str) -> bool {
     HEAL_FAILED.contains_key(name)
 }
 
+/// Does `name`'s latch need AGENT evidence to open, or is "a program owns the
+/// pty" enough?
+///
+/// Only `claude` needs the strict rule, and only because of one screen:
+/// `claude --resume '<stale>'` does not exit, it parks in claude's interactive
+/// Resume picker — a live program that satisfies `shell_is_foreground() ==
+/// Some(false)`, which is how the honest `resume failed: <link>` badge was wiped
+/// on the very next ~2 s tick and never reached a client.
+///
+/// Every other provider's failed restart really does leave a shell, and their
+/// "agent UI" is a bash prompt that `agent_ui_visible` cannot match — so
+/// applying the strict rule to them would latch a badge that nothing could ever
+/// clear. Narrowest fix that closes the bug and cannot invent a new one.
+fn agent_evidence_required(name: &str) -> bool {
+    HEAL_FAILED.get(name).map(|v| *v).unwrap_or(false)
+}
+
 /// Re-raise the terminal-died badge with the reason a heal failed, and latch it
 /// so the next alive tick does not wipe it off a pane that is only a shell.
-fn stamp_heal_failed(state: &AppState, name: &str, s: &db::sessions::Session) {
-    HEAL_FAILED.insert(name.to_string(), ());
+pub(crate) fn stamp_heal_failed(state: &AppState, name: &str, s: &db::sessions::Session) {
+    HEAL_FAILED.insert(name.to_string(), s.provider == "claude");
     let link = if !s.cc_session_name.trim().is_empty() {
         s.cc_session_name.trim()
     } else {
@@ -3504,6 +3600,131 @@ mod recovery_tests {
 
         reset_heal_state("stale");
         drop_transcript(cc);
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The two questions the auto-wake seam and the auto-heal ask are NOT the
+    /// same question, and collapsing them either way is a bug.
+    ///
+    /// `heal_is_supported` refuses a claude row with no link at all: an
+    /// automatic restart there is a FRESH session, which is not a recovery.
+    /// `dead_resume_link` — what `lifecycle::send_harness_text`'s auto-wake
+    /// consults — must NOT refuse that row: a first `/send` to a claude session
+    /// that has never had a conversation is the ordinary case and loses nothing.
+    /// Both must refuse the row that points at a transcript which is gone,
+    /// because THAT restart hands the user a bash prompt wearing the session's
+    /// name and eats whatever is typed next.
+    #[tokio::test]
+    async fn a_dead_link_is_refused_everywhere_but_a_missing_one_only_by_the_heal() {
+        let _serial = crate::sessions::native::test_serial().await;
+        let (state, dir) = test_state().await;
+        native_row(&state, "fresh", "claude", "stopped").await;
+        native_row(&state, "gone", "claude", "stopped").await;
+        native_row(&state, "kept", "claude", "stopped").await;
+        native_row(&state, "shelly", "shell", "stopped").await;
+        for (name, conv) in [("gone", "conv-vanished"), ("kept", "conv-here")] {
+            db::sessions::set_cc_conversation_id(&state.pool, name, conv).await.unwrap();
+        }
+        let cc = with_transcript("/tmp", "conv-here");
+
+        let row = |n: &'static str| {
+            let pool = state.pool.clone();
+            async move { db::sessions::get(&pool, n).await.unwrap().unwrap() }
+        };
+
+        let fresh = row("fresh").await;
+        assert_eq!(
+            dead_resume_link(&fresh),
+            None,
+            "a claude row with no link at all is a first start, not a dead link",
+        );
+        assert!(!heal_is_supported(&fresh), "…but it is still not a HEAL");
+
+        let gone = row("gone").await;
+        assert_eq!(
+            dead_resume_link(&gone),
+            Some("conv-vanished"),
+            "the seam must NAME the conversation that is no longer on disk",
+        );
+        assert!(!heal_is_supported(&gone));
+
+        let kept = row("kept").await;
+        assert_eq!(dead_resume_link(&kept), None, "a link with its transcript still there is live");
+        assert!(heal_is_supported(&kept));
+
+        let shelly = row("shelly").await;
+        assert_eq!(dead_resume_link(&shelly), None, "non-claude rows own their own continuity");
+
+        drop_transcript(cc);
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// THE LATCH RELEASE. `stamp_heal_failed` raises the honest
+    /// `resume failed: <link>` badge and latches it against the detector's alive
+    /// tick. That tick used to open the latch on `shell_is_foreground() ==
+    /// Some(false)` — "a program owns the pty" — on the assumption that a failed
+    /// resume always drops to bash.
+    ///
+    /// It does not. `claude --resume '<stale name>'` does not exit; it sits in
+    /// claude's interactive Resume picker, which IS a program. So the release
+    /// fired on the very next ~2 s tick and the badge never reached a single
+    /// client: a 130 s poll of `GET /api/sessions/<n>` saw error=null from +7 s
+    /// on. The release condition is now AGENT evidence, and these are the two
+    /// captures that must be told apart.
+    #[test]
+    fn the_resume_picker_is_not_evidence_that_the_agent_came_back() {
+        let picker = "\n Resume a conversation\n\n ❯ 1. fix the parser   2h ago\n   2. spike   3d ago\n";
+        assert!(
+            !crate::sessions::lifecycle::agent_at_the_wheel(picker),
+            "the Resume picker draws ❯ and is a running program — it is not the agent \
+             back at the wheel, and treating it as such is what wiped the badge",
+        );
+
+        let trust = "Do you trust the files in this folder?\n ❯ 1. Yes, I trust this folder\n";
+        assert!(
+            !crate::sessions::lifecycle::agent_at_the_wheel(trust),
+            "the first-run trust gate is a program too, and nothing is at the wheel behind it",
+        );
+
+        assert!(
+            crate::sessions::lifecycle::agent_at_the_wheel("╭─────╮\n│ > try \"fix\" │\n? for shortcuts"),
+            "claude's own composer IS the evidence",
+        );
+        assert!(
+            !crate::sessions::lifecycle::agent_at_the_wheel("user@host:~/work$ "),
+            "and a bare shell prompt never was",
+        );
+    }
+
+    /// …and the strict rule is scoped to the provider that needs it.
+    ///
+    /// A non-claude session's failed restart really does leave a shell, and a
+    /// bash prompt is a screen no `agent_ui_visible` heuristic can match — so
+    /// demanding agent evidence there would latch a badge nothing could ever
+    /// clear, which is a worse bug than the one being fixed.
+    #[tokio::test]
+    async fn only_claude_latches_need_agent_evidence_to_release() {
+        let (state, dir) = test_state().await;
+        native_row(&state, "cc", "claude", "stopped").await;
+        native_row(&state, "sh", "shell", "stopped").await;
+        reset_heal_state("cc");
+        reset_heal_state("sh");
+
+        for name in ["cc", "sh"] {
+            let s = db::sessions::get(&state.pool, name).await.unwrap().unwrap();
+            stamp_heal_failed(&state, name, &s);
+            assert!(heal_failed_pending(name), "the badge is latched either way");
+        }
+        assert!(agent_evidence_required("cc"), "the Resume-picker trap is claude's alone");
+        assert!(
+            !agent_evidence_required("sh"),
+            "a shell session keeps the original 'a program owns the pty' release",
+        );
+
+        reset_heal_state("cc");
+        reset_heal_state("sh");
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
     }
