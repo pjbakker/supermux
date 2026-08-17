@@ -205,15 +205,40 @@ export const SURVIVING_KINDS: ReadonlySet<ClassifiedPrompt['kind']> = new Set([
   'schedule',
 ] as const)
 
+/**
+ * The three tags one slash invocation's envelope is made of. Claude Code emits
+ * them in either order: BUILT-INS are name-first (`<command-name>/clear…`),
+ * MANAGED commands — anything in `~/.claude/commands` or `<dir>/.claude/commands`
+ * — are message-first (`<command-message>supermux-task…`). Host corpus: 253
+ * name-first, 7 message-first, and every one of the seven was a real command
+ * somebody ran.
+ */
+const COMMAND_ENVELOPE_TAGS: ReadonlySet<string> = new Set([
+  'command-name',
+  'command-message',
+  'command-args',
+])
+
 export function classifyPrompt(raw: string): ClassifiedPrompt {
   const trimmed = raw.trim()
-  const tag = leadingTag(trimmed)
-  if (!tag) {
+  const leading = leadingTag(trimmed)
+  if (!leading) {
     if (trimmed.startsWith('[Image: ')) {
       return { kind: 'image', text: trimmed.split('\n')[0] }
     }
     return { kind: 'prompt', text: sanitiseText(trimmed) }
   }
+  // CLASSIFY BY CONTENT, NOT BY THE LEADING TAG. Switching on the first tag gave
+  // the envelope one arm — `command-name` — so a message-first managed command
+  // fell to `default:` → `system`, which `SURVIVING_KINDS` does not carry: the
+  // user turn VANISHED from the transcript (the answer rendered with no question
+  // above it) and the composer's pending receipt never resolved against it.
+  // A `<command-name>` anywhere inside a command envelope is what makes it a
+  // command, whichever tag happens to open the string.
+  const tag =
+    COMMAND_ENVELOPE_TAGS.has(leading) && tagInner(trimmed, 'command-name') !== null
+      ? 'command-name'
+      : leading
   switch (tag) {
     case 'task-notification': {
       const status = tagInner(trimmed, 'status')
@@ -487,6 +512,18 @@ function num(body: unknown, key: string): number | undefined {
   return typeof v === 'number' ? v : undefined
 }
 
+/** `999996` → `1.0M`, `16752` → `17k`. Two significant figures is all a "how
+ *  much history went away" clause can support, and an exact token count would
+ *  read as a precision the number does not have. */
+function tokenCount(n: number): string {
+  const k = Math.round(n / 1_000)
+  // The promotion is on the ROUNDED value, not on the raw one: 999,996 tokens
+  // is "1.0M", never "1000k".
+  if (k >= 1_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${k}k`
+  return String(n)
+}
+
 function str(body: unknown, key: string): string | undefined {
   const v = field(body, key)
   return typeof v === 'string' && v.trim() ? v.trim() : undefined
@@ -501,10 +538,22 @@ function str(body: unknown, key: string): string | undefined {
  * naming both models is the whole content of a fallback notice — a warning that
  * says "model_refusal_fallback" tells the reader nothing they can act on.
  */
-function systemRow(w: WireEntry): { text: string; badge: string } | null {
+function systemRow(w: WireEntry): { text: string; badge: string; detail?: string } | null {
   if (w.kind === 'compact_boundary') {
+    // THE NUMBERS ARE THE POINT. "earlier turns are summarised" says the history
+    // above the seam is not what the model has any more; it does not say whether
+    // the user asked for that or the context filled up, nor how much went away —
+    // and the size of the drop is the only thing that explains why the model
+    // forgot something specific. All three fields are optional on the wire
+    // (`parser.rs` reads them defensively), so each clause appears only when the
+    // payload actually carried it.
+    const trigger = str(w.body, 'trigger')
+    const pre = num(w.body, 'pre_tokens')
+    const post = num(w.body, 'post_tokens')
+    const how = trigger === 'auto' ? ' automatically' : trigger === 'manual' ? ' on request' : ''
+    const size = pre && post ? ` · ${tokenCount(pre)} → ${tokenCount(post)} tokens` : ''
     return {
-      text: 'earlier turns are summarised',
+      text: `earlier turns are summarised${how}${size}`,
       badge: 'compaction',
     }
   }
@@ -556,6 +605,13 @@ function systemRow(w: WireEntry): { text: string; badge: string } | null {
       return {
         text: str(w.body, 'hint') === 'checkpoint' ? `${notice} · checkpointing` : notice,
         badge: 'limit',
+        // CLAUDE CODE'S OWN SENTENCE, UNDERNEATH — "[Usage limit reached — grace
+        // window active. Wrap up your current work and stop soon; do not start
+        // new tasks.]". The server has always shipped it and the row threw it
+        // away, leaving this app's paraphrase as the only account of why the
+        // agent suddenly stopped starting subagents. The paraphrase is what the
+        // reader scans; the verbatim line is what they check it against.
+        detail: str(w.body, 'content'),
       }
     }
     // A LONG-RUNNING MCP TASK (`mcp.task_input_required`). `input_required` is
@@ -736,9 +792,12 @@ export function toChatEntries(wire: readonly WireEntry[]): ChatEntry[] {
       const text = answerLine(w.body) ?? preview(toolResultText(w.body))
       if (text) target.reply = text
       // A DENIAL is a decision, not an output (`parser.rs::is_denial` labels
-      // it). Without the label the row read as "✓ Bash … → The user doesn't
-      // want to proceed" — a tick beside a refusal.
-      if (w.label === 'denied') target.label = 'denied'
+      // it). Without it the row read as "✓ Bash … → The user doesn't want to
+      // proceed" — a tick beside a refusal. It rides as its own FLAG rather than
+      // as the label, because the label is the tool's name and because the flag
+      // is what the receipt row reads: carried as a label it was write-only, and
+      // the row went on saying `failed · …` for something the user chose.
+      if (w.label === 'denied') target.denied = true
       // The receipt now carries a clipped tool OUTPUT; the flag belongs to the
       // row the user sees, which is the tool_use.
       if (w.truncated) target.truncated = true
@@ -831,6 +890,7 @@ export function toChatEntries(wire: readonly WireEntry[]): ChatEntry[] {
         ts: toSeconds(w.ts_ms),
         text: row.text,
         kind: row.badge,
+        reply: row.detail,
         truncated: w.truncated || undefined,
       })
       continue
@@ -859,8 +919,16 @@ export function toChatEntries(wire: readonly WireEntry[]): ChatEntry[] {
       // throwing away the reasoning the user had asked for. It renders
       // COLLAPSED, so the calm view is intact — the row is one line high until
       // somebody asks for the rest.
+      // RENDER ON THE METADATA, NOT ON THE BODY. Dropping the entry when the
+      // body was empty made this surface unreachable in practice: Claude Code
+      // 2.1.233 writes `{"type":"thinking","thinking":"","signature":"…"}` —
+      // 20,831 thinking blocks on the audit host, zero with any text — so the
+      // register claimed a disclosure no user of this product could ever see,
+      // and the one honest signal that IS on the wire (a reasoning phase
+      // happened, and for how long — what the terminal prints as "✻ Cogitated
+      // for 12s") went in the bin with it. The row stays COLLAPSED either way,
+      // so the calm view is unchanged; opened, an empty one says so.
       const text = sanitiseText(textOf(w.body))
-      if (!text) continue
       out.push({
         uuid: w.uuid,
         ts: toSeconds(w.ts_ms),

@@ -46,6 +46,17 @@ export interface ChatEntry {
    * and visibly no longer part of the conversation.
    */
   retracted?: boolean
+  /**
+   * `kind: 'tool_use'` only — the user DECLINED this call.
+   *
+   * A denial is not a failure: nothing broke, somebody decided. The server has
+   * always labelled it (`parser.rs::is_denial`, whose own comment says the label
+   * "is what lets the renderer say you declined this instead of drawing a
+   * success tick next to a refusal"), and the renderer went on printing
+   * `failed · The user doesn't want to proceed with this tool use…` — reporting
+   * a person's decision back to them as a broken tool.
+   */
+  denied?: boolean
 }
 
 export interface ReceiptLine {
@@ -53,6 +64,8 @@ export interface ReceiptLine {
   label: string
   ok?: boolean
   result?: string
+  /** The user declined this call — see `ChatEntry.denied`. */
+  denied?: boolean
 }
 
 export type ChatItem =
@@ -76,6 +89,17 @@ export type ChatItem =
       text: string
       badge?: string
       truncated?: boolean
+      /**
+       * The SOURCE's own words, under this app's summary of them.
+       *
+       * System rows are written in supermux's voice — "earlier turns are
+       * summarised", "Claude Code asked the agent to wrap up" — and for two of
+       * them the payload carries detail the summary cannot hold: the grace
+       * window's verbatim wrap-up instruction, which is the only evidence the
+       * reader has that Claude's sudden change of behaviour is not a bug in this
+       * app. Carried here so the row can show it without a second lookup.
+       */
+      detail?: string
     }
   | {
       type: 'assistant'
@@ -158,6 +182,7 @@ export function toDisplayList(entries: ChatEntry[]): ChatItem[] {
         label: e.text,
         ok: e.ok,
         result: e.reply,
+        denied: e.denied,
       }
       const last = out[out.length - 1]
       if (last && last.type === 'receipts') {
@@ -193,6 +218,7 @@ export function toDisplayList(entries: ChatEntry[]): ChatItem[] {
         text: e.text,
         badge: e.kind === 'prompt' ? undefined : e.kind,
         truncated: e.truncated,
+        detail: e.reply,
       })
     }
   }
