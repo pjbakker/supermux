@@ -1008,9 +1008,12 @@ pub struct CreateInput {
     /// Which Claude login this session boots on: the directory exported as
     /// `CLAUDE_CONFIG_DIR` in the launch line (migration 0100). Absolute path,
     /// existing directory, charset `[A-Za-z0-9._/-]`; anything else is a 400
-    /// (see [`valid_config_dir`]). Absent or blank keeps the daemon default,
-    /// which is what every existing client body does. Stored for any provider;
-    /// only `claude` acts on it.
+    /// (see [`valid_config_dir`]). LOCAL sessions only: combined with a
+    /// `host_id` it is a 400, because the directory is probed on this box while
+    /// the launch line would run on the remote host. Absent or blank keeps the
+    /// daemon default, which is what every existing client body does. Stored for
+    /// any provider; only a session that launches claude acts on it (see
+    /// [`lifecycle::launches_claude`]).
     #[serde(default)]
     pub config_dir: Option<String>,
     /// Stamp the created session so it auto-archives when it stops. Set by the
@@ -1093,7 +1096,22 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
     // launch line.
     let config_dir = match input.config_dir.as_deref().map(str::trim) {
         None | Some("") => String::new(),
-        Some(raw) => valid_config_dir(raw).map_err(AppError::BadRequest)?,
+        Some(raw) => {
+            // Local sessions only. `valid_config_dir` probes THIS box's
+            // filesystem, but a remote session's launch line runs over SSH on
+            // the host, where that path means nothing: we would refuse a dir
+            // that exists there and accept one that does not. Refuse the
+            // combination up front, the way native + host_id is refused above,
+            // rather than store a value the remote launch cannot honour.
+            if input.host_id.is_some() {
+                return Err(AppError::BadRequest(
+                    "config_dir is only supported for local sessions: a remote host's config \
+                     dir cannot be validated from here; drop host_id or drop config_dir"
+                        .into(),
+                ));
+            }
+            valid_config_dir(raw).map_err(AppError::BadRequest)?
+        }
     };
     // Spawn guard (`unless_live_prefix`). The lock is taken BEFORE the liveness
     // check and released only after the INSERT: check-then-insert has to be one
@@ -2129,7 +2147,15 @@ async fn resumable_handler(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("session '{name}'")))?;
     let dir = s.dir.clone();
-    let config_dir = s.config_dir.clone();
+    // Same rule as the launch line (migration 0100): the session's own config
+    // dir only applies when the session actually boots claude. A codex/kimi/
+    // shell row that carries one (via `duplicate`) reads the daemon's
+    // transcripts, exactly as it did before the column existed.
+    let config_dir = if lifecycle::launches_claude(&s.provider) {
+        s.config_dir.clone()
+    } else {
+        String::new()
+    };
     // Filesystem scan can touch large transcripts → off the async runtime.
     let list = tokio::task::spawn_blocking(move || resumable::list_for_dir(&config_dir, &dir))
         .await

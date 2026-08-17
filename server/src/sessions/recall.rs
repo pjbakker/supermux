@@ -282,7 +282,14 @@ pub async fn handler(
     // Clamp limit before crossing the thread boundary.
     let limit = q.limit.clamp(1, LIMIT_MAX);
     let dir = session.dir.clone();
-    let config_dir = session.config_dir.clone();
+    // Same rule as the launch line (migration 0100): a session's own config dir
+    // only applies when it actually boots claude, so a shell row that carries
+    // one (via `duplicate`) still recalls the daemon's transcripts.
+    let config_dir = if super::lifecycle::launches_claude(&session.provider) {
+        session.config_dir.clone()
+    } else {
+        String::new()
+    };
     let cc_id = session.cc_conversation_id.clone();
     let codex_id = session.codex_session_id.clone();
     let provider = session.provider.clone();

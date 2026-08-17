@@ -187,6 +187,46 @@ async fn bad_config_dirs_are_refused_with_400_and_no_row() {
     let _ = std::fs::remove_dir_all(data);
 }
 
+/// `config_dir` is validated against THIS box's filesystem, so it cannot be
+/// combined with a remote host: the launch line would run over SSH, where the
+/// path means something else (or nothing). The refusal is a 400 and leaves no
+/// row, so the caller can retry the same name without a config dir.
+#[tokio::test]
+async fn config_dir_with_a_remote_host_is_refused() {
+    let (state, app, data) = setup().await;
+    let account = temp_dir("remote-account");
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "name": "remote-second",
+            "dir": "/tmp",
+            "provider": "claude",
+            "host_id": 1,
+            "config_dir": account.to_string_lossy(),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("only supported for local sessions"),
+        "the 400 must name the reason: {body}"
+    );
+    assert!(
+        !db::sessions::exists(&state.pool, "remote-second")
+            .await
+            .unwrap(),
+        "a refused create must leave no session row"
+    );
+
+    let _ = std::fs::remove_dir_all(account);
+    let _ = std::fs::remove_dir_all(data);
+}
+
 /// Same encoding Claude (and `resumable.rs`) use: every `/` and `.` -> `-`.
 fn encode(abs: &str) -> String {
     abs.chars()
