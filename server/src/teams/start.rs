@@ -287,6 +287,8 @@ pub async fn start_team(
             // P3d — the LEAD inherits the caller's company (the handler already
             // forced a member's to their own; `None` for the owner path).
             company_id: input.company_id,
+            // Boots on the daemon default Claude login.
+            config_dir: None,
         },
     )
     .await?;
@@ -708,6 +710,7 @@ mod tests {
                 runtime: Some("native".into()),
                 model: None,
                 company_id: None,
+                config_dir: None,
             },
         )
         .await
@@ -759,6 +762,7 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                config_dir: None,
             },
         )
         .await
@@ -799,6 +803,7 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                config_dir: None,
             },
         )
         .await
@@ -846,6 +851,7 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                config_dir: None,
             },
         )
         .await

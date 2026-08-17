@@ -333,6 +333,11 @@ pub struct SessionView {
     /// unchanged — it is purely the PATCH result's advisory bit.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub restart_required: bool,
+    /// The Claude config dir this session boots on (migration 0041); the empty
+    /// string means the daemon default. ADDITIVE field, always present. The web
+    /// tile renders its last path segment as a small tag so the account a
+    /// session runs on is visible without opening the info panel.
+    pub config_dir: String,
     /// Last 6 lines of `last_capture`, ANSI-stripped.
     pub preview_lines: Vec<String>,
     /// Same last 6 lines, with SGR escape sequences preserved — the colour-true
@@ -677,6 +682,7 @@ fn view(
         // Only ever flipped true by `config_patch` on a launch-line change; every
         // other construction path (get/list/SSE) leaves it false → omitted.
         restart_required: false,
+        config_dir: s.config_dir.clone(),
         preview_lines: preview_lines(last_capture),
         preview_ansi: last_n_lines(last_capture_ansi, 20),
         activity: act.as_ref().and_then(|a| a.activity.clone()),
@@ -842,6 +848,41 @@ static CC_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9._-]{1,128}$
 /// string the charset admits that walks out of the project directory.
 pub(crate) fn valid_cc_id(id: &str) -> bool {
     CC_ID_RE.is_match(id) && !id.bytes().all(|b| b == b'.')
+}
+
+// The session's Claude config dir is interpolated into a shell launch line
+// (`export CLAUDE_CONFIG_DIR='<dir>'`, see `lifecycle::build_launch_command`),
+// so the charset is pinned at the boundary: letters, digits, `.`, `_`, `/`,
+// `-`. That excludes whitespace, quotes, `$`, backtick, `;`, `|`, `&` - the
+// whole shell-meta surface. The launch line quotes the value anyway; both
+// defences stay.
+static CONFIG_DIR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9._/-]{1,512}$").unwrap());
+
+/// Validate a session's Claude config dir: an ABSOLUTE path over
+/// `[A-Za-z0-9._/-]`, at most 512 chars, that exists on this host and is a
+/// directory. Returns the cleaned value (trimmed, no trailing `/`, so the web
+/// tag reads `.claude-second` rather than an empty segment) or the reason to
+/// put in the 400.
+pub(crate) fn valid_config_dir(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('/') {
+        return Err(format!("config_dir '{trimmed}' must be an absolute path"));
+    }
+    if !CONFIG_DIR_RE.is_match(trimmed) {
+        return Err(
+            "invalid config_dir (allowed: letters, digits, '.', '_', '/', '-'; max 512 chars)"
+                .to_string(),
+        );
+    }
+    let cleaned = trimmed.trim_end_matches('/');
+    // A path of only slashes trims to nothing; that is the root dir.
+    let cleaned = if cleaned.is_empty() { "/" } else { cleaned };
+    // `is_dir` follows symlinks and answers false for a missing path, so this
+    // one call covers both "must exist" and "must be a directory".
+    if !std::path::Path::new(cleaned).is_dir() {
+        return Err(format!("config_dir '{cleaned}' is not an existing directory"));
+    }
+    Ok(cleaned.to_string())
 }
 
 fn valid_provider(provider: &str) -> bool {
@@ -1175,6 +1216,14 @@ pub struct CreateInput {
     /// value is a 400 and writes no row). Absent = provider default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Which Claude login this session boots on: the directory exported as
+    /// `CLAUDE_CONFIG_DIR` in the launch line (migration 0041). Absolute path,
+    /// existing directory, charset `[A-Za-z0-9._/-]`; anything else is a 400
+    /// (see [`valid_config_dir`]). Absent or blank keeps the daemon default,
+    /// which is what every existing client body does. Stored for any provider;
+    /// only `claude` acts on it.
+    #[serde(default)]
+    pub config_dir: Option<String>,
     /// The company a new session is created into (migration 0032). Absent /
     /// null => a main bot (`company_id` NULL). When set, the create path forces
     /// `dir` under the company's `root_dir/<name>/`, IGNORING (overriding, never
@@ -1231,6 +1280,15 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
                 .into(),
         ));
     }
+    // Per-session Claude config dir (migration 0041). Absent or blank keeps the
+    // daemon default; a present value is validated HERE so a bad path is a 400
+    // before any row exists, and so nothing shell-meta can ever reach the
+    // launch line.
+    let config_dir = match input.config_dir.as_deref().map(str::trim) {
+        None | Some("") => String::new(),
+        Some(raw) => valid_config_dir(raw).map_err(AppError::BadRequest)?,
+    };
+
     if db::sessions::exists(&state.pool, &name).await? {
         return Err(AppError::Conflict(format!(
             "session '{name}' already exists"
@@ -1321,9 +1379,9 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         company_id: input.company_id,
         runtime: runtime_kind,
         model,
-        // Empty = the daemon default Claude config dir. The API field that lets
-        // a caller pick another account lands in a later step.
-        config_dir: String::new(),
+        // Empty = the daemon default Claude config dir; a non-empty value is
+        // the validated absolute path this session's Claude boots on.
+        config_dir,
     };
     db::sessions::create(&state.pool, &new).await?;
     let hook_token = gen_hook_token();
@@ -2777,6 +2835,31 @@ mod tests {
         assert!(!valid_cc_id(&too_long));
     }
 
+    /// `valid_config_dir` cleans what it accepts. The 400 cases that need a
+    /// live filesystem (missing dir, a file, shell-meta) are pinned end to end
+    /// in `tests/session_config_dir.rs`; this covers the pure-string edges that
+    /// an HTTP test cannot reach: surrounding whitespace, a trailing `/`, the
+    /// root dir, and the length cap.
+    #[test]
+    fn valid_config_dir_cleans_the_value() {
+        // `/tmp` exists on every host that runs this suite.
+        assert_eq!(valid_config_dir("/tmp").unwrap(), "/tmp");
+        assert_eq!(valid_config_dir("  /tmp  ").unwrap(), "/tmp");
+        // Trailing slashes go, so the web tag reads the last real segment.
+        assert_eq!(valid_config_dir("/tmp//").unwrap(), "/tmp");
+        // A path of only slashes IS the root dir, not an empty string.
+        assert_eq!(valid_config_dir("///").unwrap(), "/");
+        // Relative paths never reach the charset check.
+        assert!(valid_config_dir(".claude-second")
+            .unwrap_err()
+            .contains("absolute"));
+        // Length cap (>512 rejected) before the filesystem is touched.
+        let too_long: String = std::iter::once('/')
+            .chain(std::iter::repeat('a').take(512))
+            .collect();
+        assert!(valid_config_dir(&too_long).unwrap_err().contains("512"));
+    }
+
     // ── runtime seam: the `runtime` column, end to end ───────────────────────
 
     async fn test_state() -> (AppState, std::path::PathBuf) {
@@ -2821,6 +2904,7 @@ mod tests {
             runtime: None,
             model: None,
             company_id: None,
+            config_dir: None,
         }
     }
 

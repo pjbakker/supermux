@@ -101,6 +101,7 @@ async fn session_create_and_start_never_install_the_statusline() {
             runtime: Some("tmux".into()),
             model: None,
             company_id: None,
+            config_dir: None,
         },
     )
     .await

@@ -163,6 +163,7 @@ async fn make_session(state: &AppState, name: &str) {
             runtime: Some("tmux".into()),
             model: None,
             company_id: None,
+            config_dir: None,
         },
     )
     .await
