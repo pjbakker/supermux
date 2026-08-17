@@ -1,3 +1,10 @@
+import {
+  AutoHealToggle,
+  RecoveryLadder,
+} from '@/components/recovery/recovery-ladder'
+/** The `prefs` k/v key behind the automatic recovery switch. Mirrors
+ *  `db::prefs::AUTO_HEAL_PREF_KEY` — one string, both sides. */
+const AUTO_HEAL_KEY = 'recovery.auto_heal'
 import * as React from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
@@ -42,6 +49,8 @@ import {
   usePatchEnvKeys,
   useRegenerateToken,
 } from '@/hooks/use-settings'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { settingsApi } from '@/lib/api/settings'
 import {
   Row,
   Section,
@@ -263,6 +272,63 @@ function RegenerateTokenButton({ onRotated }: { onRotated: (token: string) => vo
  *  footnote + a disabled switch (NEVER red/alarmist — this is opt-in power, not a
  *  failure). The teammateMode is forced server-side and intentionally NOT
  *  user-facing. */
+/** B5/T8.4 — the CANONICAL recovery ladder, plus the automatic layer's switch.
+ *
+ *  Two gaps closed here. The manual rungs existed only as endpoints, so a user
+ *  whose terminal died had no vocabulary for what to press. And
+ *  `recovery.auto_heal` was a real, allowlisted pref with ZERO UI anywhere in
+ *  `web/src` — reachable only by hand-crafting a `PUT /api/prefs`, which means
+ *  in practice it could not be turned off at all.
+ *
+ *  The `#recovery` anchor is what the inline affordance on a dead tile links
+ *  to, so "More" lands on this section rather than the top of Settings. */
+function RecoverySection() {
+  const qc = useQueryClient()
+  const { data: autoHeal, isLoading } = useQuery({
+    queryKey: ['pref', AUTO_HEAL_KEY],
+    queryFn: () => settingsApi.getPref(AUTO_HEAL_KEY),
+  })
+  const [saving, setSaving] = React.useState(false)
+
+  // Absent means ON: the pref is the operator's off-switch, not an opt-in. A
+  // terminal dying under a running agent is a fault, and leaving it dead until
+  // a human notices is the incident this whole layer exists to end. Mirrors
+  // `db::prefs::auto_heal_enabled`, which reads the same way.
+  const enabled = !(
+    typeof autoHeal === 'string' && /^(off|false|0|no)$/i.test(autoHeal.trim())
+  )
+
+  const setEnabled = React.useCallback(
+    (next: boolean) => {
+      setSaving(true)
+      void settingsApi
+        .putPref(AUTO_HEAL_KEY, next ? 'on' : 'off')
+        .then(() => qc.invalidateQueries({ queryKey: ['pref', AUTO_HEAL_KEY] }))
+        .finally(() => setSaving(false))
+    },
+    [qc],
+  )
+
+  return (
+    <Section
+      title="Recovery"
+      footnote="Each option says what it keeps and what it clears. Pick the highest one that keeps what you still need — they are listed least-destructive first."
+    >
+      <div id="recovery" className="flex flex-col gap-2 p-3">
+        <AutoHealToggle
+          enabled={enabled}
+          onChange={setEnabled}
+          busy={saving || isLoading}
+        />
+        {/* No session in context here: the list is documentation as much as it
+            is a control. Hiding it when nothing is selected would leave the
+            vocabulary undiscoverable, which is the gap this section closes. */}
+        <RecoveryLadder />
+      </div>
+    </Section>
+  )
+}
+
 function ExperimentalSection() {
   const { data, isError } = useAgentTeams()
   const patch = usePatchAgentTeams()
@@ -438,7 +504,20 @@ interface NotifTypeSpec {
 /** The categories, in display order. Kept short on purpose — every extra
  *  toggle is another decision the user has to make AND another row in the
  *  Recent activity diagnostic. Each one maps 1:1 to a distinct
- *  `send_push_for(NotifCategory::*)` call site on the server. */
+ *  `send_push_for(NotifCategory::*)` call site on the server.
+ *
+ *  **All six ship ON** (B5, gate G2b). The upstream design had
+ *  `agent_finished` shipping OFF; that was declined, because the server already
+ *  carries three mitigations aimed at exactly that noise — a 2 s trailing
+ *  coalesce, a 15 s window for a team lead bouncing through idle, and a gate
+ *  that holds the ping while Task subagents are still in flight. Silently
+ *  muting a category people already receive is a worse trade than the noise
+ *  those three suppress. An explicit choice here always wins over the default,
+ *  in both directions.
+ *
+ *  These are the GLOBAL half of the mute. The per-BOT half lives in each
+ *  session's own info panel, and a push goes out only when both allow it —
+ *  see `BRAND.md` §6g for the full tier × policy × category table. */
 const NOTIF_TYPES: NotifTypeSpec[] = [
   {
     key: 'agent_waiting',
@@ -449,6 +528,14 @@ const NOTIF_TYPES: NotifTypeSpec[] = [
     key: 'agent_finished',
     label: 'Agent finished',
     hint: 'When an agent finishes its turn — ready for your review.',
+  },
+  {
+    // B5/T3.4 — the sixth category. Distinct from `agent_stopped`, which is the
+    // PROCESS going away: this is the agent still running and telling you, in
+    // its own words, that the work did not land.
+    key: 'agent_error',
+    label: 'Agent hit an error',
+    hint: 'When a turn ends in an error the agent could not recover from.',
   },
   {
     key: 'agent_stopped',
@@ -936,6 +1023,8 @@ export function Settings() {
           <ApiKeysSection />
 
           <ConnectionSection />
+
+          <RecoverySection />
 
           <ExperimentalSection />
 

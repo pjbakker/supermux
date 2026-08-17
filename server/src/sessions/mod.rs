@@ -114,10 +114,17 @@ pub fn router_for(state: AppState) -> Router {
             "/api/claude/statusline",
             axum::routing::delete(chat::statusline::uninstall_handler),
         )
+        // B5/T4 — the cross-device seen cursor. PATCH, not POST: it advances a
+        // value on the session rather than performing an action on it.
+        .route("/api/sessions/{name}/seen", axum::routing::patch(seen_handler))
+        // ── the manual recovery ladder (B5/T8) ──
+        // Labelled by what they PRESERVE, not by how drastic they sound; see
+        // `lifecycle`'s ladder table and BRAND.md §6h.
+        .route("/api/sessions/{name}/restart", post(restart_handler))
+        .route("/api/sessions/{name}/recover", post(recover_handler))
+        .route("/api/sessions/{name}/reset", post(reset_handler))
         .route("/api/sessions/{name}/archive", post(archive_handler))
         .route("/api/sessions/{name}/unarchive", post(unarchive_handler))
-        .route("/api/sessions/{name}/wake", post(wake_handler))
-        .route("/api/sessions/{name}/clone", post(clone_handler))
         // ── switch the Claude permission mode from the ⋯ menu ──
         .route("/api/sessions/{name}/mode", post(mode_handler))
         // ── reopen a past Claude conversation for the dir ──
@@ -190,6 +197,17 @@ pub struct SessionView {
     /// or `None`. Assignment is derived client-side; this is written only by the
     /// reroll affordance.
     pub mark_pin: Option<String>,
+    /// This bot's own notification policy (migration 0028) — the per-BOT half of
+    /// the mute decision, ANDed with the global per-category toggles. Always
+    /// present on the wire (never omitted), because the control has to render a
+    /// definite state and `inherit` is a real choice, not an absence.
+    pub notif: String,
+    /// The cross-device seen cursor (migration 0029), or `None` for never seen.
+    /// Same triple the client's `SeenCursor` carries, so the merge is
+    /// field-for-field.
+    pub seen_ts: Option<i64>,
+    pub seen_count: Option<i64>,
+    pub seen_epoch: Option<i64>,
     pub flags: String,
     pub branch: String,
     pub mcp: String,
@@ -317,6 +335,16 @@ fn view(s: &Session, rt: Option<&SessionRuntime>, act: Option<SessionActivity>) 
         // to the derived face either way, and normalising here keeps the wire
         // from carrying two spellings of the same absence.
         mark_pin: s.mark_pin.as_deref().filter(|v| !v.is_empty()).map(str::to_string),
+        // Normalised through `parse`, so a hand-edited junk value in the column
+        // reaches the client as `inherit` rather than as something its four-way
+        // control cannot render.
+        notif: crate::notify::NotifPolicy::parse(&s.notif).as_str().to_string(),
+        // B5/T4.3 — the stored cursor rides the row, so a device that has never
+        // seen this session starts correct instead of showing everything as
+        // unread until its first local read.
+        seen_ts: s.seen_ts,
+        seen_count: s.seen_count,
+        seen_epoch: s.seen_epoch,
         flags: s.flags.clone(),
         branch: s.branch.clone(),
         mcp: s.mcp.clone(),
@@ -890,17 +918,37 @@ pub async fn duplicate(
     src: &str,
     new_name: &str,
 ) -> Result<SessionView, AppError> {
-    let new_name = new_name.trim();
+    ensure_session(state, src).await?;
+    // T6.4 — the caller no longer has to invent a name. §15.1 asks for a
+    // `<name> copy` default, and an empty `new_name` is what requests it; a
+    // supplied name still wins, so every existing caller is unchanged.
+    let new_name = if new_name.trim().is_empty() {
+        next_copy_name(state, src).await?
+    } else {
+        new_name.trim().to_string()
+    };
+    let new_name = new_name.as_str();
     if !valid_name(new_name) {
         return Err(AppError::BadRequest("invalid new_name".into()));
     }
-    ensure_session(state, src).await?;
     if db::sessions::exists(&state.pool, new_name).await? {
         return Err(AppError::Conflict(format!(
             "session '{new_name}' already exists"
         )));
     }
     db::sessions::duplicate(&state.pool, src, new_name).await?;
+    // T6.2 — the schedules come too, DISABLED. Before B5 no child row was
+    // cloned at all, so "duplicate this agent" silently dropped its jobs. They
+    // arrive disabled because a copy that immediately starts firing cron jobs
+    // is a surprise, and the framing is "a bot is its own template", not "its
+    // own daemon" — the UI says so at the call site.
+    match db::schedules::copy_for_session(&state.pool, src, new_name).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(src = %src, new = %new_name, schedules = n, "duplicate: copied schedules (disabled)"),
+        // Best-effort: a session without its schedules is still a usable copy,
+        // and failing the whole duplicate over them would be worse.
+        Err(e) => tracing::warn!(src = %src, error = %e, "duplicate: could not copy schedules"),
+    }
     let hook_token = gen_hook_token();
     db::sessions::ensure_runtime(&state.pool, new_name, &hook_token).await?;
     state.hook_tokens.insert(new_name.to_string(), hook_token);
@@ -909,6 +957,29 @@ pub async fn duplicate(
     auto_actions::spawn_status_loop(state.clone(), new_name.to_string());
     steering::deliver_loop::spawn(state.clone(), new_name.to_string());
     get(state, new_name).await
+}
+
+/// The default name for a copy: `<name> copy`, then `<name> copy 2`, `3`, …
+///
+/// §15.1 asks for `<name> copy` with "the usual collision suffix". Slugs cannot
+/// hold spaces, so the separator is `-` — the DISPLAY name is what a user
+/// reads, and `duplicate` sets that to the new slug anyway.
+async fn next_copy_name(state: &AppState, src: &str) -> Result<String, AppError> {
+    let base = format!("{src}-copy");
+    if !db::sessions::exists(&state.pool, &base).await? {
+        return Ok(base);
+    }
+    // Bounded: 99 copies of one session is not a workflow, it is a runaway
+    // loop, and returning a clean error beats scanning forever.
+    for n in 2..100 {
+        let candidate = format!("{base}-{n}");
+        if !db::sessions::exists(&state.pool, &candidate).await? {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Conflict(format!(
+        "too many copies of '{src}' — name the next one yourself"
+    )))
 }
 
 /// Config patch — the tmux-free fields of `PATCH .../config`. `model`,
@@ -937,6 +1008,11 @@ pub struct ConfigInput {
     /// the override and returns the session to its derived face — the one way
     /// back, and the reason this is not a bare `Option<String>` meaning "unset".
     pub mark_pin: Option<String>,
+    /// Set this bot's notification policy (migration 0028): `inherit` | `all` |
+    /// `attention` | `off`. An unrecognised value is a 400 rather than a silent
+    /// coercion — mis-typing this would quietly change whether the user's phone
+    /// rings, which is exactly the class of failure that must be loud.
+    pub notif: Option<String>,
 }
 
 pub async fn config_patch(
@@ -1084,6 +1160,15 @@ pub async fn config_patch(
         .await?;
         changed = true;
     }
+    if let Some(v) = patch.notif {
+        let parsed = crate::notify::NotifPolicy::from_str(v.trim()).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "unknown notification policy '{v}' (expected inherit|all|attention|off)"
+            ))
+        })?;
+        db::sessions::set_notif_policy(&state.pool, &current, parsed).await?;
+        changed = true;
+    }
     if patch.toggle_pin.is_some() {
         db::sessions::toggle_pin(&state.pool, &current).await?;
         changed = true;
@@ -1219,6 +1304,11 @@ async fn purge_handler(
 
 #[derive(Debug, Deserialize)]
 struct DuplicateInput {
+    /// Optional since B5/T6.4: omit it (or send `""`) and the server picks
+    /// `<name>-copy`, with the usual collision suffix. §15.1 asks that the
+    /// caller not have to invent a name for what is conceptually "this one,
+    /// again".
+    #[serde(default)]
     new_name: String,
 }
 
@@ -1396,6 +1486,98 @@ async fn peek_handler(
     Ok(Json(json!({ "ok": true, "data": text })))
 }
 
+/// `PATCH /api/sessions/{name}/seen` — record where the user last read this
+/// session, so the cursor follows them across devices (B5/T4).
+///
+/// The body is exactly B2's `SeenCursor` shape (`attention-tiers.ts`), because
+/// this endpoint persists a client model that already exists rather than
+/// inventing a second one: `{ ts, count?, epoch? }`, `ts` in server-clock **ms**.
+///
+/// **Monotonic.** A cursor older than the stored one is a no-op with a 200, not
+/// a write and not an error. The scenario that forces this: a laptop tab that
+/// has been asleep for an hour wakes, replays its last known cursor, and would
+/// otherwise un-read on the phone every session the user has since caught up on.
+/// A 200 is right because nothing is wrong — the client's view was simply
+/// older, and `advanced: false` tells it so without asking it to handle a
+/// failure it cannot act on.
+///
+/// Authorised by the dashboard bearer like every other session route. The
+/// per-session hook token deliberately grants nothing here: hooks report what
+/// the AGENT did, and where a HUMAN last looked is not something an agent may
+/// assert (`tests/seen_cursor.rs` pins that).
+#[derive(serde::Deserialize)]
+pub struct SeenInput {
+    /// Server-clock milliseconds. Required — a cursor with no position is not
+    /// a cursor.
+    pub ts: i64,
+    /// `chat_tail.entry_count` at that moment, in the seq domain.
+    #[serde(default)]
+    pub count: Option<i64>,
+    /// The chat-store epoch `count` was recorded under.
+    #[serde(default)]
+    pub epoch: Option<i64>,
+}
+
+async fn seen_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(input): Json<SeenInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // 404 before the UPDATE, so a typo'd name is distinguishable from a
+    // regressive cursor — both would otherwise be "0 rows affected".
+    if !db::sessions::exists(&state.pool, &name).await? {
+        return Err(AppError::NotFound(format!("session '{name}'")));
+    }
+    let advanced =
+        db::sessions::set_seen(&state.pool, &name, input.ts, input.count, input.epoch).await?;
+    Ok(Json(json!({ "ok": true, "data": { "advanced": advanced } })))
+}
+
+/// `POST /api/sessions/{name}/restart` — atomic stop→start (rung 2).
+///
+/// Preserves the conversation, worktree and schedules; destroys the live pty.
+/// Exists because two clients composed this differently, and because a composed
+/// stop+start leaves a window in which the auto-healer can race the user.
+async fn restart_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let res = lifecycle::restart(&state, &name).await?;
+    Ok(Json(json!({ "ok": true, "data": res })))
+}
+
+/// `POST /api/sessions/{name}/recover` — the manual holder heal (rung 1).
+///
+/// Returns the `Heal` outcome as a string so the UI can say WHY nothing
+/// happened. Every non-`healed` outcome is a 200, not an error: "auto-heal is
+/// off" and "this session type cannot be healed" are ANSWERS, not failures, and
+/// modelling them as errors would push them into a generic red toast that says
+/// less than the word itself does.
+async fn recover_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let outcome = lifecycle::recover_holder(&state, &name).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "data": { "outcome": outcome.as_str(), "healed": outcome.healed() },
+    })))
+}
+
+/// `POST /api/sessions/{name}/reset` — a fresh runtime (rung 3).
+///
+/// Preserves the worktree, schedules and config; destroys the conversation and
+/// scrollback. Refuses a RUNNING session with a 409 rather than resetting under
+/// a live pty — see `lifecycle::reset` for why that split-brain is worse than
+/// the refusal.
+async fn reset_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    lifecycle::reset(&state, &name).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn archive_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -1416,23 +1598,6 @@ async fn unarchive_handler(
     // `sessions` SSE delta SYNCHRONOUSLY, so it returns 200 once the row is back.
     lifecycle::unarchive(&state, &name).await?;
     Ok(Json(json!({ "ok": true })))
-}
-
-async fn wake_handler(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let result = lifecycle::wake(&state, &name).await?;
-    Ok(Json(json!({ "ok": true, "data": result })))
-}
-
-async fn clone_handler(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(input): Json<DuplicateInput>,
-) -> Result<impl IntoResponse, AppError> {
-    let v = lifecycle::clone(&state, &name, &input.new_name).await?;
-    Ok((StatusCode::CREATED, ok(v)))
 }
 
 // ── permission mode ──────────────────────────────────────────────────────────
@@ -1859,6 +2024,7 @@ mod tests {
                 tags: None,
                 toggle_pin: None,
                 mark_pin: None,
+                notif: None,
                 toggle_auto_continue: None,
             },
         )
@@ -1899,6 +2065,7 @@ mod tests {
                 tags: None,
                 toggle_pin: None,
                 mark_pin: None,
+                notif: None,
                 toggle_auto_continue: None,
             },
         )
@@ -2037,6 +2204,7 @@ mod tests {
             tags: None,
             toggle_pin: None,
             mark_pin: Some(value.into()),
+            notif: None,
             toggle_auto_continue: None,
         }
     }
@@ -2068,6 +2236,7 @@ mod tests {
             tags: None,
             toggle_pin: None,
             mark_pin: None,
+            notif: None,
             toggle_auto_continue: None,
         }
     }

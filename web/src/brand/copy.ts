@@ -1,5 +1,12 @@
 // Microcopy — every empty / error / confirm string in one place, in one
-// voice. Later milestones import from here instead of inlining strings, so the
+// voice.
+//
+// B5/T11.3 swept the dead keys out: `CONNECTION` (zero importers — the chat
+// surface uses its own `CHAT_CONNECTION`), three `CONFIRM` entries, five
+// `ERROR` entries and three `EMPTY` entries that no surface rendered while
+// inlining their own strings instead. Dead copy is worse than missing copy: it
+// makes this file look like more coverage than exists, and nobody reviews a
+// string that is never on screen. Later milestones import from here instead of inlining strings, so the
 // voice stays consistent and a single edit fixes it everywhere.
 //
 // VOICE: builder-to-builder. Calm, direct, lowercase-friendly, technically
@@ -34,11 +41,6 @@ export interface ConfirmCopy {
 // ── Per-surface empty states ──────────────────────────────────────────────────
 
 export const EMPTY = {
-  sessions: {
-    title: 'No sessions yet',
-    body: 'Start one to put an agent to work. It runs in tmux and survives restarts.',
-    cta: 'New session',
-  },
   /** Renamed from `EMPTY.board` in fase B2 T10: the issues are no longer "on a
    *  board", they are on a session and on a team. The copy was dead code before
    *  (nothing rendered it); it is adopted by `components/issues/issue-list.tsx`
@@ -48,18 +50,10 @@ export const EMPTY = {
     body: 'Issues linked to this session show up here — an agent reports onto them with /supermux-task.',
     cta: 'New issue',
   },
-  files: {
-    title: 'Nothing here',
-    body: 'This directory is empty. Pick another path from the breadcrumb.',
-  },
   scheduler: {
     title: 'No scheduled jobs',
     body: 'Schedule a job to boot an agent or send a command on a cron expression.',
     cta: 'New job',
-  },
-  search: {
-    title: 'No matches',
-    body: 'Nothing matched that filter. Try a shorter query.',
   },
   stoppedSession: {
     title: 'This session is stopped',
@@ -71,32 +65,10 @@ export const EMPTY = {
 // ── Error states ──────────────────────────────────────────────────────────────
 
 export const ERROR = {
-  generic: {
-    title: 'That request failed',
-    body: 'The server returned an error. Check the logs, then try again.',
-    retry: 'Try again',
-  },
-  network: {
-    title: 'Can’t reach the server',
-    body: 'No response from supermux-server. It may be restarting or off the network.',
-    retry: 'Retry',
-  },
-  notFound: {
-    title: 'Not found',
-    body: 'This no longer exists. It may have been deleted or renamed.',
-  },
   sessionMissing: {
     title: 'tmux session is gone',
     body: 'supermux can’t find the underlying tmux session. Reattach, or remove it from supermux.',
     retry: 'Reattach',
-  },
-  unauthorized: {
-    title: 'Not authorized',
-    body: 'Your token was rejected. Reopen supermux from a trusted link to refresh it.',
-  },
-  fileTooLarge: {
-    title: 'File is too large to open',
-    body: 'This file exceeds the inline edit limit. Open it in the terminal instead.',
   },
 } satisfies Record<string, ErrorCopy>
 
@@ -115,29 +87,22 @@ export const CONFIRM = {
     confirm: 'Remove',
     cancel: 'Cancel',
   },
-  deleteIssue: {
-    title: 'Delete this issue?',
-    body: 'The card and its history are removed. This can’t be undone.',
-    confirm: 'Delete',
-    cancel: 'Cancel',
-  },
   deleteSchedule: {
     title: 'Delete this job?',
     body: 'The schedule stops and won’t run again. Past runs stay in the log.',
     confirm: 'Delete',
     cancel: 'Cancel',
   },
-  discardEdits: {
-    title: 'Discard changes?',
-    body: 'You have unsaved edits in this file. Leaving drops them.',
-    confirm: 'Discard',
-    cancel: 'Keep editing',
-  },
-  overwriteFile: {
-    title: 'Overwrite this file?',
-    body: 'A file with this name already exists. Saving replaces its contents.',
-    confirm: 'Overwrite',
-    cancel: 'Cancel',
+  // B5/T5.3 — archiving a session that is still running. Hoisted out of
+  // `use-session-actions.ts`, where it lived as an inline string, so the
+  // archive/schedule contract sentence below can be appended from ONE place
+  // and stay identical to the Archived sheet's (§15.5: "blocked things state
+  // why with the same sentence everywhere").
+  archiveRunningSession: {
+    title: 'Archive this running session?',
+    body: 'The agent stops, the terminal session ends, and the tile leaves the overview. You can restore it from the Archived sheet.',
+    confirm: 'Archive',
+    cancel: 'Keep running',
   },
   // mode-shift: bypass is launch-only, so switching to it RESTARTS the session.
   switchToBypass: {
@@ -169,13 +134,124 @@ export function killTeamLeadConfirm(teammateCount: number): ConfirmCopy {
   }
 }
 
-// ── Connection / status banner ────────────────────────────────────────────────
+// ── Lifecycle contracts (B5) ──────────────────────────────────────────────────
 
-export const CONNECTION = {
-  reconnecting: 'Reconnecting…',
-  connected: 'Back online',
-  offline: 'Offline — tap to retry',
+/** The one-sentence contracts behind supermux's lifecycle verbs. Each string
+ *  here has MORE THAN ONE call site by design — that is the whole point. §15.5
+ *  asks that a blocked or surprising thing "state why with the same sentence
+ *  everywhere", so the sentence lives here and the surfaces import it rather
+ *  than each inventing its own phrasing and drifting apart.
+ *
+ *  `BRAND.md` §6h carries the full verb-by-verb table; these are the strings
+ *  that table describes, and a change to one is a diff in both. */
+export const LIFECYCLE = {
+  /** B5/T5 — the archive/schedule contract, chosen at gate G4 (option a).
+   *  Rendered by BOTH the archive confirm and the Archived sheet. Before B5
+   *  the scheduler was archive-blind and an archived session was silently
+   *  restarted by its own schedule while staying hidden from the overview;
+   *  now archiving pauses the schedules and unarchiving resumes them, with
+   *  nothing mutated on the schedule rows. */
+  archivePausesSchedules:
+    'Scheduled jobs on an archived session are paused, and start running again when you restore it.',
+
+  /** B5/T7.3 — archive named as the undo window §15.3 asks for. It always WAS
+   *  the undo; it was simply never called one, so users reached for it without
+   *  knowing it was reversible (and reached past it for things that were not). */
+  archiveIsTheUndo:
+    'Archiving is reversible — restore a session any time from the Archived sheet.',
+
+  /** B5/T7.2 — the single most important sentence in the delete dialog. It is
+   *  first in the disposition table below and repeated here because it is the
+   *  fact users are most surprised by: supermux removes its own record of a
+   *  session, never your code. */
+  /** B5/T6.5 — the honest description of what "duplicate" produces.
+   *
+   *  `duplicate` copies `worktree`/`worktree_repo` as STRINGS and creates no
+   *  git worktree: the copy lands in the SOURCE'S directory. Leaving those
+   *  columns to imply a worktree that does not exist is the dishonesty §15.1
+   *  objects to, so the UI says where the copy actually goes — and, since
+   *  B5/T6.2, that its scheduled jobs come along switched off. */
+  duplicateIsATemplate:
+    'The copy runs in this same directory, and starts out with this agent\u2019s settings. Its scheduled jobs are copied but switched off.',
+
+  purgeLeavesYourFilesAlone:
+    'Your working directory, git branch and worktree are never touched — on archive or on delete.',
 } as const
+
+/** B5/T7.2 — what each destructive verb actually disposes of, as DATA.
+ *
+ *  R3 is that this dialog "becomes a lie the moment the handler changes": the
+ *  most surprising facts live in copy, not in code. The mitigation is that the
+ *  disposition is asserted from both ends — `server/tests/delete_disposition.rs`
+ *  asserts the behaviour, and `web/tests/unit/delete-honesty.test.tsx` asserts
+ *  that every row here reaches the screen. A handler change that forgets the
+ *  copy fails CI on one side or the other.
+ *
+ *  Ordered most-surprising-first, which is also least-destructive-sounding
+ *  first — the two happen to agree here. */
+export const PURGE_DISPOSITION = [
+  {
+    thing: 'Working directory, branch, worktree',
+    archive: 'Untouched',
+    purge: 'Untouched',
+  },
+  { thing: 'The session in supermux', archive: 'Hidden, restorable', purge: 'Deleted' },
+  {
+    thing: 'Conversation, tracked files, share links',
+    archive: 'Kept',
+    purge: 'Deleted',
+  },
+  { thing: 'Scheduled jobs', archive: 'Paused', purge: 'Stopped for good' },
+  { thing: 'Past schedule runs', archive: 'Kept', purge: 'Kept in the log' },
+  { thing: 'Scrollback', archive: 'Saved to a file', purge: 'Deleted' },
+] as const satisfies readonly {
+  thing: string
+  archive: string
+  purge: string
+}[]
+
+/** B5/T8 — the recovery ladder's vocabulary.
+ *
+ *  Every rung is named by WHAT IT PRESERVES, not by its mechanism. "Restart"
+ *  and "Reset" mean nothing to someone deciding under pressure whether they are
+ *  about to lose a conversation; "keeps your scrollback" and "clears the
+ *  conversation" do. The `destroys` half is never softened — it is the sentence
+ *  that prevents regret, and hiding it would make the ladder a trap.
+ *
+ *  Blocked rungs state WHY with the same sentence in both places they appear
+ *  (§15.5): the inline affordance on a dead tile, and the canonical list in
+ *  Settings. `BRAND.md` §6h carries the full table. */
+export const RECOVERY = {
+  recover: {
+    label: 'Recover terminal',
+    preserves: 'Keeps your scrollback and conversation.',
+    destroys: 'Nothing else changes.',
+  },
+  restart: {
+    label: 'Restart session',
+    preserves: 'Keeps the conversation, worktree and scheduled jobs.',
+    destroys: 'The live terminal and anything only on screen are lost.',
+  },
+  reset: {
+    label: 'Reset session',
+    preserves: 'Keeps the working directory, worktree, scheduled jobs and settings.',
+    destroys: 'The conversation, scrollback and activity are cleared.',
+  },
+  /** One string, two call sites — the inline action and the Settings list. */
+  recoverBlocked:
+    'Recovering in place works on local sessions running the built-in terminal. Restart works everywhere.',
+  /** Shown when the server answered but named no reason — should not happen. */
+  outcomeFallback: 'Nothing to recover.',
+  restartDone: 'Session restarted.',
+  resetDone: 'Session reset. Start it to begin a fresh conversation.',
+  failed: 'That did not work.',
+  /** The automatic layer, which had no UI at all before B5. */
+  autoHealLabel: 'Recover a terminal that dies on its own',
+  autoHealHint:
+    'When a session\u2019s terminal dies unexpectedly, bring it back automatically. Retries are rate-limited, and a session you stopped yourself is never restarted.',
+} as const
+
+// ── Connection / status banner ────────────────────────────────────────────────
 
 /**
  * Subagents, said out loud (fase A6 T4.1).

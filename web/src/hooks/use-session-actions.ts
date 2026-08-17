@@ -21,7 +21,8 @@ import { SESSIONS_KEY } from '@/hooks/use-sessions'
 import { ARCHIVED_SESSIONS_KEY } from '@/hooks/use-archived-sessions'
 import { useTeams } from '@/hooks/use-teams'
 import { useToast } from '@/components/ui/use-toast'
-import { CONFIRM, killTeamLeadConfirm } from '@/brand/copy'
+import { useConfirm } from '@/components/ui/confirm-dialog'
+import { CONFIRM, LIFECYCLE, killTeamLeadConfirm } from '@/brand/copy'
 
 export interface UseSessionActions {
   /** True while either action is mid-flight. Callers should disable their
@@ -51,6 +52,7 @@ export function useSessionActions(sessionName: string): UseSessionActions {
   const qc = useQueryClient()
   const { toast } = useToast()
   const { teams } = useTeams()
+  const confirm = useConfirm()
   const [busy, setBusy] = React.useState(false)
 
   const stop = React.useCallback(async () => {
@@ -63,13 +65,41 @@ export function useSessionActions(sessionName: string): UseSessionActions {
     const c = team
       ? killTeamLeadConfirm(team.members.length)
       : CONFIRM.killSession
-    if (!window.confirm(`${c.title}\n\n${c.body}`)) return
+    // B5/T9.3 — `window.confirm` could only render a string, which is why the
+    // team consequence had to be crammed into the body. The dialog enumerates
+    // it instead: each teammate that goes down is its own line.
+    const ok = await confirm({
+      ...c,
+      ...(team && team.members.length > 0
+        ? {
+            consequences: team.members.map(
+              (m) => `${m.name} stops with it (it is a pane in this session)`,
+            ),
+          }
+        : {}),
+    })
+    if (!ok) return
     setBusy(true)
+    // OPTIMISTIC head-start, lifted here from `routes/focus/desktop.tsx` when
+    // that route stopped reimplementing this (B5/T9.4). Flip the cached row to
+    // `stopped` the instant Stop is confirmed, so the header dot, the strip row
+    // and the dock all read stopped immediately — the user never perceives the
+    // server-side teardown as "it didn't work". The backend also broadcasts
+    // `stopped` over SSE, so this is only the head-start; the invalidate below
+    // backfills the authoritative row.
+    qc.setQueryData<ApiSession[]>(SESSIONS_KEY, (prev) =>
+      (prev ?? []).map((s) =>
+        s.name === sessionName ? { ...s, status: 'stopped' as const } : s,
+      ),
+    )
     try {
       await focusApi.stopSession(sessionName)
       void qc.invalidateQueries({ queryKey: SESSIONS_KEY })
       toast({ message: 'Session stopped', tone: 'waiting' })
     } catch (e) {
+      // The optimistic write said "stopped"; the server disagreed. Reconcile
+      // rather than leaving a tile lying about its state.
+      void qc.invalidateQueries({ queryKey: SESSIONS_KEY })
       toast({
         message: e instanceof Error ? e.message : 'Stop failed.',
         tone: 'error',
@@ -77,7 +107,7 @@ export function useSessionActions(sessionName: string): UseSessionActions {
     } finally {
       setBusy(false)
     }
-  }, [busy, sessionName, teams, qc, toast])
+  }, [busy, sessionName, teams, qc, toast, confirm])
 
   const archive = React.useCallback(
     async (opts?: { onAfterArchive?: () => void; confirm?: boolean }) => {
@@ -85,12 +115,21 @@ export function useSessionActions(sessionName: string): UseSessionActions {
       // Archive on a NOT-yet-stopped session also stops + tears down the pty
       // (server-side), so the desktop hover-kebab opts into a confirm for that
       // path. A stopped tile's archive is reversible from the Archived sheet,
-      // so it lands without a confirm (the default). Inline copy — small enough
-      // that hoisting to brand/copy.ts would be more code than the string.
+      // so it lands without a confirm (the default).
+      //
+      // B5/T5.3: the copy moved to `brand/copy.ts` and now carries the
+      // archive/schedule contract sentence — the SAME sentence the Archived
+      // sheet renders. Archiving pauses this session's scheduled jobs, which
+      // is the half of the transaction users could not previously see.
       if (opts?.confirm) {
-        const ok = window.confirm(
-          'Archive this running session?\n\nThe agent stops, the tmux session ends, and the tile leaves the overview. You can restore it from the Archived sheet.',
-        )
+        const c = CONFIRM.archiveRunningSession
+        const ok = await confirm({
+          ...c,
+          consequences: [
+            LIFECYCLE.archivePausesSchedules,
+            LIFECYCLE.archiveIsTheUndo,
+          ],
+        })
         if (!ok) return
       }
       setBusy(true)
@@ -115,7 +154,7 @@ export function useSessionActions(sessionName: string): UseSessionActions {
         setBusy(false)
       }
     },
-    [busy, qc, sessionName, toast],
+    [busy, qc, sessionName, toast, confirm],
   )
 
   return { busy, stop, archive }

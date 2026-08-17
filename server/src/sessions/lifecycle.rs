@@ -28,9 +28,8 @@ use super::runtime::SessionRuntime;
 use super::status::{self, Mode};
 use super::tmux::Tmux;
 use super::transport::HostId;
-use super::SessionView;
 
-/// Outcome of a `start`/`wake` (returned to the client).
+/// Outcome of a `start`/`restart` (returned to the client).
 #[derive(Debug, Serialize)]
 pub struct StartResult {
     pub name: String,
@@ -1177,7 +1176,15 @@ pub async fn send_text_with_preview(
     text: &str,
     preview_text: Option<&str>,
 ) -> Result<(), AppError> {
-    if !db::sessions::exists(&state.pool, name).await? {
+    // ARCHIVE CONTRACT (B5/T5): `exists_active`, never the archive-blind
+    // `exists`. This function AUTO-STARTS a session that is not alive (three
+    // lines down), so gating it on `exists` meant any caller — most visibly a
+    // schedule tick — silently resurrected an archived session: running again,
+    // yet still hidden from `list` (which filters `archived = 0`). The guard
+    // belongs here rather than only in the scheduler so a future job kind or
+    // delivery path cannot reintroduce the bug. An archived session is not a
+    // send target; unarchive it first.
+    if !db::sessions::exists_active(&state.pool, name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
     }
     let rt = state.runtime_for(name).await?;
@@ -1539,24 +1546,122 @@ pub async fn unarchive(state: &AppState, name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Wake a (possibly hibernated/stopped) session: clear the hibernate flag and
-/// start it if its tmux session is gone.
-pub async fn wake(state: &AppState, name: &str) -> Result<StartResult, AppError> {
-    if !db::sessions::exists(&state.pool, name).await? {
+// ── the manual recovery ladder (B5/T8) ──────────────────────────────────────
+//
+// The AUTOMATIC layer already existed and is good: holder supervision, the
+// `auto_heal` reaction with its 10-minute cooldown, and the "Terminal died"
+// badge. What did not exist was any way for a HUMAN to act on it. Clients
+// composed their own stop+start (and `focus/desktop.tsx` composed it
+// *differently* from `use-session-actions.ts`), there was no manual heal at
+// all, and no way back from a wedged runtime short of deleting the session.
+//
+// Three rungs, ordered by WHAT THEY PRESERVE rather than by how drastic they
+// sound — that ordering is the whole design, because "restart" and "reset" mean
+// nothing to someone deciding under pressure whether they are about to lose a
+// conversation:
+//
+//   | rung           | preserves                          | destroys                    |
+//   |----------------|------------------------------------|-----------------------------|
+//   | Recover holder | scrollback                         | nothing else                |
+//   | Restart        | conversation, worktree, schedules  | live pty + in-memory buffer |
+//   | Reset          | worktree, schedules, config        | conversation + scrollback   |
+//
+// `BRAND.md` §6h carries the same three sentences the UI shows.
+
+/// Rung 2 — **Restart**: stop and start as ONE server-side operation.
+///
+/// Exists because the client composed it, twice, differently. A composed
+/// stop+start also has a window: between the two calls the session is a stopped
+/// row that the detector, the auto-healer and any other client can all act on,
+/// and a heal landing in that gap races the user's own restart.
+///
+/// Preserves the conversation (Claude resumes it), the worktree and the
+/// schedules. Destroys the live pty and whatever scrollback lived only in it.
+pub async fn restart(state: &AppState, name: &str) -> Result<StartResult, AppError> {
+    if !db::sessions::exists_active(&state.pool, name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
     }
-    db::sessions::set_hibernated(&state.pool, name, false).await?;
-    let rt = state.runtime_for(name).await?;
-    if rt.alive().await {
-        return Ok(StartResult {
-            name: name.to_string(),
-            started: false,
-            ready: true,
-            target: rt.target(),
-        });
+    // A stop on an already-stopped session is not an error here: the user asked
+    // for the END STATE ("be running again"), and refusing because it was
+    // already down would make the button fail exactly when it is most needed.
+    if let Err(e) = stop(state, name).await {
+        tracing::debug!(name = %name, error = %e, "restart: stop was a no-op or failed; starting anyway");
     }
     start(state, name, None).await
 }
+
+/// Rung 1 — **Recover holder**: the manual trigger for `auto_heal`, deliberately
+/// bypassing its 10-minute cooldown.
+///
+/// The cooldown exists to stop the AUTOMATIC layer from fighting a session that
+/// dies repeatedly. A human pressing a button is not that loop: they have seen
+/// the badge, they know it just tried, and they are asking anyway. Making them
+/// wait out a cooldown they cannot see is the worst version of this feature.
+///
+/// Returns the `Heal` outcome verbatim so the caller can say WHY nothing
+/// happened — "auto-heal is off", "this session type cannot be healed" and "it
+/// tried and failed" are three different answers, and before B5 all three were
+/// a `tracing` line the user never saw.
+pub async fn recover_holder(state: &AppState, name: &str) -> Result<super::auto_actions::Heal, AppError> {
+    if !db::sessions::exists_active(&state.pool, name).await? {
+        return Err(AppError::NotFound(format!("session '{name}'")));
+    }
+    super::auto_actions::clear_heal_cooldown(name);
+    Ok(super::auto_actions::auto_heal(state, name, "manual").await)
+}
+
+/// Rung 3 — **Reset**: a fresh runtime for a session whose state is wedged.
+///
+/// Preserves everything the user thinks of as THEIRS — the working directory,
+/// the worktree, the branch, the schedules, the config, the session's identity
+/// and name. Destroys the conversation link, the scrollback and the activity
+/// state.
+///
+/// The session must be stopped first, and that refusal is deliberate rather
+/// than a convenience gap: resetting under a live pty would leave a running
+/// agent writing into a runtime row that no longer describes it, and the
+/// resulting split-brain is far harder to explain than a 409 telling the user
+/// to stop it first.
+pub async fn reset(state: &AppState, name: &str) -> Result<(), AppError> {
+    if !db::sessions::exists_active(&state.pool, name).await? {
+        return Err(AppError::NotFound(format!("session '{name}'")));
+    }
+    let rt = state.runtime_for(name).await?;
+    if rt.alive().await {
+        return Err(AppError::Conflict(format!(
+            "session '{name}' is still running — stop it before resetting"
+        )));
+    }
+
+    let lock = state.lock_for(name);
+    let _guard = lock.lock().await;
+
+    // A NEW hook token, not the old one. A reset is the answer to "something
+    // about this session's runtime is wrong", and a leaked or stale token is
+    // squarely in that set — reusing it would leave the one thing a reset
+    // cannot fix.
+    let token = uuid::Uuid::new_v4().to_string();
+    db::sessions::ensure_runtime(&state.pool, name, &token).await?;
+    db::sessions::set_last_status(&state.pool, name, "stopped").await?;
+    // Drop the conversation link: the next start begins fresh rather than
+    // resuming into whatever state was wedged.
+    db::sessions::clear_cc_conversation_id(&state.pool, name).await?;
+
+    // In-memory: the chat ring, the activity snapshot, and every per-session map.
+    if let Some(store) = state.chat_store(name) {
+        store.reset();
+    }
+    state.clear_activity(name);
+    state.clear_error(name);
+    state.clear_permission_request(name);
+    state.reset_turn_state(name);
+    state.clear_forced_status(name);
+
+    db::audit::log(&state.pool, "user", "session.reset", name, serde_json::json!({})).await?;
+    broadcast_status(state, name, "stopped");
+    Ok(())
+}
+
 
 // ── mode-shift: switch the permission mode from the UI ────────────────────────
 
@@ -1760,16 +1865,6 @@ fn broadcast_mode(state: &AppState, name: &str, mode: Mode) {
     });
 }
 
-/// Clone a session's config under `new_name` (fresh runtime + hook token). The
-/// git-worktree variant of clone is deferred (see agent notes); this mirrors
-/// `duplicate` so the new session is independently startable.
-pub async fn clone(
-    state: &AppState,
-    src: &str,
-    new_name: &str,
-) -> Result<SessionView, AppError> {
-    super::duplicate(state, src, new_name).await
-}
 
 // ── REST send_keys allowlist ─────────────────────────────────────────────────
 
@@ -1947,6 +2042,10 @@ mod build_env_tests {
             host_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session);
@@ -2000,6 +2099,10 @@ mod build_env_tests {
             host_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session);
@@ -2054,6 +2157,10 @@ mod build_env_tests {
             host_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
         };
 
         // Fresh: no cc handles → `--name`, not resume-intended.
@@ -2114,6 +2221,10 @@ mod build_env_tests {
             host_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
         };
 
         let (command, _resume) = build_launch_command(&config, &session);
@@ -2159,6 +2270,10 @@ mod build_env_tests {
             host_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
         };
 
         let (command, _resume) = build_launch_command(&config, &session);

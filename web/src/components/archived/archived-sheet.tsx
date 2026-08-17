@@ -22,10 +22,13 @@
 // UPPERCASE), spring transitions (springs.*), design tokens throughout.
 
 import * as React from 'react'
+
+import { useArmedConfirm } from '@/hooks/use-armed-confirm'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { Archive, RotateCcw, Trash2 } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
+import { Skeleton, SkeletonRegion } from '@/components/ui/skeleton'
 import { springs } from '@/lib/springs'
 import { ShellOverlay } from '@/components/shell/shell-overlay'
 import { StatusDot } from '@/components/session-tile/status-dot'
@@ -35,6 +38,7 @@ import {
   type UseArchivedSessionsResult,
 } from '@/hooks/use-archived-sessions'
 import { displayLabel, type ApiSession } from '@/lib/api'
+import { LIFECYCLE, PURGE_DISPOSITION } from '@/brand/copy'
 
 export interface ArchivedSheetProps {
   open: boolean
@@ -64,6 +68,15 @@ export function ArchivedSheet({ open, onOpenChange }: ArchivedSheetProps) {
   const recovery = useArchivedSessions(open)
   const { archived, isLoading, isError } = recovery
 
+  // B5/T7.2 — the bulk-delete confirm is armed in the header's trailing slot,
+  // but the disposition it needs to state is far too big to live on that
+  // 28px-high row. Lifting just the armed flag lets the table render in the
+  // sheet BODY, where there is room to be honest, while the buttons stay where
+  // the user's finger already is.
+  // B5/T9.2 keeps the flag lifted (rather than owning a hook here) precisely so
+  // the table above can see it; the ARMING itself lives in `DeleteAllAction`.
+  const [confirmingPurgeAll, setConfirmingPurgeAll] = React.useState(false)
+
   const count = archived.length
   const description = isLoading
     ? 'Loading…'
@@ -82,24 +95,38 @@ export function ArchivedSheet({ open, onOpenChange }: ArchivedSheetProps) {
       // list, keeps the action discoverable at the same eye line as the count
       // it modifies ("N items · delete them all").
       descriptionTrailing={
-        count > 0 ? <DeleteAllAction recovery={recovery} /> : null
+        count > 0 ? (
+          <DeleteAllAction
+            recovery={recovery}
+            onArmedChange={setConfirmingPurgeAll}
+          />
+        ) : null
       }
       className="sm:max-w-md"
     >
       <div className="px-2 py-2 sm:px-3">
+        {/* B5/T7.2 — the disposition, shown at the moment it is decided rather
+            than buried in docs. Only while the irreversible bulk delete is
+            armed: on the resting sheet it would be a wall of rules about an
+            action nobody has reached for. */}
+        {confirmingPurgeAll ? (
+          <div className="px-1 pb-2">
+            <DispositionTable />
+          </div>
+        ) : null}
         {isError ? (
           <p className="px-3 py-10 text-center text-sm text-muted-foreground">
             Couldn’t load archived sessions.
           </p>
         ) : isLoading && count === 0 ? (
-          <div className="flex flex-col gap-1">
+          <SkeletonRegion
+            label="Loading archived sessions…"
+            className="flex flex-col gap-1"
+          >
             {Array.from({ length: 3 }).map((_, i) => (
-              <div
-                key={i}
-                className="h-14 animate-pulse rounded-lg bg-muted/50"
-              />
+              <Skeleton key={i} className="h-14 rounded-lg bg-muted/50" />
             ))}
-          </div>
+          </SkeletonRegion>
         ) : count === 0 ? (
           <EmptyArchived />
         ) : (
@@ -111,6 +138,16 @@ export function ArchivedSheet({ open, onOpenChange }: ArchivedSheetProps) {
             </AnimatePresence>
           </ul>
         )}
+        {/* B5/T5.3 — the archive/schedule contract, stated where the archived
+            rows are. This is the SAME sentence the archive confirm renders
+            (`LIFECYCLE.archivePausesSchedules`), imported rather than retyped,
+            so the two can never drift. Shown only when there is something
+            archived: on an empty sheet it would be a rule about nothing. */}
+        {count > 0 && !isError ? (
+          <p className="px-3 pb-1 pt-3 text-[12px] leading-snug text-muted-foreground">
+            {LIFECYCLE.archiveIsTheUndo} {LIFECYCLE.archivePausesSchedules}
+          </p>
+        ) : null}
       </div>
     </ShellOverlay>
   )
@@ -121,11 +158,20 @@ export function ArchivedSheet({ open, onOpenChange }: ArchivedSheetProps) {
  *  fighting the per-row mutation otherwise). On confirm, fans out every
  *  archived row's purge in parallel; the sheet empties progressively as each
  *  request resolves. */
-function DeleteAllAction({ recovery }: { recovery: UseArchivedSessionsResult }) {
+function DeleteAllAction({
+  recovery,
+  onArmedChange,
+}: {
+  recovery: UseArchivedSessionsResult
+  /** B5/T7.2 — the arming lives HERE (it is this button's state), but the
+   *  disposition table it should reveal lives in the sheet body, where there is
+   *  room to be honest. So the flag is reported upward rather than owned there:
+   *  one source of truth, two places that need to see it. */
+  onArmedChange: (armed: boolean) => void
+}) {
   const { archived, purgeAll, pending } = recovery
   const { toast } = useToast()
   const reduce = useReducedMotion()
-  const [confirming, setConfirming] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
   // Lock out the bulk action while ANY individual purge is mid-flight to avoid
   // racing with a per-row delete-confirm the user already kicked off.
@@ -133,7 +179,6 @@ function DeleteAllAction({ recovery }: { recovery: UseArchivedSessionsResult }) 
   const count = archived.length
 
   const onPurgeAll = React.useCallback(async () => {
-    setConfirming(false)
     setBusy(true)
     try {
       const { ok, failed } = await purgeAll()
@@ -159,7 +204,14 @@ function DeleteAllAction({ recovery }: { recovery: UseArchivedSessionsResult }) 
   // Compact inline action sized to fit ON the description row (h-7 / text-xs)
   // so the sheet header gains zero vertical space vs the count alone. The
   // confirm morph keeps the same height so the row never reflows.
-  if (confirming) {
+  // B5/T9.2 — variant C → the shared idiom. Untimed before: "Delete all" armed
+  // and forgotten stayed one click from purging every archived session.
+  const confirming = useArmedConfirm({ onConfirm: () => void onPurgeAll() })
+  React.useEffect(() => {
+    onArmedChange(confirming.armed)
+  }, [confirming.armed, onArmedChange])
+
+  if (confirming.armed) {
     return (
       <motion.div
         initial={reduce ? false : { opacity: 0, x: 8 }}
@@ -169,7 +221,7 @@ function DeleteAllAction({ recovery }: { recovery: UseArchivedSessionsResult }) 
       >
         <button
           type="button"
-          onClick={() => setConfirming(false)}
+          onClick={confirming.cancel}
           disabled={anyPending}
           className="flex h-7 items-center rounded-md px-2 text-xs font-medium text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
         >
@@ -177,7 +229,7 @@ function DeleteAllAction({ recovery }: { recovery: UseArchivedSessionsResult }) 
         </button>
         <button
           type="button"
-          onClick={() => void onPurgeAll()}
+          onClick={confirming.press}
           disabled={anyPending}
           className="flex h-7 items-center gap-1 rounded-md bg-destructive px-2 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
         >
@@ -190,7 +242,7 @@ function DeleteAllAction({ recovery }: { recovery: UseArchivedSessionsResult }) 
   return (
     <button
       type="button"
-      onClick={() => setConfirming(true)}
+      onClick={confirming.press}
       disabled={anyPending}
       aria-label={`Delete all ${count} archived sessions forever`}
       className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
@@ -198,6 +250,41 @@ function DeleteAllAction({ recovery }: { recovery: UseArchivedSessionsResult }) 
       <Trash2 className="size-3.5" aria-hidden />
       Delete all
     </button>
+  )
+}
+
+/** B5/T7.2 — the disposition, rendered. "Delete forever" is the only truly
+ *  irreversible verb in supermux, and until now it asked for confirmation
+ *  without ever saying what it disposed of. This renders `PURGE_DISPOSITION`
+ *  row by row (archive vs purge, side by side) so the comparison the user is
+ *  actually making is on screen instead of in their head.
+ *
+ *  It is driven by the exported table rather than hand-written markup, and
+ *  `delete-honesty.test.tsx` asserts every row reaches the DOM — so a row added
+ *  to the table cannot be silently left out of the dialog (R3). */
+export function DispositionTable() {
+  return (
+    <div className="rounded-lg border border-border/60 bg-muted/30 p-2">
+      <p className="px-1 pb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        What happens
+      </p>
+      <dl className="flex flex-col gap-1">
+        {PURGE_DISPOSITION.map((row) => (
+          <div
+            key={row.thing}
+            className="flex items-baseline justify-between gap-3 px-1"
+          >
+            <dt className="text-[12px] text-muted-foreground">{row.thing}</dt>
+            <dd className="shrink-0 text-[12px] font-medium text-foreground">
+              {row.purge}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      <p className="px-1 pt-2 text-[11px] leading-snug text-muted-foreground">
+        {LIFECYCLE.purgeLeavesYourFilesAlone}
+      </p>
+    </div>
   )
 }
 
@@ -232,7 +319,6 @@ function ArchivedRow({
   const { restore, purge, pending } = recovery
   const { toast } = useToast()
   const reduce = useReducedMotion()
-  const [confirming, setConfirming] = React.useState(false)
   const busy = pending.has(session.name)
   const label = displayLabel(session)
 
@@ -245,13 +331,16 @@ function ArchivedRow({
   }, [restore, session.name, label, toast])
 
   const onPurge = React.useCallback(() => {
-    setConfirming(false)
     purge(session.name)
       .then(() => toast({ message: `Deleted ${label}` }))
       .catch(() =>
         toast({ message: 'Couldn’t delete session', tone: 'error' }),
       )
   }, [purge, session.name, label, toast])
+
+  // B5/T9.2 — variant C → the shared idiom. Untimed before: a row armed and
+  // forgotten was one click from an irreversible delete, indefinitely.
+  const confirming = useArmedConfirm({ onConfirm: onPurge })
 
   return (
     <motion.li
@@ -281,7 +370,7 @@ function ArchivedRow({
           </p>
         </div>
 
-        {confirming ? (
+        {confirming.armed ? (
           // Inline destructive confirm — the row morphs into "Cancel / Delete"
           // so a stray tap can never nuke a session. Matches the tile's
           // archive-confirm pattern.
@@ -293,7 +382,7 @@ function ArchivedRow({
           >
             <button
               type="button"
-              onClick={() => setConfirming(false)}
+              onClick={confirming.cancel}
               disabled={busy}
               className="flex h-11 items-center rounded-md px-3 text-[13px] font-medium text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
             >
@@ -323,7 +412,7 @@ function ArchivedRow({
             </button>
             <button
               type="button"
-              onClick={() => setConfirming(true)}
+              onClick={confirming.press}
               disabled={busy}
               aria-label={`Delete ${displayLabel(session)} forever`}
               title="Delete forever"

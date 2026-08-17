@@ -69,6 +69,27 @@ pub struct Session {
     /// backends under a live pane.
     #[serde(default)]
     pub runtime: String,
+    /// This bot's own notification policy (migration 0028): `inherit` | `all` |
+    /// `attention` | `off`. `#[serde(default)]` so a row read by a binary that
+    /// predates the column still deserialises; `notify::NotifPolicy::parse`
+    /// reads an empty or unrecognised value as `inherit`, which is the same
+    /// thing the column DEFAULT gives every backfilled row.
+    #[serde(default)]
+    pub notif: String,
+    /// Cross-device seen cursor (migration 0029) — server-clock **ms** at which
+    /// this session was last read. `None` = never seen, which `tierFor`
+    /// already treats as "not unread".
+    #[serde(default)]
+    pub seen_ts: Option<i64>,
+    /// `chat_tail.entry_count` when [`Self::seen_ts`] was recorded — the SEQ
+    /// domain, not the ring length.
+    #[serde(default)]
+    pub seen_count: Option<i64>,
+    /// The chat-store epoch [`Self::seen_count`] was recorded under. Counts are
+    /// only comparable within one epoch; across a mismatch the client renders a
+    /// dot rather than a number.
+    #[serde(default)]
+    pub seen_epoch: Option<i64>,
 }
 
 /// A row of the `session_runtime` table (ephemeral, persisted across restarts).
@@ -190,7 +211,17 @@ pub async fn ensure_runtime(
 }
 
 /// Delete a session. `session_runtime` and child rows cascade via FK.
+///
+/// `schedules` does NOT — its `session` column is a bare `TEXT` with no foreign
+/// key (`0003_schedules.sql`) — so the disposition is enforced in code here
+/// (B5/T7.1). Without it a deleted session's schedules kept firing, failing,
+/// and pushing an error notification to the user's phone every tick. Soft, so
+/// the `schedule_runs` ledger (which DOES cascade) survives.
 pub async fn delete(pool: &SqlitePool, name: &str) -> sqlx::Result<()> {
+    let disposed = super::schedules::soft_delete_for_session(pool, name).await?;
+    if disposed > 0 {
+        tracing::info!(session = %name, schedules = disposed, "disposed of schedules with their session");
+    }
     sqlx::query("DELETE FROM sessions WHERE name = ?")
         .bind(name)
         .execute(pool)
@@ -208,6 +239,16 @@ pub async fn purge_archived(pool: &SqlitePool, name: &str) -> sqlx::Result<u64> 
         .bind(name)
         .execute(pool)
         .await?;
+    // Schedules have no FK to cascade on (see [`delete`]), so dispose of them
+    // explicitly (B5/T7.1) — but only if the guarded DELETE actually removed
+    // the row. A purge that raced an unarchive removes nothing, and must
+    // therefore destroy nothing either.
+    if res.rows_affected() > 0 {
+        let disposed = super::schedules::soft_delete_for_session(pool, name).await?;
+        if disposed > 0 {
+            tracing::info!(session = %name, schedules = disposed, "disposed of schedules with their purged session");
+        }
+    }
     Ok(res.rows_affected())
 }
 
@@ -227,6 +268,66 @@ pub async fn list_runtimes(pool: &SqlitePool) -> sqlx::Result<Vec<SessionRuntime
     sqlx::query_as::<_, SessionRuntime>("SELECT * FROM session_runtime")
         .fetch_all(pool)
         .await
+}
+
+/// This bot's own notification setting (migration 0028).
+///
+/// Fails toward `Inherit`: a missing row, a DB error or a hand-edited junk
+/// value must never silently mute a session. Read on every send, so it is one
+/// indexed lookup on the primary key.
+pub async fn notif_policy(pool: &SqlitePool, name: &str) -> crate::notify::NotifPolicy {
+    let row: Option<(String,)> = sqlx::query_as("SELECT notif FROM sessions WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+    row.map(|(v,)| crate::notify::NotifPolicy::parse(&v))
+        .unwrap_or(crate::notify::NotifPolicy::Inherit)
+}
+
+/// Set this bot's notification setting (the four-way in its detail sheet).
+pub async fn set_notif_policy(
+    pool: &SqlitePool,
+    name: &str,
+    policy: crate::notify::NotifPolicy,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE sessions SET notif = ? WHERE name = ?")
+        .bind(policy.as_str())
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Advance this session's seen cursor — **monotonically** (B5/T4.2).
+///
+/// The `WHERE seen_ts IS NULL OR seen_ts < ?` guard is the whole contract, and
+/// it is enforced in SQL rather than read-modify-write on purpose: two devices
+/// can PATCH concurrently, and a compare-in-Rust would have a window where the
+/// older one wins. A cursor older than the stored one is a no-op, so a stale tab
+/// waking up from sleep cannot un-read a session on the phone.
+///
+/// Returns whether a row was actually advanced, so the handler can report the
+/// no-op honestly instead of implying a write.
+pub async fn set_seen(
+    pool: &SqlitePool,
+    name: &str,
+    ts: i64,
+    count: Option<i64>,
+    epoch: Option<i64>,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE sessions SET seen_ts = ?, seen_count = ?, seen_epoch = ?
+         WHERE name = ? AND (seen_ts IS NULL OR seen_ts < ?)",
+    )
+    .bind(ts)
+    .bind(count)
+    .bind(epoch)
+    .bind(name)
+    .bind(ts)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Does a session row exist? Used for clean 404/409 mapping before mutating.
@@ -343,16 +444,24 @@ pub async fn runtime_kind(pool: &SqlitePool, name: &str) -> sqlx::Result<Option<
 /// is reset and `created_at` refreshed; the caller seeds a fresh runtime row.
 /// The clone's `display_name` is set to its own new slug (not the source's
 /// label) so two sessions never share a confusing identical title.
+///
+/// The column list is EXPLICIT, not `SELECT *`, so a new column is opt-in: a
+/// copy silently inheriting something it should not is worse than one missing a
+/// field. `notif` (migration 0028) is opted in — a bot you have muted should
+/// stay muted in its copy, which is what "a bot is its own template" means
+/// (B5/T1.6). `mark_pin` (0027) likewise: §10 names "the copy carries the
+/// avatar" as one of the reasons that column is persisted at all, and the
+/// explicit column list had quietly omitted it (B5/T6.3).
 pub async fn duplicate(pool: &SqlitePool, src: &str, new_name: &str) -> sqlx::Result<()> {
     let now = chrono::Utc::now().timestamp();
     sqlx::query(
         "INSERT INTO sessions
             (name, display_name, dir, desc, provider, flags, pinned, auto_continue, auto_continue_msg,
              rate_limit_resume_text, tags, creator, branch, worktree, worktree_repo, mcp,
-             host_id, runtime, created_at)
+             host_id, runtime, notif, mark_pin, created_at)
          SELECT ?, ?, dir, desc, provider, flags, 0, auto_continue, auto_continue_msg,
                 rate_limit_resume_text, tags, creator, branch, worktree, worktree_repo, mcp,
-                host_id, runtime, ?
+                host_id, runtime, notif, mark_pin, ?
          FROM sessions WHERE name = ?",
     )
     .bind(new_name)
@@ -604,6 +713,21 @@ pub async fn set_cc_conversation_id(
 /// stale-recall bug. Conditional so a no-op hook doesn't write: only updates when
 /// the id actually changed, and never blanks a known id with an empty hook value.
 /// Returns whether a row was updated.
+/// Drop the Claude conversation link (B5/T8 — the Reset rung).
+///
+/// Separate from [`track_cc_conversation_id`], which deliberately treats an
+/// empty id as a no-op so a hook payload missing the field can never clobber a
+/// good link. Reset needs the opposite: an EXPLICIT clear, so the next start
+/// begins a fresh conversation instead of resuming into whatever was wedged.
+/// Two callers, two intents, two functions — rather than a flag on one.
+pub async fn clear_cc_conversation_id(pool: &SqlitePool, name: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE sessions SET cc_conversation_id = '' WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn track_cc_conversation_id(
     pool: &SqlitePool,
     name: &str,

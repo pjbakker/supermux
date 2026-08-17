@@ -7,6 +7,8 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { ToastProvider } from '@/components/ui/toast'
 import { Layout } from '@/components/layout'
 import { A2HSInstructionsSheet } from '@/components/pwa/a2hs-sheet'
+import { PushBridge } from '@/components/pwa/push-bridge'
+import { ConfirmDialogProvider } from '@/components/ui/confirm-dialog'
 import { OnboardingHost } from '@/components/onboarding/onboarding-host'
 import { useRendererPrefsSync } from '@/hooks/use-renderer-prefs-sync'
 import { ConnectionOverlay } from '@/components/connection/connection-overlay'
@@ -112,9 +114,22 @@ export default function App() {
                 provider. Routes that previously self-wrapped (scheduler) no
                 longer need their own. */}
             <ToastProvider>
+            {/* B5/T9.3 — the consequential-confirm host. Mounted once here so a
+                `useConfirm()` anywhere in the tree resolves against ONE dialog
+                rather than each surface hand-rolling an open flag and a pending
+                action. This is what let the last four `window.confirm` calls
+                go: an OS confirm can only render a string, which is why the
+                consequence enumeration was impossible before. */}
+            <ConfirmDialogProvider>
             {/* "Add to Home Screen" coaching sheet — self-gates to the
                 first iOS-Safari (non-standalone) load, then remembers dismiss. */}
             <A2HSInstructionsSheet />
+            {/* B5/T3 — the in-app half of the notification pipeline. Renders
+                nothing; it listens for the payloads the service worker
+                forwards, keeps the home-screen badge honest, and tells the SW
+                which lock-screen card has gone stale. Mounted here, inside the
+                providers, because it reads the sessions snapshot. */}
+            <PushBridge />
             {/* First-60-seconds unboxing — welcome banner + 4-step tour
                 (step 4 = Agent Teams explainer) for migrated v2 users;
                 self-gates to the first launch only. */}
@@ -286,6 +301,7 @@ export default function App() {
                 />
               )}
             </Routes>
+            </ConfirmDialogProvider>
             </ToastProvider>
           </TooltipProvider>
         </QueryClientProvider>

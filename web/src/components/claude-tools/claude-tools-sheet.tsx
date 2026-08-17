@@ -35,6 +35,9 @@
 // sentence-case copy, design tokens throughout.
 
 import * as React from 'react'
+
+import { useArmedConfirm } from '@/hooks/use-armed-confirm'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import {
   Activity,
@@ -65,6 +68,7 @@ import {
 } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
+import { Skeleton, SkeletonRegion } from '@/components/ui/skeleton'
 import { motionOff, springs } from '@/lib/springs'
 import { settingsRequest } from '@/lib/api/client'
 import { CONFIRM } from '@/brand/copy'
@@ -472,14 +476,25 @@ function ModeSectionInner({
   mode: SessionMode
 }) {
   const { toast } = useToast()
+  const confirm = useConfirm()
   const [busy, setBusy] = React.useState(false)
 
   const applyMode = React.useCallback(
     async (target: SessionMode) => {
       if (busy || target === mode) return
       if (target === 'bypass') {
-        const c = CONFIRM.switchToBypass
-        if (!window.confirm(`${c.title}\n\n${c.body}`)) return
+        // B5/T9.3 — destructive-and-consequential: this RELAUNCHES the session
+        // and then skips every permission prompt. Two facts a two-press button
+        // cannot convey, and which `window.confirm` could only run together in
+        // one paragraph.
+        const ok = await confirm({
+          ...CONFIRM.switchToBypass,
+          consequences: [
+            'The session restarts and resumes the same conversation.',
+            'While bypassed, the agent runs tools without asking.',
+          ],
+        })
+        if (!ok) return
       }
       setBusy(true)
       try {
@@ -501,7 +516,7 @@ function ModeSectionInner({
         setBusy(false)
       }
     },
-    [busy, mode, name, toast],
+    [busy, mode, name, toast, confirm],
   )
 
   return (
@@ -599,11 +614,14 @@ function ModeRow({
 
 function LoadingRows() {
   return (
-    <div className="flex flex-col gap-1.5 px-1 py-1">
+    <SkeletonRegion
+      label="Loading MCP servers…"
+      className="flex flex-col gap-1.5 px-1 py-1"
+    >
       {Array.from({ length: 4 }).map((_, i) => (
-        <div key={i} className="h-14 animate-pulse rounded-xl bg-muted/50" />
+        <Skeleton key={i} className="h-14 rounded-xl bg-muted/50" />
       ))}
-    </div>
+    </SkeletonRegion>
   )
 }
 
@@ -845,7 +863,9 @@ function McpRow({
   const reduce = useReducedMotion()
   const { toast } = useToast()
   const [expanded, setExpanded] = React.useState(false)
-  const [confirming, setConfirming] = React.useState(false)
+  // B5/T9.2 — variant C → the shared idiom. Untimed before, so a Remove armed
+  // and forgotten stayed live indefinitely; now it disarms after 4 s.
+  const confirming = useArmedConfirm({ onConfirm: () => onRemove() })
   const remove = useRemoveMcp()
   const toggle = useToggleMcp()
   const check = useCheckMcp()
@@ -861,7 +881,6 @@ function McpRow({
       health.status === 'timeout')
 
   const onRemove = () => {
-    setConfirming(false)
     remove
       .mutateAsync({
         name: entry.name,
@@ -1044,18 +1063,18 @@ function McpRow({
 
                 {/* remove (only when the entry's file is editable) */}
                 {entry.removable && (
-                  confirming ? (
-                    <div className="flex items-center gap-1.5">
-                      <RowAction onClick={() => setConfirming(false)} disabled={busy}>
+                  confirming.armed ? (
+                    <div className="flex items-center gap-1.5" role="status" aria-live="polite">
+                      <RowAction onClick={confirming.cancel} disabled={busy}>
                         Cancel
                       </RowAction>
-                      <RowAction onClick={onRemove} disabled={busy} icon={Trash2} tone="destructive">
+                      <RowAction onClick={confirming.press} disabled={busy} icon={Trash2} tone="destructive">
                         Remove
                       </RowAction>
                     </div>
                   ) : (
                     <RowAction
-                      onClick={() => setConfirming(true)}
+                      onClick={confirming.press}
                       disabled={busy}
                       icon={Trash2}
                       tone="destructive"

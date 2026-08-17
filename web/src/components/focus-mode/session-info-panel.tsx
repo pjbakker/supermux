@@ -34,6 +34,8 @@ import {
 } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
+import { NotifPolicyControl } from '@/components/focus-mode/notif-policy-control'
+import { LIFECYCLE } from '@/brand/copy'
 import { motionOff, springs } from '@/lib/springs'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import {
@@ -315,6 +317,13 @@ function PanelBody({
         )}
         {clone.pending ? 'Cloning…' : 'Clone agent in this directory'}
       </button>
+      {/* B5/T6.5 — say where the copy actually lands. `duplicate` copies the
+          worktree COLUMNS as strings and creates no git worktree, so the copy
+          runs in this same directory. Letting the columns imply otherwise is
+          the dishonesty §15.1 objects to. */}
+      <p className="px-1 pt-2 text-[12px] leading-snug text-muted-foreground">
+        {LIFECYCLE.duplicateIsATemplate}
+      </p>
     </div>
   )
 }
@@ -373,6 +382,20 @@ function SettingsRows({
           {session ? (worktree ? 'Yes' : 'No') : '—'}
         </span>
       </InfoRow>
+      {/* B5/T3.3 — the per-BOT notification policy. It lives HERE, in the bot's
+          own settings, rather than only in the global Settings list: that is
+          the whole point of the per-session column (migration 0028). The
+          effective decision is the AND of this and the global per-category
+          toggles, applied once on the server in `push::send_push_for`.
+          Full-width because it is a 4-way control, not a value. */}
+      <div className="flex flex-col gap-1.5 pt-1">
+        <dt className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          Notifications
+        </dt>
+        <dd>
+          <NotifPolicyControl name={name} value={session?.notif} />
+        </dd>
+      </div>
       {/* `name` is the stable identity even before the row loads — keep it as the
           row's accessible label fallback so the section is never empty. */}
       <span className="sr-only">Session {name}</span>

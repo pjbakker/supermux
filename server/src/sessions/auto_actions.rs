@@ -1075,7 +1075,7 @@ static LAST_HEAL: once_cell::sync::Lazy<dashmap::DashMap<String, Instant>> =
 
 /// Why a heal did or did not happen. Returned rather than logged-and-forgotten
 /// so the post-update audit can COUNT outcomes and the tests can assert them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Heal {
     /// A restart ran and the session is live again.
     Healed,
@@ -1095,6 +1095,47 @@ pub enum Heal {
     /// deciding: the user pressed Stop or Resume, or another lifecycle op holds
     /// the session lock. Their action wins.
     Superseded,
+}
+
+impl Heal {
+    /// The wire/UI identifier. Stable strings: they reach the sessions delta and
+    /// the recovery UI, and `BRAND.md` §6h pairs each with the sentence the user
+    /// reads (B5/T8.2).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healed => "healed",
+            Self::Failed => "failed",
+            Self::Disabled => "disabled",
+            Self::Cooldown => "cooldown",
+            Self::Unsupported => "unsupported",
+            Self::Gone => "gone",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    /// Did the session actually come back?
+    pub const fn healed(self) -> bool {
+        matches!(self, Self::Healed)
+    }
+
+    /// The one sentence the user reads for this outcome.
+    ///
+    /// Before B5 every one of these was a `tracing` line, so a user looking at
+    /// "Terminal died" could not tell "we tried and it is on cooldown" from
+    /// "auto-heal is off" from "this session type cannot be healed" — three
+    /// different situations with three different next actions, all rendered as
+    /// the same silence. Each sentence names what happened AND what to do.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Healed => "The terminal came back.",
+            Self::Failed => "The restart ran but the terminal did not come back. Try Restart.",
+            Self::Disabled => "Auto-recovery is off. Turn it on in Settings, or press Restart.",
+            Self::Cooldown => "This session was recovered a moment ago. Try Restart instead.",
+            Self::Unsupported => "This session type cannot be recovered in place. Try Restart.",
+            Self::Gone => "This session is archived or no longer exists.",
+            Self::Superseded => "Something else changed this session first — nothing was done.",
+        }
+    }
 }
 
 /// Fire-and-forget [`auto_heal`]. The detector tick must not block on a `start`
@@ -1146,6 +1187,18 @@ fn heal_is_supported(s: &db::sessions::Session) -> bool {
 /// `start`'s ordinary `starting → active` broadcasts, so the user sees a session
 /// that simply came back. The death is NOT hidden: it stays in `holder.log`, in
 /// the session dir's crash evidence, and in the WARN line this writes.
+/// Forget this session's heal cooldown, so the next [`auto_heal`] runs
+/// immediately (B5/T8.1).
+///
+/// The ONLY caller is the manual `POST /api/sessions/{name}/recover` rung. The
+/// cooldown exists to stop the AUTOMATIC layer from thrashing a session that
+/// dies repeatedly; a human pressing a button, having already seen the badge,
+/// is not that loop. Making them wait out a timer they cannot see would be the
+/// worst version of this feature.
+pub fn clear_heal_cooldown(name: &str) {
+    LAST_HEAL.remove(name);
+}
+
 pub async fn auto_heal(state: &AppState, name: &str, reason: &str) -> Heal {
     let s = match db::sessions::get(&state.pool, name).await {
         Ok(Some(s)) if s.archived == 0 => s,
@@ -1650,6 +1703,30 @@ fn push_should_fire(cat: crate::db::push::NotifCategory, last_status: &str, suba
     cat_matches && !(matches!(cat, NotifCategory::AgentFinished) && subagents > 0)
 }
 
+/// The detector's push path — now the FALLBACK, not the primary (B5/T2.2).
+///
+/// **Why this is gated.** `notify::notify_event` (the hook-anchored path) and
+/// this function perform the identical `pending_pushes.remove().abort()` +
+/// `insert()` dance on the same `DashMap`. A Claude session drives BOTH for one
+/// logical turn boundary — the `Stop` hook fires one, the detector observes
+/// `Idle` ~2 s later and fires the other — so left ungated they abort each
+/// other's timers in whichever order they happen to land. The failure is
+/// SILENT: a dropped push is indistinguishable from a muted one, and the
+/// surviving push may be composed by the wrong writer with different copy.
+/// (`tests/notify_one_writer.rs` pins this.)
+///
+/// So there is exactly one writer per session, chosen by provider:
+///
+/// * `claude` (including board / scheduler sessions) → the hook path owns it.
+///   This function returns early, having touched nothing.
+/// * `codex` / `kimi` / `shell` → no hooks exist, so this remains their ONLY
+///   route to a notification and stays fully live.
+///
+/// The two behaviours this path had grown that the hook path lacked — the 15 s
+/// team-finish window and `push_should_fire`'s subagent gate — moved into
+/// `notify.rs` (T2.3) BEFORE this demotion, not after, so nothing was lost in
+/// transit. The gate is one predicate (`notify::provider_emits_hooks`), which
+/// is what makes gate G2(a) reversible without a revert.
 pub fn maybe_push_on_transition(state: &AppState, name: &str, new: Status) {
     use crate::db::push::NotifCategory;
     let cat = match new {
@@ -1658,6 +1735,11 @@ pub fn maybe_push_on_transition(state: &AppState, name: &str, new: Status) {
         Status::Stopped => NotifCategory::AgentStopped,
         _ => return,
     };
+
+    // The provider read is a cheap PK lookup, but it is async and this function
+    // is sync, so the check rides inside the spawned task below rather than
+    // gating here. Reading it here would mean either blocking the detector loop
+    // or making every caller async for a branch that is usually `return`.
 
     // Two timers: the default 2s quiet window handles the bootup flurry; a
     // longer 15s window is used ONLY for "agent finished" on a team-tagged
@@ -1669,18 +1751,51 @@ pub fn maybe_push_on_transition(state: &AppState, name: &str, new: Status) {
     const T_DEFAULT: Duration = Duration::from_secs(2);
     const T_TEAM_FINISH: Duration = Duration::from_secs(15);
 
-    // Cancel any prior pending send for this session FIRST, then install the
-    // new task. Using `remove` (rather than `insert` + checking the return)
-    // lets us abort the prior handle before the new one is even spawned —
-    // there's no detector-loop concurrency for a single session, so no thread
-    // can squeeze a second insert in between.
-    if let Some((_, prev)) = state.pending_pushes.remove(name) {
-        prev.abort();
-    }
+    // B5/T2.2 — the one-writer gate runs BEFORE anything touches
+    // `pending_pushes`, and that ordering is the whole fix.
+    //
+    // The provider read is async and this function is sync (the detector loop
+    // calls it from a tick), so the gate rides in an outer task whose ONLY job
+    // is to decide. The debounce dance — cancel-prior, spawn, install — happens
+    // inside it, after the decision. Gating any later would mean this path had
+    // already aborted and removed the HOOK path's pending handle on its way to
+    // discovering it should not have run: the observable symptom is zero
+    // pushes for a turn that produced two writers, which is exactly what
+    // `notify_one_writer.rs` caught.
+    let gate_state = state.clone();
+    let gate_name = name.to_string();
+    tokio::spawn(async move {
+        // A lookup that fails falls through to the fallback: an unknown
+        // provider losing its notifications entirely is worse than an
+        // occasional duplicate.
+        let hooked = match db::sessions::get(&gate_state.pool, &gate_name).await {
+            Ok(Some(row)) => crate::notify::provider_emits_hooks(&row.provider),
+            _ => false,
+        };
+        if hooked {
+            tracing::trace!(
+                name = %gate_name,
+                "detector push skipped — this provider's notifications are hook-anchored",
+            );
+            return;
+        }
 
-    let task_state = state.clone();
-    let task_name = name.to_string();
-    let handle = tokio::spawn(async move {
+        // From here down this session has no hook path, so this IS its single
+        // writer and the original debounce applies unchanged.
+        //
+        // Cancel any prior pending send for this session FIRST, then install
+        // the new task. Using `remove` (rather than `insert` + checking the
+        // return) lets us abort the prior handle before the new one is even
+        // spawned — there's no detector-loop concurrency for a single session,
+        // so no thread can squeeze a second insert in between.
+        if let Some((_, prev)) = gate_state.pending_pushes.remove(&gate_name) {
+            prev.abort();
+        }
+
+        let task_state = gate_state.clone();
+        let task_name = gate_name.clone();
+        let handle = tokio::spawn(async move {
+
         let delay = if matches!(cat, NotifCategory::AgentFinished)
             && db::sessions::team_name(&task_state.pool, &task_name).await.ok().flatten().is_some()
         {
@@ -1730,7 +1845,17 @@ pub fn maybe_push_on_transition(state: &AppState, name: &str, new: Status) {
             _ => return,
         };
         let url = format!("/focus/{task_name}");
-        let n = crate::push::send_push_for(&task_state, cat, &title, &body, &url).await;
+        // B5/T1.4 — the payload shape. The tier is derived from the category
+        // rather than hard-coded: `AgentFinished` is the calm review-when-you-can
+        // tier, the other two genuinely interrupt. Passing the session lets the
+        // per-bot policy mute this lane, which is what that control is for.
+        let tier = match cat {
+            NotifCategory::AgentFinished => crate::notify::Tier::Unread,
+            NotifCategory::AgentStopped => crate::notify::Tier::Error,
+            _ => crate::notify::Tier::Attention,
+        };
+        let payload = crate::notify::PushPayload::simple(title, body, url, tier);
+        let n = crate::push::send_push_for(&task_state, cat, &payload, Some(&task_name)).await;
         if n > 0 {
             tracing::debug!(
                 name = %task_name,
@@ -1742,17 +1867,20 @@ pub fn maybe_push_on_transition(state: &AppState, name: &str, new: Status) {
         // The scheduled task has completed: clear its slot so the map doesn't
         // grow unboundedly. A new transition between the send finishing and
         // this remove will simply overwrite the slot, which is correct.
-        task_state.pending_pushes.remove(&task_name);
-    });
+            task_state.pending_pushes.remove(&task_name);
+        });
 
-    // Spawn → insert ordering note. We `tokio::spawn` BEFORE installing the
-    // abort handle, but the spawned task's first action is
-    // `tokio::time::sleep(delay).await` with `delay >= 2s`, so it cannot reach
-    // its `pending_pushes.remove(...)` bookkeeping until well after the insert
-    // below has completed on the calling task. Stale-slot scenarios are
-    // therefore unreachable as long as both `T_DEFAULT` and `T_TEAM_FINISH`
-    // stay well above scheduler-poll latency.
-    state.pending_pushes.insert(name.to_string(), handle.abort_handle());
+        // Spawn → insert ordering note. We `tokio::spawn` BEFORE installing the
+        // abort handle, but the spawned task's first action is
+        // `tokio::time::sleep(delay).await` with `delay >= 2s`, so it cannot
+        // reach its `pending_pushes.remove(...)` bookkeeping until well after
+        // the insert below has completed. Stale-slot scenarios are therefore
+        // unreachable as long as both `T_DEFAULT` and `T_TEAM_FINISH` stay well
+        // above scheduler-poll latency.
+        gate_state
+            .pending_pushes
+            .insert(gate_name.clone(), handle.abort_handle());
+    });
 }
 
 /// Last [`PREVIEW_LINES`] lines of the (already ANSI-stripped) capture — the tile
