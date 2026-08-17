@@ -27,11 +27,13 @@ import {
   loginCodeProblem,
   maskCode,
   readLogin,
+  loginOwnsScreen,
   readProviderAuth,
   reassembleUrl,
   type LoginStage,
   type ProviderAuthKind,
 } from '../../src/components/chat/login-lens'
+import { readLens } from '../../src/components/chat/peek-lens'
 
 interface CorpusRow {
   name: string
@@ -163,5 +165,69 @@ describe('the code field', () => {
     expect(masked).not.toContain('#')
     expect(masked).not.toContain('cQfTy')
     expect(masked).toMatch(/^•+$/)
+  })
+})
+
+/* ── the 2.1.233 screen, and the card that owns it ───────────────────────── */
+
+describe('what Claude Code 2.1.233 actually draws', () => {
+  const cc233 = (name: string) =>
+    capture({ file: `${name}.txt` } as CorpusRow)
+
+  test('the field is found THROUGH the footer the TUI draws under it', () => {
+    // The `cc233-*` captures came off a live pty (see the corpus' build.py):
+    // two blank rows and `Esc to cancel` sit BELOW the waiting field, and the
+    // in-session dialog is drawn under the composer's echo of `/login` and a
+    // box rule. Every earlier fixture ends ON the prompt, so a lens anchored to
+    // the last content row passed the whole corpus and then read `Esc to
+    // cancel` on the real screen: no card at all while an OAuth code was live.
+    const got = readLogin(cc233('cc233-paste-prompt'))
+    expect(got?.stage).toBe('paste_prompt')
+    expect(got?.url).toContain('claude.com/cai/oauth/authorize')
+  })
+
+  test('the field is still found once a code is IN it', () => {
+    // 2.1.233 does not mask this field — it echoes what was typed. A lens that
+    // only knew the masked shape went blind at the one moment the freeze has to
+    // hold: while the code is on the screen.
+    expect(readLogin(cc233('cc233-field-typed'))?.stage).toBe('paste_prompt')
+  })
+
+  test('a rejection under the same footer is a re-prompt, not a dead end', () => {
+    const got = readLogin(cc233('cc233-invalid'))
+    expect(got?.stage).toBe('invalid')
+    expect(got?.message).toBe('Invalid code. Please make sure the full code was copied')
+  })
+
+  test('an error screen never degrades into "still waiting"', () => {
+    // `Press Enter to retry.` is deliberately NOT treated as chrome: skipping
+    // it would let a stale paste row above win the read.
+    const got = readLogin(cc233('cc233-oauth-error'))
+    expect(got?.stage).toBe('error')
+    expect(got?.message).toBe('OAuth error: Request failed with status code 400')
+  })
+})
+
+describe('one sighting, one card', () => {
+  test('the method selector is seen by BOTH lenses, and the specific one wins', () => {
+    const cap = capture({ file: 'cc233-method-select.txt' } as CorpusRow)
+    const sighting = readLogin(cap)
+    expect(sighting?.stage).toBe('method_select')
+    // The generic dialog lens reads the same rows and — correctly — has no
+    // fingerprint for the screen, which is what drew a SECOND card with every
+    // option disabled and an attention row saying chat could not answer, beside
+    // a login card whose pills answered it fine.
+    const generic = readLens(cap).dialog
+    expect(generic?.family).toBe('unknown')
+    expect(generic?.options).toEqual(sighting!.options)
+    // So the precedence rule the panel applies has to say the login owns it.
+    expect(loginOwnsScreen({ sighting, providerAuth: readProviderAuth(cap) })).toBe(true)
+  })
+
+  test('an ordinary screen leaves the generic reader alone', () => {
+    const cap = capture({ file: 'negative-idle-composer.txt' } as CorpusRow)
+    expect(
+      loginOwnsScreen({ sighting: readLogin(cap), providerAuth: readProviderAuth(cap) }),
+    ).toBe(false)
   })
 })
