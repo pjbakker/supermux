@@ -61,6 +61,10 @@ export interface SessionSummary {
   /** Epoch seconds when `last_send_text` was written. Absent iff
    *  `last_send_text` is absent. */
   last_send_at?: number
+  /** The Claude config dir this session boots on (server migration 0100).
+   *  Empty string / absent = the daemon default account. The tile renders its
+   *  last path segment as a small tag; see `configDirTag`. */
+  config_dir?: string
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +174,10 @@ export interface ApiSession {
   created_at?: string
   /** Who created the session (server `SessionView.creator`). */
   creator?: string
+  /** The Claude config dir this session boots on (server migration 0100).
+   *  Empty string / absent = the daemon default account. The tile renders its
+   *  last path segment as a small tag; see `configDirTag`. */
+  config_dir?: string
   /** Free-text description (searchable). */
   desc?: string
   /** Tags (searchable). */
@@ -315,6 +323,18 @@ export interface ApiSession {
  *  older payloads / optimistic rows that omit `display_name`. */
 export function displayLabel(s: { name: string; display_name?: string }): string {
   return s.display_name?.trim() ? s.display_name : s.name
+}
+
+/** The tile's account marker for a session's `config_dir`: the LAST path
+ *  segment, which is the part that names the account
+ *  (`/home/agent/.claude-second` -> `.claude-second`). Returns `null` when the
+ *  session has no config dir, which is the whole existing fleet, so the tile
+ *  renders nothing and takes no space. */
+export function configDirTag(configDir?: string): string | null {
+  const trimmed = configDir?.trim()
+  if (!trimmed) return null
+  const segments = trimmed.split('/').filter(Boolean)
+  return segments.length ? segments[segments.length - 1] : trimmed
 }
 
 /** The title for the big surfaces (overview tile + focus header). A user-set

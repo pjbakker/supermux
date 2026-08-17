@@ -3,11 +3,17 @@ import * as React from 'react'
 import { useArmedConfirm } from '@/hooks/use-armed-confirm'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { useQueryClient } from '@tanstack/react-query'
-import { Archive, GitBranch, X } from 'lucide-react'
+import { Archive, GitBranch, UserRound, X } from 'lucide-react'
 
 import { eases, motionOff, springs } from '@/lib/springs'
 import { MISC } from '@/brand/copy'
-import { displayLabel, sessionsApi, sessionTitle, type ApiSession } from '@/lib/api'
+import {
+  configDirTag,
+  displayLabel,
+  sessionsApi,
+  sessionTitle,
+  type ApiSession,
+} from '@/lib/api'
 import { SESSIONS_KEY } from '@/hooks/use-sessions'
 import { ARCHIVED_SESSIONS_KEY } from '@/hooks/use-archived-sessions'
 import { useToast } from '@/components/ui/use-toast'
@@ -692,6 +698,9 @@ export function SessionTile({
   const title = sessionTitle(session)
   const tokens =
     typeof session.tokens === 'number' ? formatTokens(session.tokens) : null
+  // Which Claude account this session boots on. Absent for the whole default
+  // fleet, so the meta row is unchanged for them.
+  const accountTag = configDirTag(session.config_dir)
   // Stopped UX (polish-pass): a stopped tile is visually distinct AT A GLANCE
   // — the whole card dims to the app's "muted" treatment (token-driven, no
   // ad-hoc colour) and a sentence-case "Stopped" pill replaces the running
@@ -1086,6 +1095,19 @@ export function SessionTile({
                   <span className="flex min-w-0 items-center gap-1">
                     <GitBranch className="size-3 shrink-0" />
                     <span className="truncate">{session.branch}</span>
+                  </span>
+                )}
+                {/* The account is short and identity-critical ("which login is
+                    this?"), so it keeps its width and the long-tailed branch
+                    name absorbs the truncation instead. Capped anyway, so an
+                    unusually long config dir can't push the branch out. */}
+                {accountTag && (
+                  <span
+                    className="flex shrink-0 items-center gap-1"
+                    title={`Claude config dir: ${session.config_dir}`}
+                  >
+                    <UserRound className="size-3 shrink-0" aria-hidden />
+                    <span className="max-w-28 truncate">{accountTag}</span>
                   </span>
                 )}
               </>

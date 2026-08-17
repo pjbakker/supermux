@@ -118,6 +118,9 @@ export const MOCK_TILES: TileSession[] = [
     provider: 'claude',
     tokens: 12300,
     branch: 'fix/range-headers',
+    // Runs on the second Claude account, so the tile shows the account tag next
+    // to the branch.
+    config_dir: '/home/agent/.claude-second',
     preview_lines: [
       '● I can implement this two ways: a tower middleware',
       '  or inline in the handler. The middleware is reusable',
