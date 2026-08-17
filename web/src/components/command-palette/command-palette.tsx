@@ -7,6 +7,11 @@
 //
 //   • Sessions   — `useSessions()`, sorted by recency. Pick → navigate to
 //                  `/focus/{name}`.
+//   • Go to      — the app's four routes, the two Settings anchors (/scheduler
+//                  and /hosts are already redirects onto them) and the theme
+//                  flip. Added because the palette reached NONE of them: an
+//                  empty query offered four headings and `settings` returned
+//                  zero rows, so the discovery spine could not discover a page.
 //   • MCP        — servers from the Claude registry (`useClaudeRegistry`, scoped
 //                  to the freshest session's project). Pick → open the Claude
 //                  tools manager (MCP tab) where check/reconnect/add/remove live.
@@ -43,11 +48,18 @@ import * as React from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Archive,
+  CalendarClock,
   Command as CommandIcon,
+  FolderClosed,
   FolderPlus,
+  LayoutGrid,
+  Moon,
   ServerCog,
+  Settings as SettingsIcon,
   SlidersHorizontal,
   Sparkles,
+  Sun,
+  Terminal,
   TerminalSquare,
 } from 'lucide-react'
 
@@ -68,10 +80,14 @@ import { useAgentToolsSheet } from '@/stores/claude-tools-store'
 import { AgentToolsHost } from '@/components/claude-tools/claude-tools-host'
 import { SnippetsManagerHost } from '@/components/snippets/snippets-manager-host'
 import { Kbd } from '@/components/ui/kbd'
+import { useToast } from '@/components/ui/use-toast'
+import { cn } from '@/lib/utils'
 import { EntityPickerView } from '@/components/ui/entity-picker'
 import { resolveEntityTarget, type EntityRow } from '@/lib/entity'
-import { rankEntities } from '@/lib/rank'
+import { rankEntities, type RankText } from '@/lib/rank'
 import { composerKeyIntent, jumpTarget } from '@/components/chat/composer-keys'
+import { useTheme } from '@/components/theme-provider'
+import { useMediaQuery } from '@/hooks/use-media-query'
 
 // ── Rows ─────────────────────────────────────────────────────────────────────
 //
@@ -91,10 +107,26 @@ import { composerKeyIntent, jumpTarget } from '@/components/chat/composer-keys'
 // Each row carries the string it is ranked on. Keeping that beside the row
 // rather than deriving it inside the matcher is what lets one ranker serve
 // six different shapes without knowing what any of them is.
+/** The combobox relationship, as two ids. Module constants rather than
+ *  `useId`: they are referenced from an `aria-controls` on one element and an
+ *  `id` on another, and a stable literal is what makes both greppable in an
+ *  ax-tree dump. */
+const LISTBOX_ID = 'command-palette-listbox'
+const optionId = (index: number) => `command-palette-option-${index}`
+
 interface Ranked {
   row: EntityRow
-  /** What the query is matched against. */
-  text: string
+  /**
+   * What the query is matched against.
+   *
+   * A `{ label, extra }` pair rather than one joined sentence (blocker fix):
+   * ranking a command on `"/cmd <its whole description>"` let a subsequence
+   * walk the description and win the row — `dark` offered `/supermux-schedule`
+   * as its only result, and Enter on that row POSTs the command into a live
+   * agent. The name is what a query must match; the description can only ever
+   * find its row as a substring, below every name hit.
+   */
+  text: RankText
   /** Which heading it sits under. */
   group: string
 }
@@ -161,6 +193,17 @@ export function CommandPalette() {
   // route, so the "New group" row is conditionally surfaced below.
   const newGroupAction = useNewGroupAction((s) => s.action)
 
+  const { toast } = useToast()
+  const { resolvedTheme, setTheme } = useTheme()
+  const dark = resolvedTheme === 'dark'
+  // TOUCH IS A DIFFERENT SURFACE, and the palette was the one picker that never
+  // learned it: rows measured 38px against the primitive's documented 44pt
+  // phone rung (the chat picker, which passes surface="phone", measures 47px on
+  // the same viewport), and the box was pinned at top-[20%] with no safe-area
+  // inset and no allowance for a soft keyboard. Same fork every other sheet in
+  // the app uses.
+  const coarse = useMediaQuery('(pointer: coarse)')
+
   const [query, setQuery] = React.useState('')
   // `viaKey` rides with the index because the picker scrolls the active row
   // into view for KEYBOARD moves only (fase B3 T2.6). The effect this replaced
@@ -200,6 +243,56 @@ export function CommandPalette() {
     setActive({ i: 0, viaKey: false })
   }, [])
 
+  // WHERE THE APP'S FOUR DESTINATIONS LIVE (fase B3 T4.3 / deliverable 5,
+  // shipped late). The palette reached NONE of them: an empty query offered
+  // SESSIONS / ACTIONS / MCP / COMMANDS and nothing else, `settings` returned
+  // zero rows, and `files` returned only an unrelated slash command. A
+  // discovery spine that cannot reach Settings is a session switcher.
+  //
+  // Deep links rather than a second route table: /scheduler and /hosts are
+  // already redirects onto these two Settings anchors (App.tsx), so the hash IS
+  // the address — the same fact `lib/entity.ts` writes down for schedule and
+  // host rows.
+  const goRows: Ranked[] = React.useMemo(() => {
+    const go = (
+      to: string,
+      label: string,
+      keywords: string,
+      icon: EntityRow['icon'],
+    ): Ranked => ({
+      row: { id: `go:${to}`, kind: 'action', label, icon, run: () => navigate(to) },
+      text: { label, extra: keywords },
+      group: 'Go to',
+    })
+    return [
+      go('/', 'Overview', 'home sessions roster tiles dashboard start', LayoutGrid),
+      go('/focus', 'Focus', 'terminal session pane current agent', Terminal),
+      go('/files', 'Files', 'file tree browse edit diff working directory', FolderClosed),
+      go('/settings', 'Settings', 'preferences config options update theme', SettingsIcon),
+      go(
+        '/settings#schedules',
+        'Schedules',
+        'scheduler cron recurring timer prompt later',
+        CalendarClock,
+      ),
+      go('/settings#hosts', 'Remote hosts', 'ssh host remote machine registry', ServerCog),
+      {
+        row: {
+          id: 'go:theme',
+          kind: 'action',
+          label: dark ? 'Switch to light theme' : 'Switch to dark theme',
+          icon: dark ? Sun : Moon,
+          run: () => setTheme(dark ? 'light' : 'dark'),
+        },
+        text: {
+          label: 'theme',
+          extra: 'dark light appearance colour color mode switch toggle',
+        },
+        group: 'Go to',
+      },
+    ]
+  }, [navigate, dark, setTheme])
+
   // In-app actions (not sessions, not slash commands). Hidden in slash mode
   // (a leading "/" means the user wants a command). Stable identity so arrow-key
   // state survives re-renders.
@@ -214,8 +307,10 @@ export function CommandPalette() {
       row: { id, kind: 'action', label, icon, run },
       // Keywords are ranked on but never shown. A user who types "trash"
       // should find "View archived sessions"; a user reading the list should
-      // not see a bag of synonyms under it.
-      text: `${label} ${keywords}`,
+      // not see a bag of synonyms under it. They live in `extra`, so they can
+      // only match as a SUBSTRING — a synonym bag is exactly the string a
+      // scattered subsequence used to walk.
+      text: { label, extra: keywords },
       group: 'Actions',
     })
     const base = [
@@ -281,21 +376,34 @@ export function CommandPalette() {
   // No session → close (the overview empty-state teaches booting one). Shared by
   // command AND skill picks (skills are `/<name>` slash-invokable). Fire-and-
   // forget; `settingsRequest` reads the bearer off env.ts.
+  //
+  // IT NAMES ITS TARGET, BEFORE AND AFTER (blocker fix). A slash row is the one
+  // palette row that WRITES — it POSTs into a live agent chosen by recency, not
+  // by the user — so which session that is has to be on the row before Enter
+  // (the `warn` badge below carries `freshest.name`) and has to be said again
+  // after it fires. A fire-and-forget write with no receipt is how a mistyped
+  // query became a message in somebody's session.
   const runSlash = React.useCallback(
     (text: string) => {
       const target = pickFreshestSession(sessions)
+      const label = text.replace(/\r$/, '')
       if (!target) {
         setOpen(false)
+        toast({ message: `No running session to run ${label} in`, tone: 'error' })
         return
       }
       setOpen(false)
       navigate(`/focus/${encodeURIComponent(target.name)}`)
+      toast({ message: `Ran ${label} in ${target.name}`, tone: 'active' })
       void settingsRequest(`/api/sessions/${encodeURIComponent(target.name)}/send`, {
         method: 'POST',
         body: JSON.stringify({ text }),
-      }).catch((e) => console.warn('command-palette: send failed', e))
+      }).catch((e) => {
+        console.warn('command-palette: send failed', e)
+        toast({ message: `Couldn’t run ${label} in ${target.name}`, tone: 'error' })
+      })
     },
-    [sessions, navigate, setOpen],
+    [sessions, navigate, setOpen, toast],
   )
 
   // ONE RANKER, SIX SHAPES (fase B3 T4.2). Every candidate is turned into a
@@ -311,6 +419,8 @@ export function CommandPalette() {
   const groups: { label: string; rows: EntityRow[] }[] = React.useMemo(() => {
     const slashMode = query.startsWith('/')
     const cmdQ = slashMode ? query.slice(1) : query
+    // The session a slash row would write to, said on the row itself.
+    const sendTarget = freshest ? `runs in ${freshest.name}` : 'no session'
     const rank = (items: Ranked[], q: string) =>
       rankEntities(items, q, (r) => r.text).map((r) => r.row)
 
@@ -336,7 +446,7 @@ export function CommandPalette() {
               />
             ),
           },
-          text: `${s.name} ${s.task_summary ?? ''}`,
+          text: { label: s.name, extra: s.task_summary ?? undefined },
           group: 'Sessions',
         }))
 
@@ -354,7 +464,7 @@ export function CommandPalette() {
             icon: ServerCog,
             run: () => openClaudeTools(freshest?.name ?? null),
           },
-          text: `${m.name} ${m.transport} ${m.provenance}`,
+          text: { label: m.name, extra: `${m.transport} ${m.provenance}` },
           group: 'MCP',
         }))
 
@@ -369,9 +479,13 @@ export function CommandPalette() {
           label: `/${s.name}`,
           meta: s.description || 'skill',
           icon: Sparkles,
+          // WHERE IT WILL RUN, ON THE ROW. `runSlash` picks the freshest
+          // session; a row that fires a write on one keystroke has to say
+          // which session that is before the keystroke, not after.
+          warn: sendTarget,
           run: () => runSlash(`/${s.name}\r`),
         },
-        text: `${s.name} ${s.description}`,
+        text: { label: s.name, extra: s.description },
         group: 'Skills',
       }))
 
@@ -382,14 +496,18 @@ export function CommandPalette() {
         label: c.cmd,
         meta: c.desc,
         icon: TerminalSquare,
+        warn: sendTarget,
         run: () => runSlash(`${c.cmd}\r`),
       },
-      text: `${c.cmd} ${c.desc ?? ''}`,
+      text: { label: c.cmd.replace(/^\//, ''), extra: c.desc ?? undefined },
       group: 'Commands',
     }))
 
     return [
       { label: 'Sessions', rows: rank(sessionRows, query) },
+      // Destinations before verbs: "where do I want to be" is the commoner
+      // question, and it is the one the palette could not answer at all.
+      { label: 'Go to', rows: rank(slashMode ? [] : goRows, query) },
       { label: 'Actions', rows: rank(slashMode ? [] : actions, query) },
       { label: 'MCP', rows: rank(mcpRows, query) },
       { label: 'Skills', rows: rank(skillRows, cmdQ) },
@@ -397,6 +515,7 @@ export function CommandPalette() {
     ].filter((g) => g.rows.length > 0)
   }, [
     sessions,
+    goRows,
     actions,
     mergedCommands,
     commandNames,
@@ -528,12 +647,27 @@ export function CommandPalette() {
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent
         // Override the default Dialog padding — we want a flush input + list.
-        className="top-[20%] max-w-xl translate-y-0 gap-0 overflow-hidden p-0"
+        //
+        // On a coarse pointer the box moves to the TOP of the safe area rather
+        // than 20% down: the palette has to stay above the soft keyboard, and
+        // the keyboard is the whole bottom of the screen. Width goes
+        // edge-to-edge minus a gutter, because 36rem on a 390px viewport is
+        // just "the screen with a stripe missing".
+        className={cn(
+          'max-w-xl translate-y-0 gap-0 overflow-hidden p-0',
+          coarse
+            ? 'top-[max(env(safe-area-inset-top),0.5rem)] w-[calc(100vw-1rem)] max-w-none'
+            : 'top-[20%]',
+        )}
         // Don't auto-focus the close button; let the input take focus.
         onOpenAutoFocus={(e) => e.preventDefault()}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>
-        <div className="flex items-center gap-3 border-b border-border px-4 py-3">
+        {/* pr-11 on the row, not on the chip: the dialog's own close ✕ is
+            `absolute right-4 top-4` and was overlapping the "Esc" Kbd by 16px
+            at every desktop width, so the chip rendered as "Es✕". The row has
+            to reserve the corner the ✕ occupies. */}
+        <div className="flex items-center gap-3 border-b border-border py-3 pl-4 pr-11">
           <CommandIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
           <input
             autoFocus
@@ -541,6 +675,18 @@ export function CommandPalette() {
             onChange={(e) => updateQuery(e.target.value)}
             placeholder={placeholder}
             aria-label="Command palette"
+            // THE FOUR ATTRIBUTES THAT MAKE IT A COMBOBOX. Focus never leaves
+            // this input — the arrows move `aria-selected` on a row the input
+            // has to POINT AT, or a screen reader is told nothing at all as the
+            // highlight travels. The primitive has exposed `listboxId` /
+            // `optionId` for exactly this since B3 and the palette passed
+            // neither, while `chat/composer.tsx` sets the same four correctly on
+            // the same component. This is that, verbatim.
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded
+            aria-controls={LISTBOX_ID}
+            aria-activedescendant={rows.length > 0 ? optionId(clampedActive) : undefined}
             className="min-w-0 flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground"
           />
           <Kbd className="hidden sm:inline-flex">Esc</Kbd>
@@ -552,8 +698,14 @@ export function CommandPalette() {
             list by it — a correct rebuild leaves them untouched. */}
         <EntityPickerView
           anchor="field"
+          // 44pt rows on touch (the primitive's own rung) and a list short
+          // enough to clear a raised keyboard.
+          surface={coarse ? 'phone' : 'desktop'}
+          maxHeight={coarse ? 'max-h-[min(360px,42dvh)]' : undefined}
           rows={rows}
           activeIndex={clampedActive}
+          listboxId={LISTBOX_ID}
+          optionId={optionId}
           ariaLabel="Palette results"
           headingAt={headingAt}
           emptyLabel={
