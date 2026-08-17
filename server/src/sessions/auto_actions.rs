@@ -765,6 +765,16 @@ pub async fn tick(
     let prev = detector.last_status();
     let new_status = detector.detect(&capture, last_pty, turn, has_hooks);
 
+    // THE FREEZE, reconciled with what is actually on the screen.
+    //
+    // The overwhelmingly common login is the one this app did not start: Claude
+    // Code hit an expired credential and the user typed `/login` into the
+    // terminal. A freeze that only existed for API-driven flows would leave
+    // exactly those sessions exposed to the auto-heal that kills the PKCE
+    // verifier they are holding. This tick already has the capture, so the
+    // reconciliation is one pure classification and no extra I/O.
+    super::login::observe(name, &capture);
+
     // last_capture writeback — ALWAYS (canonical preview source).
     db::sessions::set_last_capture(&state.pool, name, &capture, &capture_ansi).await?;
 
@@ -1101,6 +1111,12 @@ pub enum Heal {
     Unsupported,
     /// The row is gone or archived — nothing to heal.
     Gone,
+    /// A `/login` is in flight. Restarting now would kill the PKCE verifier that
+    /// only exists inside the running process, so the code the user is copying
+    /// out of their browser right this second would fail — and the failure would
+    /// read as "Authentication failed: Invalid authorization code", with nothing
+    /// in the UI able to connect it to a helpful restart.
+    Frozen,
     /// The session stopped being the thing this heal was for while the heal was
     /// deciding: the user pressed Stop or Resume, or another lifecycle op holds
     /// the session lock. Their action wins.
@@ -1119,6 +1135,7 @@ impl Heal {
             Self::Cooldown => "cooldown",
             Self::Unsupported => "unsupported",
             Self::Gone => "gone",
+            Self::Frozen => "frozen",
             Self::Superseded => "superseded",
         }
     }
@@ -1143,6 +1160,7 @@ impl Heal {
             Self::Cooldown => "This session was recovered a moment ago. Try Restart instead.",
             Self::Unsupported => "This session type cannot be recovered in place. Try Restart.",
             Self::Gone => "This session is archived or no longer exists.",
+            Self::Frozen => "This session is signing in. Finish the login first — restarting now would invalidate the login code.",
             Self::Superseded => "Something else changed this session first — nothing was done.",
         }
     }
@@ -1242,6 +1260,15 @@ pub async fn auto_heal(state: &AppState, name: &str, reason: &str) -> Heal {
             return Heal::Gone;
         }
     };
+    // THE LOGIN FREEZE, checked before anything else this function could do.
+    // `lifecycle::send_*` refuses writes while a login is in flight; this is the
+    // other half — the restart. It comes before the runtime/support checks so a
+    // frozen session reports the reason a human can act on ("finish the login")
+    // rather than an incidental one.
+    if super::login::is_frozen(name) {
+        tracing::info!(name = %name, "auto-heal: skipped — a login is in flight");
+        return Heal::Frozen;
+    }
     if s.runtime != RUNTIME_NATIVE || s.host_id.is_some() {
         return Heal::Unsupported;
     }
