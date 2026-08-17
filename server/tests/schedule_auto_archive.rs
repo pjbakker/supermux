@@ -45,6 +45,7 @@ async fn insert_session(state: &supermux_server::state::AppState, name: &str, ar
         host_id: None,
         runtime: "tmux".into(),
         archive_on_stop,
+        config_dir: String::new(),
     };
     db::sessions::create(&state.pool, &new).await.unwrap();
 }

@@ -694,6 +694,9 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         host_id: input.host_id,
         runtime: runtime_kind,
         archive_on_stop: input.archive_on_stop.unwrap_or(false),
+        // Empty = the daemon default Claude config dir. The API field that lets
+        // a caller pick another account lands in a later step.
+        config_dir: String::new(),
     };
     db::sessions::create(&state.pool, &new).await?;
     // End of the guarded section: the row exists now, so a concurrent spawn on

@@ -82,6 +82,7 @@ async fn insert_session(state: &AppState, name: &str) {
         host_id: None,
         runtime: "tmux".into(),
         archive_on_stop: false,
+        config_dir: String::new(),
     };
     db::sessions::create(&state.pool, &new).await.unwrap();
 }
