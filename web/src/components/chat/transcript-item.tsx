@@ -260,6 +260,13 @@ function AgentRow({
   ...rest
 }: TranscriptItemProps & { item: ChatItem; grouped: boolean; gutter?: string }) {
   const mark = gutter ? <Mark seed={gutter} pinFor={rest.pinFor} /> : undefined
+  if (item.type === 'thinking') {
+    return (
+      <MessageRow grouped={grouped} gutter={mark}>
+        <ThinkingDisclosure item={item} surface={rest.surface} />
+      </MessageRow>
+    )
+  }
   if (item.type === 'receipts') {
     return (
       <MessageRow grouped={grouped} gutter={mark}>
@@ -283,6 +290,54 @@ function AgentRow({
         {item.truncated && <ClippedMarker uuid={item.uuid} />}
       </Bubble>
     </MessageRow>
+  )
+}
+
+/**
+ * THE MODEL'S REASONING, COLLAPSED (A6 register S21 — the P7 disclosure).
+ *
+ * Until now `wire-entries.ts` ended its dispatch by dropping `kind:'thinking'`
+ * on the floor — "not part of the A1 calm view" — while the register went on
+ * listing the disclosure as a shipped scenario, and an extended-thinking model's
+ * entire reasoning phase was thrown away by the surface the user was reading.
+ *
+ * A native `<details>`, not a `useState` toggle: it is the one control on this
+ * surface whose whole job is show/hide, the browser already gives it the right
+ * role, keyboard behaviour and AT announcement for free, and it costs no
+ * re-render of a memoised transcript row to open. Collapsed by default, because
+ * the calm view is the promise — the row is one line high until somebody asks.
+ *
+ * The clock is honest or absent: a thinking block is written when it is
+ * COMPLETE, so the gap from the row above it is what the model spent (see
+ * `entries.ts::toDisplayList`). With no row above to measure from, the summary
+ * says "Thought" and claims nothing.
+ */
+function ThinkingDisclosure({
+  item,
+  surface,
+}: {
+  item: ChatItem
+  surface?: 'desktop' | 'phone'
+}) {
+  if (item.type !== 'thinking') return null
+  const label = item.secs ? `Thought for ${item.secs}s` : 'Thought'
+  return (
+    <details
+      className="group min-w-0"
+      style={{ maxWidth: surface === 'phone' ? BUBBLE_MAX.phoneAssistant : BUBBLE_MAX.assistant }}
+      data-testid="chat-thinking"
+    >
+      <summary className="chat-thinking-summary">
+        <span aria-hidden className="inline-block transition-transform group-open:rotate-90">
+          ›
+        </span>
+        {label}
+      </summary>
+      <p className="chat-thinking-body">
+        {item.text}
+        {item.truncated && <ClippedMarker uuid={item.uuid} />}
+      </p>
+    </details>
   )
 }
 

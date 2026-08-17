@@ -369,9 +369,67 @@ describe('the adapter', () => {
     ])
   })
 
-  test('the calm view: everything A1 hid stays hidden', () => {
+  /**
+   * A SLASH COMMAND IS ONE ROW, NOT TWO (verified finding 18).
+   *
+   * `/supermux-schedule` writes two user records: the 191-byte
+   * `<command-name>` envelope — correctly `kind:'command'` — and a 6.8 KB plain
+   * prompt carrying the ENTIRE command file, which the raw JSONL marks
+   * `isMeta: true` and gives no `promptSource`. `recall.rs` has filtered the
+   * second since A1 (step 8 → `Kind::System`); this plane could not, because
+   * the flag was not on the wire, and B4's own headline flow rendered a giant
+   * beige user bubble ending in `ARGUMENTS: …`.
+   */
+  test('an isMeta harness aside is not something the human said', () => {
     const entries = toChatEntries([
-      block({ uuid: 'th', kind: 'thinking', body: { text: 'hmm' } }),
+      block({
+        uuid: 'c1',
+        kind: 'prompt',
+        body: {
+          text: '<command-name>/supermux-schedule</command-name><command-args>in 2m</command-args>',
+        },
+      }),
+      block({
+        uuid: 'c2',
+        kind: 'prompt',
+        meta: true,
+        body: {
+          text: 'Base directory for this skill: /home/x/.claude/skills/supermux-schedule\n\n# Schedule\n\nARGUMENTS: in 2m — reply with exactly X',
+        },
+      }),
+    ])
+    expect(entries.map((e) => [e.uuid, e.kind])).toEqual([['c1', 'command']])
+  })
+
+  test('…but a marked line a WRAPPER already named keeps that name', () => {
+    // `recall.rs` checks `isMeta` at step 8 — after the wrapper rules (6/7),
+    // before the plain-prompt fallback (9). The arm has to sit in the same
+    // place or a delegated prompt that happened to be marked would vanish.
+    const entries = toChatEntries([
+      block({
+        uuid: 'd1',
+        kind: 'prompt',
+        meta: true,
+        body: {
+          text: '<supermux-delegation from="ceo-root">ship it</supermux-delegation>',
+        },
+      }),
+    ])
+    expect(entries.map((e) => [e.uuid, e.kind])).toEqual([['d1', 'delegation']])
+  })
+
+  test('…and an unmarked prompt is untouched', () => {
+    const entries = toChatEntries([
+      block({ uuid: 'p1', kind: 'prompt', body: { text: 'ARGUMENTS: not a dump' } }),
+    ])
+    expect(entries.map((e) => e.kind)).toEqual(['prompt'])
+  })
+
+  test('the calm view: everything A1 hid stays hidden', () => {
+    // `thinking` LEFT this list when the S21 disclosure shipped (finding 16):
+    // it is drawn now, collapsed, so the view stays calm without the renderer
+    // throwing the reasoning away. Its own cases are below.
+    const entries = toChatEntries([
       block({ uuid: 'at', kind: 'attachment', label: 'image', body: { image: true } }),
       block({ uuid: 'sy', kind: 'system', label: 'compact', body: { content: 'compacted' } }),
       block({ uuid: 'qu', kind: 'queue', body: null }),
@@ -419,5 +477,50 @@ describe('the adapter', () => {
     expect(classifyPrompt('<task-notification><summary>ran the suite</summary></task-notification>')).toMatchObject(
       { kind: 'notification', text: 'ran the suite' },
     )
+  })
+})
+
+/**
+ * THE MODEL'S REASONING REACHES THE SURFACE (verified finding 16, A6 §S21).
+ *
+ * `wire-entries.ts` ended its dispatch by dropping `kind:'thinking'` on the
+ * floor — "not part of the A1 calm view" — while the A6 register listed the
+ * disclosure (S21) as a shipped scenario. With an extended-thinking model the
+ * primary interface silently threw away the reasoning the user asked for.
+ */
+describe('thinking entries', () => {
+  test('survive the adapter instead of being dropped', () => {
+    const entries = toChatEntries([
+      block({ uuid: 'th', kind: 'thinking', ts_ms: 5_000, body: { text: '91 = 7 × 13' } }),
+      block({ uuid: 'a1', kind: 'assistant', ts_ms: 6_000, body: { text: '91 is not prime.' } }),
+    ])
+    expect(entries.map((e) => [e.uuid, e.kind])).toEqual([
+      ['a1', 'assistant'],
+      ['th', 'thinking'],
+    ])
+    expect(entries[1].text).toBe('91 = 7 × 13')
+  })
+
+  test('an EMPTY thinking block is still nothing — no blank disclosure', () => {
+    expect(toChatEntries([block({ uuid: 'th', kind: 'thinking', body: { text: '  ' } })])).toEqual(
+      [],
+    )
+  })
+
+  test('a subagent’s thinking stays out, like everything else it does', () => {
+    const entries = toChatEntries([
+      block({ uuid: 'th', kind: 'thinking', agent_id: 'x1', body: { text: 'sub reasoning' } }),
+    ])
+    expect(entries).toEqual([])
+  })
+
+  test('a clipped thinking body is NOT auto-fetched — the row opens collapsed', () => {
+    // `find_full_entry` streams the transcript from byte 0; spending that on a
+    // body nobody has expanded is the cost `truncatedUuids` exists to bound.
+    const wire = [
+      block({ uuid: 'th', kind: 'thinking', truncated: true, body: { text: 'long…' } }),
+      block({ uuid: 'a1', kind: 'assistant', truncated: true, body: { text: 'long…' } }),
+    ]
+    expect(truncatedUuids(wire, 12)).toEqual(['a1'])
   })
 })
