@@ -761,10 +761,22 @@ fn build_launch_command(
     // BOT_MEMORY_* is unset.
     let bin_dir = config.data_dir.join("bin");
     let bin_dir = bin_dir.display();
+    // Per-session Claude login (migration 0041). A session can be pointed at a
+    // second account's config dir. Exported AFTER the profile sources so a user
+    // `~/.zprofile` that sets its own CLAUDE_CONFIG_DIR cannot override it, and
+    // BEFORE `{agent}` so the launched provider inherits it. Claude-only:
+    // codex/shell do not read it. The value is charset-validated at the HTTP
+    // boundary (`sessions::valid_config_dir`), and single-quoted here as well,
+    // so nothing can break out of the line.
+    let config_dir_export = if s.provider == "claude" && !s.config_dir.trim().is_empty() {
+        format!("export CLAUDE_CONFIG_DIR='{}'; ", s.config_dir.trim())
+    } else {
+        String::new()
+    };
     let command = format!(
         "source ~/.zprofile 2>/dev/null; source ~/.bash_profile 2>/dev/null; \
          source ~/.profile 2>/dev/null; export EDITOR='{bridge}' VISUAL='{bridge}'; \
-         export PATH='{bin_dir}':\"$PATH\"; {agent}"
+         export PATH='{bin_dir}':\"$PATH\"; {config_dir_export}{agent}"
     );
     (command, resume_intended)
 }
@@ -4134,6 +4146,134 @@ mod build_env_tests {
         let (cmd, resume) = build_launch_command(&config, &by_name, &[]);
         assert!(cmd.contains("--resume 'my-chat'"));
         assert!(resume);
+    }
+
+    /// A session with a `config_dir` boots Claude under that account: the export
+    /// lands AFTER the profile sources (so a user `~/.zprofile` cannot win) and
+    /// BEFORE the agent (so `claude` inherits it). Claude-only, single-quoted,
+    /// and absent entirely when the session has no config dir.
+    #[test]
+    fn claude_launch_exports_the_session_config_dir() {
+        let config = cfg();
+        let base = Session {
+            name: "acct".into(),
+            display_name: "Acct".into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "claude".into(),
+            flags: String::new(),
+            pinned: 0,
+            archived: 0,
+            auto_continue: 0,
+            auto_continue_msg: String::new(),
+            rate_limit_resume_text: String::new(),
+            tags: "[]".into(),
+            creator: String::new(),
+            branch: String::new(),
+            worktree: 0,
+            worktree_repo: String::new(),
+            mcp: String::new(),
+            created_at: 0,
+            start_count: 0,
+            last_started: 0,
+            last_send: 0,
+            last_send_text: String::new(),
+            task_summary: String::new(),
+            cc_session_name: String::new(),
+            cc_conversation_id: String::new(),
+            codex_session_id: String::new(),
+            start_error: String::new(),
+            team_name: None,
+            host_id: None,
+            company_id: None,
+            runtime: "native".into(),
+            mark_pin: None,
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
+            config_dir: "/home/agent/.claude-second".into(),
+        };
+
+        let (command, _resume) = build_launch_command(&config, &base, &[]);
+        assert!(
+            command.contains("export CLAUDE_CONFIG_DIR='/home/agent/.claude-second';"),
+            "missing single-quoted export: {command}"
+        );
+        let profile_at = command.find("source ~/.profile").expect("profile sourced");
+        let export_at = command.find("export CLAUDE_CONFIG_DIR=").expect("export present");
+        let agent_at = command.find("claude --name acct").expect("agent launched");
+        assert!(
+            profile_at < export_at && export_at < agent_at,
+            "export must sit between the profile sources and the agent: {command}"
+        );
+        // The whole line still parses as shell.
+        let status = std::process::Command::new("bash")
+            .args(["-n", "-c", &command])
+            .status()
+            .expect("bash must be available to validate the launch command");
+        assert!(status.success(), "launch line must parse as shell: {command}");
+
+        // No config dir -> byte-identical to today: nothing exported at all.
+        let plain = Session { config_dir: String::new(), ..base.clone() };
+        let (command, _resume) = build_launch_command(&config, &plain, &[]);
+        assert!(!command.contains("CLAUDE_CONFIG_DIR"), "{command}");
+    }
+
+    /// Only Claude reads `CLAUDE_CONFIG_DIR`. A codex session that carries one
+    /// (a duplicate of a Claude session, say) must not get the export.
+    #[test]
+    fn non_claude_providers_never_get_the_config_dir_export() {
+        let config = cfg();
+        let session = Session {
+            name: "codex-acct".into(),
+            display_name: "Codex acct".into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "codex".into(),
+            flags: String::new(),
+            pinned: 0,
+            archived: 0,
+            auto_continue: 0,
+            auto_continue_msg: String::new(),
+            rate_limit_resume_text: String::new(),
+            tags: "[]".into(),
+            creator: String::new(),
+            branch: String::new(),
+            worktree: 0,
+            worktree_repo: String::new(),
+            mcp: String::new(),
+            created_at: 0,
+            start_count: 0,
+            last_started: 0,
+            last_send: 0,
+            last_send_text: String::new(),
+            task_summary: String::new(),
+            cc_session_name: String::new(),
+            cc_conversation_id: String::new(),
+            codex_session_id: String::new(),
+            start_error: String::new(),
+            team_name: None,
+            host_id: None,
+            company_id: None,
+            runtime: "tmux".into(),
+            mark_pin: None,
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
+            config_dir: "/home/agent/.claude-second".into(),
+        };
+        let (command, _resume) = build_launch_command(&config, &session, &[]);
+        assert!(!command.contains("CLAUDE_CONFIG_DIR"), "{command}");
     }
 
     #[test]
