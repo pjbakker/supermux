@@ -36,7 +36,12 @@ import { expect, test } from '@playwright/test'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { injectGlobals, startBackend, type Backend } from './harness'
+import {
+  injectGlobals,
+  missingAgentCredentials,
+  startBackend,
+  type Backend,
+} from './harness'
 
 /**
  * A session's hook token, read from the backend's own SQLite file.
@@ -72,6 +77,16 @@ async function hookTokenFor(dataDir: string, session: string): Promise<string | 
 
 const SENDER = 'b4-sender'
 const RECEIVER = 'b4-receiver'
+
+/**
+ * The three specs below wait for a real Claude session to ANSWER. Without
+ * credentials the harness's isolated `CLAUDE_CONFIG_DIR` puts the agent on the
+ * first-run sign-in gate, where it can never take a turn — so they would fail
+ * on every machine, for a reason that is not the product's. They skip with the
+ * sentence `missingAgentCredentials()` writes; the security-boundary spec below
+ * drives no turn and always runs.
+ */
+const NO_AGENT = missingAgentCredentials()
 
 /** Turn the chat renderer on for this browser (it is default-OFF until A7). */
 function enableChatRenderer() {
@@ -130,123 +145,138 @@ test.describe('@slow the fabric: one hand-off between two real sessions', () => 
     }
   })
 
-  test('the human path: @colleague hands work over, and both ends say so', async ({
-    context,
-  }) => {
-    test.setTimeout(240_000)
-    await context.addInitScript(injectGlobals(backend.token))
-    await context.addInitScript(enableChatRenderer)
+  // THE THREE SPECS THAT NEED THE AGENT TO ANSWER.
+  //
+  // Grouped so the skip is declared at GROUP scope: a `test.skip()` in the
+  // body would still pay for the browser and the two booted sessions first,
+  // and the point of the gate is that a runner without credentials never
+  // starts a turn it cannot finish.
+  test.describe('with a credentialed runner', () => {
+    test.skip(NO_AGENT !== null, NO_AGENT ?? '')
 
-    const sender = await context.newPage()
-    const receiver = await context.newPage()
-    await sender.goto(`${backend.baseUrl}/focus/${SENDER}`)
-    await receiver.goto(`${backend.baseUrl}/focus/${RECEIVER}`)
-    await expect(sender.getByTestId('chat-panel')).toBeVisible({ timeout: 30_000 })
+    test('the human path: @colleague hands work over, and both ends say so', async ({
+      context,
+    }) => {
+      test.setTimeout(240_000)
+      await context.addInitScript(injectGlobals(backend.token))
+      await context.addInitScript(enableChatRenderer)
 
-    // ── the control changes meaning BEFORE the key ────────────────────────
-    const field = sender.getByTestId('chat-composer-field')
-    await field.click()
-    await field.fill(`@${RECEIVER} please reply with exactly: B4 HANDOFF OK`)
-    const send = sender.getByTestId('chat-send')
-    await expect(send).toHaveAttribute('aria-label', `Hand to ${RECEIVER}`)
-    await expect(send).toHaveAttribute('data-handoff', RECEIVER)
+      const sender = await context.newPage()
+      const receiver = await context.newPage()
+      await sender.goto(`${backend.baseUrl}/focus/${SENDER}`)
+      await receiver.goto(`${backend.baseUrl}/focus/${RECEIVER}`)
+      await expect(sender.getByTestId('chat-panel')).toBeVisible({ timeout: 30_000 })
 
-    await field.press('Enter')
+      // ── the control changes meaning BEFORE the key ────────────────────────
+      const field = sender.getByTestId('chat-composer-field')
+      await field.click()
+      await field.fill(`@${RECEIVER} please reply with exactly: B4 HANDOFF OK`)
+      const send = sender.getByTestId('chat-send')
+      await expect(send).toHaveAttribute('aria-label', `Hand to ${RECEIVER}`)
+      await expect(send).toHaveAttribute('data-handoff', RECEIVER)
 
-    // ── the in-flight pill, then the durable line in its place ────────────
-    await expect(sender.getByText(/asking/)).toBeVisible({ timeout: 10_000 })
-    await expect(sender.getByText(/Delegated to/)).toBeVisible({ timeout: 60_000 })
-    // LIVE — no reload. The pill retires in the same breath.
-    await expect(sender.getByText(/asking/)).toHaveCount(0)
-    await expect(sender.getByText(/Delegated to/)).toHaveCount(1)
-    await expect(sender.locator('[data-notice="handoff-sent"]')).toBeVisible()
+      await field.press('Enter')
 
-    // ── the recipient reads it as an ARRIVAL, not as its owner speaking ───
-    await expect(receiver.getByText(/Message from/)).toBeVisible({ timeout: 60_000 })
-    await expect(receiver.getByText(/please reply with exactly/)).toBeVisible()
+      // ── the in-flight pill, then the durable line in its place ────────────
+      // BY TESTID, not by text: "asking" is a word four different surfaces use
+      // (the sr-only live region, the chat attention row, the terminal note and
+      // this pill), so a text locator resolves to 4 elements and fails Playwright's
+      // strict mode the moment any of the others is on screen.
+      const pill = sender.getByTestId('chat-delegation-pill')
+      await expect(pill).toBeVisible({ timeout: 10_000 })
+      await expect(sender.getByText(/Delegated to/)).toBeVisible({ timeout: 60_000 })
+      // LIVE — no reload. The pill retires in the same breath.
+      await expect(pill).toHaveCount(0)
+      await expect(sender.getByText(/Delegated to/)).toHaveCount(1)
+      await expect(sender.locator('[data-notice="handoff-sent"]')).toBeVisible()
 
-    // ── T11.5: durability. The ledger is the truth, not the frame. ────────
-    await sender.reload()
-    await receiver.reload()
-    await expect(sender.getByText(/Delegated to/)).toHaveCount(1, { timeout: 30_000 })
-    await expect(receiver.getByText(/Message from/)).toHaveCount(1, { timeout: 30_000 })
+      // ── the recipient reads it as an ARRIVAL, not as its owner speaking ───
+      await expect(receiver.getByText(/Message from/)).toBeVisible({ timeout: 60_000 })
+      await expect(receiver.getByText(/please reply with exactly/)).toBeVisible()
 
-    // ── the chip is a destination ─────────────────────────────────────────
-    await sender.getByRole('button', { name: RECEIVER }).first().click()
-    await expect(sender).toHaveURL(new RegExp(`/focus/${RECEIVER}$`))
-  })
+      // ── T11.5: durability. The ledger is the truth, not the frame. ────────
+      await sender.reload()
+      await receiver.reload()
+      await expect(sender.getByText(/Delegated to/)).toHaveCount(1, { timeout: 30_000 })
+      await expect(receiver.getByText(/Message from/)).toHaveCount(1, { timeout: 30_000 })
 
-  test('the agent path: a curl with no actor audits as the agent and draws no pill', async ({
-    page,
-  }) => {
-    test.setTimeout(180_000)
-    await page.addInitScript(injectGlobals(backend.token))
-    await page.addInitScript(enableChatRenderer)
-    await page.goto(`${backend.baseUrl}/focus/${RECEIVER}`)
-    await expect(page.getByTestId('chat-panel')).toBeVisible({ timeout: 30_000 })
-
-    const res = await api('/api/agents/delegate', {
-      method: 'POST',
-      body: JSON.stringify({
-        from: RECEIVER,
-        to: SENDER,
-        prompt: 'noted, thanks — no reply needed',
-      }),
+      // ── the chip is a destination ─────────────────────────────────────────
+      await sender.getByRole('button', { name: RECEIVER }).first().click()
+      await expect(sender).toHaveURL(new RegExp(`/focus/${RECEIVER}$`))
     })
-    expect(res.status).toBe(200)
 
-    await expect(page.getByText(/Delegated to/)).toBeVisible({ timeout: 60_000 })
-    // T5.4: the app learned about this AFTER the fact, so there was never
-    // anything in flight for it to draw.
-    await expect(page.getByText(/asking/)).toHaveCount(0)
+    test('the agent path: a curl with no actor audits as the agent and draws no pill', async ({
+      page,
+    }) => {
+      test.setTimeout(180_000)
+      await page.addInitScript(injectGlobals(backend.token))
+      await page.addInitScript(enableChatRenderer)
+      await page.goto(`${backend.baseUrl}/focus/${RECEIVER}`)
+      await expect(page.getByTestId('chat-panel')).toBeVisible({ timeout: 30_000 })
 
-    const feed = await (await api(`/api/sessions/${RECEIVER}/events?limit=20`)).json()
-    const row = feed.data.events.find((e: { action: string }) => e.action === 'session.delegate')
-    // Only the exact string "human" maps to `user`; an absent `actor` is the
-    // agent, and the ledger says which one asked.
-    expect(row.actor).toBe(`agent:${RECEIVER}`)
-  })
+      const res = await api('/api/agents/delegate', {
+        method: 'POST',
+        body: JSON.stringify({
+          from: RECEIVER,
+          to: SENDER,
+          prompt: 'noted, thanks — no reply needed',
+        }),
+      })
+      expect(res.status).toBe(200)
 
-  test('an agent schedules for itself, and the transcript narrates both ends', async ({
-    page,
-  }) => {
-    test.setTimeout(300_000)
-    await page.addInitScript(injectGlobals(backend.token))
-    await page.addInitScript(enableChatRenderer)
-    await page.goto(`${backend.baseUrl}/focus/${RECEIVER}`)
-    await expect(page.getByTestId('chat-panel')).toBeVisible({ timeout: 30_000 })
+      await expect(page.getByText(/Delegated to/)).toBeVisible({ timeout: 60_000 })
+      // T5.4: the app learned about this AFTER the fact, so there was never
+      // anything in flight for it to draw.
+      await expect(page.getByTestId('chat-delegation-pill')).toHaveCount(0)
 
-    // The session's own hook token — the same string its pane carries as
-    // `$SUPERMUX_HOOK_TOKEN`. See `hookTokenFor`: it is deliberately not on any
-    // HTTP route, so the test reads the row the pane's copy came from.
-    const hookToken = await hookTokenFor(backend.dataDir, RECEIVER)
-    test.skip(!hookToken, 'node:sqlite unavailable — cannot read the hook token')
-
-    const created = await fetch(`${backend.backendUrl}/api/hook/schedule/create`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Supermux-Hook-Token': hookToken! },
-      body: JSON.stringify({
-        session: RECEIVER,
-        title: 'B4 e2e follow-up',
-        prompt: 'say SCHEDULED FIRE OK and nothing else',
-        schedule_expr: 'in 1m',
-      }),
+      const feed = await (await api(`/api/sessions/${RECEIVER}/events?limit=20`)).json()
+      const row = feed.data.events.find((e: { action: string }) => e.action === 'session.delegate')
+      // Only the exact string "human" maps to `user`; an absent `actor` is the
+      // agent, and the ledger says which one asked.
+      expect(row.actor).toBe(`agent:${RECEIVER}`)
     })
-    expect(created.status).toBe(201)
 
-    // The ledger row + `harness` tick give the line for free.
-    await expect(page.getByText(/Created schedule/)).toBeVisible({ timeout: 60_000 })
+    test('an agent schedules for itself, and the transcript narrates both ends', async ({
+      page,
+    }) => {
+      test.setTimeout(300_000)
+      await page.addInitScript(injectGlobals(backend.token))
+      await page.addInitScript(enableChatRenderer)
+      await page.goto(`${backend.baseUrl}/focus/${RECEIVER}`)
+      await expect(page.getByTestId('chat-panel')).toBeVisible({ timeout: 30_000 })
 
-    // The fire: the prompt arrives under the SCHEDULE as its speaker — a 03:00
-    // prompt with the owner's face on it is the transcript telling a lie about
-    // who was awake — and the run's own line follows.
-    await expect(page.getByText(/Sent by schedule/)).toBeVisible({ timeout: 150_000 })
-    await expect(page.getByText(/Ran schedule/)).toBeVisible({ timeout: 60_000 })
+      // The session's own hook token — the same string its pane carries as
+      // `$SUPERMUX_HOOK_TOKEN`. See `hookTokenFor`: it is deliberately not on any
+      // HTTP route, so the test reads the row the pane's copy came from.
+      const hookToken = await hookTokenFor(backend.dataDir, RECEIVER)
+      test.skip(!hookToken, 'node:sqlite unavailable — cannot read the hook token')
 
-    // …and the `⏱` chip opens this session's Schedules sheet, straight into the
-    // schedule the line named (the ledger row carries its id).
-    await page.getByRole('button', { name: /B4 e2e follow-up/ }).first().click()
-    await expect(page.getByText('B4 e2e follow-up')).toBeVisible()
+      const created = await fetch(`${backend.backendUrl}/api/hook/schedule/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Supermux-Hook-Token': hookToken! },
+        body: JSON.stringify({
+          session: RECEIVER,
+          title: 'B4 e2e follow-up',
+          prompt: 'say SCHEDULED FIRE OK and nothing else',
+          schedule_expr: 'in 1m',
+        }),
+      })
+      expect(created.status).toBe(201)
+
+      // The ledger row + `harness` tick give the line for free.
+      await expect(page.getByText(/Created schedule/)).toBeVisible({ timeout: 60_000 })
+
+      // The fire: the prompt arrives under the SCHEDULE as its speaker — a 03:00
+      // prompt with the owner's face on it is the transcript telling a lie about
+      // who was awake — and the run's own line follows.
+      await expect(page.getByText(/Sent by schedule/)).toBeVisible({ timeout: 150_000 })
+      await expect(page.getByText(/Ran schedule/)).toBeVisible({ timeout: 60_000 })
+
+      // …and the `⏱` chip opens this session's Schedules sheet, straight into the
+      // schedule the line named (the ledger row carries its id).
+      await page.getByRole('button', { name: /B4 e2e follow-up/ }).first().click()
+      await expect(page.getByText('B4 e2e follow-up')).toBeVisible()
+    })
   })
 
   test('the security boundary holds against a real server', async () => {
