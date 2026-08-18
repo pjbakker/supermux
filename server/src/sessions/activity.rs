@@ -97,6 +97,21 @@ pub struct HookPayload {
     /// vanishing.
     #[serde(default)]
     pub action: Option<String>,
+    /// Claude's MAIN-THREAD agent type for the session that fired the hook
+    /// (`general-purpose`, a named agent type, ...). An in-process teammate
+    /// shares the parent pane's `$SUPERMUX_SESSION` token but has its own Claude
+    /// session id and its own lifecycle, and its payloads carry this key, so it
+    /// is the first half of the teammate discriminator. It is NOT sufficient on
+    /// its own: a LEAD launched as `claude --agent <name>` (or with `"agent"` in
+    /// settings.json) carries it on its own payloads too. See
+    /// `hooks::is_foreign_agent_payload`, which pairs it with the session's
+    /// tracked conversation id as the tie-breaker.
+    ///
+    /// NOTE: this is not the same `agentType` as the team STATE FILE parsed by
+    /// `teams::scan`, whose polarity is inverted (there it marks a LEAD, and real
+    /// teammates carry no such field).
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 /// The live "Claude is asking permission to do X" state, derived from a
