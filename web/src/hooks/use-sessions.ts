@@ -66,6 +66,32 @@ function mergeRow(prev: ApiSession, delta: Partial<ApiSession>): ApiSession {
   return next
 }
 
+/** A short-lived record of names the backend just told us are gone, so a delta
+ *  that was already in flight when the delete landed cannot resurrect the tile.
+ *
+ *  WHY this exists (the resurrection race): a hard DELETE / archive drops the
+ *  row here, but the SSE stream is not ordered against the delete — a
+ *  preview/activity/error `sessions` delta for that same name can have been
+ *  queued microseconds earlier and arrive AFTER the removal. With no memory of
+ *  the delete, that late delta takes the unknown-name branch (`allowAdd`) and
+ *  RE-ADDS the session with synthetic defaults (`status: 'idle'`) — a deleted
+ *  session comes back as a green Idle tile and lingers until a full resync.
+ *
+ *  The tombstone denies the re-add for a brief window after the delete. It is
+ *  intentionally short: a genuine RE-CREATE of the same name (names are
+ *  reusable) is a human action seconds+ later and must be allowed, so an entry
+ *  older than the TTL no longer blocks. An explicit create also clears it
+ *  eagerly (`clearRemovalTombstone`), and any full refetch bypasses this path
+ *  entirely (it replaces the cache from server truth). */
+const REMOVAL_TOMBSTONE_TTL_MS = 15_000
+const removalTombstones = new Map<string, number>()
+
+/** Forget a name's tombstone — called on an explicit create so the recreated
+ *  session's own deltas flow immediately instead of waiting out the TTL. */
+export function clearRemovalTombstone(name: string): void {
+  removalTombstones.delete(name)
+}
+
 /** Apply a `sessions` SSE payload to the cached list. The payload is an array of
  *  delta rows keyed by `name`; unknown names are appended (a session created in
  *  another tab), known names are merged. A row carrying `missing: true` /
@@ -76,11 +102,15 @@ function mergeRow(prev: ApiSession, delta: Partial<ApiSession>): ApiSession {
  *  `allowAdd` gates the "append unknown name" branch: full `sessions` deltas
  *  may add (a session created in another tab); status-only deltas may NOT
  *  (otherwise a `stopped`-status event from a session we just optimistically
- *  removed via archive would re-add it — the archive bug). */
+ *  removed via archive would re-add it — the archive bug). Even when `allowAdd`
+ *  is on, a name tombstoned by a just-seen delete is NOT re-added (see
+ *  `removalTombstones`). */
 export function applyDelta(
   prev: ApiSession[] | undefined,
   delta: Partial<ApiSession>[],
   allowAdd: boolean,
+  tombstones: Map<string, number> = removalTombstones,
+  now: number = Date.now(),
 ): ApiSession[] {
   const list = prev ? [...prev] : []
   const indexByName = new Map(list.map((s, i) => [s.name, i]))
@@ -97,6 +127,10 @@ export function applyDelta(
     // roster tile and composer all clear at once instead of lingering as a
     // green Idle until an unrelated focus/visibility/online resync.
     if (row.archived === true || row.removed === true) {
+      // Tombstone the name so an in-flight delta cannot resurrect it (the
+      // resurrection race). Done whether or not the row is currently present:
+      // the removal can itself arrive before the row we would have dropped.
+      tombstones.set(row.name, now)
       if (idx !== undefined) {
         list.splice(idx, 1)
         removed = true
@@ -109,6 +143,14 @@ export function applyDelta(
     }
     if (idx === undefined) {
       if (!allowAdd) continue
+      // A name we just saw deleted must not be re-added by a delta that was
+      // already in flight. Inside the TTL: deny. Past it: a real recreate, so
+      // forget the tombstone and fall through to add.
+      const tombstonedAt = tombstones.get(row.name)
+      if (tombstonedAt !== undefined) {
+        if (now - tombstonedAt < REMOVAL_TOMBSTONE_TTL_MS) continue
+        tombstones.delete(row.name)
+      }
       // New session seen via SSE before the next list refetch. Seed sane
       // defaults so the tile renders even from a partial delta.
       list.push({
@@ -121,6 +163,26 @@ export function applyDelta(
       } as ApiSession)
       indexByName.set(row.name, list.length - 1)
     } else {
+      // The row is present and alive: any stale tombstone for it is moot.
+      if (tombstones.has(row.name)) tombstones.delete(row.name)
+      // Version guard for `status` events (w6 #8). The server stamps every
+      // status broadcast with a per-session monotonic counter. Two lifecycle
+      // tasks can allocate N/N+1 and, after an await, send them REVERSED — the
+      // stale N would then overwrite N+1 and regress a `stopped`/blocked row
+      // back to `active`/`idle`. Drop a status delta whose version is strictly
+      // older than the one already applied to the row. Only status events carry
+      // `status_version` (full `sessions` deltas do not), so this never gates a
+      // richer merge — and a first event on a freshly-fetched row (no stored
+      // version) always applies.
+      const incoming = row.status_version
+      const applied = list[idx].status_version
+      if (
+        typeof incoming === 'number' &&
+        typeof applied === 'number' &&
+        incoming < applied
+      ) {
+        continue
+      }
       list[idx] = mergeRow(list[idx], row)
     }
   }
@@ -131,14 +193,26 @@ export function applyDelta(
 }
 
 /** Normalise a `status` event payload (`{name, status, version}`) into the same
- *  delta shape `applyDelta` consumes. */
-function statusToDelta(payload: unknown): Partial<ApiSession>[] {
+ *  delta shape `applyDelta` consumes.
+ *
+ *  The `version` is carried through as `status_version` so `applyDelta` can drop
+ *  a status event that lost a race — see `ApiSession.status_version`. It is a
+ *  per-session monotonic counter, so any FINITE number is meaningful; a payload
+ *  without one (an older server) simply skips the version guard. */
+export function statusToDelta(payload: unknown): Partial<ApiSession>[] {
   if (!payload || typeof payload !== 'object') return []
   const p = payload as Record<string, unknown>
   if (typeof p.name !== 'string') return []
   const status = p.status
   if (typeof status !== 'string') return []
-  return [{ name: p.name, status: status as ApiSession['status'] }]
+  const row: Partial<ApiSession> = {
+    name: p.name,
+    status: status as ApiSession['status'],
+  }
+  if (typeof p.version === 'number' && Number.isFinite(p.version)) {
+    row.status_version = p.version
+  }
+  return [row]
 }
 
 /** DEV-only: `?mock=1` seeds the cache from the mocks (overview dogfooding
@@ -250,6 +324,10 @@ export function useSessions(): UseSessionsResult {
     mutationFn: async (input: NewSession): Promise<string> => {
       const created = await sessionsApi.create(input)
       const name = created?.name ?? input.name
+      // An explicit create is the "until a real create" that lifts a delete
+      // tombstone: if this name was just deleted and is being recreated, its
+      // own deltas must land immediately instead of waiting out the TTL.
+      clearRemovalTombstone(name)
       // Boot tmux + deliver the initial prompt (the Quick-start presets set a
       // `command`). Non-fatal if it fails — the row exists; the focus route can
       // start it. We swallow only network/501s, never a 409 from create.
