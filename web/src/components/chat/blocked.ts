@@ -44,19 +44,60 @@ export interface BlockedState {
  */
 export function blockedState(entries: readonly ChatEntry[]): BlockedState | null {
   for (const e of entries) {
-    // The agent has spoken or run a tool since — it is working again.
+    // The agent has spoken or run a tool since — it is working again. This is
+    // the ONLY recovery evidence that clears a wall (see the file header): a
+    // newer prompt is somebody who has not noticed, and a newer failed attempt
+    // is not the agent proving it can work.
     if (e.kind === 'assistant' || e.kind === 'tool_use') return null
     if (e.kind !== 'blocked') continue
     // A transient failure (a 529 retry, a server-side throttle) is worth a card
     // in the transcript and is NOT worth blanking the composer for: it clears
-    // itself, usually within seconds.
-    if (!e.blocking) return null
+    // itself, usually within seconds. But it is ALSO not recovery — so it is
+    // SKIPPED, not returned on. Returning `null` here let a transient error that
+    // landed AFTER a quota/auth wall reopen the composer while the wall still
+    // applied (wave 6 #12): the newer line does not prove the bucket refilled or
+    // the session signed back in, only that one more attempt failed. Keep
+    // walking; if an older blocking wall is behind it, that wall is still the
+    // truth, and only a real recovery above clears it.
+    if (!e.blocking) continue
     return {
       uuid: e.uuid,
       label: e.label ?? 'Blocked',
       text: e.text,
       resets: e.reply,
     }
+  }
+  return null
+}
+
+/**
+ * The newest un-answered dialog the session is WAITING ON, from the transcript
+ * plane alone, or `null`.
+ *
+ * A `kind:'dialog'` entry with `awaitsInput` is CC's `request_user_dialog` or an
+ * MCP `task_*` parked on `input_required`: the turn has not ended, no quota wall
+ * was written, and — crucially — the peek lens may never fingerprint it (the
+ * elicitation form family it cannot read at all, or a peek that is simply down).
+ * In that case the durable transcript is the ONLY witness that a person is
+ * needed, and a composer that keeps accepting sends is pasting messages into a
+ * modal that drops them. This gate is that witness.
+ *
+ * The clearing rule is `blockedState`'s, and for the same reason: only a newer
+ * ASSISTANT or TOOL entry proves the dialog was answered and the agent moved on.
+ * A newer user prompt does not — typing at a waiting dialog is exactly what
+ * somebody does when they have not noticed it — so it must not reopen the gate.
+ */
+export function awaitingInputState(entries: readonly ChatEntry[]): BlockedState | null {
+  for (const e of entries) {
+    // The agent has spoken or run a tool since the dialog — it was answered and
+    // the turn is moving again.
+    if (e.kind === 'assistant' || e.kind === 'tool_use') return null
+    if (e.kind !== 'dialog' || !e.awaitsInput) continue
+    // CC's own sentence for what is waiting ("an MCP task on … is waiting for
+    // your input", "this session is waiting on a permission dialog"). It stands
+    // alone as the label — there is no bucket/clock split to make — so it rides
+    // in both slots and `blockedComposerNote` returns it verbatim.
+    return { uuid: e.uuid, label: e.text, text: e.text }
   }
   return null
 }
