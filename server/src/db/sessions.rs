@@ -831,6 +831,20 @@ pub async fn track_cc_conversation_id(
     Ok(res.rows_affected() > 0)
 }
 
+/// Read just the session's tracked Claude conversation id (empty string when
+/// nothing is tracked yet). A one-column lookup rather than a full `get`, because
+/// the hook handler runs it inline on the hot POST path (only for payloads that
+/// carry an `agent_type`, where it is the teammate-vs-lead tie-breaker).
+/// `None` = no such session row.
+pub async fn cc_conversation_id(pool: &SqlitePool, name: &str) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT cc_conversation_id FROM sessions WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(id,)| id))
+}
+
 /// Set the hibernated flag in `session_runtime` (cleared by `wake`).
 pub async fn set_hibernated(pool: &SqlitePool, name: &str, hibernated: bool) -> sqlx::Result<()> {
     sqlx::query("UPDATE session_runtime SET hibernated = ? WHERE name = ?")
