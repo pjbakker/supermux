@@ -177,7 +177,16 @@ pub fn parse_scan<R: BufRead>(
             }
             ParsedLine::Skip => {}
             ParsedLine::Malformed(m) => {
-                tracing::debug!(offset, error = %m, "skipping malformed transcript line")
+                // NO silent drop. A newline-terminated line that is not
+                // parseable JSON used to only debug-log and advance the cursor,
+                // so a malformed blocked/error record vanished entirely and the
+                // stated no-silent-loss / totality property was violated. Emit a
+                // visible placeholder instead — the reader sees an 'unparseable
+                // line' marker rather than a hole in the transcript.
+                tracing::debug!(offset, error = %m, "malformed transcript line — emitting placeholder");
+                if !sink(malformed_entry(&text, offset)) {
+                    stop = true;
+                }
             }
         }
         offset += n as u64;
@@ -671,8 +680,15 @@ fn retracted_uuids(obj: &Map<String, Value>) -> Option<Vec<Value>> {
 /// on purpose: a tool whose OUTPUT quotes the sentence must not be re-read as a
 /// refusal.
 fn is_denial(content: &Value) -> bool {
-    const HEAD: &str = "The user doesn't want to proceed with this tool use.";
-    let starts = |s: &str| s.trim_start().starts_with(HEAD);
+    // Match on a NORMALIZED sentence, not a byte-exact ASCII one. Two things
+    // legitimately vary between a test fixture and Claude Code's live copy:
+    // letter case, and the apostrophe glyph — CC's UI renders a curly U+2019, so
+    // a straight-ASCII `starts_with` silently fails and a refusal is recorded as
+    // a SUCCESS (`ok=true`), drawing a green tick next to a declined action.
+    // Still anchored at the start: a tool whose OUTPUT quotes the sentence must
+    // not be re-read as a refusal.
+    const HEAD: &str = "the user doesn't want to proceed with this tool use.";
+    let starts = |s: &str| normalize_denial(s.trim_start()).starts_with(HEAD);
     match content {
         Value::String(s) => starts(s),
         Value::Array(items) => items.iter().any(|b| {
@@ -682,6 +698,19 @@ fn is_denial(content: &Value) -> bool {
         }),
         _ => false,
     }
+}
+
+/// Fold a candidate refusal prefix to lowercase ASCII with a straight
+/// apostrophe, so case changes and CC's curly `’` (U+2019) do not defeat the
+/// match. Bounded to the sentence length — only the prefix is compared.
+fn normalize_denial(s: &str) -> String {
+    s.chars()
+        .take(80)
+        .map(|c| match c {
+            '\u{2019}' | '\u{2018}' | '\u{02BC}' => '\'',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect()
 }
 
 /// The wire body of a failure banner: the words CC showed, plus every fact a
@@ -734,6 +763,36 @@ fn agent_error_body(
 fn oversize_entry(line: &str, offset: u64) -> ChatEntry {
     let ty = scan_top_level_type(line).unwrap_or("");
     let uuid = scan_field(line, "uuid").unwrap_or_else(|| format!("@{offset}"));
+
+    // A blocked/failed assistant record must stay blocked even when oversized.
+    // The reduction below would otherwise collapse an `isApiErrorMessage` /
+    // `error:"rate_limit"` banner (whose `errorDetails` or text pushed it over
+    // the cap) into an ordinary `Kind::Assistant` with a null body — losing the
+    // class, the `blocked` bit and the reset clause, so a quota-blocked session
+    // renders healthy. Classify from the raw bytes FIRST and carry those bits
+    // across the size-truncation reduction (fetch-full still streams the rest).
+    if ty == "assistant" {
+        if let Some(info) = agent_error::from_oversize_line(line) {
+            let text = scan_field(line, "text").unwrap_or_default();
+            return ChatEntry {
+                uuid,
+                kind: Kind::AgentError,
+                ts_ms: parse_ts_ms(scan_field(line, "timestamp").as_deref()),
+                offset,
+                session_id: scan_field(line, "session_id").or_else(|| scan_field(line, "sessionId")),
+                tool_use_id: None,
+                label: Some(info.class.clone()),
+                // A banner is never a success — same as the parsed path.
+                ok: Some(false),
+                is_sidechain: line.contains("\"isSidechain\":true"),
+                agent_id: scan_field(line, "agentId"),
+                is_meta: line.contains("\"isMeta\":true"),
+                oversize: true,
+                body: oversize_agent_error_body(&text, &info),
+            };
+        }
+    }
+
     ChatEntry {
         uuid,
         kind: kind_for_top_level(ty),
@@ -752,6 +811,58 @@ fn oversize_entry(line: &str, offset: u64) -> ChatEntry {
         is_meta: line.contains("\"isMeta\":true"),
         oversize: true,
         body: Value::Null,
+    }
+}
+
+/// The blocking bits an oversized failure banner must carry across the
+/// size-truncation reduction. Deliberately small — the full line is still
+/// streamable via fetch-full — but it names the class, the reset clause and,
+/// above all, the `blocked` bit the composer/attention gate reads. Mirrors
+/// [`agent_error_body`] for the parsed path.
+fn oversize_agent_error_body(text: &str, info: &agent_error::AgentErrorInfo) -> Value {
+    let mut body = serde_json::json!({
+        "text": text,
+        "class": info.class,
+        "blocked": info.blocking,
+    });
+    if let Some(l) = &info.limit {
+        body["limit"] = Value::String(l.clone());
+    }
+    if let Some(l) = &info.label {
+        body["limit_label"] = Value::String(l.clone());
+    }
+    if let Some(r) = &info.resets_at {
+        body["resets_at"] = Value::String(r.clone());
+    }
+    body
+}
+
+/// A visible placeholder for a newline-terminated line that is not parseable
+/// JSON (or whose top-level value is not an object). The totality contract
+/// forbids a silent drop: without this the cursor advances past the line and a
+/// malformed blocked/error record disappears with no trace on the wire. The
+/// renderer shows an 'unparseable line' marker; `fetch-full` can still stream
+/// the raw bytes for anyone who needs to inspect them.
+fn malformed_entry(text: &str, offset: u64) -> ChatEntry {
+    // Best-effort id/timestamp recovery so a partially-corrupt line still
+    // threads the ring in order; the scan never parses, mirroring the oversize
+    // path. A bounded preview lets the reader see WHAT failed.
+    let uuid = scan_field(text, "uuid").unwrap_or_else(|| format!("@{offset}"));
+    let preview: String = text.chars().take(200).collect();
+    ChatEntry {
+        uuid,
+        kind: Kind::Unknown,
+        ts_ms: parse_ts_ms(scan_field(text, "timestamp").as_deref()),
+        offset,
+        session_id: None,
+        tool_use_id: None,
+        label: Some("unparseable".to_string()),
+        ok: None,
+        is_sidechain: false,
+        agent_id: None,
+        is_meta: false,
+        oversize: false,
+        body: serde_json::json!({ "unparseable": true, "preview": preview }),
     }
 }
 
@@ -1067,6 +1178,59 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_assistant_failure_stays_blocked_not_healthy_prose() {
+        // #7 (HIGH): an `isApiErrorMessage` / `error:"rate_limit"` banner whose
+        // `errorDetails` pushes the line over MAX_LINE_BYTES used to collapse to
+        // an ordinary `Kind::Assistant` with a null body — byte-identical to
+        // prose — so a quota-blocked session rendered healthy. The blocked bits
+        // must survive the size-truncation reduction.
+        let banner = "You've hit your session limit · resets 4:40am (Europe/Amsterdam)";
+        let huge = format!(
+            r#"{{"type":"assistant","uuid":"blk","timestamp":"2026-01-01T00:00:00Z","error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"message":{{"role":"assistant","content":[{{"type":"text","text":"{banner}"}}]}},"errorDetails":"{}"}}"#,
+            "x".repeat(MAX_LINE_BYTES)
+        );
+        assert!(huge.len() > MAX_LINE_BYTES, "line must actually be oversized");
+        let ParsedLine::Entry(e) = parse_line(&huge, 0) else {
+            panic!("oversize line must still produce a placeholder entry")
+        };
+        assert_eq!(e.len(), 1);
+        let e = &e[0];
+        assert!(e.oversize, "still oversized — fetch-full streams the full line");
+        assert_eq!(e.kind, Kind::AgentError, "must NOT degrade to Kind::Assistant");
+        assert_eq!(e.ok, Some(false), "a banner is never a success");
+        assert_eq!(e.uuid, "blk", "the real uuid must survive for fetch-full");
+        assert_eq!(
+            e.body.get("blocked").and_then(Value::as_bool),
+            Some(true),
+            "the composer/attention gate reads body.blocked"
+        );
+        assert_eq!(e.body.get("class").and_then(Value::as_str), Some("limit"));
+        assert_eq!(e.body.get("limit").and_then(Value::as_str), Some("session_5h"));
+        assert_eq!(
+            e.body.get("resets_at").and_then(Value::as_str),
+            Some("4:40am (Europe/Amsterdam)"),
+            "the reset clause is the whole 'when can I work again' answer"
+        );
+    }
+
+    #[test]
+    fn an_oversized_ordinary_assistant_line_is_not_falsely_blocked() {
+        // The failure fast-path must NOT fire on prose: no error discriminators,
+        // so it stays the coarse placeholder with a null body.
+        let huge = format!(
+            r#"{{"type":"assistant","uuid":"ok","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"assistant","content":[{{"type":"text","text":"here is a very long answer {}"}}]}}}}"#,
+            "x".repeat(MAX_LINE_BYTES)
+        );
+        let ParsedLine::Entry(e) = parse_line(&huge, 0) else {
+            panic!("oversize line must still produce a placeholder entry")
+        };
+        assert_eq!(e[0].kind, Kind::Assistant);
+        assert!(e[0].oversize);
+        assert!(e[0].body.is_null(), "ordinary prose keeps a null oversize body");
+        assert_eq!(e[0].ok, None);
+    }
+
+    #[test]
     fn oversize_line_scan_never_panics_on_a_multibyte_field_value() {
         // The oversize path scans RAW bytes, so its `"uuid":"` needle can land on
         // a nested key — e.g. a tool_use `input` object — whose value is not
@@ -1194,6 +1358,67 @@ mod tests {
         assert_eq!(entries[1].uuid, "after");
         assert_eq!(entries[1].offset, (huge.len() + 1) as u64);
         assert_eq!(off, buf.len() as u64);
+    }
+
+    #[test]
+    fn a_malformed_complete_line_emits_a_placeholder_and_is_never_silently_dropped() {
+        // #14 (LOW): a newline-terminated line that is not parseable JSON used to
+        // only debug-log and advance the cursor, so a malformed blocked/error
+        // record vanished with no trace on the wire. The no-silent-loss property
+        // requires a visible placeholder, and the cursor must still advance past
+        // the good line that follows.
+        let bad = r#"{"type":"assistant" NOT JSON blocked=true"#;
+        let good = r#"{"type":"user","uuid":"after","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"ok"}}"#;
+        let buf = format!("{bad}\n{good}\n");
+        let (entries, off) = parse_stream(std::io::Cursor::new(buf.as_bytes()), 0);
+        assert_eq!(entries.len(), 2, "the malformed line must still yield an entry");
+        assert_eq!(entries[0].kind, Kind::Unknown);
+        assert_eq!(entries[0].label.as_deref(), Some("unparseable"));
+        assert_eq!(
+            entries[0].body.get("unparseable").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(entries[0].offset, 0);
+        assert_eq!(entries[1].uuid, "after");
+        assert_eq!(entries[1].offset, (bad.len() + 1) as u64);
+        assert_eq!(off, buf.len() as u64, "cursor stays aligned past both lines");
+    }
+
+    #[test]
+    fn a_curly_apostrophe_or_uppercased_refusal_is_still_a_denial_not_a_success() {
+        // #15 (LOW): denial detection was byte-exact ASCII, so CC's live copy —
+        // which renders a curly U+2019 apostrophe — fell through as ok=true and
+        // a declined action got a green success tick. Case and apostrophe glyph
+        // must not defeat the match.
+        let make = |content: &str| {
+            format!(
+                r#"{{"type":"user","uuid":"d","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","content":"{content}"}}]}}}}"#
+            )
+        };
+        // Curly apostrophe (U+2019) — the exact glyph CC's UI emits.
+        let curly = make("The user doesn\u{2019}t want to proceed with this tool use.");
+        let ParsedLine::Entry(e) = parse_line(&curly, 0) else {
+            panic!("must parse")
+        };
+        assert_eq!(e[0].label.as_deref(), Some("denied"), "curly apostrophe refusal");
+        assert_eq!(e[0].ok, Some(false), "a refusal is never a success");
+
+        // Case change in the copy.
+        let upper = make("THE USER DOESN'T WANT TO PROCEED WITH THIS TOOL USE. Stopped.");
+        let ParsedLine::Entry(e) = parse_line(&upper, 0) else {
+            panic!("must parse")
+        };
+        assert_eq!(e[0].label.as_deref(), Some("denied"), "uppercased refusal");
+        assert_eq!(e[0].ok, Some(false));
+
+        // Anchoring preserved: a tool OUTPUT that merely quotes the sentence
+        // partway through is NOT a refusal.
+        let quoting = make("Docs say: the user doesn't want to proceed with this tool use.");
+        let ParsedLine::Entry(e) = parse_line(&quoting, 0) else {
+            panic!("must parse")
+        };
+        assert_ne!(e[0].label.as_deref(), Some("denied"), "mid-string quote is not a denial");
+        assert_eq!(e[0].ok, Some(true));
     }
 
     #[test]
