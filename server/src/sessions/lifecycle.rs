@@ -571,6 +571,51 @@ fn should_escape_resume_picker(capture: &str, resume_intended: bool, already_esc
     !resume_intended && !already_escaped && at_resume_picker(capture)
 }
 
+/// What one poll tick of [`wait_for_agent_ready`] should DO for a given capture.
+/// Factored out pure so the ready-vs-boot-gate ordering — and, above all, the
+/// rule that a MODAL is never "ready" — is unit-tested without driving a real
+/// pty.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyTick {
+    /// The first-run trust dialog is up: Enter to accept, then keep polling.
+    AcceptTrust,
+    /// A stale resume picker on a FRESH start: escape it once, then keep polling.
+    EscapePicker,
+    /// The agent's OWN prompt is on screen with no boot modal over it — READY.
+    Ready,
+    /// Nothing actionable yet — keep polling. Critically this INCLUDES a resume
+    /// picker left open on an intended resume (`should_escape_resume_picker`
+    /// deliberately does not escape it): the `❯` cursor makes `agent_ui_visible`
+    /// true, but the agent is NOT at the wheel behind the modal, so it must not
+    /// count as ready. Reporting it ready is what let a stale `--resume` park at
+    /// the picker, be recorded as a successful heal, and have the next send typed
+    /// (with an Enter) straight into the picker and logged as delivered.
+    Wait,
+}
+
+/// Decide one tick. Order is trust → picker-escape → ready, matching the boot
+/// gates the launch has to clear; the ready arm keys on
+/// [`agent_at_the_wheel`] (NOT the bare `agent_ui_visible`) so neither the trust
+/// dialog nor the resume picker — both of which draw the `❯` glyph — is ever
+/// mistaken for a live prompt.
+fn classify_ready_tick(
+    capture: &str,
+    resume_intended: bool,
+    already_escaped: bool,
+    trusted: bool,
+) -> ReadyTick {
+    if !trusted && at_trust_dialog(capture) {
+        return ReadyTick::AcceptTrust;
+    }
+    if should_escape_resume_picker(capture, resume_intended, already_escaped) {
+        return ReadyTick::EscapePicker;
+    }
+    if agent_at_the_wheel(capture) {
+        return ReadyTick::Ready;
+    }
+    ReadyTick::Wait
+}
+
 /// Confirm the pane shell is live (and let it print a prompt).
 async fn settle_shell(rt: &dyn SessionRuntime) -> bool {
     for _ in 0..10 {
@@ -609,34 +654,34 @@ async fn wait_for_agent_ready(
             // Dismiss the first-run BOOT GATES *before* the ready-check. Both the
             // trust dialog and the resume picker draw a numbered menu whose cursor
             // is `❯` — the exact glyph `agent_ui_visible` keys on — so a ready-check
-            // first would declare the session "ready" with a modal still up. Two
-            // costs we actually hit in prod:
+            // keyed on that glyph alone would declare the session "ready" with a
+            // modal still up. Two costs we actually hit in prod:
             //   1. the steering deliver then sends the dispatched task INTO the modal
             //      (a bare Enter just picks "Yes, I trust" / a stale conversation),
             //      so the agent "never got the message"; and
             //   2. the status detector captures the `❯ 1.` menu, matches the WAITING
             //      bank, and flips the card to "needs your input" the instant it is
             //      claimed — before the agent has done anything.
-            // Order is trust → resume → ready, and we `continue` after handling a
-            // gate so we never fall through to the ready-check on the SAME capture
-            // that still shows the menu (the escape/accept has not rendered yet).
-            if !trusted && at_trust_dialog(&cap) {
-                // Default option is "1. Yes, I trust this folder"; a bare Enter
-                // accepts it (and persists the trust so it never reappears).
-                let _ = rt.send_key("Enter").await;
-                trusted = true;
-                continue;
-            }
-            if should_escape_resume_picker(&cap, resume_intended, escaped) {
-                let _ = rt.send_key("Escape").await;
-                let _ = rt.send_key("Escape").await;
-                let _ = rt.send_key("C-c").await;
-                let _ = db::sessions::clear_cc(&state.pool, name).await;
-                escaped = true;
-                continue;
-            }
-            if agent_ui_visible(&cap) {
-                return true;
+            // Order is trust → resume → ready (see [`classify_ready_tick`]); the
+            // ready arm keys on `agent_at_the_wheel`, so a picker left open on an
+            // INTENDED resume (which we deliberately do not escape) reads Wait, not
+            // Ready — a heal that only reaches the picker is a FAILED heal.
+            match classify_ready_tick(&cap, resume_intended, escaped, trusted) {
+                ReadyTick::AcceptTrust => {
+                    // Default option is "1. Yes, I trust this folder"; a bare Enter
+                    // accepts it (and persists the trust so it never reappears).
+                    let _ = rt.send_key("Enter").await;
+                    trusted = true;
+                }
+                ReadyTick::EscapePicker => {
+                    let _ = rt.send_key("Escape").await;
+                    let _ = rt.send_key("Escape").await;
+                    let _ = rt.send_key("C-c").await;
+                    let _ = db::sessions::clear_cc(&state.pool, name).await;
+                    escaped = true;
+                }
+                ReadyTick::Ready => return true,
+                ReadyTick::Wait => {}
             }
         }
     }
@@ -795,7 +840,56 @@ pub async fn start(
 ) -> Result<StartResult, AppError> {
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
+    start_locked(state, name, prompt).await
+}
 
+/// Outcome of [`start_if_stopped`]: either we started (carrying `start`'s
+/// readiness flag), or the death-stamp precondition no longer held under the lock
+/// and we deliberately did nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HealStart {
+    Started(bool),
+    Superseded,
+}
+
+/// [`start`], made ATOMIC with the "is this still a death-stamped, nobody-else-
+/// touched-it session?" precondition the auto-heal depends on.
+///
+/// The old auto-heal probed `try_lock` + re-read status in a helper, dropped the
+/// lock, then called `start`, which re-acquired it — a TOCTOU window in which a
+/// user's Stop/Resume/delete could land and be silently undone by the restart.
+/// Here the status re-read and the spawn happen under ONE continuous hold of the
+/// per-session lock, so any lifecycle op that moved the row off `stopped` before
+/// we started is seen and honored: we bail `Superseded` rather than resurrect a
+/// session the owner just acted on. THE USER WINS, atomically.
+pub(super) async fn start_if_stopped(
+    state: &AppState,
+    name: &str,
+) -> Result<HealStart, AppError> {
+    let lock = state.lock_for(name);
+    let _guard = lock.lock().await;
+    // Authoritative re-check UNDER the lock we are about to start under. `stopped`
+    // is exactly the state a terminal death leaves behind; anything else means a
+    // user (or another lifecycle op) moved it while the daemon was deciding.
+    let still_stopped = matches!(
+        db::sessions::runtime(&state.pool, name).await.ok().flatten(),
+        Some(rt) if rt.last_status == "stopped",
+    );
+    if !still_stopped {
+        return Ok(HealStart::Superseded);
+    }
+    let res = start_locked(state, name, None).await?;
+    Ok(HealStart::Started(res.ready))
+}
+
+/// The body of [`start`], assuming the per-session lock is ALREADY held. Split
+/// out so [`start_if_stopped`] can wrap it with an atomic precondition without
+/// re-entering the (non-reentrant) lock.
+async fn start_locked(
+    state: &AppState,
+    name: &str,
+    prompt: Option<&str>,
+) -> Result<StartResult, AppError> {
     let mut s = require_session(state, name).await?;
 
     // RETIRED PROVIDER GUARD. A row whose provider supermux no longer ships
@@ -1094,6 +1188,33 @@ pub async fn start(
     };
 
     db::sessions::bump_start(&state.pool, name).await?;
+
+    if !ready {
+        // FAILED launch/resume: the pane came back (a bash prompt, or a modal we
+        // could not clear such as a stale resume picker) but the AGENT never took
+        // the wheel. Persisting `active` here — as this path unconditionally did —
+        // is the false-healthy bug: `Heal::Failed`'s contract is that the session
+        // STAYS stopped, yet any consumer reading `status` independently of the
+        // `holder_died` badge (the roster dot, the board's live check, the
+        // detector's own `prev` seed) saw a green `active` row over a shell.
+        //
+        // Restore `stopped` and broadcast it, and do NOT type `prompt` into
+        // whatever is sitting on the pty (that is how a delegated message got
+        // swallowed by a bash prompt / typed into the picker). The caller
+        // (`wake_for_send`, `auto_heal`) re-stamps the honest `holder_died` badge
+        // and reports UNDELIVERED. We do not wake the detector: there is nothing
+        // good for it to observe, and a live bash prompt would only tempt it to
+        // settle the row back to `idle`.
+        db::sessions::set_last_status(&state.pool, name, "stopped").await?;
+        broadcast_status(state, name, "stopped");
+        return Ok(StartResult {
+            name: name.to_string(),
+            started: true,
+            ready,
+            target: rt.target(),
+        });
+    }
+
     db::sessions::set_last_status(&state.pool, name, "active").await?;
     // Explicitly publish the `starting → active` transition ourselves. The
     // detector loop can't be trusted to do it: by the time it ticks, it seeds
@@ -1358,6 +1479,23 @@ pub async fn send_text(state: &AppState, name: &str, text: &str) -> Result<(), A
 /// surface as the send preview the roster renders (`last-send-recall.tsx`) or as
 /// the text `receiptClaims` matches against, hence `preview_text`.
 /// `preview: None` keeps the old behaviour (preview == what was sent).
+/// The runtime a `send_harness_text` WRITE must target. Pure decision, factored
+/// out so the "re-resolve after a migrating wake" rule is unit-tested against the
+/// real runtime cache: when `woke` is true the pre-wake handle may point at a
+/// backend `start` just migrated away from, so re-resolve; otherwise reuse it.
+async fn write_runtime(
+    state: &AppState,
+    name: &str,
+    pre_wake: Arc<dyn SessionRuntime>,
+    woke: bool,
+) -> Result<Arc<dyn SessionRuntime>, AppError> {
+    if woke {
+        Ok(state.runtime_for(name).await?)
+    } else {
+        Ok(pre_wake)
+    }
+}
+
 pub async fn send_harness_text(
     state: &AppState,
     name: &str,
@@ -1394,12 +1532,20 @@ pub async fn send_harness_text(
     }
     let rt = state.runtime_for(name).await?;
     // Auto-wake BEFORE taking the lock (start() acquires it itself).
-    if !rt.alive().await {
+    let woke = !rt.alive().await;
+    if woke {
         wake_for_send(state, name).await?;
     }
 
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
+    // RE-RESOLVE after a wake. `wake_for_send` → `start` can migrate a legacy
+    // tmux session to native on its fresh start, which `runtime_invalidate`s the
+    // cache — so `rt`, resolved BEFORE the wake, is now a handle to the dead tmux
+    // backend. Writing `text` through it would let the wake succeed yet drop the
+    // very first message into nothing. When we did not wake, the pre-resolved
+    // handle is still valid; reuse it.
+    let rt = write_runtime(state, name, rt, woke).await?;
     rt.send_text(text).await?;
     // Backend-declared gap between the text and its submit (see `submit_gap`).
     submit_gap(rt.as_ref()).await;
@@ -2220,6 +2366,60 @@ mod agent_ready_heuristics_tests {
         // Normal agent UI is never mistaken for the picker.
         assert!(!should_escape_resume_picker("❯ Try \"fix tests\"", false, false));
     }
+
+    /// REGRESSION (codex #1, CRITICAL). A resume picker left open on an INTENDED
+    /// resume must classify `Wait`, NEVER `Ready` — even though its `❯` cursor
+    /// makes `agent_ui_visible` true. Reporting it ready is what let a stale
+    /// `--resume` park at the picker, be recorded as a successful heal (clearing
+    /// `holder_died`), and have the next send typed + Enter'd straight INTO the
+    /// modal and logged as delivered.
+    #[test]
+    fn a_resume_picker_left_open_is_never_ready() {
+        let picker = "Resume a conversation\n❯ 1. Fix the parser  2h ago\n  2. Older chat";
+        // The exact honest-state hazard: intended resume, picker still up.
+        assert!(
+            agent_ui_visible(picker),
+            "precondition: the picker's ❯ cursor DOES trip the bare glyph check — \
+             which is why keying readiness on it was the bug",
+        );
+        assert_eq!(
+            classify_ready_tick(picker, /*resume_intended*/ true, /*escaped*/ false, /*trusted*/ false),
+            ReadyTick::Wait,
+            "a picker we deliberately do not escape must keep the ready-poll WAITING, \
+             so the heal times out to ready=false (a FAILED heal), not a false success",
+        );
+        // The trust dialog is the sibling boot modal: also `❯`, also not ready.
+        let trust = "Quick safety check: do you trust the files in this folder?\n❯ 1. Yes";
+        assert_eq!(
+            classify_ready_tick(trust, true, false, false),
+            ReadyTick::AcceptTrust,
+            "trust dialog is dismissed, not treated as ready",
+        );
+        // A real composer prompt (no modal) is the ONLY thing that reads Ready.
+        assert_eq!(
+            classify_ready_tick("❯ Try \"fix tests\"\n  ⏵⏵ bypass permissions on", true, false, false),
+            ReadyTick::Ready,
+            "the agent's own prompt, with no boot modal over it, is ready",
+        );
+    }
+
+    /// A FRESH (not resume-intended) stale picker is escaped ONCE, then — once the
+    /// escape has been issued (`escaped=true`) but the picker capture has not yet
+    /// re-rendered — must still `Wait`, not fall through to `Ready` on the same
+    /// menu still showing `❯`.
+    #[test]
+    fn a_fresh_stale_picker_escapes_then_waits_not_ready() {
+        let picker = "Select a session to resume\n❯ 1. old chat";
+        assert_eq!(
+            classify_ready_tick(picker, false, false, false),
+            ReadyTick::EscapePicker,
+        );
+        assert_eq!(
+            classify_ready_tick(picker, false, /*escaped*/ true, false),
+            ReadyTick::Wait,
+            "after the one-shot escape, the still-visible menu must not read Ready",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3017,5 +3217,95 @@ mod peek_cap_tests {
         let s = "x".repeat(1_000);
         let out = cap_bytes_from_tail(s, 100);
         assert_eq!(out.len(), 100);
+    }
+}
+
+#[cfg(test)]
+mod write_runtime_tests {
+    //! REGRESSION (codex #10). `send_harness_text` resolved the runtime BEFORE
+    //! the auto-wake. When the wake's `start` migrates a legacy tmux session to
+    //! native it `runtime_invalidate`s the cache — so the pre-wake handle points
+    //! at the dead tmux backend, and writing the first message through it drops it
+    //! into nothing while the wake reports success. `write_runtime` is the fix's
+    //! decision point: re-resolve after a wake, reuse otherwise.
+
+    use super::*;
+    use crate::config::Config;
+    use crate::sessions::runtime::{RUNTIME_NATIVE, RUNTIME_TMUX};
+
+    async fn test_state() -> (AppState, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("supermux-writert-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            extra_binds: vec![],
+            tls: Default::default(),
+            auth_token: "test-token".to_string(),
+            provider_defaults: Default::default(),
+            ws: Default::default(),
+            remote_callback_url: None,
+            push_sub: None,
+            github_token: None,
+            statusline_tap: false,
+            extra_origins: Vec::new(),
+        };
+        let pool = crate::db::init(&config).await.expect("init pool");
+        (AppState::new(pool, config), dir)
+    }
+
+    /// After a wake that migrated tmux→native, re-resolving yields a DIFFERENT
+    /// (live, native) handle than the one resolved before the wake — proving that
+    /// reusing the pre-wake handle (the old bug) would have targeted the dead
+    /// backend. When we did NOT wake, the pre-resolved handle is reused verbatim.
+    #[tokio::test]
+    async fn re_resolves_the_runtime_only_after_a_migrating_wake() {
+        let (state, dir) = test_state().await;
+        db::sessions::insert_minimal(&state.pool, "mig", "/tmp", "claude")
+            .await
+            .unwrap();
+        db::sessions::set_runtime(&state.pool, "mig", RUNTIME_TMUX)
+            .await
+            .unwrap();
+        db::sessions::ensure_runtime(&state.pool, "mig", "tok")
+            .await
+            .unwrap();
+
+        // The handle `send_harness_text` resolves BEFORE the auto-wake.
+        let pre_wake = state.runtime_for("mig").await.unwrap();
+
+        // The wake's `start` migrates the legacy row and invalidates the cache.
+        db::sessions::set_runtime(&state.pool, "mig", RUNTIME_NATIVE)
+            .await
+            .unwrap();
+        state.runtime_invalidate("mig");
+
+        // woke == true → re-resolve. Must be a fresh handle, not the tmux one.
+        let after_wake = write_runtime(&state, "mig", pre_wake.clone(), true)
+            .await
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&pre_wake, &after_wake),
+            "a migrating wake must hand the write the NEW backend, not the stale \
+             pre-wake tmux handle that start migrated away from",
+        );
+        assert_ne!(
+            pre_wake.target(),
+            after_wake.target(),
+            "the re-resolved handle is the native backend, distinct from tmux",
+        );
+
+        // woke == false → reuse the pre-resolved handle exactly (no needless churn).
+        let no_wake = write_runtime(&state, "mig", pre_wake.clone(), false)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&pre_wake, &no_wake),
+            "with no wake there was no migration; reuse the handle we already had",
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
