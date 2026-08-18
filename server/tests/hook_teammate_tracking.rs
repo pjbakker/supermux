@@ -1,0 +1,192 @@
+//! `cc_conversation_id` tracking on `/api/_internal/hook` must follow the LEAD's
+//! conversation only.
+//!
+//! An in-process teammate (Claude Code >= 2.1.232) runs under the parent pane's
+//! `$SUPERMUX_SESSION` and hook token, and fires its own `SessionStart` /
+//! `UserPromptSubmit` with its OWN `session_id` plus an `agent_type`. Following
+//! those would point "this session" prompt-recall at the teammate's transcript.
+//! This drives the real handler end to end (the unit tests in `hooks::tests` only
+//! reach `apply_payload`, which does not run the tracking block at all).
+
+use supermux_server::config::{Config, ProviderDefaults, TlsConfig};
+use supermux_server::state::AppState;
+use supermux_server::{db, http};
+
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
+use tower::ServiceExt; // for `oneshot`
+
+const BEARER: &str = "dashboard-bearer-secret";
+const TOK: &str = "hook-token-of-the-lead";
+const SESSION: &str = "lead";
+
+async fn setup() -> (AppState, axum::Router, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("supermux-hooktrack-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = Config {
+        data_dir: dir.clone(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        extra_binds: vec![],
+        extra_origins: vec![],
+        tls: TlsConfig::default(),
+        auth_token: BEARER.to_string(),
+        provider_defaults: ProviderDefaults::default(),
+        ws: Default::default(),
+        remote_callback_url: None,
+        push_sub: None,
+        github_token: None,
+        statusline_tap: false,
+    };
+    let pool = db::init(&config).await.expect("db init");
+    let state = AppState::new(pool, config);
+
+    db::sessions::insert_minimal(&state.pool, SESSION, "/tmp", "shell").await.unwrap();
+    db::sessions::ensure_runtime(&state.pool, SESSION, TOK).await.unwrap();
+
+    let app = http::router(state.clone());
+    (state, app, dir)
+}
+
+/// POST one hook event with the session's real token and a raw payload object.
+async fn post_hook(app: &axum::Router, event: &str, payload: serde_json::Value) -> StatusCode {
+    let body = serde_json::json!({ "session": SESSION, "event": event, "payload": payload });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/_internal/hook")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Supermux-Hook-Token", TOK)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+async fn tracked(state: &AppState) -> String {
+    db::sessions::cc_conversation_id(&state.pool, SESSION)
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn teammate_hooks_do_not_move_the_lead_conversation_id() {
+    let (state, app, dir) = setup().await;
+
+    // 1. The lead's own SessionStart (no agent_type) establishes the id.
+    assert_eq!(
+        post_hook(&app, "session_start", serde_json::json!({ "session_id": "lead-conv-1" })).await,
+        StatusCode::OK
+    );
+    assert_eq!(tracked(&state).await, "lead-conv-1", "the lead's own SessionStart tracks");
+
+    // 2. A teammate's SessionStart: its own id + an agent_type, must be ignored.
+    assert_eq!(
+        post_hook(
+            &app,
+            "session_start",
+            serde_json::json!({
+                "session_id": "teammate-conv-9",
+                "agent_type": "general-purpose",
+                "source": "startup",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        tracked(&state).await,
+        "lead-conv-1",
+        "a teammate SessionStart must not move the lead's conversation id"
+    );
+
+    // 3. A teammate's UserPromptSubmit (fired whenever the lead messages it) is
+    //    the other event that writes the id, and must be ignored too.
+    assert_eq!(
+        post_hook(
+            &app,
+            "user_prompt_submit",
+            serde_json::json!({
+                "session_id": "teammate-conv-9",
+                "agent_type": "general-purpose",
+                "prompt": "go",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        tracked(&state).await,
+        "lead-conv-1",
+        "a teammate UserPromptSubmit must not move the lead's conversation id"
+    );
+
+    // 4. The lead's own prompt on a NEW conversation (a /clear or compaction
+    //    forks a fresh transcript) still moves it: the guard must not over-reach.
+    assert_eq!(
+        post_hook(
+            &app,
+            "user_prompt_submit",
+            serde_json::json!({ "session_id": "lead-conv-2", "prompt": "hi" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        tracked(&state).await,
+        "lead-conv-2",
+        "the lead's own UserPromptSubmit still tracks the fresh conversation"
+    );
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn an_agent_lead_tracks_and_keeps_its_own_lifecycle() {
+    // A lead launched as `claude --agent <name>` carries agent_type on its OWN
+    // payloads. With nothing tracked yet it is accepted (first contact
+    // establishes the id), and from then on its id matches, so its lifecycle is
+    // never masked: no zombie row, teardown / archive-on-stop still run.
+    let (state, app, dir) = setup().await;
+
+    assert_eq!(
+        post_hook(
+            &app,
+            "session_start",
+            serde_json::json!({
+                "session_id": "agent-lead-1",
+                "agent_type": "reviewer",
+                "source": "startup",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        tracked(&state).await,
+        "agent-lead-1",
+        "an --agent lead establishes its id on first contact"
+    );
+
+    // Its own SessionEnd now matches the tracked id, so it still forces Stopped.
+    assert_eq!(
+        post_hook(
+            &app,
+            "session_end",
+            serde_json::json!({
+                "session_id": "agent-lead-1",
+                "agent_type": "reviewer",
+                "reason": "other",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        state.take_forced_status(SESSION),
+        Some(supermux_server::sessions::status::Status::Stopped),
+        "an --agent lead's own SessionEnd must still force Stopped"
+    );
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
