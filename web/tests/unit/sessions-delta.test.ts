@@ -238,3 +238,73 @@ describe('status version — a reordered event cannot regress newer truth (w6 #8
     expect(list[0].status).toBe('stopped')
   })
 })
+
+describe('applyDelta — the archive twin-broadcast race (ported PR #54)', () => {
+  // Archiving also STOPS the session, and the stop broadcasts its own thin
+  // `{name, status:'stopped'}` `sessions` delta from a separate task, so that
+  // partial can land AFTER the archive's removal delta. That exact shape is the
+  // bug the old archive-tombstone PR chased: an unknown name on a `sessions`
+  // event (allowAdd = true) used to be re-inserted as a synthetic idle stub with
+  // an empty dir and preview — a ghost tile that only a reload cleared. The
+  // removal tombstone above covers it; these cases pin the archive-specific
+  // shapes so a future edit to the discriminator cannot quietly lose them.
+
+  test('the twin late `status: stopped` partial does not resurrect the tile', () => {
+    const tomb = new Map<string, number>()
+    const alive = [row({ name: 'keep' }), row({ name: 'arch', status: 'active' })]
+    // The archive broadcast drops the row and tombstones the name.
+    const gone = applyDelta(alive, [{ name: 'arch', archived: true }], true, tomb, 1000)
+    expect(gone.map((s) => s.name)).toEqual(['keep'])
+    // The stop's own `sessions` delta lands 300ms later, on the add-allowing
+    // path. It carries no `dir`/`provider`, so it is a synthetic partial: deny.
+    const after = applyDelta(gone, [{ name: 'arch', status: 'stopped' }], true, tomb, 1300)
+    expect(after.map((s) => s.name)).toEqual(['keep'])
+  })
+
+  test('the same stop arriving on the `status` channel is a no-op too', () => {
+    const tomb = new Map<string, number>()
+    const gone = applyDelta([row({ name: 'arch' })], [{ name: 'arch', archived: true }], true, tomb, 0)
+    // `status` events never add (allowAdd = false) — the second half of the
+    // guard, independent of the tombstone.
+    const after = applyDelta(
+      gone,
+      statusToDelta({ name: 'arch', status: 'stopped', version: 4 }),
+      false,
+      tomb,
+      100,
+    )
+    expect(after.map((s) => s.name)).toEqual([])
+  })
+
+  test('a row put back into the cache out of band takes deltas at once', () => {
+    // Two paths re-insert a row WITHOUT going through applyDelta: the tile's
+    // optimistic undo (session-tile/tile.tsx) and a full `GET /api/sessions`
+    // refetch (that endpoint filters archived rows out, so every name it returns
+    // is live). Neither can clear a tombstone, so the reducer has to: a delta
+    // for a PRESENT row always merges, and lifts the tombstone on the way.
+    const tomb = new Map<string, number>()
+    const gone = applyDelta([row({ name: 'arch', status: 'active' })], [{ name: 'arch', archived: true }], true, tomb, 0)
+    expect(gone.map((s) => s.name)).toEqual([])
+    expect(tomb.has('arch')).toBe(true)
+    // Undo / refetch puts the row back by hand, still inside the TTL.
+    const restored = [row({ name: 'arch', status: 'stopped' })]
+    const after = applyDelta(restored, [{ name: 'arch', preview_lines: ['back'] }], true, tomb, 500)
+    expect(after.map((s) => s.name)).toEqual(['arch'])
+    expect(after[0].preview_lines).toEqual(['back'])
+    expect(tomb.has('arch')).toBe(false)
+  })
+
+  test('after an unarchive full row, trailing archive-era partials still merge', () => {
+    const tomb = new Map<string, number>()
+    const gone = applyDelta([row({ name: 'arch', status: 'active' })], [{ name: 'arch', archived: true }], true, tomb, 0)
+    // Unarchive re-broadcasts the whole SessionView with `archived: false`
+    // (sessions/lifecycle.rs::unarchive) — authoritative, so the tile is back.
+    const back = applyDelta(gone, [row({ name: 'arch', status: 'stopped', archived: false })], true, tomb, 200)
+    expect(back.map((s) => s.name)).toEqual(['arch'])
+    // A partial queued before the unarchive arrives after it: it must merge into
+    // the restored row, not be swallowed by a stale tombstone.
+    const after = applyDelta(back, [{ name: 'arch', preview_lines: ['tail'] }], true, tomb, 300)
+    expect(after.map((s) => s.name)).toEqual(['arch'])
+    expect(after[0].preview_lines).toEqual(['tail'])
+  })
+})
