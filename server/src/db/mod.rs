@@ -145,6 +145,7 @@ mod tests {
             worktree_repo: String::new(),
             host_id: None,
             runtime: "native".into(),
+            archive_on_stop: false,
             config_dir: "/home/agent/.claude-second".into(),
         };
         sessions::create(&pool, &new).await.unwrap();

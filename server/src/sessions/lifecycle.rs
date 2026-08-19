@@ -3782,6 +3782,7 @@ mod build_env_tests {
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            archive_on_stop: 0,
             config_dir: "/home/agent/.claude-second".into(),
         };
 
@@ -3856,6 +3857,7 @@ mod build_env_tests {
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            archive_on_stop: 0,
             config_dir: "/home/agent/.claude-second".into(),
         };
         // `shell` is deliberately absent: `start` settles a shell session

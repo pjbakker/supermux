@@ -43,6 +43,7 @@ async fn setup() -> (AppState, axum::Router, PathBuf) {
         provider_defaults: ProviderDefaults::default(),
         ws: Default::default(),
         statusline_tap: false,
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
