@@ -191,3 +191,94 @@ async fn an_agent_lead_tracks_and_keeps_its_own_lifecycle() {
     state.pool.close().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Combined-branch guard: the teammate-hooks filter must short-circuit the
+/// archive-on-stop path.
+///
+/// Two units meet here. `archive_on_stop` (the scheduler's disposable-session
+/// marker) makes `hooks::force_stopped` archive the row the moment a `SessionEnd`
+/// settles it to `stopped`. The teammate filter drops a lifecycle payload that
+/// belongs to an in-process teammate before `force_stopped` ever runs. Without
+/// that filter, one `TaskStop` on a subagent would archive the LEAD's live
+/// session out from under the user: exactly the damage the fix exists to prevent,
+/// now with a permanent consequence rather than a recoverable status flip.
+///
+/// The lead's OWN `SessionEnd` at the end is the control: it proves the row was
+/// genuinely archivable the whole time, so the first half is not vacuous.
+#[tokio::test]
+async fn a_teammate_session_end_never_archives_a_live_archive_on_stop_session() {
+    let (state, app, dir) = setup().await;
+
+    // A scheduler-booted disposable session: flagged, live, not archived.
+    sqlx::query("UPDATE sessions SET archive_on_stop = 1 WHERE name = ?")
+        .bind(SESSION)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    assert!(
+        db::sessions::archive_pending(&state.pool, SESSION).await.unwrap(),
+        "fixture: the session must start out flagged and archivable"
+    );
+
+    // The lead's own SessionStart establishes the tracked conversation id, which
+    // is what makes the teammate's id below read as foreign.
+    assert_eq!(
+        post_hook(&app, "session_start", serde_json::json!({ "session_id": "lead-conv-1" })).await,
+        StatusCode::OK
+    );
+
+    // A teammate's SessionEnd (its own id + an agent_type) — what `TaskStop` on
+    // an in-process subagent emits.
+    assert_eq!(
+        post_hook(
+            &app,
+            "session_end",
+            serde_json::json!({
+                "session_id": "teammate-conv-9",
+                "agent_type": "general-purpose",
+                "reason": "other",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        state.take_forced_status(SESSION),
+        None,
+        "a teammate SessionEnd must not force the lead Stopped"
+    );
+    // `force_stopped` archives on a detached task, so absence needs a real
+    // window, not just one yield. Poll for the same budget the positive control
+    // below gets, and fail on the first sight of an archive.
+    for _ in 0..100 {
+        assert_eq!(
+            db::sessions::is_archived(&state.pool, SESSION).await.unwrap(),
+            Some(false),
+            "a teammate SessionEnd must never archive the lead's live session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Control: the lead's own SessionEnd still archives it.
+    assert_eq!(
+        post_hook(
+            &app,
+            "session_end",
+            serde_json::json!({ "session_id": "lead-conv-1", "reason": "other" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let mut archived = false;
+    for _ in 0..100 {
+        if db::sessions::is_archived(&state.pool, SESSION).await.unwrap() == Some(true) {
+            archived = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(archived, "the lead's own SessionEnd must still auto-archive the flagged session");
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
