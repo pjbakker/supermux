@@ -1693,6 +1693,7 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                ..Default::default()
             },
         )
         .await
