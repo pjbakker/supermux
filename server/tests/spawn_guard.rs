@@ -36,6 +36,7 @@ async fn setup() -> (AppState, axum::Router, std::path::PathBuf) {
         push_sub: None,
         github_token: None,
         statusline_tap: false,
+        swarm_reaper: Default::default(),
     };
     let pool = db::init(&config).await.expect("db init");
     let state = AppState::new(pool, config);
