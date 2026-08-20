@@ -17,7 +17,7 @@
 -- change into a schema migration.
 --
 -- Numbering: upstream main is at 0029, and origin/feat/grok-mode has already
--- taken 0100 and 0031, so this fork-local migration sits in a high slot (0100)
+-- taken 0030 and 0031, so this fork-local migration sits in a high slot (0100)
 -- that upstream will not reach for a long time. sqlx orders purely by version
 -- and tolerates gaps (0006 is already skipped), and a later upstream 0032-0099
 -- still applies normally on a DB that already has 0100.
