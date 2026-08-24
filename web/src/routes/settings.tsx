@@ -83,7 +83,7 @@ import {
 } from '@/components/settings/secret-field'
 import { SnippetsSection } from '@/components/settings/snippets-section'
 import { HostsSection } from '@/components/settings/hosts-section'
-import { SchedulesSection } from '@/components/settings/schedules-section'
+import { WorkflowsRow } from '@/components/settings/workflows-row'
 import { AuditLog } from '@/components/settings/audit-log'
 import { UpdatesSection } from '@/components/settings/updates-panel'
 import { Button } from '@/components/ui/button'
@@ -601,13 +601,13 @@ const NOTIF_TYPES: NotifTypeSpec[] = [
   },
   {
     key: 'schedule_error',
-    label: 'Scheduled task errored',
-    hint: 'When a scheduled task fails. Successful runs are silent on purpose.',
+    label: 'Workflow errored',
+    hint: 'When a workflow run fails. Successful runs are silent on purpose.',
   },
   {
     key: 'schedule_finished',
-    label: 'Scheduled task finished',
-    hint: 'When a schedule you marked "notify me when done" completes.',
+    label: 'Workflow finished',
+    hint: 'When a workflow you marked "notify me when done" completes.',
   },
 ]
 
@@ -783,7 +783,7 @@ function NotificationsSection() {
       case 'blocked':
         return 'Notifications are blocked for this site. Allow them in your browser settings, then turn this on.'
       default:
-        return 'Get a phone notification when an agent needs you, finishes, stops, or a scheduled task errors.'
+        return 'Get a phone notification when an agent needs you, finishes, stops, or a workflow errors.'
     }
   })()
 
@@ -1354,10 +1354,10 @@ export function Settings() {
 
           <HostsSection />
 
-          {/* B1 T8 — the former /scheduler route, folded in. Sits between Hosts
-              and Claude tools: the three are registry-ish configuration
-              neighbours, and `/scheduler` now redirects to `#schedules`. */}
-          <SchedulesSection />
+          {/* Workflows v1: ONE row, pointing at `/workflows`. It used to be the
+              whole folded /scheduler table — a schedule had no home of its own
+              then, and a workflow does. `#schedules` still lands here. */}
+          <WorkflowsRow />
 
           <ClaudeToolsSection />
 

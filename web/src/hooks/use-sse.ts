@@ -66,7 +66,6 @@ export const SSE_NAMED_EVENTS = [
   // The boards list (switcher options) — re-published when a board is
   // created / renamed / deleted / registered for a team.
   'boards',
-  'schedules',
   // Workflows v1 — list/step deltas (`{change, workflow, session, title, run_id?,
   // step?, steps?}`). COMPANY-STAMPED server-side, so a bot's own people see it
   // and not only the owner. An INVALIDATION TICK: `use-workflows.ts` refetches.

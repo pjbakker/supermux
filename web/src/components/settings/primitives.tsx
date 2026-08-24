@@ -16,7 +16,7 @@ export const listContainer: Variants = {
 }
 
 /** Per-section spring-in. Pairs with `springs.cardExpand` (Apple Music feel). */
-const sectionItem: Variants = {
+export const sectionItem: Variants = {
   hidden: { opacity: 0, y: 10 },
   visible: { opacity: 1, y: 0, transition: springs.cardExpand },
 }

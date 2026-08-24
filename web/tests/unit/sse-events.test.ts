@@ -90,12 +90,13 @@ describe('the SSE channel list', () => {
   test('the client subscribes to nothing that does not exist', () => {
     // The other direction is a warning rather than a bug, but a channel nobody
     // emits is either a rename that half-landed or dead weight.
-    const orphans = (SSE_NAMED_EVENTS as readonly string[]).filter(
-      // `schedules` is emitted by the scheduler through the `alerts` channel
-      // today; the name is kept because `use-scheduler.ts` still routes on it.
-      (e) => !EMITTED.includes(e) && e !== 'schedules',
-    )
+    // Phase 4B removed the ONE exemption this test carried: `schedules` was
+    // kept because `use-scheduler.ts` routed on it. The scheduler client is
+    // gone, the server emits `workflows` instead, and the allowlist shrank —
+    // which is the direction it is allowed to move.
+    const orphans = (SSE_NAMED_EVENTS as readonly string[]).filter((e) => !EMITTED.includes(e))
     expect(orphans).toEqual([])
+    expect(SSE_NAMED_EVENTS as readonly string[]).not.toContain('schedules')
   })
 
   test('the list has no duplicates — a double subscription fires twice', () => {

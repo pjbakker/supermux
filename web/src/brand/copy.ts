@@ -344,8 +344,8 @@ export const ONBOARDING = {
       body: 'Tap a tile to take over its terminal. Every keystroke goes straight to tmux.',
     },
     {
-      title: 'Schedule the routine',
-      body: 'Schedules live in Settings now — boot agents or send commands on a cron expression. Set it once, walk away.',
+      title: 'Give a bot a job',
+      body: 'Workflows are in Settings — a bot, an ordered list of prompts, and one trigger. Set it once, walk away.',
     },
     {
       title: 'Start another agent',

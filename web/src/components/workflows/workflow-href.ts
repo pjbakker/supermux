@@ -27,10 +27,15 @@ export function workflowHref(id: string): string {
 
 /** The composer, creating. `session` pre-selects the owning bot — what
  *  "+ New workflow" inside a bot's panel needs. */
-export function workflowNewHref(session?: string | null): string {
-  return session
-    ? `${WORKFLOWS_ROUTE}/new?session=${encodeURIComponent(session)}`
-    : `${WORKFLOWS_ROUTE}/new`
+export function workflowNewHref(session?: string | null, prompt?: string | null): string {
+  const q = new URLSearchParams()
+  if (session) q.set('session', session)
+  // The chat composer's clock carries the draft the typist already wrote into
+  // step 1 — the human path §13.3 calls trivial, and it stays trivial: no new
+  // form, no new endpoint, just a seeded first step.
+  if (prompt?.trim()) q.set('prompt', prompt.trim())
+  const s = q.toString()
+  return s ? `${WORKFLOWS_ROUTE}/new?${s}` : `${WORKFLOWS_ROUTE}/new`
 }
 
 /** The composer, editing. */

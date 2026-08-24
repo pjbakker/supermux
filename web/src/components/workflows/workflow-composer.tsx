@@ -74,12 +74,15 @@ export interface ComposerDraft {
  *  It is deliberately NOT empty: a workflow that runs every weekday at 9 is
  *  what most people are here to make, so the only thing left to do is say what
  *  it should do. Defaults are the cheapest UX there is. */
-export function emptyDraft(session = ''): ComposerDraft {
+export function emptyDraft(session = '', prompt = ''): ComposerDraft {
   return {
     title: '',
     session,
     trigger: { kind: 'recurring', expr: 'every weekday at 9:00', text: 'every weekday at 9:00' },
-    steps: [newStep()],
+    // `prompt` is the composer's clock (`?prompt=`): the human path that used to
+    // hand a chat draft to the schedules sheet hands it to step 1 instead. The
+    // draft is COPIED, so backing out of here costs the typist nothing.
+    steps: [newStep(prompt ? { text: prompt } : {})],
     onComplete: { kind: 'notify' },
   }
 }
@@ -201,7 +204,7 @@ export function WorkflowComposer() {
     ? draftFromWorkflow(loaded.data as WorkflowDetailPayload)
     : params.get('template')
       ? draftFromTemplate(params.get('template') as string, params.get('session') ?? '')
-      : emptyDraft(params.get('session') ?? '')
+      : emptyDraft(params.get('session') ?? '', params.get('prompt') ?? '')
 
   // Keyed on the id so navigating create → edit re-seeds instead of carrying a
   // stale draft across two different workflows.

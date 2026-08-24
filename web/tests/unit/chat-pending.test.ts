@@ -552,7 +552,7 @@ describe('the server’s delivery receipt', () => {
  *
  * The marker is pure and asserted directly; the two suppressions it drives live
  * in hooks, so they are asserted against the source — the same way
- * `session-schedules.test.tsx` pins its dependency rule.
+ * `board-removal-keeplist.test.ts` pins its keep-list.
  */
 describe('one owner per failed send', () => {
   test('an error the inline row has stated is recognised; anything else is not', () => {
