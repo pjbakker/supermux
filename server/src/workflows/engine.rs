@@ -930,9 +930,27 @@ async fn fire_workflow_complete(state: &AppState, wf: &Workflow, run_id: i64) {
     fire_completion(state, wf, run_id, &wf.on_complete).await;
 }
 
-/// Shared body of the two above. Wired to `complete::fire` in T2.6.
+/// Shared body of the two above.
+///
+/// The seam: a TYPED enum crosses it, never text. A stored value that no longer
+/// parses is logged and skipped rather than guessed at — guessing is how
+/// `command:<text>` would come back.
 async fn fire_completion(state: &AppState, wf: &Workflow, run_id: i64, action_json: &str) {
-    let _ = (state, wf, run_id, action_json);
+    let action = match super::complete::parse(action_json) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(workflow = %wf.id, error = %e, "unparseable on_complete — skipped");
+            return;
+        }
+    };
+    if matches!(action, super::complete::CompletionAction::None) {
+        return;
+    }
+    let Ok(Some(run)) = db::workflows::get_run(&state.pool, run_id).await else {
+        return;
+    };
+    let outcome = super::complete::fire(state, &run, &action).await;
+    tracing::debug!(workflow = %wf.id, run_id, ?outcome, "completion action fired");
 }
 
 /// The absolute paths a step's file chips resolve to, read from the step's own

@@ -620,6 +620,15 @@ pub async fn runs_for(pool: &SqlitePool, workflow_id: &str, limit: i64) -> sqlx:
     .await
 }
 
+/// One run row by id — what `complete::fire` is handed after the engine closes
+/// a run and before it fires the workflow's typed completion action.
+pub async fn get_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<Option<WorkflowRun>> {
+    sqlx::query_as::<_, WorkflowRun>("SELECT * FROM workflow_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// The step rows of one run, in order.
 pub async fn step_runs_for(pool: &SqlitePool, run_id: i64) -> sqlx::Result<Vec<WorkflowStepRun>> {
     sqlx::query_as::<_, WorkflowStepRun>(
