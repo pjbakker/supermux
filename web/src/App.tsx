@@ -46,6 +46,9 @@ const Workflows = lazy(() =>
 const WorkflowEdit = lazy(() =>
   import('@/routes/workflow-edit').then((m) => ({ default: m.WorkflowEdit })),
 )
+const WorkflowDetail = lazy(() =>
+  import('@/routes/workflow-detail').then((m) => ({ default: m.WorkflowDetail })),
+)
 // The phone team-detail surface (Phase 6a). Lazy so the 160 KB entry gate never
 // carries ChatPanel/TeamPanel/MemberPane for a route the roster only reaches on a
 // phone tap (and which redirects to /focus when bot mode is off).
@@ -303,6 +306,14 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <WorkflowEdit />
+                    </Suspense>
+                  }
+                />
+                <Route
+                  path="/workflows/:id"
+                  element={
+                    <Suspense fallback={null}>
+                      <WorkflowDetail />
                     </Suspense>
                   }
                 />
