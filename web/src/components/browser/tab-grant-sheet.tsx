@@ -23,24 +23,28 @@ import { cn } from '@/lib/utils'
 import { ALL_AGENTS, companyGrantKey } from '@/lib/api/connectors'
 import {
   activeGrantees,
+  grantCandidates,
   granteeLabel,
+  mayGrantAll,
   tabHost,
   tabState,
   type BrowserTab,
+  type GrantCandidate,
 } from '@/lib/api/browser'
 import { GrantControl, type GrantScope } from '@/components/store/grant-control'
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
 import { useCompanies } from '@/hooks/use-companies'
-import { useUI } from '@/stores/ui-store'
 
 export interface TabGrantSheetProps {
   tab: BrowserTab | null
   open: boolean
   onOpenChange: (open: boolean) => void
-  /** Candidate grantees (bot slugs). Injected so the bench needs no server. */
-  bots: string[]
-  onGrant: (grantee: string) => Promise<void>
-  onRevoke: (grantee: string) => Promise<void>
+  /** Candidate grantees WITH their company, so the sheet can offer only the
+   *  ones this tab's company containment will accept. Injected so the bench
+   *  needs no server. */
+  bots: GrantCandidate[]
+  onGrant: (grantee: string) => Promise<unknown>
+  onRevoke: (grantee: string) => Promise<unknown>
   onPin: (pinned: boolean) => void
   /** Replace the origin allowlist. Omit to render it read-only. */
   onOrigins?: (origins: string[]) => void
@@ -59,11 +63,24 @@ export function TabGrantSheet({
   onOrigins,
   contentTheme,
 }: TabGrantSheetProps) {
-  const activeCompany = useUI((s) => s.activeCompany)
   const { companies } = useCompanies()
+  // The TAB's company, not the roster's. A grant must land in the tab's own
+  // company or `grant_handler` refuses it with a 400 — so the globally-active
+  // UI company is the wrong scope here, and offering it would draw a tier that
+  // can only fail.
   const company =
-    activeCompany !== null ? companies.find((c) => c.id === activeCompany) ?? null : null
-  const [bot, setBot] = React.useState<string | null>(null)
+    tab && tab.company_id !== null
+      ? companies.find((c) => c.id === tab.company_id) ?? null
+      : null
+  const candidates = React.useMemo(
+    () => (tab ? grantCandidates(bots, tab) : []),
+    [bots, tab],
+  )
+  const [picked, setPicked] = React.useState<string | null>(null)
+  // DERIVED, not reset in an effect: a bot picked on one tab is not necessarily
+  // a legal target on the next, and the selection must never outlive the tab
+  // whose containment made it legal.
+  const bot = picked !== null && candidates.some((c) => c.name === picked) ? picked : null
   const [busy, setBusy] = React.useState<string | null>(null)
 
   const granted = React.useMemo(() => (tab ? activeGrantees(tab) : []), [tab])
@@ -149,26 +166,27 @@ export function TabGrantSheet({
           {/* Pick the bot the "This bot" tier targets. Without one, only the
               company / all-agents tiers are reachable — GrantControl already
               disables its own bot tier when `botName` is null. */}
-          {bots.length > 0 && (
+          {candidates.length > 0 && (
             <div className="flex flex-col gap-2">
               <div className="text-[11.5px] font-medium uppercase tracking-wide text-muted-foreground">
                 Bot
               </div>
               <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                {bots.map((name) => (
+                {candidates.map((c) => (
                   <button
-                    key={name}
+                    key={c.name}
                     type="button"
-                    onClick={() => setBot(bot === name ? null : name)}
-                    aria-pressed={bot === name}
+                    onClick={() => setPicked(bot === c.name ? null : c.name)}
+                    aria-pressed={bot === c.name}
+                    data-grant-candidate={c.name}
                     className={cn(
                       'min-h-11 shrink-0 rounded-xl border px-3 text-[12.5px] font-medium transition-colors motion-reduce:transition-none',
-                      bot === name
+                      bot === c.name
                         ? 'border-transparent bg-secondary text-foreground'
                         : 'border-border text-muted-foreground hover:text-foreground',
                     )}
                   >
-                    {name}
+                    {c.name}
                   </button>
                 ))}
               </div>
@@ -180,8 +198,29 @@ export function TabGrantSheet({
             botName={bot}
             scope={scope}
             resourceLabel="this tab"
-            api={{ grant: onGrant, revoke: onRevoke }}
+            companyOverride={company}
+            allowAll={mayGrantAll(tab)}
+            api={{
+              grant: async (target) => {
+                await onGrant(target)
+              },
+              revoke: async (target) => {
+                await onRevoke(target)
+              },
+            }}
           />
+
+          {/* Containment, stated where the choice is made. The server enforces
+              it either way; saying so here is what stops a human hunting for
+              the bot that is deliberately not in the list. */}
+          {company && (
+            <p className="text-[11.5px] leading-relaxed text-muted-foreground">
+              This tab belongs to{' '}
+              <span className="font-medium text-foreground">{company.display_name}</span>
+              . Only that company's bots can be lent it — a tab is never shared
+              across companies.
+            </p>
+          )}
 
           {/* Who holds it right now — the blast radius, spelled out. */}
           <div className="flex flex-col gap-2">

@@ -31,14 +31,20 @@ export function BrowserRoute() {
         activeId={active}
         onActivate={setActiveId}
         onNew={(url) => {
-          void actions.create(url).then((tab) => setActiveId(tab.id))
+          // `null` = the server refused it and the human already saw why; do
+          // NOT select a tab that was never created.
+          void actions.create(url).then((tab) => {
+            if (tab) setActiveId(tab.id)
+          })
         }}
         onClose={(id) => void actions.close(id)}
         onPin={(id, pinned) => void actions.setPinned(id, pinned)}
         onGrant={(id, grantee) => actions.grant(id, grantee)}
         onRevoke={(id, grantee) => actions.revoke(id, grantee)}
         onOrigins={(id, origins) => void actions.patch(id, { origins })}
-        bots={sessions.map((s) => s.name)}
+        // Company-tagged: the sheet drops the bots this tab's containment would
+        // make the server refuse, rather than offering a control that 400s.
+        bots={sessions.map((s) => ({ name: s.name, company_id: s.company_id ?? null }))}
       />
     </div>
   )

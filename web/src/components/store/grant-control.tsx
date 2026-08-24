@@ -16,6 +16,7 @@ import { ALL_AGENTS, companyGrantKey } from '@/lib/api/connectors'
 import { useConnectorActions } from '@/stores/connectors-store'
 import { useUI } from '@/stores/ui-store'
 import { useCompanies } from '@/hooks/use-companies'
+import type { Company } from '@/lib/api'
 import { CompanyMark } from '@/components/roster/company-mark'
 
 export type GrantScope = 'bot' | 'company' | 'all' | null
@@ -39,6 +40,8 @@ export function GrantControl({
   accountRef,
   resourceLabel,
   api,
+  companyOverride,
+  allowAll = true,
 }: {
   connectorId: string
   /** The bot this control grants to. `null` = library view (only All agents). */
@@ -58,6 +61,15 @@ export function GrantControl({
   resourceLabel?: string
   /** Lend something that is NOT a connector (a browser tab). See [[GrantApi]]. */
   api?: GrantApi
+  /** Which company the "This company" tier targets, when the RESOURCE has an
+   *  owning company of its own. `undefined` (the default, and every connector
+   *  call site) keeps today's behaviour: the currently-active UI company.
+   *  `null` means the resource is HQ-owned, so there is no company tier at all
+   *  — never the globally-active one, which the server would refuse. */
+  companyOverride?: Company | null
+  /** Offer the all-agents tier. `false` where `*` cannot be a legal target — a
+   *  company-owned resource, since `*` resolves to NO company server-side. */
+  allowAll?: boolean
 }) {
   const actions = useConnectorActions()
   const [busy, setBusy] = React.useState<'bot' | 'company' | 'all' | 'revoke' | null>(null)
@@ -67,8 +79,11 @@ export function GrantControl({
   // tier is hidden — a grant to "this company" has no referent there.
   const activeCompany = useUI((s) => s.activeCompany)
   const { companies } = useCompanies()
-  const company =
+  const inferred =
     activeCompany !== null ? companies.find((c) => c.id === activeCompany) ?? null : null
+  // A resource that OWNS a company overrides the roster scope entirely: the
+  // grant has to land in the resource's company or the server refuses it.
+  const company = companyOverride !== undefined ? companyOverride : inferred
   const companyTarget = company ? companyGrantKey(company.id) : null
 
   const grantTo = async (which: 'bot' | 'company' | 'all') => {
@@ -147,13 +162,15 @@ export function GrantControl({
             mark={<CompanyMark slug={company.slug} name={company.display_name} size={16} />}
           />
         )}
-        <ScopeButton
-          selected={scope === 'all'}
-          disabled={busy !== null}
-          busy={busy === 'all'}
-          onClick={() => grantTo('all')}
-          label="All agents"
-        />
+        {allowAll && (
+          <ScopeButton
+            selected={scope === 'all'}
+            disabled={busy !== null}
+            busy={busy === 'all'}
+            onClick={() => grantTo('all')}
+            label="All agents"
+          />
+        )}
       </div>
 
       {scope !== null && (

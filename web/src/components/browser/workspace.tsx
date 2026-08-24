@@ -37,6 +37,7 @@ import {
   tabHost,
   tabState,
   type BrowserTab,
+  type GrantCandidate,
 } from '@/lib/api/browser'
 import type { TakeoverOptions } from '@/lib/browser/takeover-socket'
 import {
@@ -63,11 +64,12 @@ export interface BrowserWorkspaceProps {
   onNew: (url: string) => void
   onClose: (id: string) => void
   onPin: (id: string, pinned: boolean) => void
-  onGrant: (id: string, grantee: string) => Promise<void>
-  onRevoke: (id: string, grantee: string) => Promise<void>
+  onGrant: (id: string, grantee: string) => Promise<unknown>
+  onRevoke: (id: string, grantee: string) => Promise<unknown>
   onOrigins?: (id: string, origins: string[]) => void
-  /** Candidate grantees for the sheet's "This bot" tier. */
-  bots: string[]
+  /** Candidate grantees WITH their company — the sheet offers only the ones the
+   *  active tab's company containment will accept. */
+  bots: GrantCandidate[]
   /** Injected for the bench; production passes nothing. */
   panelOptions?: TakeoverOptions
   /** Bench only: mount the live panel even for an asleep tab, so the offline

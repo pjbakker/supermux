@@ -17,11 +17,15 @@
  *     expired tab, which must name the browser restart that caused it.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 
+import { ApiError } from '../../src/lib/api/client'
 import {
   activeGrantees,
   ago,
   createTab,
+  grantCandidates,
+  mayGrantAll,
   deleteTab,
   granteeLabel,
   grantTab,
@@ -40,6 +44,7 @@ import {
   subjectPath,
   type SocketLike,
 } from '../../src/lib/browser/takeover-socket'
+import { settled, tabErrorMessage } from '../../src/hooks/use-browser-tabs'
 
 /** A tab row, as `GET /api/browser/tabs` renders one. */
 function tab(over: Partial<BrowserTab> = {}): BrowserTab {
@@ -323,5 +328,88 @@ describe('a tab attaches to the TAB route, a session to the session route', () =
       },
     ).start()
     expect(dialled).toBe('ws://bench/ws/browser/ada/takeover')
+  })
+})
+
+/* ── failure is visible ──────────────────────────────────────────────────── */
+
+describe('a refused mutation says so', () => {
+  test('the message carries the SERVER\'s words, not a generic failure', () => {
+    // The refusal a human will actually hit: company containment. Its whole
+    // value is the sentence the server wrote — "grant failed" alone leaves them
+    // guessing at a rule they cannot see.
+    const msg = tabErrorMessage(
+      'grant',
+      new ApiError(400, "'Ada' is not in this tab's company; a tab is never shared across companies"),
+    )
+    expect(msg).toContain('Grant failed')
+    expect(msg).toContain("not in this tab's company")
+  })
+
+  test('every verb has its own lead, and a wordless error still reads', () => {
+    expect(tabErrorMessage('revoke', new Error('boom'))).toBe('Revoke failed — boom')
+    expect(tabErrorMessage('pin', new Error(''))).toBe("Couldn't change the pin")
+    expect(tabErrorMessage('close', undefined)).toBe("Couldn't close the tab")
+  })
+
+  test('settled resolves null instead of rejecting, so the spinner clears', async () => {
+    // `onError` has already toasted by the time this runs; what `settled` adds
+    // is that the caller's `finally` runs and no unhandled rejection escapes.
+    expect(await settled(Promise.reject(new Error('nope')))).toBe(null)
+    expect(await settled(Promise.resolve(7))).toBe(7)
+  })
+
+  test('EVERY mutation in the hook reports its failure', () => {
+    // The blocker this suite exists for: a grant/revoke/close that failed
+    // silently is indistinguishable from one that worked. Counted from source
+    // because the alternative is a React renderer this suite does not have.
+    const src = readFileSync(
+      new URL('../../src/hooks/use-browser-tabs.ts', import.meta.url),
+      'utf8',
+    )
+    const mutations = src.split('useMutation({').length - 1
+    const reporters = src.split('onError:').length - 1
+    expect(mutations).toBeGreaterThanOrEqual(5)
+    expect(reporters).toBe(mutations)
+  })
+})
+
+/* ── only offer what the server will accept ──────────────────────────────── */
+
+describe('company containment shapes the OPTIONS, not just the outcome', () => {
+  const bots = [
+    { name: 'Ada', company_id: null },
+    { name: 'Grace', company_id: 4 },
+    { name: 'Linus', company_id: 7 },
+  ]
+
+  test('a company-owned tab offers only that company\'s bots', () => {
+    const t = tab({ company_id: 4 })
+    expect(grantCandidates(bots, t).map((b) => b.name)).toEqual(['Grace'])
+  })
+
+  test('an HQ tab offers only HQ bots — a company bot resolves to a company', () => {
+    const t = tab({ company_id: null })
+    expect(grantCandidates(bots, t).map((b) => b.name)).toEqual(['Ada'])
+  })
+
+  test('all-agents is a legal target ONLY for an HQ tab', () => {
+    // `company_of_grant_target('*')` is None, so `*` on a company tab is a 400
+    // every single time — the tier is hidden rather than drawn and refused.
+    expect(mayGrantAll(tab({ company_id: null }))).toBe(true)
+    expect(mayGrantAll(tab({ company_id: 4 }))).toBe(false)
+  })
+
+  test('the sheet scopes the company tier to the TAB, not the active roster', () => {
+    const src = readFileSync(
+      new URL('../../src/components/browser/tab-grant-sheet.tsx', import.meta.url),
+      'utf8',
+    )
+    // The bug this pins: `useUI().activeCompany` is the globally-selected
+    // company, which has nothing to do with which company owns this tab.
+    expect(src).not.toContain('activeCompany')
+    expect(src).toContain('companyOverride={company}')
+    expect(src).toContain('allowAll={mayGrantAll(tab)}')
+    expect(src).toContain('grantCandidates')
   })
 })

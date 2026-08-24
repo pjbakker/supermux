@@ -14,7 +14,7 @@
 // DEV-only and lazily imported by the bench route, so none of it reaches the
 // production bundle.
 
-import type { BrowserTab, TabGrant } from '@/lib/api/browser'
+import type { BrowserTab, GrantCandidate, TabGrant } from '@/lib/api/browser'
 
 /** Deterministic-ish: everything is expressed as an offset from load, so the
  *  age lines ("verified 6 min ago") render the same on every capture. */
@@ -140,5 +140,11 @@ export const BENCH_TABS: BrowserTab[] = [
   },
 ]
 
-/** The bots the grant sheet offers as the "This bot" tier. */
-export const BENCH_BOTS = ['Ada', 'Grace', 'Linus']
+/** The bots the grant sheet offers as the "This bot" tier. All HQ, like the
+ *  fixture tabs — a company-owned bot would (correctly) be filtered out of
+ *  every one of them. */
+export const BENCH_BOTS: GrantCandidate[] = [
+  { name: 'Ada', company_id: null },
+  { name: 'Grace', company_id: null },
+  { name: 'Linus', company_id: null },
+]

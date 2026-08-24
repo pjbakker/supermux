@@ -278,3 +278,32 @@ export function granteeLabel(grantee: string, companyName?: string): string {
 export function activeGrantees(tab: BrowserTab): string[] {
   return tab.grants.filter((g) => g.enabled !== 0).map((g) => g.grantee)
 }
+
+/** A bot the workspace could lend a tab to. `company_id` is what decides
+ *  whether the SERVER will accept it — see [[grantCandidates]]. */
+export interface GrantCandidate {
+  name: string
+  company_id: number | null
+}
+
+/**
+ * The bots the server will actually accept for THIS tab.
+ *
+ * `api.rs::grant_handler` refuses (400) unless
+ * `company_of_grant_target(grantee) == tab.company_id`, and `has_tab_grant`
+ * re-checks the same predicate on every agent call — a tab is never shared
+ * across companies. Offering a bot from another company is therefore not a
+ * hole (the server holds), it is a control that can only ever fail, so it is
+ * not offered.
+ */
+export function grantCandidates(bots: GrantCandidate[], tab: BrowserTab): GrantCandidate[] {
+  const owner = tab.company_id ?? null
+  return bots.filter((b) => (b.company_id ?? null) === owner)
+}
+
+/** `company_of_grant_target('*')` resolves to NO company, so the all-agents
+ *  sentinel is a legal target only for an HQ tab (`company_id === null`). On a
+ *  company-owned tab the tier is hidden rather than drawn and refused. */
+export function mayGrantAll(tab: BrowserTab): boolean {
+  return (tab.company_id ?? null) === null
+}
