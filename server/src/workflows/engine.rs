@@ -16,7 +16,21 @@
 //! `scheduler::runner::deliveries` and carries every one of its escaping and
 //! defanging tests forward, byte-for-byte.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde_json::json;
+use tokio::sync::{watch, Notify};
+
+use crate::db;
 use crate::db::workflows::{Workflow, WorkflowStep};
+use crate::error::AppError;
+use crate::sessions;
+use crate::state::{AppState, SseEvent};
+
+use super::parser;
 
 // ── the transcript wrapper (moved verbatim from scheduler/runner.rs) ──────────
 
@@ -292,6 +306,613 @@ pub fn truncate(s: &str) -> String {
     let mut out: String = s.chars().take(MAX_CHARS).collect();
     out.push('…');
     out
+}
+
+// ── the chain ────────────────────────────────────────────────────────────────
+
+/// What caused this run. Distinguishes the idempotent tick path (which owns
+/// cadence) from a manual "run now" and from an agent-triggered start (neither
+/// of which touches `next_run`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The 10s tick fired this.
+    Tick,
+    /// `POST /api/workflows/{id}/run` — explicit user request.
+    Manual,
+    /// An agent asked for it over the hook path.
+    Agent,
+}
+
+impl Trigger {
+    /// The `workflow_runs.trigger` value (an exhaustive CHECK in 0038).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trigger::Tick => "tick",
+            Trigger::Manual => "manual",
+            Trigger::Agent => "agent",
+        }
+    }
+}
+
+/// Why a step stopped waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepSignal {
+    /// The session's status went to `idle` with a version newer than the
+    /// baseline captured before the send — the apex "the agent finished" signal.
+    Idle,
+    /// The agent called `/api/hook/workflow/step-done` itself.
+    AgentConfirmed,
+    /// `timeout_secs` elapsed with neither of the above.
+    Timeout,
+    /// The status sender was dropped: the session went away mid-step.
+    Interrupted,
+}
+
+impl StepSignal {
+    /// The `workflow_step_runs.signal` value.
+    fn as_str(self) -> &'static str {
+        match self {
+            StepSignal::Idle => "status-idle",
+            StepSignal::AgentConfirmed => "agent-confirmed",
+            StepSignal::Timeout => "timeout",
+            StepSignal::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// Per-`(run_id, step)` "this step already advanced" guard.
+///
+/// Completion can be observed by TWO independent paths — the status→idle edge
+/// and the agent-confirm hook — and the chain must advance exactly once for
+/// each. Same fail-open-on-poisoned-lock rule as the scheduler's `claim_fire`:
+/// a missed dedup is a duplicate ping, never a lost one.
+///
+/// Keyed by RUN, not by workflow: a recurring workflow's *next* run must be able
+/// to fire its step 0 again, so a workflow-scoped guard would wedge the chain
+/// permanently after the first run.
+fn fire_guard() -> &'static Mutex<HashSet<String>> {
+    static G: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    G.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Claim the single advance for step `k` of `run_id`. `true` exactly once.
+fn claim_fire(run_id: i64, k: usize) -> bool {
+    match fire_guard().lock() {
+        Ok(mut g) => g.insert(format!("{run_id}:{k}")),
+        Err(_) => true,
+    }
+}
+
+/// Drop every claim belonging to a finished run, so the guard does not grow for
+/// the life of the process.
+fn release_run(run_id: i64) {
+    if let Ok(mut g) = fire_guard().lock() {
+        let prefix = format!("{run_id}:");
+        g.retain(|k| !k.starts_with(&prefix));
+    }
+}
+
+/// The in-flight steps' wakers, keyed by run id.
+///
+/// A watcher is parked in a `select!` on the status channel and a timeout; the
+/// agent-confirm hook is a different task entirely and has to reach into that
+/// `select!`. This is the only shared handle between them — and it is
+/// deliberately in-memory, which is exactly why [`reap`] exists: a restart
+/// empties this map, and a run whose waker is gone would otherwise sit
+/// `running` forever.
+fn wakers() -> &'static Mutex<HashMap<i64, Arc<Notify>>> {
+    static W: OnceLock<Mutex<HashMap<i64, Arc<Notify>>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_waker(run_id: i64) -> Arc<Notify> {
+    let n = Arc::new(Notify::new());
+    if let Ok(mut w) = wakers().lock() {
+        w.insert(run_id, n.clone());
+    }
+    n
+}
+
+fn unregister_waker(run_id: i64) {
+    if let Ok(mut w) = wakers().lock() {
+        w.remove(&run_id);
+    }
+}
+
+/// The hook entry point: the agent says step `run_id` is done.
+///
+/// It only ever WAKES the parked watcher; it never advances the chain itself.
+/// That is what makes "the idle edge and the hook cannot both advance the same
+/// step" a structural property rather than a race the fire-guard has to win. An
+/// unknown run id (already finished, or lost to a restart) is a silent no-op —
+/// the reaper is what makes the lost case honest.
+pub async fn confirm_step_done(state: &AppState, run_id: i64, session: &str) {
+    let waker = wakers().lock().ok().and_then(|w| w.get(&run_id).cloned());
+    match waker {
+        Some(n) => {
+            tracing::debug!(run_id, session, "workflow step confirmed by the agent");
+            n.notify_waiters();
+        }
+        None => {
+            tracing::debug!(run_id, session, "workflow step-done for a run with no live watcher");
+            let _ = state;
+        }
+    }
+}
+
+/// Recompute the next fire time for `wf` relative to `now`, anchored at the last
+/// fire (or the just-missed `next_run`). `None` disables — a finished one-shot,
+/// a manual workflow, or an unparseable expression.
+pub fn recompute_next(wf: &Workflow, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if wf.trigger_kind != "recurring" {
+        return None;
+    }
+    let expr = wf.schedule_expr.as_deref().unwrap_or("");
+    let parsed = parser::parse(expr, now).ok()?;
+    let anchor = wf
+        .last_run
+        .as_deref()
+        .or(wf.next_run.as_deref())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or(now);
+    parsed.recurrence.next_after(anchor, now)
+}
+
+/// Open a run for `wf` and drive its chain in the background. Returns the
+/// `workflow_runs.id` — which exists even when the run was refused, because a
+/// refusal the user cannot see in the run log is a silent failure.
+pub async fn start(state: &AppState, wf: Workflow, trigger: Trigger) -> Result<i64, AppError> {
+    let now = Utc::now().timestamp();
+    let steps = db::workflows::steps_for(&state.pool, &wf.id).await?;
+    if steps.is_empty() {
+        let id = db::workflows::insert_run(
+            &state.pool,
+            &wf.id,
+            now,
+            trigger.as_str(),
+            "skipped",
+            "the workflow has no steps yet",
+        )
+        .await?;
+        return Ok(id);
+    }
+
+    // §3.2 rule 2 — ONE RUN AT A TIME. Chains can outlive their own cadence, and
+    // two interleaved chains typing into one pane would be indistinguishable
+    // garbage in the transcript. The skip is RECORDED (and `next_run` still
+    // advances, in the tick) so "it did not run" is visible rather than inferred.
+    if let Some(inflight) = db::workflows::running_for(&state.pool, &wf.id).await? {
+        let id = db::workflows::insert_run(
+            &state.pool,
+            &wf.id,
+            now,
+            trigger.as_str(),
+            "skipped",
+            &format!("previous run #{} still in flight", inflight.id),
+        )
+        .await?;
+        return Ok(id);
+    }
+
+    let run_id = db::workflows::open_run(&state.pool, &wf.id, trigger.as_str()).await?;
+    let st = state.clone();
+    tokio::spawn(async move {
+        advance(&st, &wf, &steps, run_id, 0, trigger).await;
+    });
+    Ok(run_id)
+}
+
+/// Deliver step `k`, wait for it, then every step after it.
+///
+/// Written as a loop rather than a recursive call: an `async fn` that awaits
+/// itself needs a boxed future, and the chain is linear by definition (spec
+/// §3.1) — there is no branch a recursion would buy us.
+async fn advance(
+    state: &AppState,
+    wf: &Workflow,
+    steps: &[WorkflowStep],
+    run_id: i64,
+    from: usize,
+    trigger: Trigger,
+) {
+    let n = steps.len();
+    // Only a Claude target gets the `<supermux-schedule>` wrapper — the same
+    // provider gate delegation delivery uses (§0.2). A lookup that fails
+    // degrades to the unwrapped bytes, which is what a codex pane wants anyway.
+    let wrap = db::sessions::get(&state.pool, &wf.session)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| crate::agents::delegate::wraps_for_provider(&s.provider))
+        .unwrap_or(false);
+
+    for k in from..n {
+        let step = &steps[k];
+
+        // 1. GUARDS. An archived session is a readable SKIP, never an error and
+        //    never a start — this is the archive contract (`archive_workflow_
+        //    contract.rs`), and it is also why a deleted session does not push a
+        //    phone notification on every tick.
+        match db::sessions::exists_active(&state.pool, &wf.session).await {
+            Ok(false) => {
+                let archived =
+                    db::sessions::exists(&state.pool, &wf.session).await.unwrap_or(false);
+                let note = if archived {
+                    format!(
+                        "session '{}' is archived — its workflows are paused until you unarchive it",
+                        wf.session
+                    )
+                } else {
+                    format!("session '{}' no longer exists", wf.session)
+                };
+                let sr =
+                    db::workflows::open_step_run(&state.pool, run_id, &step.id, k as i64, "").await;
+                if let Ok(sr) = sr {
+                    let _ =
+                        db::workflows::close_step_run(&state.pool, sr, "skipped", "skipped", &note)
+                            .await;
+                }
+                finish(state, wf, run_id, "skipped", &note, trigger, k, n).await;
+                return;
+            }
+            Ok(true) => {}
+            // A DB error is not a licence to skip a real run: fall through and
+            // let the send itself decide.
+            Err(e) => tracing::warn!(session = %wf.session, error = %e, "archive check failed"),
+        }
+
+        // 2. BUILD. Files and connector ids are re-resolved SERVER-SIDE at fire
+        //    time from the step's own rows, so a stale client cannot smuggle a
+        //    different shape into somebody's pane. An id that no longer resolves
+        //    is dropped from the sentence and NOTED on the step run — never
+        //    silently rendered into an instruction the bot cannot honour.
+        let files = step_file_paths(step);
+        let (connectors, dropped) = resolve_connectors(state, &wf.session, step).await;
+        let pairs = deliveries(&StepDelivery {
+            wf,
+            step,
+            run_id,
+            k,
+            n,
+            connectors: &connectors,
+            files: &files,
+            wrap,
+        });
+        let preview = pairs
+            .iter()
+            .map(|(_, p)| p.as_str())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let step_run = match db::workflows::open_step_run(
+            &state.pool,
+            run_id,
+            &step.id,
+            k as i64,
+            &preview,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(run_id, error = %e, "could not open a step run");
+                finish(state, wf, run_id, "error", "could not record the step", trigger, k, n).await;
+                return;
+            }
+        };
+
+        // 3. SUBSCRIBE BEFORE THE SEND. Capturing the baseline AFTER the send is
+        //    a race that fires on the session's PRE-EXISTING idle: if the pane
+        //    was already sitting at a prompt, that baseline idle is not this
+        //    step finishing. Carried over from `scheduler/watch.rs`, where the
+        //    same comment is the reason the code is in this order.
+        let status_tx = state.status_watch_for(&wf.session);
+        let status_rx = status_tx.subscribe();
+        let baseline = status_rx.borrow().1;
+        let waker = register_waker(run_id);
+
+        // 4. SEND.
+        let mut send_error = None;
+        for (sent, prev) in &pairs {
+            if let Err(e) =
+                sessions::lifecycle::send_harness_text(state, &wf.session, sent, Some(prev), None)
+                    .await
+            {
+                send_error = Some(truncate(&format!("send failed: {e}")));
+                break;
+            }
+        }
+        if let Some(note) = send_error {
+            unregister_waker(run_id);
+            let _ = db::workflows::close_step_run(
+                &state.pool,
+                step_run,
+                "error",
+                "send-error",
+                &note,
+            )
+            .await;
+            finish(state, wf, run_id, "error", &note, trigger, k, n).await;
+            return;
+        }
+
+        // 5. WATCH.
+        let signal = watch_step(run_id, step, status_rx, baseline, waker).await;
+        unregister_waker(run_id);
+
+        // 6. FIRE GUARD. Belt to the braces of `confirm_step_done` never
+        //    advancing the chain itself: whichever path observed completion,
+        //    exactly one advance happens per (run, step).
+        if !claim_fire(run_id, k) {
+            tracing::debug!(run_id, k, "workflow step already advanced — skipping");
+            return;
+        }
+
+        // 7. RECORD + ADVANCE.
+        match signal {
+            StepSignal::Idle | StepSignal::AgentConfirmed => {
+                let _ = db::workflows::close_step_run(
+                    &state.pool,
+                    step_run,
+                    "ok",
+                    signal.as_str(),
+                    &dropped,
+                )
+                .await;
+                let _ = db::workflows::bump_heartbeat(&state.pool, run_id, (k + 1) as i64).await;
+                fire_step_complete(state, wf, run_id, step).await;
+            }
+            StepSignal::Timeout => {
+                let note = format!(
+                    "step {}/{} did not confirm completion within {}s",
+                    k + 1,
+                    n,
+                    step.timeout_secs.max(1)
+                );
+                let _ = db::workflows::close_step_run(
+                    &state.pool,
+                    step_run,
+                    "timeout",
+                    signal.as_str(),
+                    &note,
+                )
+                .await;
+                finish(state, wf, run_id, "timeout", &note, trigger, k, n).await;
+                return;
+            }
+            StepSignal::Interrupted => {
+                let note = format!("session '{}' went away mid-step", wf.session);
+                let _ = db::workflows::close_step_run(
+                    &state.pool,
+                    step_run,
+                    "interrupted",
+                    signal.as_str(),
+                    &note,
+                )
+                .await;
+                finish(state, wf, run_id, "interrupted", &note, trigger, k, n).await;
+                return;
+            }
+        }
+    }
+
+    // 8. FINISH.
+    finish(state, wf, run_id, "ok", "", trigger, n.saturating_sub(1), n).await;
+}
+
+/// Wait for step `step` of `run_id` to finish, by whichever signal arrives first.
+///
+/// The status→idle EDGE is the primary signal and `waker` (the agent-confirm
+/// hook) is the secondary; `timeout_secs` bounds both. Deliberately absent, and
+/// deleted rather than ported (spec §3.3/4): `done_pattern` regex polling, the
+/// `tmux capture-pane` shell-out, `tail_anchor` and `delta`.
+async fn watch_step(
+    run_id: i64,
+    step: &WorkflowStep,
+    mut rx: watch::Receiver<crate::state::StatusUpdate>,
+    baseline: u64,
+    waker: Arc<Notify>,
+) -> StepSignal {
+    let deadline = tokio::time::sleep(Duration::from_secs(step.timeout_secs.max(1) as u64));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return StepSignal::Timeout,
+            _ = waker.notified() => return StepSignal::AgentConfirmed,
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    // Sender dropped: the session was deleted mid-step. There is
+                    // nothing left to wait for, and saying so is more useful than
+                    // sitting here until the timeout.
+                    return StepSignal::Interrupted;
+                }
+                let (status, version) = rx.borrow_and_update().clone();
+                if status == "idle" && version != baseline {
+                    tracing::debug!(run_id, version, "workflow step advanced on the status→idle edge");
+                    return StepSignal::Idle;
+                }
+                // Any other transition keeps us waiting. `waiting` is
+                // DELIBERATELY not done: a session blocked on the user is the
+                // opposite of finished. It does not advance, and the step's own
+                // timeout keeps running.
+            }
+        }
+    }
+}
+
+/// Close a run, tell the user, and settle the workflow's cadence.
+///
+/// Cadence is settled on EVERY terminal status, not only `ok`: a workflow whose
+/// step timed out must still move to its next window, or one bad night wedges it
+/// until someone opens the UI.
+async fn finish(
+    state: &AppState,
+    wf: &Workflow,
+    run_id: i64,
+    status: &str,
+    note: &str,
+    trigger: Trigger,
+    k: usize,
+    n: usize,
+) {
+    let _ = db::workflows::close_run(&state.pool, run_id, status, note).await;
+    release_run(run_id);
+    unregister_waker(run_id);
+
+    if status == "ok" {
+        fire_workflow_complete(state, wf, run_id).await;
+    }
+
+    // The SSE frame is COMPANY-STAMPED (spec §3.2/3). Every scheduler frame was
+    // `company_id: None`, i.e. owner-only — so a company member never saw their
+    // own bot's job fire.
+    let _ = state.sse_tx.send(SseEvent::for_company(
+        "alerts",
+        json!({
+            "level": if status == "ok" || status == "skipped" { "info" } else { "error" },
+            "source": "workflows",
+            "workflow": wf.id,
+            "run_id": run_id,
+            "status": status,
+            "detail": format!("Workflow '{}' — {status}", wf.title),
+        }),
+        wf.company_id,
+    ));
+
+    // Phone push on FAILURE only — successes would be too noisy for a workflow
+    // firing all day. `send_push_for` honours the `schedule_error` category
+    // toggle in Settings (a persisted user preference; the DB value must not be
+    // renamed, only its UI label).
+    if matches!(status, "error" | "timeout" | "interrupted") {
+        let body = if note.is_empty() {
+            format!("'{}' stopped at step {} of {}.", wf.title, k + 1, n)
+        } else {
+            format!("'{}' stopped at step {} of {}: {note}", wf.title, k + 1, n)
+        };
+        push_failure(state, &wf.title, body).await;
+    }
+
+    // Cadence. The TICK owns `next_run`; a manual or agent-triggered run bumps
+    // `last_run`/`run_count` and nothing else.
+    let now = Utc::now();
+    match trigger {
+        Trigger::Tick => {
+            let next = recompute_next(wf, now);
+            let _ = db::workflows::record_fire(&state.pool, &wf.id, now, next).await;
+        }
+        Trigger::Manual | Trigger::Agent => {
+            let _ = db::workflows::record_manual(&state.pool, &wf.id, now).await;
+        }
+    }
+}
+
+/// One `ScheduleError`-category push, spawned so no run loop blocks on the push
+/// service. `session: None` is deliberate: a failing workflow must reach the
+/// user even when the target bot itself is muted.
+async fn push_failure(state: &AppState, title: &str, body: String) {
+    let st = state.clone();
+    let title = title.to_string();
+    tokio::spawn(async move {
+        let _ = crate::push::send_push_for(
+            &st,
+            crate::db::push::NotifCategory::ScheduleError,
+            &crate::notify::PushPayload::simple(
+                format!("workflow '{title}' needs you"),
+                body,
+                "/workflows",
+                crate::notify::Tier::Schedule,
+            ),
+            None,
+        )
+        .await;
+    });
+}
+
+/// Cancel an in-flight run: mark it `cancelled` and wake its watcher so the
+/// chain stops at the current step instead of running on to the next one.
+pub async fn cancel(state: &AppState, run_id: i64) -> Result<(), AppError> {
+    // Claiming every plausible step index is not possible, so cancellation works
+    // the other way round: the run row is closed FIRST, and `advance` re-reads
+    // nothing — the waker resolves the current step as agent-confirmed, and the
+    // claim below is what stops the next step from being delivered.
+    for k in 0..super::MAX_STEPS_PER_WORKFLOW {
+        claim_fire(run_id, k);
+    }
+    db::workflows::close_run(&state.pool, run_id, "cancelled", "cancelled").await?;
+    if let Some(n) = wakers().lock().ok().and_then(|w| w.get(&run_id).cloned()) {
+        n.notify_waiters();
+    }
+    Ok(())
+}
+
+/// Fire a STEP's own `on_complete`, if it has one. The engine never formats a
+/// message here: it hands `complete::fire` a typed enum and nothing else, which
+/// is the seam that keeps `done_action: command:<text>` from growing back.
+async fn fire_step_complete(state: &AppState, wf: &Workflow, run_id: i64, step: &WorkflowStep) {
+    fire_completion(state, wf, run_id, &step.on_complete).await;
+}
+
+/// Fire the WORKFLOW's `on_complete` after the last step lands.
+async fn fire_workflow_complete(state: &AppState, wf: &Workflow, run_id: i64) {
+    fire_completion(state, wf, run_id, &wf.on_complete).await;
+}
+
+/// Shared body of the two above. Wired to `complete::fire` in T2.6.
+async fn fire_completion(state: &AppState, wf: &Workflow, run_id: i64, action_json: &str) {
+    let _ = (state, wf, run_id, action_json);
+}
+
+/// The absolute paths a step's file chips resolve to, read from the step's own
+/// `files` JSON at fire time. A malformed column yields no paths rather than a
+/// panic: a broken chip must not stop the prompt being delivered.
+fn step_file_paths(step: &WorkflowStep) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(&step.files)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                .filter(|p| !p.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The connector ids that are STILL granted to this bot, plus a note naming the
+/// ones that are not.
+///
+/// Re-checked at fire time, not trusted from save time: a grant revoked between
+/// the two is exactly the case where an instruction naming the connector would
+/// send the agent hunting for a tool it no longer has.
+async fn resolve_connectors(
+    state: &AppState,
+    session: &str,
+    step: &WorkflowStep,
+) -> (Vec<String>, String) {
+    let wanted: Vec<String> = serde_json::from_str::<Vec<String>>(&step.connectors)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return (Vec::new(), String::new());
+    }
+    let granted: HashSet<String> = db::connectors::grants_for_session(&state.pool, session)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g| g.connector_id)
+        .collect();
+    let (kept, dropped): (Vec<String>, Vec<String>) =
+        wanted.into_iter().partition(|id| granted.contains(id));
+    let note = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!("connector hint dropped (not connected): {}", dropped.join(", "))
+    };
+    (kept, note)
 }
 
 #[cfg(test)]
