@@ -6,6 +6,7 @@
 //! once at boot after `0038_workflows.sql`, and — from Phase 2 — the execution
 //! engine and its 10s tick.
 
+pub mod engine;
 pub mod parser;
 pub mod port;
 
