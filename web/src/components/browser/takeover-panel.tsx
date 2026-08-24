@@ -50,17 +50,42 @@ import {
   EMPTY_SNAPSHOT,
   TakeoverSocket,
   modifiersFor,
+  subjectName,
   type TakeoverOptions,
   type TakeoverSnapshot,
+  type TakeoverSubject,
 } from '@/lib/browser/takeover-socket'
 
 /** Cap the backing store at 2× — a 3× phone would triple the fill cost of
  *  every frame for a JPEG that is 512px wide to begin with. */
 const MAX_DPR = 2
 
+/** The three wheel verbs, published into a host-owned ref while the socket is
+ *  alive (and nulled on teardown, so a stale handle cannot poke a dead socket).
+ *  A ref rather than a callback argument on purpose: the host calls these from
+ *  its own event handlers, so nothing reads a ref during render. */
+export interface TakeoverControls {
+  takeOver: () => void
+  handBack: () => void
+  resync: () => void
+}
+
+/** What a host-drawn header renders from. Plain values only. */
+export interface TakeoverHeaderState {
+  snapshot: TakeoverSnapshot
+  /** `snapshot.mode === 'human_driving'`, spelled out because it is the ONE
+   *  thing a host must not get wrong. */
+  driving: boolean
+}
+
 export interface TakeoverPanelProps {
-  /** The supermux session whose browser context this is. */
-  session: string
+  /** The supermux session whose SCRATCH browser context this is (the in-chat
+   *  path). Ignored when `subject` is given. */
+  session?: string
+  /** The WORKSPACE subject — a persistent tab, or a session spelled out. The
+   *  route is the only difference: a tab attaches watch-first (`/ws/browser/
+   *  tab/{id}`), a session grabs the wheel on attach. */
+  subject?: TakeoverSubject
   /** Injected for tests/benches; production passes nothing. */
   options?: TakeoverOptions
   /** The panel is hosted inside a surface that ALREADY states who is driving and
@@ -69,10 +94,30 @@ export interface TakeoverPanelProps {
    *  button beside the host's — one state, one control (jury TAKEOVER_PANEL #2).
    *  Standalone (the /dev bench, a future full-page route) keeps both. */
   embedded?: boolean
+  /** Draw the host's OWN header (address bar, Watch/Drive) in place of the
+   *  built-in one, driving this same socket. The workspace route uses it; the
+   *  in-chat card and the bench pass nothing and keep today's header. */
+  renderHeader?: (state: TakeoverHeaderState) => React.ReactNode
+  /** Where to publish [[TakeoverControls]] for a host-drawn header. */
+  controlsRef?: { current: TakeoverControls | null }
   className?: string
 }
 
-export function TakeoverPanel({ session, options, embedded, className }: TakeoverPanelProps) {
+export function TakeoverPanel({
+  session,
+  subject,
+  options,
+  embedded,
+  renderHeader,
+  controlsRef,
+  className,
+}: TakeoverPanelProps) {
+  // Primitives, not the object: a caller passing `subject={{kind:'tab',id}}`
+  // inline would otherwise hand the effect a new identity on every render and
+  // redial the socket sixty times a minute.
+  const kind = subject?.kind ?? 'session'
+  const name = subject ? subjectName(subject) : session ?? ''
+
   const [snap, setSnap] = React.useState<TakeoverSnapshot>(EMPTY_SNAPSHOT)
   const boxRef = React.useRef<HTMLDivElement | null>(null)
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null)
@@ -130,7 +175,7 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
     }
 
     const sock = new TakeoverSocket(
-      session,
+      kind === 'tab' ? { kind: 'tab', id: name } : { kind: 'session', name },
       setSnap,
       (frame) => {
         pending = frame
@@ -139,15 +184,25 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
       options,
     )
     socketRef.current = sock
+    // Publish the wheel verbs over the LOCAL socket, not the ref — they are
+    // born and die with this socket, exactly like the decode loop above.
+    if (controlsRef) {
+      controlsRef.current = {
+        takeOver: () => sock.takeOver(),
+        handBack: () => sock.handBack(),
+        resync: () => sock.resync(),
+      }
+    }
     sock.start()
     return () => {
       alive = false
       pending = null
       sock.stop()
+      if (controlsRef) controlsRef.current = null
       socketRef.current = null
       paintedRef.current = null
     }
-  }, [session, options])
+  }, [kind, name, options, controlsRef])
 
   /** A pointer/wheel event's position in PAGE coordinates, or `null` when it
    *  landed on the letterbox (or before the first frame). */
@@ -241,8 +296,12 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
   return (
     <div
       className={cn('flex min-h-0 flex-col overflow-hidden bg-paper text-ink', className)}
-      data-takeover={session}
+      data-takeover={name}
+      data-takeover-kind={kind}
     >
+      {renderHeader ? (
+        renderHeader({ snapshot: snap, driving })
+      ) : (
       <header className="flex items-center gap-2 border-b border-hairline bg-surface px-3 py-2">
         {!embedded && <ModePill mode={snap.mode} state={snap.state} />}
         <span
@@ -271,11 +330,14 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
           </button>
         )}
       </header>
+      )}
 
       <div
         ref={boxRef}
         role="application"
-        aria-label={`Shared browser for ${session}`}
+        aria-label={
+          kind === 'tab' ? 'Shared browser tab' : `Shared browser for ${name}`
+        }
         tabIndex={0}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -291,7 +353,7 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
         )}
       >
         <canvas ref={canvasRef} className="block h-full w-full" data-takeover-canvas />
-        <StatusVeil state={snap.state} refused={snap.refused} />
+        <StatusVeil state={snap.state} refused={snap.refused} kind={kind} />
       </div>
     </div>
   )
@@ -334,13 +396,20 @@ function ModePill({
 function StatusVeil({
   state,
   refused,
+  kind,
 }: {
   state: TakeoverSnapshot['state']
   refused: string | null
+  /** A tab's 4404 means something different from a session's: the tab exists and
+   *  its login is on disk, it just is not open right now. Saying "the agent has
+   *  to open one" there would be plain wrong. */
+  kind?: 'session' | 'tab'
 }) {
   const message =
     state === 'no-context'
-      ? 'This session has no open page yet — the agent has to open one before you can take over.'
+      ? kind === 'tab'
+        ? "This tab isn't open right now — it went to sleep, and its sign-in is kept on disk."
+        : 'This session has no open page yet — the agent has to open one before you can take over.'
       : state === 'busy'
         ? 'Someone else is already driving this page.'
         : state === 'offline'

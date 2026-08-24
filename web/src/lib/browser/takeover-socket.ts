@@ -99,6 +99,41 @@ export interface TakeoverOptions {
   baseUrl?: () => string
 }
 
+/**
+ * WHAT this socket is attached to. The relay is one piece of code with two
+ * subjects (`takeover.rs::router_for`):
+ *
+ *   · a SCRATCH session — `/ws/browser/{session}/takeover`, the in-chat
+ *     interruption, which grabs the wheel on attach because an ask means the
+ *     human is coming to drive;
+ *   · a WORKSPACE tab — `/ws/browser/tab/{id}`, watch-first: frames flow, input
+ *     is refused until the human presses Drive, so merely LOOKING at a tab does
+ *     not silently block every agent granted on it.
+ *
+ * A bare string stays a session subject, so every existing caller (the in-chat
+ * `TakeoverCard`, the takeover bench) is unchanged.
+ */
+export type TakeoverSubject =
+  | { kind: 'session'; name: string }
+  | { kind: 'tab'; id: string }
+
+/** A bare string is the legacy session subject. */
+export function asSubject(s: string | TakeoverSubject): TakeoverSubject {
+  return typeof s === 'string' ? { kind: 'session', name: s } : s
+}
+
+/** The route this subject attaches to — the ONLY thing that differs per kind. */
+export function subjectPath(s: TakeoverSubject): string {
+  return s.kind === 'tab'
+    ? `/ws/browser/tab/${encodeURIComponent(s.id)}`
+    : `/ws/browser/${encodeURIComponent(s.name)}/takeover`
+}
+
+/** The subject's human-readable name (aria labels, `data-` hooks). */
+export function subjectName(s: TakeoverSubject): string {
+  return s.kind === 'tab' ? s.id : s.name
+}
+
 /** Exponential backoff with ±20% jitter, capped — the terminal socket's curve. */
 export function backoffDelay(attempt: number): number {
   const base = Math.min(500 * 2 ** Math.max(0, attempt - 1), 10_000)
@@ -150,18 +185,18 @@ export class TakeoverSocket {
   // Plain fields, not constructor parameter properties: the app's tsconfig
   // sets `erasableSyntaxOnly`, so every construct that emits runtime code from
   // a type-position keyword is out.
-  private readonly session: string
+  private readonly subject: TakeoverSubject
   private readonly onSnapshot: (s: TakeoverSnapshot) => void
   private readonly onFrame: (f: TakeoverFrame) => void
   private readonly opts: TakeoverOptions
 
   constructor(
-    session: string,
+    subject: string | TakeoverSubject,
     onSnapshot: (s: TakeoverSnapshot) => void,
     onFrame: (f: TakeoverFrame) => void,
     opts: TakeoverOptions = {},
   ) {
-    this.session = session
+    this.subject = asSubject(subject)
     this.onSnapshot = onSnapshot
     this.onFrame = onFrame
     this.opts = opts
@@ -175,7 +210,7 @@ export class TakeoverSocket {
   start(): void {
     if (this.stopped || this.ws) return
     const base = (this.opts.baseUrl ?? wsUrl)()
-    const url = `${base}/ws/browser/${encodeURIComponent(this.session)}/takeover`
+    const url = `${base}${subjectPath(this.subject)}`
     const make = this.opts.factory ?? ((u: string) => new WebSocket(u) as unknown as SocketLike)
     const ws = make(url)
     this.ws = ws
