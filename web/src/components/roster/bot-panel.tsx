@@ -15,8 +15,8 @@
  *
  * Four quiet tabs: Overview (the glance, now with editable tags + a working-dir
  * row) · Instructions (role + model + notes + notifications — the launch-injected
- * identity) · Tools (skills / connectors / MCP placeholders) · Activity
- * (Schedules · Issues · Git).
+ * identity) · Connectors (the bot's grants, with skills / MCP behind Advanced) ·
+ * Activity (Schedules · Issues · Git).
  *
  * Styling is Tailwind + shadcn tokens (NOT `[data-grok]`-scoped CSS) so the ONE
  * component renders identically in the in-shell pane and in the body-portalled
@@ -31,7 +31,9 @@ import {
   Files as FilesIcon,
   FolderOpen,
   Loader2,
+  Plus,
   Terminal,
+  Undo2,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 
@@ -47,6 +49,7 @@ import {
   TagsEditor,
   GitRow,
   SchedulesList,
+  type DescEditorHandle,
 } from '@/components/focus-mode/session-info-panel'
 import {
   DropdownMenu,
@@ -72,12 +75,23 @@ function ctxPct(tokens?: number): number | null {
   if (typeof tokens !== 'number' || tokens <= 0) return null
   return Math.min(100, Math.round((tokens / CTX_WINDOW) * 100))
 }
+/** The ring's colour, as a COLOUR. `--status-*-ink` holds a bare HSL triplet
+ *  (`38 92% 33%`), so dropping it straight into `conic-gradient()` made the whole
+ *  declaration invalid at computed-value time and the ring painted NOTHING — the
+ *  glance's hero stat was a bare percentage on a blank card. `--color-status-*-ink`
+ *  is the same token already wrapped in `hsl()` (globals.css `@theme`), which is
+ *  what a gradient can actually use; the hex stays as the fallback.
+ *
+ *  The three steps follow the hexes the author wrote (green → amber → hot), so
+ *  they map onto `ready` / `active` / `error` — the app's own green, amber and
+ *  (never-alarmist) orange. `waiting` is the BLUE "needs input" channel and says
+ *  nothing about how full a context window is, so it stays out of this scale. */
 function ringColor(pct: number): string {
   return pct < 50
-    ? 'var(--status-active-ink, #16a34a)'
+    ? 'var(--color-status-ready-ink, #16a34a)'
     : pct < 80
-      ? 'var(--status-waiting-ink, #d97706)'
-      : 'var(--status-error-ink, #dc2626)'
+      ? 'var(--color-status-active-ink, #d97706)'
+      : 'var(--color-status-error-ink, #dc2626)'
 }
 function fmtTokens(n?: number): string | undefined {
   if (typeof n !== 'number' || n <= 0) return undefined
@@ -104,8 +118,10 @@ function relTime(iso?: string): string {
   return days === 1 ? 'Yesterday' : `${days}d`
 }
 
-/** Role presets that PREFILL the role/desc textarea (the durable job). Picking
- *  one seeds the field; the user edits from there and blur saves. */
+/** Role presets that ADD a durable job to the role/desc textarea. Picking one
+ *  INSERTS its paragraph (at the caret, or into an empty field as the whole
+ *  text) — it never replaces what is already written, and the row under the
+ *  field offers a one-tap Undo. The user edits from there and blur saves. */
 const ROLE_PRESETS: { label: string; text: string }[] = [
   {
     label: 'Reviewer',
@@ -124,6 +140,26 @@ const ROLE_PRESETS: { label: string; text: string }[] = [
     text: 'You keep things running. Watch health, act on failures, prefer the least-destructive recovery, and always say what you changed.',
   },
 ]
+
+/** The receipt under the instruction field: which preset was applied, the draft
+ *  it displaced (`prev`) and the one it produced (`after`, the Undo's guard).
+ *  `refused` means the editor turned the Undo down because the field has been
+ *  edited since — the row stays, saying so. */
+export interface AppliedPreset {
+  label: string
+  prev: string
+  after: string
+  refused?: boolean
+}
+
+/** What the receipt becomes after an Undo attempt. `restore()` REFUSES once the
+ *  field has moved on (reverting then would take the sentences written after the
+ *  insert), and clearing the row on a refusal would claim an undo that never
+ *  happened — so a refusal keeps the row and re-words it. Pure, so
+ *  `tests/unit/bot-panel-settings.test.ts` can pin exactly that. */
+export function afterUndo(applied: AppliedPreset, restored: boolean): AppliedPreset | null {
+  return restored ? null : { ...applied, refused: true }
+}
 
 /* ── section shell (Tailwind, portal-safe) ─────────────────────────────────── */
 
@@ -315,11 +351,16 @@ export function WorkingDirRow({ name, dir }: { name: string; dir: string }) {
 
 /* ── the four tabs ─────────────────────────────────────────────────────────── */
 
+/** The tab KEY is the durable one — it is router state (`panelTab` in history,
+ *  `initialTab`/`infoTab` on the two routes), a bench selector and the
+ *  `data-vr-tab` hook — so `'tools'` stays `'tools'` on the wire. Only the WORD
+ *  changes: the tab's own content leads with connectors, and "Connectors" is
+ *  what the store, the grants list and the mail card already call them. */
 type TabKey = 'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: 'Overview' },
   { key: 'instructions', label: 'Instructions' },
-  { key: 'tools', label: 'Tools' },
+  { key: 'tools', label: 'Connectors' },
   { key: 'memory', label: 'Memory' },
   { key: 'activity', label: 'Activity' },
 ]
@@ -354,6 +395,30 @@ function MemoryTab({
   )
 }
 
+/** One card in the glance row. The four differ only in what they SAY, so they
+ *  share a shell: the same label rhythm, and — because the Context ring is 44px
+ *  and a word is not — a common 44px value floor that lines all four values up
+ *  on one baseline instead of letting each card set its own. */
+function Stat({
+  label,
+  value,
+  meta,
+}: {
+  label: string
+  value: React.ReactNode
+  meta?: string
+}) {
+  return (
+    <div className="flex flex-col gap-2 rounded-2xl border border-border bg-card p-4">
+      <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">{label}</span>
+      <div className="flex min-h-11 flex-col justify-end gap-0.5">
+        {value}
+        {meta && <span className="truncate text-[11.5px] leading-tight text-muted-foreground">{meta}</span>}
+      </div>
+    </div>
+  )
+}
+
 function OverviewTab({
   name,
   session,
@@ -372,61 +437,82 @@ function OverviewTab({
   const dir = session?.dir?.trim() || ''
 
   return (
-    <div className="flex flex-col gap-6">
+    // TWO REGIONS, not one column of five loose things: the GLANCE (read-only
+    // numbers, one card row) and then, under a hairline, the DETAILS you can act
+    // on. The rule is what makes the tab read as intentional — before it, the
+    // stat cards, a chat bubble, a tag field and a path row all sat at the same
+    // altitude, six units apart, with nothing saying which was which.
+    <div className="flex flex-col gap-5">
       {/* the glance — Context ring HERO + Tokens + Provider + Status */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <div className="flex flex-col rounded-2xl border border-border bg-card p-4">
-          <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Context</span>
-          {pct !== null ? (
-            <div
-              className="relative mt-2 size-11"
-              style={{
-                borderRadius: '50%',
-                background: `conic-gradient(${ringColor(pct)} ${pct}%, var(--muted, #e5e5e5) 0)`,
-              }}
-            >
-              <span className="absolute inset-[6px] grid place-items-center rounded-full bg-card font-mono text-[12px] font-bold text-foreground">
-                {pct}%
-              </span>
-            </div>
-          ) : (
-            <span className="mt-2 text-base font-semibold text-foreground">—</span>
-          )}
-          <span className="mt-1.5 text-[11.5px] text-muted-foreground">{tokens ? `${tokens} tokens` : 'no tokens yet'}</span>
-        </div>
-        <div className="flex flex-col rounded-2xl border border-border bg-card p-4">
-          <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Tokens</span>
-          <span className="mt-2 font-mono text-[22px] font-semibold tabular-nums text-foreground">{tokens ?? '0'}</span>
-          <span className="mt-0.5 text-[11.5px] text-muted-foreground">cumulative</span>
-        </div>
-        <div className="flex flex-col rounded-2xl border border-border bg-card p-4">
-          <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Provider</span>
-          <span className="mt-2 text-base font-semibold capitalize text-foreground">{session?.provider ?? '—'}</span>
-          <span className="mt-0.5 text-[11.5px] text-muted-foreground">{model || (session?.runtime === 'native' ? 'native runtime' : 'runtime')}</span>
-        </div>
-        <div className="flex flex-col rounded-2xl border border-border bg-card p-4">
-          <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Status</span>
-          <span className="mt-2 text-base font-semibold capitalize text-foreground">{session?.status ?? '—'}</span>
-          <span className="mt-0.5 text-[11.5px] text-muted-foreground">{relTime(session?.updated_at) || '—'}</span>
-        </div>
+        <Stat
+          label="Context"
+          value={
+            pct !== null ? (
+              <div
+                className="relative size-11"
+                style={{
+                  borderRadius: '50%',
+                  background: `conic-gradient(${ringColor(pct)} ${pct}%, var(--muted, #e5e5e5) 0)`,
+                }}
+              >
+                <span className="absolute inset-[6px] grid place-items-center rounded-full bg-card font-mono text-[12px] font-bold text-foreground">
+                  {pct}%
+                </span>
+              </div>
+            ) : (
+              <span className="text-[15px] font-semibold text-foreground">—</span>
+            )
+          }
+          meta={tokens ? `${tokens} tokens` : 'no tokens yet'}
+        />
+        <Stat
+          label="Tokens"
+          value={
+            <span className="font-mono text-[22px] font-semibold leading-none tabular-nums text-foreground">
+              {tokens ?? '0'}
+            </span>
+          }
+          meta="cumulative"
+        />
+        <Stat
+          label="Provider"
+          value={
+            <span className="truncate text-[15px] font-semibold capitalize text-foreground">
+              {session?.provider ?? '—'}
+            </span>
+          }
+          meta={model || (session?.runtime === 'native' ? 'native runtime' : 'runtime')}
+        />
+        <Stat
+          label="Status"
+          value={
+            <span className="truncate text-[15px] font-semibold capitalize text-foreground">
+              {session?.status ?? '—'}
+            </span>
+          }
+          meta={relTime(session?.updated_at) || '—'}
+        />
       </div>
 
-      {preview && (
-        <Field label="Latest">
-          <div className="max-w-[64ch] rounded-2xl rounded-bl-md border border-border bg-card px-4 py-3 text-sm leading-relaxed text-foreground">
-            {preview}
-            <div className="mt-2 text-[12px] text-muted-foreground">{relTime(session?.updated_at)}</div>
-          </div>
+      <div className="flex flex-col gap-6 border-t border-border pt-5">
+        {preview && (
+          <Field label="Latest">
+            <div className="max-w-[64ch] rounded-2xl rounded-bl-md border border-border bg-card px-4 py-3 text-sm leading-relaxed text-foreground">
+              {preview}
+              <div className="mt-2 text-[12px] text-muted-foreground">{relTime(session?.updated_at)}</div>
+            </div>
+          </Field>
+        )}
+
+        <Field label="Tags" hint="Searchable across the roster.">
+          <TagsEditor name={name} tags={session?.tags ?? []} />
         </Field>
-      )}
 
-      <Field label="Tags" hint="Searchable across the roster.">
-        <TagsEditor name={name} tags={session?.tags ?? []} />
-      </Field>
-
-      <Field label="Working directory">
-        <WorkingDirRow name={name} dir={dir} />
-      </Field>
+        <Field label="Working directory">
+          <WorkingDirRow name={name} dir={dir} />
+        </Field>
+      </div>
     </div>
   )
 }
@@ -442,10 +528,26 @@ export function InstructionsTab({
   session: ApiSession | null
   onRestartAdvised: () => void
 }) {
-  // Prefill the role/desc field by writing through the SAME hook DescEditor
-  // uses; the editor re-seeds from the row on the next render.
-  const { setDesc } = useSessionConfig()
   const desc = session?.desc ?? ''
+  // The pills drive the EDITOR, not the row. Writing `desc` behind the field's
+  // back is what made one stray tap destroy an authored instruction: the PATCH
+  // replaced the whole value and the editor re-seeded from it, with nothing to
+  // undo. Through the handle a preset is an ordinary edit — inserted, still
+  // uncommitted, reversible.
+  const editor = React.useRef<DescEditorHandle | null>(null)
+  // The last preset applied, the draft it displaced, and the one it produced.
+  // One step is enough: the undo row is a way back from a mis-tap, not a
+  // history — and `after` is what keeps a late Undo from eating the sentences
+  // the user wrote in the meantime (the editor refuses a moved-on field).
+  const [applied, setApplied] = React.useState<AppliedPreset | null>(null)
+  // The receipt is transient — a way back from the tap you just made, not a
+  // banner that outlives it. It clears itself after a beat (and on the next
+  // preset, which replaces it).
+  React.useEffect(() => {
+    if (!applied) return
+    const t = setTimeout(() => setApplied(null), 12_000)
+    return () => clearTimeout(t)
+  }, [applied])
 
   return (
     <div className="flex flex-col gap-6">
@@ -459,14 +561,64 @@ export function InstructionsTab({
               key={p.label}
               type="button"
               data-vr="bot-role-preset"
-              onClick={() => void setDesc(name, p.text)}
-              className="rounded-full border border-border bg-secondary px-3 py-1 text-[12px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label={`Add the ${p.label} role to these instructions`}
+              // Do NOT take focus off the textarea: a blur here would commit a
+              // half-typed draft and the insert would then land in a stale one.
+              // The pill edits the field the user is still standing in.
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                const done = editor.current?.insert(p.text)
+                if (done) setApplied({ label: p.label, prev: done.prev, after: done.next })
+              }}
+              className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-secondary px-3.5 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
+              <Plus className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
               {p.label}
             </button>
           ))}
         </div>
-        <DescEditor name={name} desc={desc} />
+        <DescEditor ref={editor} name={name} desc={desc} />
+        {applied && (
+          <div
+            role="status"
+            data-vr="bot-role-undo-row"
+            data-vr-refused={applied.refused ? 'yes' : undefined}
+            className="flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground"
+          >
+            {applied.refused ? (
+              <>
+                {/* The Undo was REFUSED, and says so. Clearing the row here would
+                    read as "undone" while the field still holds the preset. */}
+                <span>Can’t undo — you’ve edited since.</span>
+                <button
+                  type="button"
+                  data-vr="bot-role-undo-dismiss"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setApplied(null)}
+                  className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-card px-3 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Dismiss
+                </button>
+              </>
+            ) : (
+              <>
+                <span>Added “{applied.label}” to your instructions.</span>
+                <button
+                  type="button"
+                  data-vr="bot-role-undo"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() =>
+                    setApplied(afterUndo(applied, editor.current?.restore(applied.prev, applied.after) ?? false))
+                  }
+                  className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-card px-3 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <Undo2 className="size-3.5 shrink-0" aria-hidden />
+                  Undo
+                </button>
+              </>
+            )}
+          </div>
+        )}
       </Field>
 
       <Field

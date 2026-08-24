@@ -842,6 +842,15 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
                     // way out of it.
                     input={restInput}
                     onOpenTerminal={() => setRenderer('terminal')}
+                    // The bot's details, from the header NAME — the chat card
+                    // is this route's header, so this is the ONLY door to the
+                    // panel while chat holds the pane. Mirrors the terminal
+                    // chrome's `<FocusHeader onTitleClick>` above, same tab
+                    // seating, same sheet.
+                    onTitleClick={() => {
+                      setInfoTab('overview')
+                      setInfoOpen(true)
+                    }}
                     // The single-bar fold: the composer's leading `+` owns an
                     // add-menu with these route-level actions folded in, in place
                     // of the old global dock. The composer adds its own

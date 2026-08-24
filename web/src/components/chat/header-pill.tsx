@@ -97,6 +97,32 @@ const BAR_MIN_H = 64
 const NAME_MIN = 56
 
 /**
+ * The one hint that the name is a door (`onTitleClick`) — a 12px chevron in the
+ * quiet ink, riding the name's own baseline. Inline SVG rather than an icon
+ * package: this module and everything it imports are rendered by `bun test`,
+ * which is why it has no `@/` imports and no icon dependency (see the file
+ * header). `shrink-0`, so it never eats the name's truncation room.
+ */
+function TitleChevron() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="12"
+      height="12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="shrink-0 text-ink-2 opacity-70"
+      aria-hidden="true"
+    >
+      <path d="m9 18 6-6-6-6" />
+    </svg>
+  )
+}
+
+/**
  * The permission mode, as a chip. Extracted so the phone can STACK it over the
  * trailing slot and the desktop can keep it in the row without two copies of the
  * class list drifting apart.
@@ -190,6 +216,14 @@ export interface SessionHeaderPillProps {
    * chat surface can keep feeding the signal without a type break.
    */
   streaming?: boolean
+  /**
+   * Open this bot's details (the `<BotPanel variant="sheet">` the mobile focus
+   * route already owns). When set, the NAME becomes the button that opens them —
+   * the same title-click contract `<FocusHeader onTitleClick>` gives the terminal
+   * chrome, which is the only way into the panel while chat holds the pane.
+   * Omitted (desktop seam, benches) → the name stays the inert span it was.
+   */
+  onTitleClick?: () => void
   className?: string
 }
 
@@ -203,6 +237,7 @@ export function SessionHeaderPill({
   connection,
   offline = false,
   tailError = false,
+  onTitleClick,
   className,
 }: SessionHeaderPillProps) {
   const phone = surface === 'phone'
@@ -318,19 +353,48 @@ export function SessionHeaderPill({
                 // The name is right there; a second announcement is noise.
                 label={null}
               />
-              <span
-                className={cn(
-                  'min-w-0 truncate text-[16px] font-semibold tracking-[-0.2px] text-ink',
-                  // On the phone the name is the elastic member: the trailing
-                  // slot has to sit on the card's right edge, not next to the
-                  // name (`mobile-light.png`). It is also the member with a
-                  // FLOOR — see `NAME_MIN` (QA #6).
-                  phone && 'flex-1',
-                )}
-                style={phone ? { minWidth: `${NAME_MIN}px` } : undefined}
-              >
-                {label}
-              </span>
+              {onTitleClick ? (
+                // The name is the way into the bot's details on the phone (the
+                // terminal chrome has had it since feat-session-info; chat had
+                // an inert span and no other door). A real button: the row's
+                // 44px hit target, taken back out of the layout with a matching
+                // negative margin so the card's geometry — the one structural
+                // promise at the top of this file — does not move by a pixel.
+                <button
+                  type="button"
+                  onClick={onTitleClick}
+                  data-testid="chat-header-title"
+                  title={label}
+                  // The visible name LEADS, so voice control ("click <name>") and
+                  // a screen reader's list both key on what is on screen.
+                  aria-label={`${label} — bot details`}
+                  aria-haspopup="dialog"
+                  className={cn(
+                    '-my-2.5 flex min-h-11 min-w-0 items-center gap-1 rounded-lg py-2.5 text-left',
+                    'text-[16px] font-semibold tracking-[-0.2px] text-ink outline-none',
+                    'transition-opacity active:opacity-60 focus-visible:ring-2 focus-visible:ring-ring',
+                    phone && 'flex-1',
+                  )}
+                  style={phone ? { minWidth: `${NAME_MIN}px` } : undefined}
+                >
+                  <span className="min-w-0 truncate">{label}</span>
+                  <TitleChevron />
+                </button>
+              ) : (
+                <span
+                  className={cn(
+                    'min-w-0 truncate text-[16px] font-semibold tracking-[-0.2px] text-ink',
+                    // On the phone the name is the elastic member: the trailing
+                    // slot has to sit on the card's right edge, not next to the
+                    // name (`mobile-light.png`). It is also the member with a
+                    // FLOOR — see `NAME_MIN` (QA #6).
+                    phone && 'flex-1',
+                  )}
+                  style={phone ? { minWidth: `${NAME_MIN}px` } : undefined}
+                >
+                  {label}
+                </span>
+              )}
               {/* The app's status affordance, not a lookalike — which is how the
                   busy states keep the spinner the boot window needs. It carries
                   the `--status-*` family and never the accent (contract C7).

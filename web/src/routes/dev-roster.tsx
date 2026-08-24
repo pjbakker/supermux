@@ -110,7 +110,7 @@ const BOT_PANEL_TABS: {
 }[] = [
   { tab: 'overview', label: 'Overview' },
   { tab: 'instructions', label: 'Instructions' },
-  { tab: 'tools', label: 'Tools' },
+  { tab: 'tools', label: 'Connectors' },
   { tab: 'memory', label: 'Memory' },
   { tab: 'activity', label: 'Activity' },
 ]
