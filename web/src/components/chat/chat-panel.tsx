@@ -31,6 +31,9 @@ import { agentsApi, commandsApi, filesApi, sessionsApi } from '@/lib/api'
 import { restSessionInput, type SessionInput } from '@/lib/session-input'
 
 import { useRosterMarks } from '@/hooks/use-roster-marks'
+import { useCancelRun, useWorkflowProgress, useWorkflows } from '@/hooks/use-workflows'
+import { workflowHref } from '@/components/workflows/workflow-href'
+import type { HeaderWorkflow } from './header-pill'
 import { claimChatSurface } from '@/lib/live-region-owner'
 
 import { detailFor, topAttention } from './attention'
@@ -249,6 +252,35 @@ export default function ChatPanel({
     (draft: string) => setScheduleSheet({ scheduleId: null, create: true, draft: draft.trim() }),
     [],
   )
+  // THE WORKFLOW TELL (T6.3). A workflow's steps arrive in THIS pane as ordinary
+  // submissions, and the human can type into the same pane mid-chain. v1 does
+  // NOT lock the composer — locking a user out of their own agent is worse than
+  // the interleaving — so the header discloses instead.
+  //
+  // The live position comes from the SSE progress map, which is keyed by
+  // WORKFLOW id and carries no session; this bot's own list is what turns that
+  // into "is one of MINE running". Both are cheap and already cached by the
+  // workflows surfaces; neither polls.
+  const myWorkflows = useWorkflows(name)
+  const workflowProgress = useWorkflowProgress()
+  const cancelRun = useCancelRun()
+  const headerWorkflow = React.useMemo<HeaderWorkflow | null>(() => {
+    for (const w of myWorkflows.data ?? []) {
+      const p = workflowProgress[w.id]
+      if (!p?.running) continue
+      const href = workflowHref(w.id)
+      return {
+        id: w.id,
+        step: p.step,
+        steps: p.steps,
+        href,
+        onOpen: () => navigate(href),
+        onStop: () => cancelRun.mutate(w.id),
+      }
+    }
+    return null
+  }, [myWorkflows.data, workflowProgress, navigate, cancelRun])
+
   // The wire labels `ChatItem` deliberately does not carry: the slash name of a
   // command, the teammate id of an arrival, the subject of a system event.
   const labels = React.useMemo(() => entryLabels(entries), [entries])
@@ -926,6 +958,9 @@ export default function ChatPanel({
       // Nothing is broken, so nothing moves over the transcript.
       headerStatus={connectionNote}
       headerTrailing={headerTrailing}
+      // The workflow tell — null (and therefore invisible) unless a run of this
+      // bot's own is in flight right now.
+      workflow={headerWorkflow}
       pinFor={pinFor}
       // The header's honesty half: an `offline` plane greys the presence dot so
       // it stops reading as a live green "ready" beside the "Offline" chip. Only

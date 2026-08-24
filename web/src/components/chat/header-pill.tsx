@@ -115,6 +115,73 @@ function ModeChip({ children, className }: { children: React.ReactNode; classNam
 }
 
 /**
+ * A workflow run in flight, as the header needs to say it.
+ *
+ * Pure props, deliberately: this module is rendered by `bun test` (empty
+ * `paths`), and a chip that fetched its own workflow would drag the whole
+ * query layer in with it. The data plane fills this in — see `chat-panel.tsx`.
+ */
+export interface HeaderWorkflow {
+  /** The workflow whose run is occupying this pane. */
+  id: string
+  /** 1-based, as the SSE frame counts. */
+  step: number
+  steps: number
+  /** The workflow's own page — where the run timeline lives. */
+  href: string
+  /** SPA navigation; the `href` stays real so the chip survives a middle-click. */
+  onOpen?: () => void
+  /** `POST /api/workflows/{id}/cancel`, supplied by the data plane. */
+  onStop?: () => void
+}
+
+/**
+ * THE HONESTY TELL.
+ *
+ * A workflow's steps arrive in this pane as ordinary submissions, and the human
+ * can type into the same pane while the chain is mid-flight. v1 does NOT lock
+ * the composer — locking a user out of their own agent is worse than the
+ * interleaving — so the header discloses instead: what is running, how far it
+ * has got, where to read it, and how to stop it.
+ *
+ * Renders nothing when nothing is running, which is the common case; a chip
+ * that is always there is one more thing to look past.
+ */
+export function WorkflowChip({ workflow }: { workflow: HeaderWorkflow | null | undefined }) {
+  if (!workflow) return null
+  const { step, steps, href, onOpen, onStop } = workflow
+  return (
+    <span className="flex flex-none items-center gap-1 rounded-full border-[0.5px] border-hairline-soft bg-fill-soft py-[3px] pl-2 pr-1 text-[11.5px] font-medium tracking-[0.1px] text-ink-2">
+      <a
+        href={href}
+        data-testid="chat-header-workflow"
+        onClick={(e) => {
+          // A real href (middle-click, long-press, "open in new tab" all work),
+          // but a plain left click stays in the SPA.
+          if (!onOpen || e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+          e.preventDefault()
+          onOpen()
+        }}
+        className="rounded-full px-0.5 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Workflow · step {step}/{steps}
+      </a>
+      {onStop && (
+        <button
+          type="button"
+          onClick={onStop}
+          data-testid="chat-header-workflow-stop"
+          aria-label="Stop this workflow run"
+          className="rounded-full px-1.5 py-[1px] text-ink-2 transition-colors hover:bg-fill hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          Stop
+        </button>
+      )}
+    </span>
+  )
+}
+
+/**
  * Status → the face's presence.
  *
  * The face and the status dot answer the same question at two volumes, so they
@@ -185,6 +252,11 @@ export interface SessionHeaderPillProps {
    */
   tailError?: boolean
   /**
+   * A workflow run is occupying this pane right now. Null/absent — the common
+   * case — renders nothing. See [`WorkflowChip`].
+   */
+  workflow?: HeaderWorkflow | null
+  /**
    * A live turn is streaming right now (the chat plane's `turnStart != null`).
    * Accepted-but-inert: the header face maps from `status` alone. Retained so the
    * chat surface can keep feeding the signal without a type break.
@@ -203,6 +275,7 @@ export function SessionHeaderPill({
   connection,
   offline = false,
   tailError = false,
+  workflow,
   className,
 }: SessionHeaderPillProps) {
   const phone = surface === 'phone'
@@ -365,6 +438,10 @@ export function SessionHeaderPill({
                 <WarningChip text={session.limit_warning} />
               )}
               {!session?.blocked && <UsageChip session={session} />}
+              {/* THE WORKFLOW TELL — beside the conditions, for the same reason
+                  they are there: it is a fact about the SESSION, not about the
+                  turn. See [`WorkflowChip`]. */}
+              <WorkflowChip workflow={workflow} />
               {/* THE TRAILING CLUSTER — ONE ROW on the phone (single-row header).
                   It used to be a flex-COLUMN: the grouped status bits (presence,
                   mode, connection) on tier 1 and the renderer TOGGLE on tier 2.

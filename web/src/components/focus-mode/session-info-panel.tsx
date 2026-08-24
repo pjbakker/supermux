@@ -46,16 +46,17 @@ import {
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
 import { useToast } from '@/components/ui/use-toast'
 import { useSession, useSessionGit } from '@/hooks/use-sessions'
-import { useSchedules } from '@/hooks/use-scheduler'
+import { useWorkflows } from '@/hooks/use-workflows'
 import { useSessionConfig } from '@/hooks/use-session-config'
 import { IssueList } from '@/components/issues/issue-list'
 import { IssueSurface } from '@/components/issues/issue-surface'
 import {
   describeSchedule,
   formatRunTime,
-} from '@/components/scheduler/helpers'
+} from '@/components/workflows/cadence'
+import { workflowHref, workflowNewHref } from '@/components/workflows/workflow-href'
 import { displayLabel } from '@/lib/api'
-import type { ApiSession, SessionMode, ScheduleRow } from '@/lib/api'
+import type { ApiSession, SessionMode } from '@/lib/api'
 import { useCloneSession } from './use-clone-session'
 import { useRenameSession, cleanDisplayName } from './use-rename-session'
 
@@ -287,9 +288,9 @@ function PanelBody({
         }}
       />
 
-      {/* Schedules */}
-      <PaneSection label="Schedules">
-        <SchedulesList name={name} />
+      {/* Workflows */}
+      <PaneSection label="Workflows">
+        <WorkflowsList name={name} />
       </PaneSection>
 
       {/* Git — live status of the working dir (real branch / dirty / ahead-behind),
@@ -595,47 +596,25 @@ export function GitRow({ name }: { name: string }) {
   )
 }
 
+// ── workflows ────────────────────────────────────────────────────────────────
+
 /**
- * LAZY, and it is budget-load-bearing (fase B4 T8).
+ * The per-session workflows list — the flat (non-Grok) focus panel's answer to
+ * "what does this bot do on its own".
  *
- * The sheet pulls in the whole scheduler editor — the form, the recurrence
- * builder, the fire log, the session picker. Imported statically it landed 8 KB
- * gz in the HERO path, for a modal nobody has opened yet. It is only ever
- * mounted while `open`, so the chunk is fetched at the moment of the tap, which
- * is the same trade the `@`/`/` picker makes (`composer.tsx`).
+ * This was `SchedulesList` until Phase 6. The shape is unchanged (a row per job,
+ * title over a human cadence, tap to open) and so is the reason it exists: the
+ * question is per-session, so the answer must not be a trip to a global table
+ * where the reader has to find their own rows again. What changed is the source
+ * — `/api/workflows?session=` instead of the whole schedules list filtered in
+ * the browser — and the destination: a row now opens the workflow's own page,
+ * which holds the step rail and the run history a lazy sheet never could.
  */
-const SessionSchedulesSheet = React.lazy(
-  () => import('@/components/session-schedules/session-schedules-sheet'),
-)
-
-// ── schedules ────────────────────────────────────────────────────────────────
-
-export function SchedulesList({ name }: { name: string }) {
-  const { data, isLoading } = useSchedules()
+export function WorkflowsList({ name }: { name: string }) {
+  const { data, isLoading, error } = useWorkflows(name)
   const reduce = useReducedMotion()
-  // The rows open THIS SESSION's Schedules sheet (fase B4 T8.6). They used to
-  // link to `/scheduler` — a route B1 has since turned into a redirect to a
-  // global admin table, where the reader would have had to find their own rows
-  // again. The sheet is the per-session answer to a per-session question, and
-  // it exists whether or not the fold landed (§0.6).
-  const [sheet, setSheet] = React.useState<{ id: string | null; create: boolean } | null>(null)
 
-  const mine = React.useMemo<ScheduleRow[]>(
-    () => (data ?? []).filter((s) => s.session === name && !s.deleted),
-    [data, name],
-  )
-
-  const sheetEl = sheet && (
-    <React.Suspense fallback={null}>
-    <SessionSchedulesSheet
-      session={name}
-      open
-      onClose={() => setSheet(null)}
-      scheduleId={sheet.id}
-      createOnOpen={sheet.create}
-    />
-    </React.Suspense>
-  )
+  const mine = data ?? []
 
   if (isLoading && !data) {
     return (
@@ -646,62 +625,55 @@ export function SchedulesList({ name }: { name: string }) {
     )
   }
 
+  if (error) {
+    // Honesty rule: unreachable is not empty. "No workflows" here would be a
+    // claim about the server that the browser is in no position to make.
+    return <p className="text-sm text-muted-foreground">Couldn’t reach the workflows.</p>
+  }
+
   if (mine.length === 0) {
     return (
-      <>
-        <p className="text-sm text-muted-foreground">
-          No schedules.{' '}
-          <button
-            type="button"
-            onClick={() => setSheet({ id: null, create: true })}
-            className="font-medium text-primary underline-offset-2 hover:underline"
-          >
-            Add one
-          </button>
-          .
-        </p>
-        {sheetEl}
-      </>
+      <p className="text-sm text-muted-foreground">
+        No workflows.{' '}
+        <Link
+          to={workflowNewHref(name)}
+          className="font-medium text-primary underline-offset-2 hover:underline"
+        >
+          Add one
+        </Link>
+        .
+      </p>
     )
   }
 
   return (
-    <>
-      <ul className="flex flex-col gap-1.5">
-        {mine.map((s, i) => (
-          <motion.li
-            key={s.id}
-            initial={reduce ? false : { opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={reduce ? motionOff : { ...springs.snappy, delay: i * 0.02 }}
+    <ul className="flex flex-col gap-1.5">
+      {mine.map((w, i) => (
+        <motion.li
+          key={w.id}
+          initial={reduce ? false : { opacity: 0, y: 4 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={reduce ? motionOff : { ...springs.snappy, delay: i * 0.02 }}
+        >
+          <Link
+            to={workflowHref(w.id)}
+            className={cn(
+              'flex min-h-11 w-full items-center gap-2 rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-left',
+              'transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+            )}
           >
-            <button
-              type="button"
-              onClick={() => setSheet({ id: s.id, create: false })}
-              className={cn(
-                'flex min-h-11 w-full items-center gap-2 rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-left',
-                'transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-              )}
-            >
-              <CalendarClock
-                className="size-4 shrink-0 text-muted-foreground"
-                aria-hidden
-              />
-              <span className="flex min-w-0 flex-1 flex-col">
-                <span className="truncate text-[13px] font-medium text-foreground">
-                  {s.title}
-                </span>
-                <span className="truncate text-[11px] text-muted-foreground">
-                  {describeSchedule(s.schedule_expr)}
-                  {s.next_run ? ` · next ${formatRunTime(s.next_run)}` : ''}
-                </span>
+            <CalendarClock className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="truncate text-[13px] font-medium text-foreground">{w.title}</span>
+              <span className="truncate text-[11px] text-muted-foreground">
+                {describeSchedule(w.schedule_expr)}
+                {w.next_run ? ` · next ${formatRunTime(w.next_run)}` : ''}
               </span>
-            </button>
-          </motion.li>
-        ))}
-      </ul>
-      {sheetEl}
-    </>
+            </span>
+          </Link>
+        </motion.li>
+      ))}
+    </ul>
   )
 }
 

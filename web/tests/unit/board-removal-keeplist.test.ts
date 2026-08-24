@@ -147,8 +147,12 @@ describe('the server-side machinery is untouched', () => {
     expect(auto).toContain('emit_board')
     expect(auto).toMatch(/NeedsReview|needs_review/)
     expect(auto).toMatch(/AwaitingInput|awaiting_input/)
-    // A scheduled run reports onto its issue with the literal skill line.
-    expect(read('server/src/scheduler/runner.rs')).toContain('/supermux-task')
+    // A scheduled run reports onto its issue with the literal skill line. The
+    // module that owns that delivery moved in Phase 4A (`scheduler::runner` →
+    // `workflows::engine`, spec §3.2) — the capability did not: a step's bare
+    // `/command` line is still sent as its own submission, which is the only
+    // reason a skill line executes as a skill.
+    expect(read('server/src/workflows/engine.rs')).toContain('/supermux-task')
     // A rename re-points the issue rows rather than orphaning them.
     expect(read('server/src/db/sessions.rs')).toMatch(/UPDATE issues SET session/)
   })

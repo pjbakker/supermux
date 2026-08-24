@@ -53,7 +53,7 @@ import { ChatSurface } from './chat-surface'
 import { ComposerShell } from './composer-shell'
 import type { ChatItem } from './entries'
 import { buildTranscript } from './grouping'
-import { SessionHeaderPill } from './header-pill'
+import { SessionHeaderPill, type HeaderWorkflow } from './header-pill'
 import { LiveLayer } from './live-layer'
 import { deliveryLine, type PendingSend } from './pending'
 import { TranscriptItem, type ScheduleRef } from './transcript-item'
@@ -163,6 +163,12 @@ export interface ChatConversationProps {
    * `TranscriptItem`.
    */
   showActions?: boolean
+  /**
+   * A workflow run occupying this pane right now (T6.3) — the header's honesty
+   * chip. Data, not a slot: the panel owns the query and the cancel mutation,
+   * this surface only renders what it is handed.
+   */
+  workflow?: HeaderWorkflow | null
   /** Go to another session — the destination of a harness line's chip. */
   onOpenSession?: (slug: string) => void
   /** Open this session's Schedules sheet — the destination of a `⏱` chip
@@ -335,6 +341,7 @@ export function ChatConversation({
   showActions = false,
   onOpenSession,
   onOpenSchedule,
+  workflow = null,
   handoff,
   nowMs,
   turnStart,
@@ -503,6 +510,7 @@ export function ChatConversation({
           trailing={headerTrailing}
           connection={headerStatus}
           offline={offline}
+          workflow={workflow}
           // The live turn signal, straight from the chat plane: a running turn
           // (`turnStart != null` while active) is the honest "streaming now" the
           // status field only approximates. Grok wears it as the header's live

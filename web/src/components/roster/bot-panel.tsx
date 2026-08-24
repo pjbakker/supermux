@@ -15,8 +15,8 @@
  *
  * Four quiet tabs: Overview (the glance, now with editable tags + a working-dir
  * row) · Instructions (role + model + notes + notifications — the launch-injected
- * identity) · Tools (skills / connectors / MCP placeholders) · Activity
- * (Schedules · Issues · Git).
+ * identity) · Tools (skills / connectors / MCP placeholders) · Workflows
+ * (the bot-scoped Workflows list · Recent runs · Issues · Git).
  *
  * Styling is Tailwind + shadcn tokens (NOT `[data-grok]`-scoped CSS) so the ONE
  * component renders identically in the in-shell pane and in the body-portalled
@@ -46,8 +46,9 @@ import {
   DescEditor,
   TagsEditor,
   GitRow,
-  SchedulesList,
 } from '@/components/focus-mode/session-info-panel'
+import { WorkflowsView } from '@/components/workflows/workflows-view'
+import { RecentRuns } from '@/components/workflows/recent-runs'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -313,15 +314,17 @@ export function WorkingDirRow({ name, dir }: { name: string; dir: string }) {
   )
 }
 
-/* ── the four tabs ─────────────────────────────────────────────────────────── */
+/* ── the five tabs ─────────────────────────────────────────────────────────── */
 
-type TabKey = 'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
-const TABS: { key: TabKey; label: string }[] = [
+export type TabKey = 'overview' | 'instructions' | 'tools' | 'memory' | 'workflows'
+/** Exported so the tab contract is asserted against the real array rather than
+ *  a test's copy of the strings (`workflows-view.test.tsx`). */
+export const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: 'Overview' },
   { key: 'instructions', label: 'Instructions' },
   { key: 'tools', label: 'Tools' },
   { key: 'memory', label: 'Memory' },
-  { key: 'activity', label: 'Activity' },
+  { key: 'workflows', label: 'Workflows' },
 ]
 
 /** The CORE-notes cap — stated plainly (the truth about when edits land). */
@@ -549,7 +552,7 @@ export function ToolsTab({ name, session }: { name: string; session: ApiSession 
   )
 }
 
-function ActivityTab({
+function WorkflowsTab({
   name,
   onNavigate,
 }: {
@@ -562,8 +565,13 @@ function ActivityTab({
 
   return (
     <div className="flex flex-col gap-6">
-      <Field label="Schedules">
-        <SchedulesList name={name} />
+      {/* The list carries its own heading and its own "+ New workflow" — one
+          implementation of a workflow list, scoped, rather than a second one
+          that would start disagreeing with /workflows about what a card says. */}
+      <WorkflowsView variant="panel" scope={name} />
+
+      <Field label="Recent runs">
+        <RecentRuns session={name} limit={5} />
       </Field>
 
       <Field label="Issues">
@@ -762,7 +770,7 @@ function BotPanelBody({
         {tab === 'memory' && (
           <MemoryTab name={name} session={session} onRestartAdvised={onRestartAdvised} />
         )}
-        {tab === 'activity' && <ActivityTab name={name} onNavigate={onNavigate} />}
+        {tab === 'workflows' && <WorkflowsTab name={name} onNavigate={onNavigate} />}
 
         {/* Clone — the panel's footer action, on every tab's scroll floor */}
         <div className="mt-8 border-t border-border pt-5">
@@ -797,7 +805,7 @@ export interface BotPanelProps {
   open?: boolean
   onOpenChange?: (open: boolean) => void
   /** Dev/bench only: seat a specific tab so a still frame can show each one. */
-  initialTab?: 'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
+  initialTab?: TabKey
 }
 
 export function BotPanel({

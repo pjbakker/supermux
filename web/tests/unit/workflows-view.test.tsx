@@ -24,6 +24,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import { WorkflowsView } from '../../src/components/workflows/workflows-view'
+import { TABS as BOT_TABS } from '../../src/components/roster/bot-panel'
 import { StepRail } from '../../src/components/workflows/step-rail'
 import { WORKFLOW_TEMPLATES } from '../../src/components/workflows/templates'
 import { ToastProvider } from '../../src/components/ui/toast'
@@ -283,5 +284,55 @@ describe('no raw pictographs on an app surface', () => {
     expect(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(src)).toBe(false)
     // A lucide icon is a forwardRef object, not a plain function component.
     for (const t of WORKFLOW_TEMPLATES) expect(t.icon).toBeDefined()
+  })
+})
+
+/**
+ * T6.1 — the bot panel's fifth tab.
+ *
+ * The tab used to be "Activity" and its first field was a `SchedulesList` that
+ * opened a per-session schedules SHEET. The sheet is gone; the same question is
+ * answered by the list itself, scoped to one bot. Issues and Git stay — losing
+ * them to a rename would be a capability drop dressed as a refactor.
+ *
+ * The tab wiring is asserted against `TABS` (a real export, so a rename cannot
+ * be "fixed" by editing the test's copy of the string) and the composition
+ * against the source, because BotPanelBody needs a live session query to render.
+ */
+describe('the bot panel tab is Workflows, not Activity', () => {
+  const PANEL_SRC = readFileSync(
+    new URL('../../src/components/roster/bot-panel.tsx', import.meta.url).pathname,
+    'utf8',
+  )
+
+  test('the five tabs, in order, and the last one is workflows', () => {
+    expect(BOT_TABS.map((t) => t.key)).toEqual([
+      'overview',
+      'instructions',
+      'tools',
+      'memory',
+      'workflows',
+    ])
+    expect(BOT_TABS[4].label).toBe('Workflows')
+  })
+
+  test('no "activity" tab key survives anywhere in the panel', () => {
+    expect(PANEL_SRC).not.toContain("'activity'")
+    expect(PANEL_SRC).not.toContain('ActivityTab')
+  })
+
+  test('the tab renders the bot-scoped list, the recent runs, and keeps Issues + Git', () => {
+    expect(PANEL_SRC).toContain('<WorkflowsView variant="panel" scope={name} />')
+    expect(PANEL_SRC).toContain('label="Recent runs"')
+    expect(PANEL_SRC).toContain('label="Issues"')
+    expect(PANEL_SRC).toContain('label="Git"')
+  })
+
+  test('the panel list is scoped and its + New pre-selects the bot', () => {
+    const html = render(<WorkflowsView variant="panel" scope="scout" mock={FIXTURE} />)
+    // The bot is already known, so the row does not repeat its face.
+    expect(html).toContain('Weekly client report')
+    expect(html).toContain('/workflows/new?session=scout')
+    expect(html).toContain('New workflow')
   })
 })

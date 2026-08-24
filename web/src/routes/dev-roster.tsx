@@ -64,7 +64,8 @@ import {
   AutoHealToggle,
   RecoveryLadder,
 } from '@/components/recovery/recovery-ladder'
-import { BotPanel } from '@/components/roster/bot-panel'
+import { BotPanel, type TabKey as BotPanelTabKey } from '@/components/roster/bot-panel'
+import type { WorkflowRunSummary, WorkflowWithSteps } from '@/lib/api/workflows'
 import { RestartToApply } from '@/components/roster/granted-connectors'
 import { GrokRow, TeamRow } from '@/components/roster/grok-roster'
 import { MOCK_TEAMS } from './dev-teams.fixture'
@@ -104,15 +105,28 @@ const MOCK_BOT: ApiSession = {
   task_summary: 'Wiring the per-bot settings panel into the roster detail pane.',
 } as ApiSession
 
-const BOT_PANEL_TABS: {
-  tab: 'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
-  label: string
-}[] = [
+/** One bench step row — the wire shape `lib/api/workflows.ts` declares. */
+const benchStep = (workflowId: string, position: number, title: string) => ({
+  id: `${workflowId}-S${position}`,
+  workflow_id: workflowId,
+  position,
+  title,
+  command: '',
+  prompt: title,
+  files: '[]',
+  connectors: '[]',
+  timeout_secs: 1800,
+  on_complete: '',
+  created: 1_790_000_000,
+  updated: 1_790_000_000,
+})
+
+const BOT_PANEL_TABS: { tab: BotPanelTabKey; label: string }[] = [
   { tab: 'overview', label: 'Overview' },
   { tab: 'instructions', label: 'Instructions' },
   { tab: 'tools', label: 'Tools' },
   { tab: 'memory', label: 'Memory' },
-  { tab: 'activity', label: 'Activity' },
+  { tab: 'workflows', label: 'Workflows' },
 ]
 
 // The bench runs BotPanel against an ISOLATED, PRE-SEEDED query client so it
@@ -125,10 +139,55 @@ const BENCH_QC = new QueryClient({
   },
 })
 BENCH_QC.setQueryData<ApiSession[]>(SESSIONS_KEY, [MOCK_BOT])
-// The Activity tab's schedules list assumes an array; seed an empty one so the
-// offline bench shows its real "No schedules" empty state instead of crashing on
-// a non-array offline response.
-BENCH_QC.setQueryData(['schedules'], [])
+// The Workflows tab reads two lists: the bot's own workflows and the
+// cross-workflow activity feed. Seed BOTH so the bench reviews the populated
+// tab offline — a card with its step rail, and the run history under it —
+// instead of two skeletons. Shapes mirror `lib/api/workflows.ts` exactly, so a
+// drift in the wire type breaks `tsc`, here.
+BENCH_QC.setQueryData<WorkflowWithSteps[]>(['workflows', 'list', BOT_PANEL_BENCH_NAME], [
+  {
+    id: 'WF-bench-1',
+    title: 'Morning triage',
+    session: BOT_PANEL_BENCH_NAME,
+    company_id: null,
+    enabled: 1,
+    trigger_kind: 'recurring',
+    schedule_expr: 'weekdays at 8:00',
+    next_run: new Date(1_800_040_000_000).toISOString(),
+    last_run: new Date(1_799_950_000_000).toISOString(),
+    run_count: 34,
+    on_complete: '{"kind":"notify"}',
+    created: 1_790_000_000,
+    updated: 1_799_950_000,
+    deleted: null,
+    steps: [
+      benchStep('WF-bench-1', 0, 'Read the overnight CI runs'),
+      benchStep('WF-bench-1', 1, 'Summarise what broke'),
+    ],
+  },
+])
+BENCH_QC.setQueryData<WorkflowRunSummary[]>(['workflows', 'activity'], [
+  {
+    id: 91,
+    workflow_id: 'WF-bench-1',
+    started_at: 1_799_950_000,
+    finished_at: 1_799_950_041,
+    status: 'ok',
+    note: '',
+    title: 'Morning triage',
+    company_id: null,
+  },
+  {
+    id: 90,
+    workflow_id: 'WF-bench-1',
+    started_at: 1_799_863_600,
+    finished_at: 1_799_865_400,
+    status: 'timeout',
+    note: 'step 2 ran out of time',
+    title: 'Morning triage',
+    company_id: null,
+  },
+])
 // The Memory tab's ARCHIVAL list (`learned-notes.tsx`) reads the bot-memory HTTP
 // routes; seed the empty-query (browse) result plus one opened note so the bench
 // reviews the POPULATED panel offline — tier chips, type dots, ages, an expanded

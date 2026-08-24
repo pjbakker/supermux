@@ -95,6 +95,8 @@ import { useTheme } from '@/components/theme-provider'
 // The per-bot settings page. Lazy — it only mounts once a bot is selected (a
 // detail pane on desktop), so its section bodies (issues, schedules, git,
 // session-actions) never weigh on the roster's first paint.
+import type { TabKey as BotPanelTabKey } from '@/components/roster/bot-panel'
+
 const BotPanel = React.lazy(() =>
   import('@/components/roster/bot-panel').then((m) => ({ default: m.BotPanel })),
 )
@@ -140,7 +142,7 @@ type Sel =
 
 /** The bot-panel's tab keys — mirrors `BotPanelProps['initialTab']` so a deep-link
  *  from the roster can seat a specific tab. */
-type BotTab = 'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
+type BotTab = BotPanelTabKey
 
 /** The pane's SUBJECT as a stable string — what the "reset the pane to the
  *  thread" guard compares across renders (objects never compare equal).

@@ -29,11 +29,17 @@
  * its placeholder), and the renderer switch keeping the hooks the e2e suite
  * clicks (`renderer-chat` / `renderer-terminal`, `role="tablist"`).
  */
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, test } from 'bun:test'
 import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import { SessionHeaderPill } from '../../src/components/chat/header-pill'
+import {
+  SessionHeaderPill,
+  WorkflowChip,
+  type HeaderWorkflow,
+} from '../../src/components/chat/header-pill'
 import { RendererSwitch } from '../../src/components/chat/renderer-switch'
 import { sessionAccentVars } from '../../src/components/chat/session-accent'
 import { PHONE } from '../../src/components/chat/ui/metrics'
@@ -394,5 +400,94 @@ describe('the phone header gives its width to the name (QA #6)', () => {
         ),
       ),
     ).toBe('Chat Terminal')
+  })
+})
+
+/**
+ * T6.3 — the honesty tell.
+ *
+ * A workflow OCCUPIES the bot's thread: its steps arrive in this pane as real
+ * submissions, and the human can type into the same pane mid-chain. v1 does not
+ * lock the pane — locking a user out of their own agent is worse than the
+ * interleaving — so it DISCLOSES instead. The chip is the disclosure: it says a
+ * run is in flight, how far along it is, where to read it, and how to stop it.
+ *
+ * The chip is pure (props, no queries) for the same reason everything else in
+ * `header-pill.tsx` is: this module is rendered by `bun test`, whose resolver
+ * reads the root tsconfig and its empty `paths`. The wiring — which workflow,
+ * and the cancel mutation behind Stop — lives in the data plane and is asserted
+ * against that source.
+ */
+describe('the chat-header workflow chip', () => {
+  const chip = (over: Partial<HeaderWorkflow> = {}) =>
+    renderToStaticMarkup(
+      <WorkflowChip
+        workflow={{
+          id: 'WF-7',
+          step: 2,
+          steps: 4,
+          href: '/workflows/WF-7',
+          onOpen: () => undefined,
+          onStop: () => undefined,
+          ...over,
+        }}
+      />,
+    )
+
+  test('shows a "Workflow · step 2/4" chip while a run is in flight', () => {
+    expect(text(chip())).toContain('Workflow · step 2/4')
+  })
+
+  test('the chip opens the run timeline', () => {
+    // The run history lives on the workflow's own page — the chip is a way in,
+    // not a second, smaller timeline.
+    expect(chip()).toContain('href="/workflows/WF-7"')
+  })
+
+  test('offers Stop', () => {
+    const out = chip()
+    expect(out).toContain('data-testid="chat-header-workflow-stop"')
+    expect(text(out)).toContain('Stop')
+  })
+
+  test('shows nothing when no run is in flight', () => {
+    expect(renderToStaticMarkup(<WorkflowChip workflow={null} />)).toBe('')
+    // …and the header itself carries no chip when the prop is absent, which is
+    // every session that is not mid-chain.
+    expect(text(pill(session()))).not.toContain('Workflow ·')
+  })
+
+  test('the header renders the chip when a run IS in flight', () => {
+    const out = renderToStaticMarkup(
+      <SessionHeaderPill
+        name={FOCUS}
+        session={session()}
+        workflow={{
+          id: 'WF-7',
+          step: 2,
+          steps: 4,
+          href: '/workflows/WF-7',
+          onOpen: () => undefined,
+          onStop: () => undefined,
+        }}
+      />,
+    )
+    expect(text(out)).toContain('Workflow · step 2/4')
+  })
+
+  test('Stop is wired to the cancel mutation, and the chip to the live progress', () => {
+    // A render cannot prove which endpoint Stop hits; the data plane can.
+    const src = readFileSync(
+      new URL('../../src/components/chat/chat-panel.tsx', import.meta.url).pathname,
+      'utf8',
+    )
+    expect(src).toContain('useCancelRun')
+    expect(src).toContain('useWorkflowProgress')
+    // `cancel` is POST /api/workflows/{id}/cancel — asserted where it is spelled.
+    const api = readFileSync(
+      new URL('../../src/lib/api/workflows.ts', import.meta.url).pathname,
+      'utf8',
+    )
+    expect(api).toContain('/cancel')
   })
 })
