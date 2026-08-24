@@ -51,7 +51,7 @@ export function SelectBar({
         <button
           type="button"
           onClick={onCancel}
-          className="flex h-9 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className="flex h-11 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           <X className="size-3.5" />
           Cancel

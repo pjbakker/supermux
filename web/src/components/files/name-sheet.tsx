@@ -81,10 +81,18 @@ export function NameSheet({
       description={description}
       footer={
         <div className="flex items-center justify-end gap-2">
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          {/* h-11: the shared `Button` default is h-9, which is below the
+              44px floor this app holds every PHONE target to. The footer of a
+              bottom sheet is the most thumb-reachable row on the screen and the
+              worst place to be 8px short. */}
+          <Button
+            variant="outline"
+            className="h-11"
+            onClick={() => onOpenChange(false)}
+          >
             Cancel
           </Button>
-          <Button onClick={submit} disabled={!canSubmit}>
+          <Button className="h-11" onClick={submit} disabled={!canSubmit}>
             {submitLabel}
           </Button>
         </div>

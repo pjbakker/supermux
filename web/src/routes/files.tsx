@@ -157,7 +157,12 @@ export function Files() {
   // the grid, explicitly. Nothing → the grid, unless a session deep link or the
   // skip rule names a directory. Three states, one param each: no surface can
   // be reached two ways, so Back always undoes exactly one step.
-  const wantsDirectory = pathParam != null || !!name || (!viewParam && !!skipTarget)
+  // Precedence: an explicit `?path=` is always a directory; otherwise an
+  // explicit `?view=` wins over the `/files/:name` session param, so "All
+  // spaces" works from a session deep link instead of being out-voted by the
+  // `:name` still in the URL.
+  const wantsDirectory =
+    pathParam != null || (!viewParam && (!!name || !!skipTarget))
   const showHq = !wantsDirectory && viewParam === 'hq'
   const showSpaces = !wantsDirectory && !showHq && !projects.isLoading
 
@@ -279,6 +284,17 @@ export function Files() {
       })
     },
     [setSearchParams],
+  )
+
+  /** Navigate to a SPACE, dropping any `/files/:name` still in the path. A
+   *  space pick is a scope change; leaving the session segment behind would
+   *  keep resolving that bot's dir underneath the new space. */
+  const gotoSpace = React.useCallback(
+    (next: Record<string, string>) => {
+      const p = new URLSearchParams(next)
+      navigate(`/files${p.size ? `?${p}` : ''}`)
+    },
+    [navigate],
   )
 
   const navigateTo = React.useCallback(
@@ -522,8 +538,8 @@ export function Files() {
     // same pick — Files is not a private lens on companies.
     setActiveCompany(id)
     exitSelect()
-    if (path) goto({ path, select: null, view: null })
-    else goto({ path: null, select: null, view: 'hq' })
+    if (path) gotoSpace({ path })
+    else gotoSpace({ view: 'hq' })
   }
 
   const onPickSession = (next: string) => {
@@ -556,7 +572,7 @@ export function Files() {
         }
         onShowSpaces={() => {
           exitSelect()
-          goto({ view: 'spaces', path: null, select: null })
+          gotoSpace({ view: 'spaces' })
         }}
         onPickSession={onPickSession}
       />

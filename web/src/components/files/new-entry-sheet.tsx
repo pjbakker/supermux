@@ -84,10 +84,16 @@ export function NewEntrySheet({
       description={dirPath}
       footer={
         <div className="flex items-center justify-end gap-2">
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          {/* h-11 — see name-sheet.tsx: the shared Button default (h-9) is
+              below this app's 44px phone floor. */}
+          <Button
+            variant="outline"
+            className="h-11"
+            onClick={() => onOpenChange(false)}
+          >
             Cancel
           </Button>
-          <Button onClick={submit} disabled={!canSubmit}>
+          <Button className="h-11" onClick={submit} disabled={!canSubmit}>
             Create
           </Button>
         </div>
@@ -97,7 +103,7 @@ export function NewEntrySheet({
         <div
           role="group"
           aria-label="What to create"
-          className="flex h-12 items-center rounded-lg border border-border bg-card p-1"
+          className="flex h-12 items-center rounded-lg border border-border bg-card p-0.5"
         >
           <SegButton
             active={kind === 'folder'}
@@ -154,7 +160,7 @@ function SegButton({
       aria-pressed={active}
       onClick={onClick}
       className={cn(
-        'flex h-10 flex-1 items-center justify-center gap-1.5 rounded-md text-sm font-medium transition-colors',
+        'flex h-11 flex-1 items-center justify-center gap-1.5 rounded-md text-sm font-medium transition-colors',
         active
           ? 'bg-primary text-primary-foreground'
           : 'text-muted-foreground hover:text-foreground',

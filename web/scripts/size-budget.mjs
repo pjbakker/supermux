@@ -1086,7 +1086,31 @@ const BUDGET_ENTRY_JS = 161 * KB
 // `connector-task` helper: the ENTRY/hero gate is UNCHANGED at 154.25 / 161 KB (the
 // feature's hero-path cost is ZERO). A genuine additive store surface, not a
 // regression to trim; ceil(measured)=345, the same rule every fase since B3 used.
-const BUDGET_APP_JS = 345 * KB
+//
+// 345 → 355 at FILES v1, THE BOT COMPANY DRIVE (feat/files): `/files` stops being a
+// `$HOME` browser with a session dropdown and becomes the shared drive — a Spaces
+// landing (HQ + one card per company, with a live activity line), a space crumb
+// replacing `SessionPicker`, a row menu (Rename/Move/Copy/Duplicate/Send-to-bot),
+// `+ New`, a dir-only destination sheet, multi-select with a safe-area bulk bar and
+// a concurrency-4 client fan-out, `?select=` deep links, and SSE liveness.
+// Measured 354.36 against 345.00 — +9.79 KB against the parent's own 344.57, which
+// is the honest price of six new surfaces plus the gzip loss of splitting them out.
+//
+// THE HERO PATH GOT CHEAPER, not more expensive. `/files` was EAGERLY imported into
+// `App.tsx` — the only non-hero route that still was — so every byte of this feature
+// would have landed on first paint for users who never open Files. It is now
+// `React.lazy` alongside Settings / Store / TeamDetail, and the ENTRY gate MOVED
+// DOWN: 148.60 / 161 KB, from the parent's 154.24. That is −5.64 KB gz off cold load
+// for every visitor, while the feature's own ~9.8 KB is paid only by someone who
+// actually opens the drive.
+//
+// Where the app-total delta went (all in the new lazy `files` chunk + its shared
+// leaves): the Spaces grid + its pure card builder, four `ResponsiveSheet` surfaces
+// (rename / new / destination picker / send-to-bot), the select bar, the space
+// crumb, the HQ projects list, and the data layer (`mapWithLimit`, the bulk summary,
+// `companyForPath`, `useFilesLive`). ceil(measured)=355, the same rule every fase
+// since B3 used.
+const BUDGET_APP_JS = 355 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

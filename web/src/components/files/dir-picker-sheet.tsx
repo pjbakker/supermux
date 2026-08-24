@@ -108,10 +108,20 @@ export function DirPickerSheet({
       className="sm:max-w-lg"
       footer={
         <div className="flex items-center justify-end gap-2">
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          {/* h-11 — see name-sheet.tsx: the shared Button default (h-9) is
+              below this app's 44px phone floor. */}
+          <Button
+            variant="outline"
+            className="h-11"
+            onClick={() => onOpenChange(false)}
+          >
             Cancel
           </Button>
-          <Button onClick={() => onPick(here)} disabled={!canConfirm}>
+          <Button
+            className="h-11"
+            onClick={() => onPick(here)}
+            disabled={!canConfirm}
+          >
             {actionLabel}
           </Button>
         </div>
@@ -142,7 +152,7 @@ export function DirPickerSheet({
             spellCheck={false}
             autoCapitalize="off"
             autoCorrect="off"
-            className="h-9 min-w-0 flex-1 bg-transparent font-mono text-sm outline-none"
+            className="h-11 min-w-0 flex-1 bg-transparent font-mono text-sm outline-none"
           />
         </div>
 

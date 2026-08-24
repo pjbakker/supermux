@@ -23,7 +23,16 @@ import { ConnectionOverlay } from '@/components/connection/connection-overlay'
 import { MorphCommitProbe } from '@/components/view-transitions/morph'
 import { Overview } from '@/routes/overview'
 import { Focus, FocusEntry } from '@/routes/focus'
-import { Files } from '@/routes/files'
+// Files is entry-lazy for the same reason Settings is, and for a reason of its
+// own: the cold hero path is the OVERVIEW, and the entry chunk should not carry
+// a file browser to render a roster. Files v1 (the Bot Company Drive) roughly
+// doubled the route's weight — Spaces grid, four `ResponsiveSheet` surfaces, a
+// dir picker, the bulk bar — and eagerly imported that put ~7.6 KB gz of it on
+// first paint for every user who never opened Files at all. Lazy is where it
+// belongs, alongside Settings, Store and TeamDetail.
+const Files = lazy(() =>
+  import('@/routes/files').then((m) => ({ default: m.Files })),
+)
 // Settings is entry-lazy: it is a cold administrative surface, and its eager
 // import tipped the hero-path bundle over the 200 KB gz budget (#67 red).
 // (B1 folded the Scheduler route into Settings, so no Scheduler import here.)
@@ -101,6 +110,11 @@ const DevComposerAttach = import.meta.env.DEV
 // overflow, in both themes, with no server behind it.
 const DevPickers = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-pickers'))
+  : null
+// The Files v1 bench: the Spaces grid, the destination sheet and the
+// multi-select bottom bar, hand-fed and seeded, for the 390px review pass.
+const DevFiles = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-files'))
   : null
 // The toggle-thrash bench (fase A5 T6): the REAL RendererShell + LiveTerminal,
 // toggled 100× against a firehosing `shell` pty by
@@ -257,7 +271,14 @@ export default function App() {
                     bookmark lands somewhere honest — the same pattern /scheduler
                     and /hosts use. */}
                 <Route path="/board" element={<Navigate to="/" replace />} />
-                <Route path="/files/:name?" element={<Files />} />
+                <Route
+                  path="/files/:name?"
+                  element={
+                    <Suspense fallback={null}>
+                      <Files />
+                    </Suspense>
+                  }
+                />
                 {/* Scheduler moved into Settings → Schedules (B1 T8: a route
                     whose 5-column table did not earn a primary-nav slot).
                     Redirect old bookmarks / deep links to the Settings anchor
@@ -488,6 +509,16 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <DevPickers />
+                    </Suspense>
+                  }
+                />
+              )}
+              {DevFiles && (
+                <Route
+                  path="/dev/files"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevFiles />
                     </Suspense>
                   }
                 />
