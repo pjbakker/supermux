@@ -39,4 +39,5 @@ pub mod static_assets;
 pub mod teams;
 pub mod updates;
 pub mod vault;
+pub mod workflows;
 pub mod ws;

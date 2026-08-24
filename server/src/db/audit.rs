@@ -105,6 +105,18 @@ pub async fn log_authored(
 
 /// The most-recent `limit` audit rows, newest first (`GET /api/audit?limit=N`).
 /// Backed by `idx_audit_ts`.
+/// Has this action ever been recorded? A cheap existence latch for one-shot
+/// boot work that must announce itself exactly once across restarts — the
+/// audit row IS the "already done" flag, so there is no second state to keep
+/// in sync with it.
+pub async fn has_action(pool: &SqlitePool, action: &str) -> sqlx::Result<bool> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = ?")
+        .bind(action)
+        .fetch_one(pool)
+        .await?;
+    Ok(n > 0)
+}
+
 pub async fn list(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<AuditEntry>> {
     sqlx::query_as::<_, AuditEntry>(
         "SELECT id, ts, actor, action, target, detail FROM audit_log ORDER BY ts DESC, id DESC LIMIT ?",

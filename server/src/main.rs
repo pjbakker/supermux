@@ -8,7 +8,7 @@
 
 use supermux_server::{
     agents, bot_memory, config, connectors, db, external_edit, http, scheduler, sessions, state,
-    teams,
+    teams, workflows,
 };
 
 #[tokio::main]
@@ -148,6 +148,19 @@ async fn main() -> anyhow::Result<()> {
     let audit_targets = sessions::auto_actions::snapshot_for_audit(&state).await;
 
     sessions::auto_actions::reconcile_on_boot(&state).await;
+
+    // One-shot, idempotent: re-derive every workflow's company_id cache and, on
+    // the FIRST boot after 0038, tell the user once about anything the port
+    // could not carry over. Runs BEFORE the tick so a workflow never fires with
+    // a stale company stamp (which is what routes its SSE frames).
+    match workflows::port::reconcile(&state).await {
+        Ok(r) if r.alerted => tracing::info!(
+            unported = r.unported, command_notes = r.command_notes,
+            "workflows: announced the schedules port"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "workflows: port reconciliation failed"),
+    }
 
     // Background tasks. The scheduler tick runs here.
     scheduler::spawn(state.clone());

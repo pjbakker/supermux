@@ -687,3 +687,133 @@ async fn the_dragons_table_is_gone() {
 
     cleanup(dir);
 }
+
+// ── post-upgrade reconciliation (workflows::port::reconcile) ─────────────────
+//
+// The migration reads `sessions.company_id` at the instant it runs, and it can
+// only write into the database it is running in. Two things therefore have to
+// happen once, at boot, on the other side of it.
+
+use supermux_server::config::{Config, ProviderDefaults, TlsConfig, WsConfig};
+use supermux_server::state::AppState;
+use supermux_server::workflows;
+
+/// The ported fixture, wrapped in an `AppState` so `reconcile` can reach the
+/// SSE bus and the push lane. Same throwaway tempdir; nothing else changes.
+async fn ported_state() -> (AppState, PathBuf) {
+    let (pool, dir) = ported().await;
+    let config = Config {
+        data_dir: dir.clone(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        extra_binds: vec![],
+        extra_origins: vec![],
+        tls: TlsConfig::default(),
+        auth_token: "workflows-port-token".to_string(),
+        provider_defaults: ProviderDefaults::default(),
+        ws: WsConfig::default(),
+        remote_callback_url: None,
+        push_sub: None,
+        github_token: None,
+        statusline_tap: false,
+        isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
+        human_auth: Default::default(),
+    };
+    (AppState::new(pool, config), dir)
+}
+
+#[tokio::test]
+async fn reconcile_rederives_company_id_for_a_session_that_appeared_after_the_migration() {
+    let (state, dir) = ported_state().await;
+
+    // `ghost` had no sessions row when 0038 ran, so its workflow is stamped
+    // NULL — correctly. This is the restored-database shape: the session rows
+    // arrive afterwards.
+    assert_eq!(
+        sqlx::query("SELECT company_id FROM workflows WHERE id = 'SCHED-tmux0007'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>(0),
+        None
+    );
+    sqlx::query(
+        "INSERT INTO sessions (name, dir, created_at, company_id) VALUES ('ghost', '/tmp/g', 1000, 3)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let report = workflows::port::reconcile(&state).await.expect("reconcile");
+    assert_eq!(report.rederived, 1, "exactly the one stale row is corrected");
+    assert_eq!(
+        sqlx::query("SELECT company_id FROM workflows WHERE id = 'SCHED-tmux0007'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>(0),
+        Some(3),
+        "the cache must not stay stale — company_id is what routes the SSE frame"
+    );
+    // The rows that were already right are not rewritten.
+    assert_eq!(
+        scalar_i64(&state.pool, "SELECT company_id FROM workflows WHERE id = 'SCHED-tmux0001'").await,
+        7
+    );
+
+    // Idempotent: a second pass has nothing left to do.
+    assert_eq!(workflows::port::reconcile(&state).await.unwrap().rederived, 0);
+
+    cleanup(dir);
+}
+
+#[tokio::test]
+async fn reconcile_raises_exactly_one_alert_for_all_unported_rows_and_is_idempotent() {
+    let (state, dir) = ported_state().await;
+    let mut rx = state.sse_tx.subscribe();
+
+    let report = workflows::port::reconcile(&state).await.expect("reconcile");
+    // shell + boot + the pre-upgrade tombstone.
+    assert_eq!(report.unported, 3);
+    assert_eq!(report.command_notes, 1);
+    assert!(report.alerted, "the first boot after the upgrade must say something");
+
+    // ONE frame, not one per row. Drain everything queued and count.
+    let mut alerts = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if ev.event == "alerts" {
+            alerts.push(ev);
+        }
+    }
+    assert_eq!(alerts.len(), 1, "one frame for the whole port, never one per row");
+    let detail = alerts[0].payload.get("detail").and_then(|d| d.as_str()).unwrap_or_default();
+    assert!(detail.contains('3'), "the text names the count: {detail}");
+    assert!(
+        detail.contains("could not be carried over"),
+        "and says plainly that they were NOT migrated: {detail}"
+    );
+    assert_eq!(alerts[0].payload.get("source").and_then(|s| s.as_str()), Some("workflows"));
+
+    // The audit row is the latch.
+    assert_eq!(
+        scalar_i64(&state.pool, "SELECT COUNT(*) FROM audit_log WHERE action = 'workflows.port'").await,
+        1
+    );
+
+    // A second boot re-derives but says nothing further.
+    let again = workflows::port::reconcile(&state).await.expect("reconcile twice");
+    assert_eq!(again.unported, 3, "the log is still readable");
+    assert!(!again.alerted, "re-announcing every restart trains the user to dismiss it");
+    let mut more = 0;
+    while let Ok(ev) = rx.try_recv() {
+        if ev.event == "alerts" {
+            more += 1;
+        }
+    }
+    assert_eq!(more, 0);
+    assert_eq!(
+        scalar_i64(&state.pool, "SELECT COUNT(*) FROM audit_log WHERE action = 'workflows.port'").await,
+        1
+    );
+
+    cleanup(dir);
+}
