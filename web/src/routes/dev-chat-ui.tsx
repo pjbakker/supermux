@@ -716,7 +716,7 @@ function Parts({ theme }: { theme: BenchTheme }) {
       <Section
         id="captured-frame-card"
         title="CapturedFrameCard"
-        note="The one warm, non-flat object in the column: 340px wide, 16:10, radius 14, with the filename and a 12px glyph under it. Every other surface here is flat warm neutral, so the object with depth is the thing the session is showing you. Without a src it renders this honest placeholder rather than a grey box."
+        note="The one warm, non-flat object in the column: 340px wide, 16:10, radius 14, with the filename and a 12px glyph under it. Every other surface here is flat warm neutral, so the object with depth is the thing the session is showing you. Without a src it renders this honest placeholder rather than a grey box. The third card is a REAL capture: its frame is a button onto the full-viewport lightbox (Esc / letterbox / ✕ / swipe down to dismiss, double-click for actual size) — the only way to review that overlay without a live session."
       >
         <Plate>
           <div className="flex flex-wrap gap-8">
@@ -726,6 +726,7 @@ function Parts({ theme }: { theme: BenchTheme }) {
             <CapturedFrameCard caption="ios-flicker-after.png" width={266}>
               <MiniWindow />
             </CapturedFrameCard>
+            <CapturedFrameCard caption="icon-512.png" src="/icon-512.png" width={266} />
           </div>
         </Plate>
       </Section>

@@ -45,6 +45,7 @@ export {
   type FacepileProps,
   type FaceNameProps,
 } from './facepile'
+export { ImageLightbox, type ImageLightboxProps } from './image-lightbox'
 export {
   ArrowIcon,
   AtIcon,
