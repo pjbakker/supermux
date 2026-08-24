@@ -334,6 +334,21 @@ async fn member_cannot_reach_global_admin_routers() {
     // audit read + push — owner/admin-only.
     assert_eq!(get_cookie(&f.app, "/api/audit", &alice).await, nf, "member 404s GET /api/audit");
     assert_eq!(get_cookie(&f.app, "/api/push/key", &alice).await, nf, "member 404s GET /api/push/key");
+
+    // …and the workflows surface is the DELIBERATE exception (spec §5.1): the
+    // scheduler's successor is NOT owner-only, because a member has to be able
+    // to see their own bot's jobs. The route is admitted; the company fence
+    // moves INSIDE the handlers (proven end to end in `scope_p3b.rs`).
+    assert_ne!(
+        get_cookie(&f.app, "/api/workflows", &alice).await, nf,
+        "member reaches GET /api/workflows — the one route this phase opens",
+    );
+    // A prefix one letter longer is still denied — `under()` needs a segment
+    // boundary, so the allowlist entry cannot widen by accident.
+    assert_eq!(
+        get_cookie(&f.app, "/api/workflowsx", &alice).await, nf,
+        "member 404s /api/workflowsx (segment boundary)",
+    );
 }
 
 #[tokio::test]

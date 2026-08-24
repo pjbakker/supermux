@@ -697,3 +697,162 @@ async fn ws_cookie_auths_and_cross_company_is_uniform_4404() {
     assert_eq!(other.1, Some(4404), "cross-company closes the identical 4404");
     assert_eq!(nope.1, Some(4404), "nonexistent closes the identical 4404");
 }
+
+// ── workflows (T3.4) ───────────────────────────────────────────────────────────
+
+/// Create one workflow per company over the owner bearer and return their ids.
+async fn seed_workflows(f: &Fixture) -> (String, String) {
+    let mut ids = Vec::new();
+    for session in ["sess-a", "sess-b"] {
+        let (status, body) = post_bearer(
+            &f.app,
+            "/api/workflows",
+            serde_json::json!({
+                "title": format!("{session} nightly"),
+                "session": session,
+                "steps": [{ "prompt": "do the thing" }],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&body));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        // The stamp the whole fence runs on, derived from the bot's own row.
+        assert!(v["data"]["company_id"].is_number(), "the row is company-stamped");
+        ids.push(id);
+        // A run apiece, so the cross-workflow activity feed has something to filter.
+        supermux_server::db::workflows::insert_run(
+            &f.state.pool,
+            ids.last().unwrap(),
+            1_760_000_000,
+            "manual",
+            "ok",
+            "done",
+        )
+        .await
+        .unwrap();
+    }
+    (ids[0].clone(), ids[1].clone())
+}
+
+/// The reason `/api/workflows` is on the member allowlist at all: with the
+/// scheduler's owner-only route layer, a company member got a blanket 404 on
+/// their OWN bot's jobs. A bot's people have to be able to see what it will do.
+#[tokio::test]
+async fn a_member_may_reach_the_workflows_api_for_their_own_company() {
+    let f = fixture().await;
+    let (wf_a, _wf_b) = seed_workflows(&f).await;
+    let (alice, csrf) = login(&f.app, HOST_A, "alice-code").await;
+
+    let (status, body) = get_cookie(&f.app, "/api/workflows", &alice).await;
+    assert_eq!(status, StatusCode::OK, "the list is reachable for a member");
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let rows = v["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "and shows ONLY her company's: {rows:?}");
+    assert_eq!(rows[0]["id"], wf_a);
+
+    let (status, _) = get_cookie(&f.app, &format!("/api/workflows/{wf_a}"), &alice).await;
+    assert_eq!(status, StatusCode::OK, "her own company's workflow reads");
+    let (status, _) = get_cookie(&f.app, &format!("/api/workflows/{wf_a}/runs"), &alice).await;
+    assert_eq!(status, StatusCode::OK, "…and so does its run history");
+
+    // She can create one for her own bot.
+    let (status, body) = post_cookie(
+        &f.app,
+        "/api/workflows",
+        &alice,
+        &csrf,
+        serde_json::json!({
+            "title": "alice's own", "session": "sess-a",
+            "steps": [{ "prompt": "summarise the week" }],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&body));
+}
+
+/// A member must not be able to PROVE another company's workflow exists —
+/// `sessions/mod.rs`'s rule, applied to every workflow verb.
+#[tokio::test]
+async fn another_companys_workflow_is_a_uniform_404_never_a_403() {
+    let f = fixture().await;
+    let (_wf_a, wf_b) = seed_workflows(&f).await;
+    let (alice, csrf) = login(&f.app, HOST_A, "alice-code").await;
+
+    // The cross-company id and an id that never existed render the IDENTICAL
+    // body — only the string the caller themselves typed differs.
+    let (other, other_body) = get_cookie(&f.app, &format!("/api/workflows/{wf_b}"), &alice).await;
+    let (nope, nope_body) = get_cookie(&f.app, "/api/workflows/WF-nosuch", &alice).await;
+    assert_eq!(other, StatusCode::NOT_FOUND);
+    assert_eq!(nope, StatusCode::NOT_FOUND);
+    let templ = |id: &str| format!(r#"{{"error":"not found: workflow '{id}'","ok":false}}"#);
+    assert_eq!(String::from_utf8(other_body).unwrap(), templ(&wf_b));
+    assert_eq!(String::from_utf8(nope_body).unwrap(), templ("WF-nosuch"));
+
+    // Every other verb answers the same way — never a 403, which would confirm
+    // the row is there.
+    let (runs, _) = get_cookie(&f.app, &format!("/api/workflows/{wf_b}/runs"), &alice).await;
+    assert_eq!(runs, StatusCode::NOT_FOUND);
+    let (run, _) =
+        post_cookie(&f.app, &format!("/api/workflows/{wf_b}/run"), &alice, &csrf, serde_json::json!({}))
+            .await;
+    assert_eq!(run, StatusCode::NOT_FOUND, "a member cannot fire another company's chain");
+    let (cancel, _) = post_cookie(
+        &f.app,
+        &format!("/api/workflows/{wf_b}/cancel"),
+        &alice,
+        &csrf,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(cancel, StatusCode::NOT_FOUND);
+    let (del, _) = delete_cookie(&f.app, &format!("/api/workflows/{wf_b}"), &alice, &csrf).await;
+    assert_eq!(del, StatusCode::NOT_FOUND);
+
+    // …and creating one FOR another company's bot is the sessions 404, so the
+    // create path cannot be used to probe which slugs exist elsewhere either.
+    let (create, _) = post_cookie(
+        &f.app,
+        "/api/workflows",
+        &alice,
+        &csrf,
+        serde_json::json!({
+            "title": "not yours", "session": "sess-b",
+            "steps": [{ "prompt": "hi" }],
+        }),
+    )
+    .await;
+    assert_eq!(create, StatusCode::NOT_FOUND);
+
+    // The owner still reaches both — the fence is the member's, not everyone's.
+    let (own, _) = get_bearer(&f.app, &format!("/api/workflows/{wf_b}")).await;
+    assert_eq!(own, StatusCode::OK);
+}
+
+/// The cross-workflow activity feed is the one place a member could otherwise
+/// read another company's titles.
+#[tokio::test]
+async fn the_workflow_activity_feed_is_scope_filtered() {
+    let f = fixture().await;
+    let (wf_a, wf_b) = seed_workflows(&f).await;
+    let (alice, _csrf) = login(&f.app, HOST_A, "alice-code").await;
+
+    let (status, body) = get_cookie(&f.app, "/api/workflows/runs", &alice).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let feed = v["data"].as_array().unwrap();
+    assert_eq!(feed.len(), 1, "a member sees only their company's runs: {feed:?}");
+    assert_eq!(feed[0]["workflow_id"], wf_a);
+
+    // The owner sees both.
+    let (status, body) = get_bearer(&f.app, "/api/workflows/runs").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let ids: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["workflow_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&wf_a.as_str()) && ids.contains(&wf_b.as_str()), "{ids:?}");
+}
