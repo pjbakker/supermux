@@ -13,17 +13,29 @@
 //!                                                        └ DriveLock ┘   ← the gate
 //! ```
 //!
-//! # Three gates, in order
+//! # Four gates, in order
 //!
 //! 1. **Identity.** The `X-Supermux-Hook-Token` header is constant-time compared
 //!    against `session_runtime.hook_token` for the session named in the body. Bot
 //!    A's token authenticates only bot A, so bot A can never drive bot B's
 //!    context — even though every bot runs the identical server script.
-//! 2. **Grant.** The session must hold an enabled `shared-browser` grant (its own
-//!    or the `*` all-agents one). An ungranted bot that somehow learned the URL
-//!    still gets a 403, and — decisively — never spawns chrome.
-//! 3. **The wheel.** Every tool calls [`super::lock::DriveLock::ensure_agent`]
-//!    BEFORE touching the page and answers `409 Conflict` while the human drives.
+//! 2. **Connector grant.** The session must hold an enabled `shared-browser`
+//!    grant (its own, its company's, or the `*` all-agents one). An ungranted bot
+//!    that somehow learned the URL still gets a 403, and — decisively — never
+//!    spawns chrome. For a workspace tab this is **necessary and NOT sufficient**.
+//! 3. **Per-tab grant** (shared-browser v1, R2 — the security crux). When the
+//!    call names a `tab`, the session must ALSO hold a per-tab grant on that tab,
+//!    resolved through the same three tiers and the same hard company
+//!    containment ([`crate::db::browser_tabs::tabs_for_session`]). Then the tab
+//!    must be usable: a `needs_login` tab refuses every agent verb (409), and an
+//!    agent `navigate` off the tab's origin allowlist is refused (403).
+//! 4. **The wheel.** Every acting tool calls
+//!    [`super::lock::DriveLock::ensure_agent`] BEFORE touching the page and
+//!    answers `409 Conflict` while the human drives.
+//!
+//! Gate 3 sits **before dispatch**, which is what makes it total: it covers
+//! `read` and `screenshot` for free, and it cannot be forgotten by a future
+//! sixth verb.
 //!
 //! # Why READS are gated too
 //!
@@ -34,6 +46,15 @@
 //! that could `browser_read`/`browser_screenshot` mid-takeover would read exactly
 //! those keystrokes back out. While the human holds the wheel, the agent sees
 //! nothing.
+//!
+//! **On a workspace tab the argument is stronger, not weaker.** The lock-free
+//! reasoning "observing the page is never a control conflict" is true for a
+//! scratch context and false for a logged-in one, where **reading IS the
+//! exfiltration**. Reads stay lock-gated here AND become grant-gated: without a
+//! per-tab grant, `browser_read` and `browser_screenshot` on a tab are 403, in
+//! the same breath as `navigate` and `click`. A confused deputy — any bot holding
+//! the connector grant reaching every authenticated surface in the company — is
+//! exactly what gate 3 exists to prevent.
 
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -43,6 +64,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+use crate::db::browser_tabs as db_tabs;
 use crate::db::connectors as db_connectors;
 use crate::error::AppError;
 use crate::extract::LenientJson;
@@ -53,6 +75,8 @@ use super::context::AgentContext;
 use super::error::BrowserError;
 use super::lock::{Actor, HandOff};
 use super::mcp::BROWSER_ID;
+use super::tab::{Tab, TabMeta};
+use std::sync::Arc;
 
 /// Default / ceiling for a `request_human_takeover` park. The hand-back wakes the
 /// call the instant it happens, so the ceiling only bites when nobody comes.
@@ -77,7 +101,8 @@ pub struct ToolBody {
     /// The supermux session name (`$SUPERMUX_SESSION`); scopes the token check
     /// AND names the browser context to drive.
     pub session: String,
-    /// `navigate` | `click` | `read` | `screenshot` | `request_human_takeover`.
+    /// `navigate` | `click` | `read` | `screenshot` | `request_human_takeover`
+    /// | `list_tabs`.
     pub tool: String,
     /// The tool's arguments (shape per tool).
     #[serde(default)]
@@ -104,26 +129,151 @@ async fn tool_handler(
         )));
     }
 
-    // Lazily spawns the ONE chrome on first use by any granted session.
-    let ctx = state
-        .browser
-        .context_for(&body.session)
-        .await
-        .map_err(browser_err)?;
-
     let args = &body.args;
+
+    // `list_tabs` is the ONE verb reachable on the connector grant alone. It
+    // returns only the tabs this session may use — an empty list for a session
+    // with no tab grants, which is the honest answer and not an existence
+    // oracle. It never touches a page, so it never spawns chrome either.
+    if body.tool == "list_tabs" {
+        let tabs = list_tabs(&state, &body.session).await?;
+        return Ok(Json(json!({ "ok": true, "result": tabs })));
+    }
+
+    // 3. **The tab gate** (R2). `tab` absent ⇒ the scratch context, byte-for-byte
+    //    today's behaviour. `tab` present ⇒ per-tab grant, containment, and
+    //    usability, ALL before dispatch — so `read` and `screenshot` are covered
+    //    without either verb knowing about it.
+    let target = match str_arg(args, "tab") {
+        Some(tab_id) => resolve_tab(&state, &body.session, tab_id).await?,
+        None => {
+            // Lazily spawns the ONE chrome on first use by any granted session.
+            Target::Scratch(
+                state
+                    .browser
+                    .context_for(&body.session)
+                    .await
+                    .map_err(browser_err)?,
+            )
+        }
+    };
+
+    // 4. Audit BEFORE the CDP call, so a call that crashes the page is still on
+    //    the record (§8.7). Only tab traffic is audited: a scratch context holds
+    //    nothing but its own agent's work.
+    if let Some(tab_id) = target.tab_id() {
+        audit_tab_call(&state, &body.session, &body.tool, tab_id, args).await;
+    }
+
     let result = match body.tool.as_str() {
-        "navigate" => navigate(&ctx, args).await,
-        "click" => click(&ctx, args).await,
-        "read" => read(&ctx, args).await,
-        "screenshot" => screenshot(&ctx, args).await,
-        "request_human_takeover" => takeover(&state, &body.session, &ctx, args).await,
+        "navigate" => navigate(&target, args).await,
+        "click" => click(target.page(), args).await,
+        "read" => read(target.page(), args).await,
+        "screenshot" => screenshot(target.page(), args).await,
+        "request_human_takeover" => takeover(&state, &body.session, &target, args).await,
         other => {
             return Err(AppError::BadRequest(format!("unknown browser tool '{other}'")));
         }
     };
     let result = result.map_err(browser_err)?;
     Ok(Json(json!({ "ok": true, "result": result })))
+}
+
+/// What a tool call is pointed at: today's per-session scratch context, or a
+/// persistent workspace tab the caller has been granted.
+///
+/// The page primitives are identical for both — the difference lives entirely in
+/// the gate that produced this value, plus the per-tab origin allowlist that only
+/// a [`Target::Workspace`] carries.
+enum Target {
+    Scratch(Arc<AgentContext>),
+    Workspace(Arc<Tab>),
+}
+
+impl Target {
+    /// The page every verb drives.
+    fn page(&self) -> &AgentContext {
+        match self {
+            Self::Scratch(ctx) => ctx,
+            Self::Workspace(tab) => tab.page(),
+        }
+    }
+
+    /// The durable tab id, for the audit trail and the lock subject.
+    fn tab_id(&self) -> Option<&str> {
+        match self {
+            Self::Scratch(_) => None,
+            Self::Workspace(tab) => Some(tab.id()),
+        }
+    }
+}
+
+/// **Resolve a `tab` argument into a driveable target, or refuse.**
+///
+/// Every refusal below is rendered `403` by [`browser_err`] except the
+/// login-expiry one, so an ungranted agent cannot use this endpoint to learn
+/// which tab ids exist. Order matters: shape, then grant, then existence.
+async fn resolve_tab(state: &AppState, session: &str, tab_id: &str) -> Result<Target, AppError> {
+    // Shape gate first — the id becomes a map key, a log field and a lock
+    // subject, and must be checked before any of that (the `valid_name` shape).
+    if !db_tabs::valid_tab_id(tab_id) {
+        return Err(browser_err(BrowserError::NotGrantedForTab {
+            session: session.to_string(),
+            tab: tab_id.to_string(),
+        }));
+    }
+    // THE gate. `has_tab_grant` is fail-closed on every path, and is built on the
+    // same predicate `list_tabs` uses, so discovery and enforcement cannot drift.
+    if !has_tab_grant(state, session, tab_id).await {
+        return Err(browser_err(BrowserError::NotGrantedForTab {
+            session: session.to_string(),
+            tab: tab_id.to_string(),
+        }));
+    }
+    let pool = &state.pool;
+    let row = db_tabs::get(pool, tab_id)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
+        .ok_or_else(|| browser_err(BrowserError::NoSuchTab(tab_id.to_string())))?;
+
+    // **Honest expiry** (§7.3). An agent reading a login wall and reporting its
+    // contents as data is worse than an agent that errors, so a lapsed tab
+    // refuses every verb — including the read verbs — rather than serving one.
+    if row.login_state == db_tabs::LOGIN_NEEDED {
+        // Raise the in-chat ask through the affordance the human already knows,
+        // so the blockage is visible where takeovers already are.
+        let reason = format!("browser tab '{tab_id}' needs you to sign in again");
+        if state.set_browser_takeover(session, TakeoverAsk::new(session, &reason)) {
+            crate::hooks::broadcast_activity_delta(state, session);
+        }
+        return Err(browser_err(BrowserError::TabNeedsLogin {
+            tab: tab_id.to_string(),
+        }));
+    }
+
+    let meta = TabMeta {
+        title: row.title.clone(),
+        url: row.url.clone(),
+        pinned: row.pinned != 0,
+        origins: db_tabs::origins_of(&row),
+        login_state: row.login_state.clone(),
+    };
+    let tab = state
+        .browser
+        .ensure_tab(tab_id, meta)
+        .await
+        .map_err(browser_err)?;
+    // Freshness for the workspace UI's "last used" ordering.
+    let _ = db_tabs::update(
+        pool,
+        tab_id,
+        &db_tabs::TabPatch {
+            touch_used: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    Ok(Target::Workspace(tab))
 }
 
 /// Does this session hold an ENABLED `shared-browser` grant (its own or `*`)?
@@ -134,6 +284,108 @@ async fn has_browser_grant(state: &AppState, session: &str) -> Result<bool, AppE
         .any(|g| g.connector_id == BROWSER_ID && g.enabled != 0))
 }
 
+/// **Does this session hold a grant on THIS tab?** (v1 §5.2 / §8.2 — R2.)
+///
+/// Two conditions, both required:
+///
+/// 1. the connector-level `shared-browser` grant — **necessary, and no longer
+///    sufficient**: holding it lets a bot open a scratch browser, not read the
+///    human's authenticated tabs;
+/// 2. a per-tab grant resolved through the same three tiers as
+///    `grants_for_session` (own slug > `@company:<id>` > `*`, `enabled = 1`),
+///    **with the hard company containment of §8.3 re-checked at call time** — so
+///    a session moved between companies after the grant was made loses access
+///    immediately, rather than merely being hidden in the UI.
+///
+/// Both live inside [`crate::db::browser_tabs::tabs_for_session`], which is also
+/// what `list_tabs` returns: one predicate, so what an agent can *discover* and
+/// what an agent can *touch* can never disagree.
+///
+/// **Fail-closed on every path.** A DB error, a malformed row, a missing session
+/// — all read as *not granted*. There is no error branch that reaches a page.
+pub async fn has_tab_grant(state: &AppState, session: &str, tab_id: &str) -> bool {
+    match has_browser_grant(state, session).await {
+        Ok(true) => {}
+        _ => return false,
+    }
+    db_tabs::session_may_use(&state.pool, session, tab_id)
+        .await
+        .unwrap_or(false)
+}
+
+/// `browser_list_tabs` — the tabs this session may use, and nothing else.
+///
+/// Grant-FILTERED, not grant-gated: it needs only the connector grant and answers
+/// an empty list for a session with no tab grants. That is the honest answer and
+/// not an oracle — an ungranted session learns nothing about which tabs exist.
+/// It is the tool an agent calls first, and it doubles as discovery.
+///
+/// A `needs_login` tab is still LISTED, with its state, so the agent can report
+/// the blockage accurately instead of guessing why its verbs are refused.
+async fn list_tabs(state: &AppState, session: &str) -> Result<Value, AppError> {
+    if !has_browser_grant(state, session).await? {
+        return Err(AppError::Forbidden(format!(
+            "session '{session}' has no '{BROWSER_ID}' grant"
+        )));
+    }
+    let rows = db_tabs::tabs_for_session(&state.pool, session)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let live = state.browser.live_tabs().await;
+    let tabs: Vec<Value> = rows
+        .iter()
+        .map(|t| {
+            json!({
+                "tab": t.id,
+                "title": t.title,
+                "url": t.url,
+                "pinned": t.pinned != 0,
+                // Never a bare green dot: the state AND the age of its evidence.
+                "login_state": t.login_state,
+                "last_verified": t.last_probe_at,
+                "live": live.contains(&t.id),
+                "allowed_hosts": db_tabs::origins_of(t),
+            })
+        })
+        .collect();
+    Ok(json!({ "tabs": tabs, "count": tabs.len() }))
+}
+
+/// Record an agent verb against a tab **before** the CDP call (§8.7).
+///
+/// Best-effort: an audit write that fails must not deny the call it is recording
+/// (that would turn the ledger into an availability dependency), but it is logged
+/// loudly. `detail` carries metadata only — a URL and a clipped selector, never
+/// page contents.
+async fn audit_tab_call(state: &AppState, session: &str, tool: &str, tab_id: &str, args: &Value) {
+    let action = match tool {
+        "navigate" => "browser.navigate",
+        "click" => "browser.click",
+        "read" => "browser.read",
+        "screenshot" => "browser.screenshot",
+        "request_human_takeover" => "browser.takeover",
+        other => other,
+    };
+    let (selector, _) = clip(str_arg(args, "selector").unwrap_or_default(), 200);
+    let (url, _) = clip(str_arg(args, "url").unwrap_or_default(), 500);
+    let detail = json!({
+        "tool": tool,
+        "url": url,
+        "selector": selector,
+    });
+    if let Err(e) = crate::db::audit::log(
+        &state.pool,
+        &format!("agent:{session}"),
+        action,
+        &format!("tab:{tab_id}"),
+        detail,
+    )
+    .await
+    {
+        tracing::warn!(session, tab = tab_id, error = %e, "browser: tab audit write failed");
+    }
+}
+
 /// Map a browser error onto HTTP. The ONE that matters is the lock refusal:
 /// `409 Conflict` is what the MCP server turns into the agent-readable
 /// "the human is driving" result.
@@ -142,8 +394,22 @@ fn browser_err(e: BrowserError) -> AppError {
         BrowserError::HumanDriving { .. } | BrowserError::TakeoverWait { .. } => {
             AppError::Conflict(e.to_string())
         }
-        BrowserError::TooManyContexts { .. } => AppError::TooManyRequests(e.to_string()),
+        BrowserError::TooManyContexts { .. } | BrowserError::TooManyTabs { .. } => {
+            AppError::TooManyRequests(e.to_string())
+        }
         BrowserError::NoSuchContext(_) => AppError::NotFound(e.to_string()),
+        // **No existence oracle.** `NoSuchTab` and `NotGrantedForTab` are both
+        // 403 to an agent caller, deliberately: a 404 here would tell an
+        // ungranted bot which tab ids are real, which is the same leak the
+        // constant-time hook-token check exists to avoid. The distinction
+        // survives in the logs and on the human surface, where it is safe.
+        BrowserError::NoSuchTab(_) | BrowserError::NotGrantedForTab { .. } => {
+            AppError::Forbidden(e.to_string())
+        }
+        BrowserError::OriginNotAllowed { .. } => AppError::Forbidden(e.to_string()),
+        // Honest expiry: a distinct, actionable 409 the agent can report.
+        BrowserError::TabNeedsLogin { .. } => AppError::Conflict(e.to_string()),
+        BrowserError::ProfileLocked { .. } => AppError::Conflict(e.to_string()),
         BrowserError::ChromeMissing(_)
         | BrowserError::Launch(_)
         | BrowserError::Transport(_)
@@ -159,6 +425,32 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// The host of an absolute URL, lowercased, or `None` for anything this gate
+/// cannot reason about.
+///
+/// Deliberately strict and hand-rolled (this module's stated pride is that it
+/// adds no crates): only `http`/`https` are recognised, and everything else —
+/// `javascript:`, `data:`, `file:`, a relative path, a userinfo trick — yields
+/// `None`, which the caller turns into a refusal. Fail closed.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    // `user@host` — the host is what the browser connects to, never the userinfo.
+    let hostport = authority.rsplit('@').next().unwrap_or_default();
+    // Strip a port; an IPv6 literal keeps its brackets and never matches a rule.
+    let host = match hostport.strip_prefix('[') {
+        Some(v6) => format!("[{}]", v6.split(']').next().unwrap_or_default()),
+        None => hostport.split(':').next().unwrap_or_default().to_string(),
+    };
+    let host = host.trim().to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
 }
 
 /// A JS string literal for `s` — `serde_json` escaping is a superset of JS's, so
@@ -207,12 +499,37 @@ fn handback_result(handoff: Option<HandOff>, url: &str, reason: &str) -> Value {
 
 // ── the tools ────────────────────────────────────────────────────────────────
 
-async fn navigate(ctx: &AgentContext, args: &Value) -> Result<Value, BrowserError> {
+/// **Navigation, origin-scoped on a workspace tab** (§8.4).
+///
+/// A tab authenticated to `bank.example` and handed to an agent is a
+/// cookie-bearing HTTP client; `navigate` + `read` against an attacker-chosen
+/// host is a plausible exfil chain. So an AGENT may only navigate a tab to a host
+/// on that tab's allowlist. The human is never blocked (they navigate by driving,
+/// not through this endpoint), and in-page navigation by the site itself —
+/// redirects, SPA routing, every SSO hop — is not blocked, because it cannot be
+/// and blocking it would break the logins this feature exists to keep.
+///
+/// A scratch context has no allowlist and is unchanged.
+async fn navigate(target: &Target, args: &Value) -> Result<Value, BrowserError> {
+    let ctx = target.page();
     ctx.lock().ensure_agent()?;
     let url = str_arg(args, "url").ok_or_else(|| BrowserError::Protocol {
         method: "navigate".into(),
         message: "missing `url`".into(),
     })?;
+    if let Target::Workspace(tab) = target {
+        let host = host_of(url).ok_or_else(|| BrowserError::OriginNotAllowed {
+            tab: tab.id().to_string(),
+            host: String::new(),
+        })?;
+        let origins = tab.origins().await;
+        if !db_tabs::host_allowed(&origins, &host) {
+            return Err(BrowserError::OriginNotAllowed {
+                tab: tab.id().to_string(),
+                host,
+            });
+        }
+    }
     ctx.navigate(Actor::Agent, url).await?;
     let landed = ctx.evaluate("({url: location.href, title: document.title})").await?;
     Ok(json!({
@@ -331,9 +648,10 @@ async fn screenshot(ctx: &AgentContext, _args: &Value) -> Result<Value, BrowserE
 async fn takeover(
     state: &AppState,
     session: &str,
-    ctx: &AgentContext,
+    target: &Target,
     args: &Value,
 ) -> Result<Value, BrowserError> {
+    let ctx = target.page();
     let reason = str_arg(args, "reason").unwrap_or("the agent needs you to take the wheel");
     let park = args
         .get("timeout_seconds")
@@ -341,13 +659,25 @@ async fn takeover(
         .unwrap_or(DEFAULT_PARK)
         .clamp(5, MAX_PARK);
 
-    // The chat surface: a card that opens the takeover panel on this session.
-    if state.set_browser_takeover(session, TakeoverAsk::new(session, reason)) {
+    // The chat surface: a card that opens the takeover panel. For a workspace tab
+    // the ask NAMES the tab, so the human knows which page they are being called
+    // to — the card is the same affordance either way.
+    let ask_reason = match target.tab_id() {
+        Some(tab_id) => format!("{reason} (tab {tab_id})"),
+        None => reason.to_string(),
+    };
+    if state.set_browser_takeover(session, TakeoverAsk::new(session, &ask_reason)) {
         crate::hooks::broadcast_activity_delta(state, session);
     }
 
     let previous = ctx.lock().request_human_takeover();
-    tracing::info!(session = %session, %previous, reason, "browser: agent asked for a human takeover");
+    tracing::info!(
+        session = %session,
+        tab = ?target.tab_id(),
+        %previous,
+        reason,
+        "browser: agent asked for a human takeover"
+    );
 
     let waited = ctx.lock().await_agent(Duration::from_secs(park)).await;
 
@@ -364,7 +694,12 @@ async fn takeover(
             Ok(handback_result(ctx.lock().last_handoff(), &url, reason))
         }
         Err(BrowserError::TakeoverWait { .. }) => {
-            let attached = super::takeover::is_attached(session);
+            // "Is a human actually looking?" is asked of THIS subject — a viewer
+            // on the tab route holds the tab's slot, not the session's.
+            let attached = match target.tab_id() {
+                Some(tab_id) => super::takeover::is_tab_attached(tab_id),
+                None => super::takeover::is_attached(session),
+            };
             if !attached {
                 // Nobody ever picked it up — don't leave the context wedged.
                 ctx.lock().release_to_agent(HandOff::Abandoned);
@@ -547,7 +882,7 @@ mod tests {
 
     #[test]
     fn the_lock_refusal_maps_to_409_and_a_quota_to_429() {
-        let e = browser_err(BrowserError::HumanDriving { session: "alice".into() });
+        let e = browser_err(BrowserError::HumanDriving { subject: "alice".into() });
         assert!(matches!(e, AppError::Conflict(_)), "human-driving is a 409");
         let e = browser_err(BrowserError::TooManyContexts { max: 4 });
         assert!(matches!(e, AppError::TooManyRequests(_)));
