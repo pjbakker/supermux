@@ -1086,7 +1086,22 @@ const BUDGET_ENTRY_JS = 161 * KB
 // `connector-task` helper: the ENTRY/hero gate is UNCHANGED at 154.25 / 161 KB (the
 // feature's hero-path cost is ZERO). A genuine additive store surface, not a
 // regression to trim; ceil(measured)=345, the same rule every fase since B3 used.
-const BUDGET_APP_JS = 345 * KB
+//
+// 345 → 348 at SEND LATER (the composer's delay plane): the chat composer grows a
+// clock beside Send that queues the typed message as a ONE-SHOT SCHEDULE — three
+// delays (10m / 1h / 3h) plus the door to the existing Schedules sheet — and a
+// receipt chip above the pill with a live countdown and a Cancel that deletes the
+// schedule and puts the words back. Measured 347.65 against 344.58 for the branch
+// parent — +3.07 KB for four new modules (`delay-send` store + wire body + the
+// cold-mount hydration that rebuilds the chips from `GET /api/schedules` after a
+// closed tab, `use-delay-send`, the two-shell chooser, the receipt chip). ZERO of it is a
+// server change: the delivery is `POST /api/schedules` with `kind:'tmux'` and
+// `schedule_expr:'in 1 hour'`, which the shipped scheduler already parses as
+// `sched_type "once"`. EVERY byte lands in the LAZY `chat-panel` chunk (nothing
+// here is reachable before a chat pane mounts), and the ENTRY/hero gate is
+// UNCHANGED at 154.24 / 161 KB — 154.22 before, so the +0.02 is chunk-hash churn,
+// not hero-path code. ceil(measured)=348, the same rule every fase since B3 used.
+const BUDGET_APP_JS = 348 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

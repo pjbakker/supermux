@@ -36,7 +36,7 @@ import { cn } from '../../lib/utils'
 
 import { useDictation } from '../focus-mode/use-dictation'
 
-import { ComposerFrame } from './composer-shell'
+import { COARSE_TARGET, ComposerFrame } from './composer-shell'
 import type { EntityPickerProps } from './entity-picker'
 import { pickerOptionId, PICKER_LISTBOX_ID, type EntityPickerData } from './slash'
 import type { ComposerHandle, ComposerNotice } from './use-composer'
@@ -44,18 +44,18 @@ import { DRAFT_PREVIEW_CHARS } from './use-composer'
 import { AtIcon, ClockIcon, Composer, MicIcon, PlusIcon } from './ui'
 import ChatActionsSheet from './chat-actions-sheet'
 import ChatActionsPopover from './chat-actions-menu'
+import { DelaySendPopover, DelaySendSheet } from './delay-send-menu'
+import { delayGateReason, type DelayOption } from './delay-send'
+import type { DelaySend } from './use-delay-send'
+import { QueuedSends } from './queued-sends'
 import { AttachmentChips } from './attachment-chips'
 import { Popover, PopoverTrigger } from '../ui/popover'
 import { useMediaQuery } from '../../hooks/use-media-query'
 import type { UseStagedAttachmentsResult } from '../focus-mode/use-staged-attachments'
 
-/** The invisible 44pt touch target every disc on the bar grows on a coarse
- *  pointer: an `::after` inset so pointer-events ride the pseudo-element and a
- *  thumb landing a few px wide of the glyph still presses the button and nothing
- *  else. One const, referenced by the leading `+`, the trailing send/stop, and
- *  the rest-state mic — so the recipe is stated once, not copied three ways. */
-const COARSE_TARGET =
-  '[@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-1 [@media(pointer:coarse)]:after:content-[""]'
+/* The 44pt coarse-pointer target this bar's discs grow — `COARSE_TARGET`, now
+ * stated once in the FRAME module (`composer-shell.tsx`) because the send-later
+ * chip's Cancel needs the same recipe and a copied class string can drift. */
 
 /** A stable empty chip list, so an unwired composer never re-renders on a new
  *  array identity (and reads byte-identically to today). */
@@ -138,6 +138,21 @@ export interface ChatComposerProps {
    */
   onSchedule?: (draft: string) => void
   /**
+   * SEND LATER (delay-send) — the same message, delivered after a delay.
+   *
+   * Wired ⇒ a clock disc joins the trailing cluster BESIDE Send (the two
+   * controls answer the same question — "when does this go?" — so they belong on
+   * the same side of the bar), its chooser offers the three delays, and the
+   * queue's receipts ride the above-pill stack with a live countdown and a
+   * Cancel that puts the words back. It also takes over the desktop pair's clock
+   * so the bar never carries two of them: the chooser's last row opens the full
+   * Schedules sheet, which is what that button did.
+   *
+   * Omit (benches, tests, the read-only shell) ⇒ nothing here renders and the
+   * composer is byte-identical to today — an inert clock would be a promise.
+   */
+  delay?: DelaySend
+  /**
    * The route-owned actions behind the leading `+` (mobile chat only). Present ⇒
    * the leading control is ONE `+` that owns the whole add-menu: the composer's
    * own mention/command/schedule PLUS these (switch session, command palette,
@@ -190,6 +205,7 @@ export function ChatComposer({
   renderPicker,
   pickerData,
   onSchedule,
+  delay,
   actions,
   attachments,
   blocked,
@@ -401,6 +417,68 @@ export function ChatComposer({
   // visibility gate.
   const showSend =
     (draft.trim().length > 0 || stagedFiles.length > 0) && !blocked
+
+  // ── SEND LATER ─────────────────────────────────────────────────────────────
+  // The chooser forks on the pointer exactly as the `+` menu does — a Vaul sheet
+  // for a thumb, an anchored popover for a cursor — and `delaySheetMounted`
+  // holds Vaul out of the tree until the first coarse tap.
+  const [delayOpen, setDelayOpen] = React.useState(false)
+  const [delaySheetMounted, setDelaySheetMounted] = React.useState(false)
+  // THE CLOCK IS ALWAYS DRAWN, AND SAYS WHY WHEN IT CANNOT ACT. A control that
+  // appeared on the first keystroke would move the send disc out from under a
+  // thumb mid-sentence, so the disabled state carries the reason instead:
+  //   · the session is BLOCKED — gone, rate-limited or off the air. The banner
+  //     above already says which; queueing into it would be the same silent drop
+  //     the blocked composer exists to refuse, one delay later;
+  //   · attachments staged — v1 queues a TEXT prompt only (the one-shot schedule
+  //     delivers `prompt`, and a staged upload is a path this browser holds), so
+  //     a delay that silently dropped the files would be the dishonest version
+  //     of supporting them. Send now, or take the files off;
+  //   · an empty box — there is nothing to queue yet.
+  //
+  // ONE reading, from `delay-send.ts`, because the CHOOSER shows it too: the menu
+  // can be open when the answer changes (a file lands, the session goes blocked),
+  // and its rows have to go inert in place rather than file a schedule the
+  // control that opened them has just stopped offering.
+  const delayReason = delay
+    ? delayGateReason({ blocked, attachments: stagedFiles.length, draft })
+    : null
+  // `delay.busy` and `sending` are the double-submit guard's visible half: one
+  // schedule at a time, and never one while an ordinary send is in flight.
+  const delayDisabled = !!delayReason || !!delay?.busy || sending
+  const toggleDelay = React.useCallback(() => {
+    setDelayOpen((open) => {
+      if (!open && coarse) setDelaySheetMounted(true)
+      return !open
+    })
+  }, [coarse])
+  const pickDelay = React.useCallback(
+    (option: DelayOption) => {
+      setDelayOpen(false)
+      // Fail closed even if a row is somehow pressed while gated (a keyboard
+      // activation racing the state that disabled it): the gate is checked
+      // where the write happens, not only where it is drawn.
+      if (delayDisabled) return
+      delay?.queue(draft, option)
+    },
+    [delay, draft, delayDisabled],
+  )
+  // The escape to the full editor — the row that used to be the leading clock.
+  const pickTime = React.useMemo(
+    () => (onSchedule ? () => onSchedule(draft) : undefined),
+    [onSchedule, draft],
+  )
+  // ONE WIND OF THE CLOCK PER QUEUED MESSAGE. The chip is the receipt; this is
+  // the acknowledgement — the disc turns once, in the same beat the chip lifts
+  // in, so the tap has an answer on the control that was tapped. Reduced motion
+  // collapses it to nothing.
+  const queuedCount = delay?.queued.length ?? 0
+  const [winds, setWinds] = React.useState(0)
+  const lastQueued = React.useRef(queuedCount)
+  React.useEffect(() => {
+    if (queuedCount > lastQueued.current) setWinds((n) => n + 1)
+    lastQueued.current = queuedCount
+  }, [queuedCount])
   // WHICH ROW THE POPOVER IS ON (A4 review). The list lives in the picker, but
   // the only element that ever has focus is the textarea — so the textarea is
   // what has to carry `aria-activedescendant`, and the highlight travels up
@@ -427,6 +505,30 @@ export function ChatComposer({
     bind: picker.bind,
     onActive: setActiveOption,
   }
+
+  // The send-later disc — the same ghost disc as the leading pair, on the
+  // trailing side. On a fine pointer it is the popover's trigger (Radix injects
+  // its own `onClick`/`aria-*` through the `{...rest}` spread, which is why the
+  // explicit `onClick` is only wired for the coarse sheet).
+  const delayButton = delay ? (
+    <LeadingButton
+      testId="chat-delay-send"
+      label={delayReason ?? 'Send later'}
+      phone={phone}
+      expanded={delayOpen}
+      aria-haspopup="menu"
+      disabled={delayDisabled}
+      onClick={coarse ? toggleDelay : undefined}
+    >
+      <motion.span
+        className="grid place-items-center"
+        animate={{ rotate: winds * 360 }}
+        transition={reduce ? motionOff : springs.cardExpand}
+      >
+        <ClockIcon className="size-[18px]" />
+      </motion.span>
+    </LeadingButton>
+  ) : null
 
   return (
     <ComposerFrame
@@ -471,6 +573,20 @@ export function ChatComposer({
           empty. */}
       {attachments && (
         <AttachmentChips attachments={attachments.attachments} onDismiss={attachments.dismiss} />
+      )}
+      {/* THE RECEIPTS — closest to the pill, because they are about the message
+          that just left it. Renders nothing when the queue is empty and no write
+          has failed, so an idle composer is unchanged. */}
+      {delay && (
+        <QueuedSends
+          queued={delay.queued}
+          nowMs={delay.nowMs}
+          onCancel={delay.cancel}
+          busy={delay.busy}
+          error={delay.error}
+          onDismissError={delay.dismissError}
+          phone={phone}
+        />
       )}
       {/* The one hidden OS file dialog for the fine-pointer attach affordances —
           the desktop pair's paperclip disc AND the `+` popover's Attach row both
@@ -542,7 +658,11 @@ export function ChatComposer({
                   onSnippets={actions.onSnippets}
                   // The draft is COPIED, not moved (T9.2): schedule opens a sheet
                   // seeded from the prompt and the composer keeps every character.
-                  onSchedule={onSchedule ? () => onSchedule(draft) : undefined}
+                  //
+                  // Dropped when send-later is wired: the trailing clock's own
+                  // "Pick a time…" row opens this exact sheet, and one action
+                  // behind two doors in one bar is a menu apologising for itself.
+                  onSchedule={onSchedule && !delay ? () => onSchedule(draft) : undefined}
                   // Omitted on desktop (the persistent session list makes it
                   // redundant) ⇒ the Switch-session row simply won't render.
                   onSwitchSession={actions.onSwitchSession}
@@ -581,7 +701,12 @@ export function ChatComposer({
                     to (they were a small 17 and a 16 beside it). */}
                 <AtIcon />
               </LeadingButton>
-              {onSchedule && (
+              {/* THE BAR NEVER CARRIES TWO CLOCKS. With send-later wired the
+                  trailing disc owns the whole "when does this go?" question and
+                  its last chooser row opens this very sheet, so the leading
+                  clock would be a second door to the same room. Unwired, it is
+                  exactly the control it has always been. */}
+              {onSchedule && !delay && (
                 <LeadingButton
                   testId="chat-composer-schedule"
                   label="Schedule this instead of sending now"
@@ -643,118 +768,149 @@ export function ChatComposer({
           'data-session': name,
         }}
         trailing={
-          <div className="grid size-10 place-items-center">
-            <AnimatePresence initial={false}>
-              <motion.div
-                key={showSend ? 'send' : active ? 'stop' : 'idle'}
-                style={{ gridArea: '1 / 1' }}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                // Opacity only, in one cell: nothing reflows when the status
-                // flips mid-sentence.
-                transition={reduce ? motionOff : tweens.swap}
-              >
-                {/* THE BUTTON DOES WHAT THE BOX SAYS (A4 review). The plan drew
-                    Stop as the trailing control "while Active" full stop; with
-                    a draft in the box that made the ONE control a pointer user
-                    can reach mid-turn an INTERRUPT — and typing a follow-up
-                    mid-turn is a first-class flow here (Claude Code queues it,
-                    receipt measured at 158ms). So: text in the box → Send;
-                    empty box during a turn → Stop; at rest → the boards' mic.
-                    Stop with a draft up is still one Escape away (the key
-                    contract) and the dock keeps its own Stop. */}
-                {showSend ? (
-                  <TrailingButton
-                    // THE CONTROL SAYS WHERE THE WORDS ARE GOING (fase B4
-                    // T4.4). While the draft reads as a hand-off, Enter goes to
-                    // a COLLEAGUE rather than to this session — so the label
-                    // changes before the key is pressed, not after. Same
-                    // element, same cell, no swap: only the sentence differs.
-                    testId="chat-send"
-                    label={
-                      uploading
-                        ? 'Waiting for uploads…'
-                        : handoff
-                          ? `Hand to ${handoff.label}`
-                          : `Send to ${label}`
-                    }
-                    data-handoff={handoff ? handoff.to : undefined}
-                    phone={phone}
-                    onClick={submit}
-                    // Disabled while a POST is in flight, while an upload is
-                    // still settling, or when there is nothing actually sendable
-                    // (only errored chips + an empty box) — `!canSend` folds all
-                    // three: the disc stays visible, present but not yet armed.
-                    disabled={sending || !canSend}
-                  >
-                    {/* THE GLYPH CHANGES TOO, not just the label (fase B4
-                        T4.4). An `aria-label` alone is not "visible before the
-                        key is pressed" for a sighted user — so while the intent
-                        holds the arrow becomes the RECIPIENT'S FACE, which is
-                        this app's word for "this is going to them" everywhere
-                        else. Same cell, same size, no reflow. */}
-                    {handoff ? (
-                      <SessionMark
-                        seed={handoff.to}
-                        size={phone ? 19 : 21}
-                        animate={false}
-                        label={null}
-                      />
-                    ) : (
-                      <SendIcon />
-                    )}
-                  </TrailingButton>
-                ) : active ? (
-                  <TrailingButton
-                    testId="chat-stop"
-                    label="Stop"
-                    phone={phone}
-                    onClick={stop}
-                  >
-                    <StopIcon />
-                  </TrailingButton>
-                ) : dictation.supported ? (
-                  /* AT REST THE MIC IS DICTATION — a real button, not decoration.
-                     Tapping it toggles Web Speech; transcribed text lands in the
-                     draft via `insert`. It exists on iOS too
-                     (`webkitSpeechRecognition`), so it is NOT hidden there.
-
-                     While listening it shows a recording state: `aria-pressed`
-                     and the brand-amber wash in place of the `.sm-mic` disc, so
-                     the user can see dictation is live before they speak. */
-                  <motion.button
-                    type="button"
-                    data-testid="chat-mic"
-                    aria-label={dictation.listening ? 'Stop dictation' : 'Dictate'}
-                    aria-pressed={dictation.listening}
-                    title={dictation.listening ? 'Stop dictation' : 'Dictate'}
-                    onClick={onMicTap}
-                    whileTap={{ scale: 0.94 }}
-                    transition={springs.buttonPress}
-                    className={cn(
-                      'relative grid place-items-center rounded-full',
-                      phone ? 'size-9' : 'size-10',
-                      // Recording → brand wash; at rest → the boards' inverted disc.
-                      // Swapped (not layered) so there is no `.sm-mic`-vs-utility
-                      // specificity fight over the background.
-                      dictation.listening ? 'bg-brand/20 text-brand' : 'sm-mic',
-                      // The invisible 44pt target on a coarse pointer — same
-                      // `::after` inset the Send/Stop control uses, so the disc is
-                      // unchanged but a thumb landing 4px wide still presses it.
-                      COARSE_TARGET,
-                    )}
-                  >
-                    <MicIcon />
-                  </motion.button>
+          // THE TRAILING CLUSTER — send-later, then send. One row, `items-end`
+          // like the pill itself, so both discs stay on the last line's baseline
+          // as the field grows. Without `delay` the wrapper holds one child and
+          // the geometry is exactly what it was.
+          <div className="flex flex-none items-end gap-1">
+            {delay && (
+              // The SAME 40px cell the send/stop/mic swap rides in, so the two
+              // trailing discs sit on one optical baseline on the phone too
+              // (there the disc is 36 and the cell is 40 — a bare button would
+              // land 2px low beside Send).
+              <div className="grid size-10 place-items-center">
+                {coarse ? (
+                  delayButton
                 ) : (
-                  /* No Web Speech here — draw nothing rather than a dead mic. The
-                     cell keeps its footprint so the field width does not jump
-                     between the idle and the armed states. */
-                  <span aria-hidden className={phone ? 'size-9' : 'size-10'} />
+                  <Popover open={delayOpen} onOpenChange={setDelayOpen}>
+                    <PopoverTrigger asChild>{delayButton}</PopoverTrigger>
+                    <DelaySendPopover
+                      options={delay.options}
+                      nowMs={delay.nowMs}
+                      // The SAME gate the disc wears, read live — see `delayReason`.
+                      disabled={delayDisabled}
+                      reason={delayReason ?? undefined}
+                      onPick={pickDelay}
+                      onPickTime={pickTime}
+                      onClose={() => setDelayOpen(false)}
+                    />
+                  </Popover>
                 )}
-              </motion.div>
-            </AnimatePresence>
+              </div>
+            )}
+            <div className="grid size-10 place-items-center">
+              <AnimatePresence initial={false}>
+                <motion.div
+                  key={showSend ? 'send' : active ? 'stop' : 'idle'}
+                  style={{ gridArea: '1 / 1' }}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  // Opacity only, in one cell: nothing reflows when the status
+                  // flips mid-sentence.
+                  transition={reduce ? motionOff : tweens.swap}
+                >
+                  {/* THE BUTTON DOES WHAT THE BOX SAYS (A4 review). The plan drew
+                      Stop as the trailing control "while Active" full stop; with
+                      a draft in the box that made the ONE control a pointer user
+                      can reach mid-turn an INTERRUPT — and typing a follow-up
+                      mid-turn is a first-class flow here (Claude Code queues it,
+                      receipt measured at 158ms). So: text in the box → Send;
+                      empty box during a turn → Stop; at rest → the boards' mic.
+                      Stop with a draft up is still one Escape away (the key
+                      contract) and the dock keeps its own Stop. */}
+                  {showSend ? (
+                    <TrailingButton
+                      // THE CONTROL SAYS WHERE THE WORDS ARE GOING (fase B4
+                      // T4.4). While the draft reads as a hand-off, Enter goes to
+                      // a COLLEAGUE rather than to this session — so the label
+                      // changes before the key is pressed, not after. Same
+                      // element, same cell, no swap: only the sentence differs.
+                      testId="chat-send"
+                      label={
+                        uploading
+                          ? 'Waiting for uploads…'
+                          : handoff
+                            ? `Hand to ${handoff.label}`
+                            : `Send to ${label}`
+                      }
+                      data-handoff={handoff ? handoff.to : undefined}
+                      phone={phone}
+                      onClick={submit}
+                      // Disabled while a POST is in flight, while an upload is
+                      // still settling, or when there is nothing actually sendable
+                      // (only errored chips + an empty box) — `!canSend` folds all
+                      // three: the disc stays visible, present but not yet armed.
+                      disabled={sending || !canSend}
+                    >
+                      {/* THE GLYPH CHANGES TOO, not just the label (fase B4
+                          T4.4). An `aria-label` alone is not "visible before the
+                          key is pressed" for a sighted user — so while the intent
+                          holds the arrow becomes the RECIPIENT'S FACE, which is
+                          this app's word for "this is going to them" everywhere
+                          else. Same cell, same size, no reflow. */}
+                      {handoff ? (
+                        <SessionMark
+                          seed={handoff.to}
+                          size={phone ? 19 : 21}
+                          animate={false}
+                          label={null}
+                        />
+                      ) : (
+                        <SendIcon />
+                      )}
+                    </TrailingButton>
+                  ) : active ? (
+                    <TrailingButton
+                      testId="chat-stop"
+                      label="Stop"
+                      phone={phone}
+                      onClick={stop}
+                    >
+                      <StopIcon />
+                    </TrailingButton>
+                  ) : dictation.supported ? (
+                    /* AT REST THE MIC IS DICTATION — a real button, not decoration.
+                       Tapping it toggles Web Speech; transcribed text lands in the
+                       draft via `insert`. It exists on iOS too
+                       (`webkitSpeechRecognition`), so it is NOT hidden there.
+
+                       While listening it shows a recording state: `aria-pressed`
+                       and the brand-amber wash in place of the `.sm-mic` disc, so
+                       the user can see dictation is live before they speak. */
+                    <motion.button
+                      type="button"
+                      data-testid="chat-mic"
+                      aria-label={dictation.listening ? 'Stop dictation' : 'Dictate'}
+                      aria-pressed={dictation.listening}
+                      title={dictation.listening ? 'Stop dictation' : 'Dictate'}
+                      onClick={onMicTap}
+                      whileTap={{ scale: 0.94 }}
+                      transition={springs.buttonPress}
+                      className={cn(
+                        'relative grid place-items-center rounded-full',
+                        phone ? 'size-9' : 'size-10',
+                        // Recording → brand wash; at rest → the boards' inverted disc.
+                        // Swapped (not layered) so there is no `.sm-mic`-vs-utility
+                        // specificity fight over the background.
+                        dictation.listening ? 'bg-brand/20 text-brand' : 'sm-mic',
+                        // The invisible 44pt target on a coarse pointer — same
+                        // `::after` inset the Send/Stop control uses, so the disc is
+                        // unchanged but a thumb landing 4px wide still presses it.
+                        COARSE_TARGET,
+                      )}
+                    >
+                      <MicIcon />
+                    </motion.button>
+                  ) : (
+                    /* No Web Speech here — draw nothing rather than a dead mic. The
+                       cell keeps its footprint so the field width does not jump
+                       between the idle and the armed states. */
+                    <span aria-hidden className={phone ? 'size-9' : 'size-10'} />
+                  )}
+                </motion.div>
+              </AnimatePresence>
+            </div>
           </div>
         }
       />
@@ -772,13 +928,32 @@ export function ChatComposer({
           onOpenChange={setMenuOpen}
           onMention={onMention}
           onSlash={onSlash}
-          onSchedule={onSchedule ? () => onSchedule(draft) : undefined}
+          // See the popover above: with send-later wired, the clock's chooser
+          // owns the door to the Schedules sheet.
+          onSchedule={onSchedule && !delay ? () => onSchedule(draft) : undefined}
           onSnippets={actions.onSnippets}
           onSwitchSession={actions.onSwitchSession}
           onCommandPalette={actions.onCommandPalette}
           // The Attach group at the top of the `+` sheet — Camera / Photo
           // library / Files — feeds the same staged plane the chips render.
           onFiles={handleFiles}
+        />
+      )}
+      {/* THE DELAY CHOOSER (COARSE) — same rule as the `+` sheet above it: owned
+          by the composer, opened by the disc directly above it, and held out of
+          the tree until the first coarse tap so Vaul is never constructed on a
+          surface that gets the popover instead. */}
+      {delay && coarse && delaySheetMounted && (
+        <DelaySendSheet
+          open={delayOpen}
+          onOpenChange={setDelayOpen}
+          options={delay.options}
+          nowMs={delay.nowMs}
+          // The SAME gate the disc wears, read live — see `delayReason`.
+          disabled={delayDisabled}
+          reason={delayReason ?? undefined}
+          onPick={pickDelay}
+          onPickTime={pickTime}
         />
       )}
     </ComposerFrame>
@@ -840,6 +1015,10 @@ const LeadingButton = React.forwardRef<
         'relative grid flex-none place-items-center rounded-full text-ink-2 transition-colors',
         phone ? 'size-9' : 'size-10',
         'hover:text-ink active:bg-fill-soft',
+        // A leading disc that cannot act (send-later with nothing to queue, or
+        // with attachments staged) dims and stops taking the pointer — its
+        // `aria-label` carries the reason, and its `title` shows it on hover.
+        'disabled:pointer-events-none disabled:opacity-40',
         // The invisible 44pt target — pointer-events ride the pseudo-element, so
         // a thumb landing a few px wide of the glyph still hits this and nothing
         // else. The pill's `gap-3` leaves clearance to the field.

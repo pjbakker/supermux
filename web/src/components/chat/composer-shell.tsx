@@ -26,6 +26,20 @@ import { cn } from '../../lib/utils'
 
 import { Composer } from './ui'
 
+/**
+ * The invisible 44pt touch target every control on the composer bar grows on a
+ * coarse pointer: an `::after` inset so pointer-events ride the pseudo-element
+ * and a thumb landing a few px wide of the glyph still presses the button and
+ * nothing else.
+ *
+ * It lives in the FRAME module, not in `composer.tsx`, because it is a fact
+ * about the bar rather than about one component: the leading `+`, the trailing
+ * send/stop, the rest-state mic and the send-later chip's Cancel all state it,
+ * and a class string copied into a second file is a rule that can drift.
+ */
+export const COARSE_TARGET =
+  '[@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-1 [@media(pointer:coarse)]:after:content-[""]'
+
 export interface ComposerShellProps {
   /** The name the placeholder says out loud — display name, then slug. */
   label: string
