@@ -14,6 +14,7 @@ use crate::config::Config;
 pub mod audit;
 pub mod board;
 pub mod boards;
+pub mod browser_tabs;
 pub mod companies;
 pub mod connectors;
 pub mod hosts;
