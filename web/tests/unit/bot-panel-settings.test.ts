@@ -18,7 +18,12 @@ import { describe, expect, test } from 'bun:test'
 
 import { readFileSync } from 'node:fs'
 
-import { afterUndo, type AppliedPreset } from '../../src/components/roster/bot-panel'
+import {
+  afterUndo,
+  normalizeTab,
+  TABS,
+  type AppliedPreset,
+} from '../../src/components/roster/bot-panel'
 import { insertPreset, makeDescHandle } from '../../src/components/focus-mode/session-info-panel'
 
 const PRESET = 'You review changes for correctness and clarity.'
@@ -72,38 +77,110 @@ describe('insertPreset', () => {
 })
 
 /**
- * 2 — The tab is CALLED "Connectors" and keyed `'tools'`.
+ * 2 — Five tabs folded to THREE, and the config tab keeps its key.
  * ─────────────────────────────────────────────────────────────────────────────
- * The word was wrong (its own body leads with connectors, and the store, the
- * grants list and the mail card all say "connectors"), but the KEY is router
- * state: `panelTab` in history, `initialTab`/`infoTab` on the two routes, the
- * `data-vr-tab` bench hook. Renaming the key would break every deep link that
- * already exists, so exactly one of the two changed — and this pins which.
+ * The owner found five settings screens (Overview · Instructions · Connectors ·
+ * Memory · Workflows) redundant and nerdy — the core-notes editor even appeared
+ * on two of them — and they overflowed the phone tab bar. Instructions +
+ * Connectors + Memory folded into ONE "Setup" tab; Overview and Workflows stay.
+ *
+ * The KEY is router state (`panelTab` in history, `initialTab`/`infoTab` on the
+ * two routes, the `data-vr-tab` bench hook), so the config tab stays keyed
+ * `'instructions'` even though its LABEL is now "Setup" — the same key-vs-label
+ * split the panel already used. A bookmarked `tools`/`memory` panelTab is
+ * re-pointed onto Setup by `normalizeTab`, never landing on a dead body.
  */
-describe('the Connectors tab', () => {
+describe('the three-tab fold', () => {
   const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8')
 
-  test('the bot panel shows the word and keeps the key', () => {
+  test('the bot panel is three tabs, config keyed instructions and labelled Setup', () => {
+    expect(TABS.map((t) => [t.key, t.label])).toEqual([
+      ['overview', 'Overview'],
+      ['instructions', 'Setup'],
+      ['workflows', 'Workflows'],
+    ])
     const src = read('../../src/components/roster/bot-panel.tsx')
-    expect(src).toContain("{ key: 'tools', label: 'Connectors' }")
-    expect(src).not.toContain("label: 'Tools'")
+    // The two folded keys are no longer their own tabs.
+    expect(src).not.toContain("key: 'tools'")
+    expect(src).not.toContain("key: 'memory'")
     // The key is still what the routes and the deep-link state speak.
     expect(src).toContain('initialTab?: TabKey')
-    expect(src).toContain("{tab === 'tools' && <ToolsTab")
+    expect(src).toContain("{tab === 'instructions' && (")
+    expect(src).toContain('<SetupTab')
   })
 
-  test('the team panel says the same word (it mounts the same tab body)', () => {
+  test('normalizeTab re-points every legacy key onto a tab that still exists', () => {
+    // The folded-away keys land on Setup; the survivors pass through; junk falls
+    // back to Overview rather than a blank panel.
+    expect(normalizeTab('tools')).toBe('instructions')
+    expect(normalizeTab('memory')).toBe('instructions')
+    expect(normalizeTab('instructions')).toBe('instructions')
+    expect(normalizeTab('overview')).toBe('overview')
+    expect(normalizeTab('workflows')).toBe('workflows')
+    expect(normalizeTab(undefined)).toBe('overview')
+    expect(normalizeTab('nonsense')).toBe('overview')
+  })
+
+  test('the team panel mirrors the fold — three tabs, Setup keyed instructions', () => {
     const src = read('../../src/components/roster/team-panel.tsx')
-    expect(src).toContain("{ key: 'tools', label: 'Connectors' }")
-    expect(src).not.toContain("label: 'Tools'")
+    expect(src).toContain("{ key: 'instructions', label: 'Setup' }")
+    expect(src).not.toContain("label: 'Connectors' }")
+    expect(src).not.toContain("key: 'tools'")
+  })
+
+  test('Setup keeps every capability the three folded tabs held', () => {
+    const src = read('../../src/components/roster/bot-panel.tsx')
+    // Instructions: role presets + model. Connectors: the grants surface.
+    // Memory: core notes AND the learned notes. Nothing deleted, only grouped.
+    expect(src).toContain('<RoleField')
+    expect(src).toContain('<ModelPicker')
+    expect(src).toContain('<GrantedConnectors')
+    expect(src).toContain('<NotesEditor')
+    expect(src).toContain('<LearnedNotes')
+    expect(src).toContain('<NotifPolicyControl')
+    // The nerdy launch internals are folded under one Advanced disclosure, not
+    // dropped.
+    expect(src).toContain('<LaunchInternals')
   })
 
   test("a connector's OWN tools keep their name", () => {
     // `tool_count` / `ConnectorTool` mean the tools inside one connector — a
-    // different thing entirely, and untouched by the relabel.
+    // different thing entirely, and untouched by the fold.
     const api = read('../../src/lib/api/connectors.ts')
     expect(api).toContain('tool_count')
   })
+})
+
+/**
+ * 2b — The tab bar FITS the phone, and the body (not the bar) scrolls.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The five-tab bar was `flex gap-1` over intrinsic-width tabs: at 390px it
+ * overflowed and the last tab ("Workflows") was clipped. Three equal-width tabs
+ * (`flex-1 basis-0`) divide the width instead — there is no per-tab fixed width
+ * to sum past the viewport, and the bar declares no horizontal scroll. bun has
+ * no layout engine, so this is a STRUCTURAL proof (the class contract that makes
+ * overflow impossible), asserted on both the bot and team bars.
+ */
+describe('the tab bar fits a 390 / 320px phone', () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8')
+
+  for (const file of ['bot-panel.tsx', 'team-panel.tsx']) {
+    test(`${file}: the tablist is equal-width and never scrolls sideways`, () => {
+      const src = read(`../../src/components/roster/${file}`)
+      const bar = src.slice(src.indexOf('role="tablist"'))
+      const openTag = bar.slice(0, bar.indexOf('>'))
+      // The container fills the width and lays its tabs out as flex cells…
+      expect(openTag).toContain('flex w-full')
+      // …and it does NOT opt into horizontal scrolling (which would mean it can
+      // exceed the width) — the fix is fitting, not scrolling.
+      expect(openTag).not.toContain('overflow-x')
+      // Each tab is an equal share of the row, so N tabs can never sum wider
+      // than the row regardless of label length or viewport.
+      expect(bar).toContain('flex-1 basis-0')
+      // 44px minimum touch target survives the redesign.
+      expect(bar).toContain('min-h-11')
+    })
+  }
 })
 
 /**

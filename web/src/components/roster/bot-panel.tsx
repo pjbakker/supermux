@@ -13,10 +13,20 @@
  *   • variant="sheet" — a bottom sheet (the mobile focus-view title opens THIS,
  *                       not a duplicate surface).
  *
- * Four quiet tabs: Overview (the glance, now with editable tags + a working-dir
- * row) · Instructions (role + model + notes + notifications — the launch-injected
- * identity) · Connectors (the bot's grants, with skills / MCP behind Advanced) ·
- * Workflows (the bot-scoped Workflows list · Recent runs · Issues · Git).
+ * Three quiet tabs — the five-tab version read as five settings screens, so it
+ * was folded down to what you actually DO here: glance, configure, automate.
+ *   • Overview  — the glance (context / tokens / provider / status), the latest
+ *                 line, editable tags and the working directory.
+ *   • Setup     — everything you CONFIGURE, grouped: the role + model + core
+ *                 notes, the bot's Connectors, what it has learned, how it
+ *                 notifies you, and the launch internals (skills / MCP / flags)
+ *                 tucked under one Advanced disclosure.
+ *   • Workflows — the bot-scoped Workflows list · Recent runs · Issues · Git.
+ *
+ * The old `instructions` / `tools` / `memory` keys folded into ONE tab keyed
+ * `instructions` (labelled "Setup"); `normalizeTab()` re-points any legacy
+ * deep-link at `tools` or `memory` onto it, so a bookmarked panelTab never lands
+ * on a tab that no longer exists.
  *
  * Styling is Tailwind + shadcn tokens (NOT `[data-grok]`-scoped CSS) so the ONE
  * component renders identically in the in-shell pane and in the body-portalled
@@ -350,51 +360,34 @@ export function WorkingDirRow({ name, dir }: { name: string; dir: string }) {
   )
 }
 
-/* ── the five tabs ─────────────────────────────────────────────────────────── */
+/* ── the three tabs ────────────────────────────────────────────────────────── */
 
 /** The tab KEY is the durable one — it is router state (`panelTab` in history,
  *  `initialTab`/`infoTab` on the two routes), a bench selector and the
- *  `data-vr-tab` hook — so `'tools'` stays `'tools'` on the wire even though its
- *  LABEL is "Connectors". Exported so the tab contract is asserted against the
+ *  `data-vr-tab` hook — so the config tab stays keyed `'instructions'` even
+ *  though its LABEL is now "Setup" (the same key-vs-label split the roster
+ *  already uses elsewhere). Exported so the tab contract is asserted against the
  *  real array rather than a test's copy of the strings (`workflows-view.test.tsx`). */
-export type TabKey = 'overview' | 'instructions' | 'tools' | 'memory' | 'workflows'
+export type TabKey = 'overview' | 'instructions' | 'workflows'
 export const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: 'Overview' },
-  { key: 'instructions', label: 'Instructions' },
-  { key: 'tools', label: 'Connectors' },
-  { key: 'memory', label: 'Memory' },
+  { key: 'instructions', label: 'Setup' },
   { key: 'workflows', label: 'Workflows' },
 ]
 
+/** Re-point a legacy or unknown tab key onto a tab that still exists. The old
+ *  five-tab model shipped `'tools'` and `'memory'` as router state; both folded
+ *  into Setup (`'instructions'`), so a bookmarked `panelTab: 'tools'` must land
+ *  there rather than on a blank body. Pure, so the redirect is unit-testable
+ *  without a live panel. */
+export function normalizeTab(t?: string | null): TabKey {
+  if (t === 'tools' || t === 'memory' || t === 'instructions') return 'instructions'
+  if (t === 'overview' || t === 'workflows') return t
+  return 'overview'
+}
+
 /** The CORE-notes cap — stated plainly (the truth about when edits land). */
 const CORE_NOTES_CAP = 2000
-
-function MemoryTab({
-  name,
-  session,
-  onRestartAdvised,
-}: {
-  name: string
-  session: ApiSession | null
-  onRestartAdvised: () => void
-}) {
-  const memory = session?.memory ?? ''
-  return (
-    <div className="flex flex-col gap-6">
-      <Field
-        label="Core notes"
-        hint="Kept verbatim and injected into the system prompt every run — the bot reads these, but can't rewrite them."
-      >
-        <NotesEditor name={name} memory={memory} onRestartAdvised={onRestartAdvised} />
-        <p className="mt-1 text-[12px] tabular-nums text-muted-foreground">
-          ~{memory.length} / {CORE_NOTES_CAP} chars · restart to apply
-        </p>
-      </Field>
-
-      <LearnedNotes name={name} />
-    </div>
-  )
-}
 
 /** One card in the glance row. The four differ only in what they SAY, so they
  *  share a shell: the same label rhythm, and — because the Context ring is 44px
@@ -518,17 +511,12 @@ function OverviewTab({
   )
 }
 
-/** The LEAD's instructions, verbatim, when `<TeamPanel>` mounts it — a crew is
- *  steered by steering its lead, so there is exactly ONE instructions surface. */
-export function InstructionsTab({
-  name,
-  session,
-  onRestartAdvised,
-}: {
-  name: string
-  session: ApiSession | null
-  onRestartAdvised: () => void
-}) {
+/** The "What this bot does" block — the role/desc textarea, the preset pills
+ *  that INSERT (never overwrite) a durable job, and the transient undo receipt.
+ *  Pulled out of `InstructionsTab` so the folded Setup tab and `<TeamPanel>`'s
+ *  Setup tab share ONE implementation of the pill/undo contract rather than two
+ *  that could drift. */
+function RoleField({ name, session }: { name: string; session: ApiSession | null }) {
   const desc = session?.desc ?? ''
   // The pills drive the EDITOR, not the row. Writing `desc` behind the field's
   // back is what made one stray tap destroy an authored instruction: the PATCH
@@ -551,91 +539,156 @@ export function InstructionsTab({
   }, [applied])
 
   return (
-    <div className="flex flex-col gap-6">
-      <Field
-        label="What this bot does"
-        hint="The durable role, injected into the agent's system prompt at launch — this steers every turn. Tasks still go in the message; this is the standing job."
-      >
-        <div className="flex flex-wrap gap-1.5">
-          {ROLE_PRESETS.map((p) => (
-            <button
-              key={p.label}
-              type="button"
-              data-vr="bot-role-preset"
-              aria-label={`Add the ${p.label} role to these instructions`}
-              // Do NOT take focus off the textarea: a blur here would commit a
-              // half-typed draft and the insert would then land in a stale one.
-              // The pill edits the field the user is still standing in.
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => {
-                const done = editor.current?.insert(p.text)
-                if (done) setApplied({ label: p.label, prev: done.prev, after: done.next })
-              }}
-              className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-secondary px-3.5 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <Plus className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-              {p.label}
-            </button>
-          ))}
-        </div>
-        <DescEditor ref={editor} name={name} desc={desc} />
-        {applied && (
-          <div
-            role="status"
-            data-vr="bot-role-undo-row"
-            data-vr-refused={applied.refused ? 'yes' : undefined}
-            className="flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground"
+    <Field
+      label="What this bot does"
+      hint="The durable role, injected into the agent's system prompt at launch — this steers every turn. Tasks still go in the message; this is the standing job."
+    >
+      <div className="flex flex-wrap gap-1.5">
+        {ROLE_PRESETS.map((p) => (
+          <button
+            key={p.label}
+            type="button"
+            data-vr="bot-role-preset"
+            aria-label={`Add the ${p.label} role to these instructions`}
+            // Do NOT take focus off the textarea: a blur here would commit a
+            // half-typed draft and the insert would then land in a stale one.
+            // The pill edits the field the user is still standing in.
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              const done = editor.current?.insert(p.text)
+              if (done) setApplied({ label: p.label, prev: done.prev, after: done.next })
+            }}
+            className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-secondary px-3.5 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            {applied.refused ? (
-              <>
-                {/* The Undo was REFUSED, and says so. Clearing the row here would
-                    read as "undone" while the field still holds the preset. */}
-                <span>Can’t undo — you’ve edited since.</span>
-                <button
-                  type="button"
-                  data-vr="bot-role-undo-dismiss"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => setApplied(null)}
-                  className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-card px-3 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  Dismiss
-                </button>
-              </>
-            ) : (
-              <>
-                <span>Added “{applied.label}” to your instructions.</span>
-                <button
-                  type="button"
-                  data-vr="bot-role-undo"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() =>
-                    setApplied(afterUndo(applied, editor.current?.restore(applied.prev, applied.after) ?? false))
-                  }
-                  className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-card px-3 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <Undo2 className="size-3.5 shrink-0" aria-hidden />
-                  Undo
-                </button>
-              </>
-            )}
-          </div>
-        )}
-      </Field>
+            <Plus className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            {p.label}
+          </button>
+        ))}
+      </div>
+      <DescEditor ref={editor} name={name} desc={desc} />
+      {applied && (
+        <div
+          role="status"
+          data-vr="bot-role-undo-row"
+          data-vr-refused={applied.refused ? 'yes' : undefined}
+          className="flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground"
+        >
+          {applied.refused ? (
+            <>
+              {/* The Undo was REFUSED, and says so. Clearing the row here would
+                  read as "undone" while the field still holds the preset. */}
+              <span>Can’t undo — you’ve edited since.</span>
+              <button
+                type="button"
+                data-vr="bot-role-undo-dismiss"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setApplied(null)}
+                className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-card px-3 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Dismiss
+              </button>
+            </>
+          ) : (
+            <>
+              <span>Added “{applied.label}” to your instructions.</span>
+              <button
+                type="button"
+                data-vr="bot-role-undo"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() =>
+                  setApplied(afterUndo(applied, editor.current?.restore(applied.prev, applied.after) ?? false))
+                }
+                className="inline-flex min-h-10 items-center gap-1.5 rounded-full border border-border bg-card px-3 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Undo2 className="size-3.5 shrink-0" aria-hidden />
+                Undo
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </Field>
+  )
+}
 
-      <Field
-        label="Model"
-        hint="The launch model for this bot."
-      >
+/** The launch internals — skills, MCP, flags, worktree, runtime — behind ONE
+ *  disclosure. These are the "nerdy" bits the owner wanted folded away, not
+ *  deleted: shown on demand, never in the resting surface. Shared by the Setup
+ *  tab and by `<TeamPanel>`'s `ToolsTab`. */
+function LaunchInternals({ session }: { session: ApiSession | null }) {
+  const mcp = session?.mcp?.trim() || ''
+  return (
+    <details className="group rounded-xl border border-border bg-card px-4 py-3">
+      <summary className="cursor-pointer list-none text-[13px] font-medium text-foreground [&::-webkit-details-marker]:hidden">
+        Advanced
+      </summary>
+      <div className="mt-3 flex flex-col gap-4">
+        <div className="flex items-baseline justify-between gap-3">
+          <dt className="text-muted-foreground text-[13px]">Skills</dt>
+          <dd className="text-[13px] text-foreground">Workspace defaults</dd>
+        </div>
+        <div className="flex flex-col gap-1">
+          <dt className="text-muted-foreground text-[13px]">MCP</dt>
+          <dd className="min-w-0">
+            {mcp ? (
+              <code className="block max-w-full truncate rounded-md bg-muted/60 px-2 py-1.5 font-mono text-[12px] text-foreground">
+                {mcp}
+              </code>
+            ) : (
+              <span className="text-[13px] text-muted-foreground">None</span>
+            )}
+          </dd>
+        </div>
+      </div>
+      <dl className="mt-4 flex flex-col gap-2 border-t border-border pt-3 text-[13px]">
+        <div className="flex items-baseline justify-between gap-3">
+          <dt className="text-muted-foreground">Flags</dt>
+          <dd className="min-w-0 text-right">
+            {session?.flags?.trim() ? (
+              <code className="max-w-full truncate rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[11px]">{session.flags}</code>
+            ) : (
+              <span className="text-muted-foreground">None</span>
+            )}
+          </dd>
+        </div>
+        <div className="flex items-baseline justify-between gap-3">
+          <dt className="text-muted-foreground">Worktree</dt>
+          <dd>{session ? (session.worktree ? 'Yes' : 'No') : '—'}</dd>
+        </div>
+        <div className="flex items-baseline justify-between gap-3">
+          <dt className="text-muted-foreground">Runtime</dt>
+          <dd className="capitalize">{session?.runtime ?? '—'}</dd>
+        </div>
+      </dl>
+    </details>
+  )
+}
+
+/** The LEAD's instructions, verbatim, when `<TeamPanel>` mounts it — a crew is
+ *  steered by steering its lead, so there is exactly ONE instructions surface.
+ *  Kept for `<TeamPanel>`, which composes it with `<ToolsTab>` into its own
+ *  Setup tab; the bot panel folds the same pieces inline via `<SetupTab>`. */
+export function InstructionsTab({
+  name,
+  session,
+  onRestartAdvised,
+}: {
+  name: string
+  session: ApiSession | null
+  onRestartAdvised: () => void
+}) {
+  return (
+    <div className="flex flex-col gap-6">
+      <RoleField name={name} session={session} />
+      <Field label="Model" hint="The launch model for this bot.">
         <ModelPicker name={name} session={session} onRestartAdvised={onRestartAdvised} />
       </Field>
-
       <Field
         label="Notes this bot keeps"
         hint="Injected read-only into the system prompt at launch — the bot can read these, but not rewrite them."
       >
         <NotesEditor name={name} memory={session?.memory ?? ''} onRestartAdvised={onRestartAdvised} />
       </Field>
-
       <Field label="Notifications">
         <NotifPolicyControl name={name} value={session?.notif} />
       </Field>
@@ -643,61 +696,85 @@ export function InstructionsTab({
   )
 }
 
-/** The lead's tools. `<TeamPanel>` mounts this too, labelled crew-scoped: a
- *  teammate pane inherits the lead's env/config, so the lead's grants ARE the
- *  crew's grants. */
+/** The lead's tools. `<TeamPanel>` mounts this crew-scoped: a teammate pane
+ *  inherits the lead's env/config, so the lead's grants ARE the crew's grants. */
 export function ToolsTab({ name, session }: { name: string; session: ApiSession | null }) {
-  const mcp = session?.mcp?.trim() || ''
   return (
     <div className="flex flex-col gap-6">
-      {/* Connectors are the HERO of this tab — the real, per-bot action surface —
-          so they lead. The Skills placeholder + MCP + launch flags fold behind
-          Advanced below, where they stop pushing the live content down. */}
+      {/* Connectors are the HERO — the real, per-bot action surface — so they
+          lead; the launch internals fold behind Advanced below. */}
       <GrantedConnectors name={name} />
+      <LaunchInternals session={session} />
+    </div>
+  )
+}
 
-      <details className="group rounded-xl border border-border bg-card px-4 py-3">
-        <summary className="cursor-pointer list-none text-[13px] font-medium text-foreground [&::-webkit-details-marker]:hidden">
-          Advanced
-        </summary>
-        <div className="mt-3 flex flex-col gap-4">
-          <div className="flex items-baseline justify-between gap-3">
-            <dt className="text-muted-foreground text-[13px]">Skills</dt>
-            <dd className="text-[13px] text-foreground">Workspace defaults</dd>
-          </div>
-          <div className="flex flex-col gap-1">
-            <dt className="text-muted-foreground text-[13px]">MCP</dt>
-            <dd className="min-w-0">
-              {mcp ? (
-                <code className="block max-w-full truncate rounded-md bg-muted/60 px-2 py-1.5 font-mono text-[12px] text-foreground">
-                  {mcp}
-                </code>
-              ) : (
-                <span className="text-[13px] text-muted-foreground">None</span>
-              )}
-            </dd>
-          </div>
-        </div>
-        <dl className="mt-4 flex flex-col gap-2 border-t border-border pt-3 text-[13px]">
-          <div className="flex items-baseline justify-between gap-3">
-            <dt className="text-muted-foreground">Flags</dt>
-            <dd className="min-w-0 text-right">
-              {session?.flags?.trim() ? (
-                <code className="max-w-full truncate rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[11px]">{session.flags}</code>
-              ) : (
-                <span className="text-muted-foreground">None</span>
-              )}
-            </dd>
-          </div>
-          <div className="flex items-baseline justify-between gap-3">
-            <dt className="text-muted-foreground">Worktree</dt>
-            <dd>{session ? (session.worktree ? 'Yes' : 'No') : '—'}</dd>
-          </div>
-          <div className="flex items-baseline justify-between gap-3">
-            <dt className="text-muted-foreground">Runtime</dt>
-            <dd className="capitalize">{session?.runtime ?? '—'}</dd>
-          </div>
-        </dl>
-      </details>
+/** A hairline group divider inside a tab — the same rule the Overview tab uses
+ *  to split the glance from the details: a quiet rule between altitudes, not a
+ *  heavy heading, so the folded Setup tab reads as calm sections rather than one
+ *  long column of loose fields. */
+function Group({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-6 border-t border-border pt-6 first:border-t-0 first:pt-0">
+      {children}
+    </div>
+  )
+}
+
+/** SETUP — the one tab that holds everything you CONFIGURE, folded from the old
+ *  Instructions + Connectors + Memory tabs. The owner found three separate
+ *  settings screens nerdy and redundant (the core-notes editor even appeared on
+ *  two of them); here they are four calm groups, hairline-separated, with the
+ *  launch internals under a single Advanced disclosure.
+ *
+ *   1 · Behavior   — the role, the model, the core notes it always carries.
+ *   2 · Connectors — the real per-bot action surface.
+ *   3 · Memory     — what the bot has LEARNED across runs.
+ *   4 · Delivery   — how it notifies you, then the Advanced internals. */
+function SetupTab({
+  name,
+  session,
+  onRestartAdvised,
+}: {
+  name: string
+  session: ApiSession | null
+  onRestartAdvised: () => void
+}) {
+  const memory = session?.memory ?? ''
+  return (
+    <div className="flex flex-col gap-6">
+      <Group>
+        <RoleField name={name} session={session} />
+        <Field label="Model" hint="The launch model for this bot.">
+          <ModelPicker name={name} session={session} onRestartAdvised={onRestartAdvised} />
+        </Field>
+        <Field
+          label="Notes this bot keeps"
+          hint="Kept verbatim and injected into the system prompt every run — the bot reads these, but can't rewrite them."
+        >
+          <NotesEditor name={name} memory={memory} onRestartAdvised={onRestartAdvised} />
+          <p className="mt-1 text-[12px] tabular-nums text-muted-foreground">
+            ~{memory.length} / {CORE_NOTES_CAP} chars · restart to apply
+          </p>
+        </Field>
+      </Group>
+
+      <Group>
+        <Field label="Connectors" hint="What this bot can reach — its per-bot grants.">
+          <GrantedConnectors name={name} />
+        </Field>
+      </Group>
+
+      <Group>
+        <LearnedNotes name={name} />
+      </Group>
+
+      <Group>
+        <Field label="Notifications">
+          <NotifPolicyControl name={name} value={session?.notif} />
+        </Field>
+        <LaunchInternals session={session} />
+      </Group>
     </div>
   )
 }
@@ -787,7 +864,10 @@ function BotPanelBody({
   const { session } = useSession(name)
   const clone = useCloneSession()
   const { toast } = useToast()
-  const [tab, setTab] = React.useState<TabKey>(initialTab ?? 'overview')
+  // `normalizeTab` re-points a stale deep-link (a bookmarked `tools`/`memory`
+  // panelTab from the five-tab era) onto the tab that absorbed it, so the panel
+  // never opens on a body that no longer renders.
+  const [tab, setTab] = React.useState<TabKey>(() => normalizeTab(initialTab))
   const [restartAdvised, setRestartAdvised] = React.useState(false)
   const onRestartAdvised = React.useCallback(() => setRestartAdvised(true), [])
 
@@ -848,15 +928,21 @@ function BotPanelBody({
         )}
       </header>
 
-      {/* tab bar — a plain `div` carries `role="tablist"` (a `nav` is a landmark
-          and may not take an interactive role: jsx-a11y/no-noninteractive-
-          element-to-interactive-role). Full WAI-ARIA tab pattern: roving
-          `tabindex`, arrow-key movement, and each tab `aria-controls` the one
-          panel it drives (`aria-labelledby` points back). */}
+      {/* tab bar — an EQUAL-WIDTH segmented control. Each tab is `flex-1
+          basis-0`, so three of them divide the width instead of overflowing it:
+          the bar fits at 320px with no horizontal scroll and no cut-off tab (the
+          five-tab version scrolled sideways on a phone and clipped its last
+          tab). The BODY scrolls; this bar never does.
+
+          A plain `div` carries `role="tablist"` (a `nav` is a landmark and may
+          not take an interactive role: jsx-a11y/no-noninteractive-element-to-
+          interactive-role). Full WAI-ARIA tab pattern: roving `tabindex`,
+          arrow-key movement, and each tab `aria-controls` the one panel it
+          drives (`aria-labelledby` points back). */}
       <div
         role="tablist"
         aria-label="Bot settings"
-        className="flex shrink-0 items-center gap-1 border-b border-border px-4"
+        className="flex w-full shrink-0 items-stretch border-b border-border px-2"
       >
         {TABS.map((t, ti) => (
           <button
@@ -886,10 +972,10 @@ function BotPanelBody({
                 ?.focus()
             }}
             className={cn(
-              'relative -mb-px min-h-11 px-3 text-[13px] font-medium transition-colors',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              'relative -mb-px min-h-11 flex-1 basis-0 px-2 text-center text-[13px] font-medium transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
               tab === t.key
-                ? 'text-foreground after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full after:bg-primary'
+                ? 'text-foreground after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:bg-primary'
                 : 'text-muted-foreground hover:text-foreground',
             )}
           >
@@ -914,11 +1000,7 @@ function BotPanelBody({
           <OverviewTab name={name} session={session} />
         )}
         {tab === 'instructions' && (
-          <InstructionsTab name={name} session={session} onRestartAdvised={onRestartAdvised} />
-        )}
-        {tab === 'tools' && <ToolsTab name={name} session={session} />}
-        {tab === 'memory' && (
-          <MemoryTab name={name} session={session} onRestartAdvised={onRestartAdvised} />
+          <SetupTab name={name} session={session} onRestartAdvised={onRestartAdvised} />
         )}
         {tab === 'workflows' && <WorkflowsTab name={name} onNavigate={onNavigate} />}
 

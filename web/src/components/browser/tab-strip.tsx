@@ -260,11 +260,18 @@ export function TabStrip({
       data-tab-rail=""
       data-tab-dragging={drag ? drag.id : undefined}
       style={{
+        // The shell drops its MobileTopBar, so this rail is the browser
+        // workspace's top chrome and owns the iOS-PWA status-bar inset (same
+        // reason the grok roster header does): reserve it on top so the tab chips
+        // clear the notch. `max()` no-ops at env=0, so desktop and the browser
+        // tab keep the original 0.5rem the `pb-2`/floor supplies. The L/R insets
+        // are already handled below.
+        paddingTop: 'max(0.5rem, env(safe-area-inset-top))',
         paddingInlineStart: 'max(12px, env(safe-area-inset-left))',
         paddingInlineEnd: 'max(12px, env(safe-area-inset-right))',
       }}
       className={cn(
-        'flex shrink-0 items-center gap-1.5 overflow-x-auto overflow-y-hidden border-b border-border bg-card py-2',
+        'flex shrink-0 items-center gap-1.5 overflow-x-auto overflow-y-hidden border-b border-border bg-card pb-2',
         '[scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
         '[-webkit-overflow-scrolling:touch] [overscroll-behavior-x:contain] [scroll-snap-type:x_proximity]',
         // A drag must not also scroll the rail out from under itself.

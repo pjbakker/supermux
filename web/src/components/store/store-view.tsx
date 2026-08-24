@@ -219,7 +219,19 @@ export function StoreView({
   return (
     <div className={cn('cs-root flex min-h-0 flex-1 flex-col', variant === 'page' && 'mx-auto w-full max-w-[1120px]')}>
       {/* header */}
-      <div className="cs-header sticky top-0 z-10 flex flex-col gap-3 px-4 pb-3 pt-4 sm:px-6">
+      <div
+        className={cn(
+          'cs-header sticky top-0 z-10 flex flex-col gap-3 px-4 pb-3 sm:px-6',
+          // The shell's MobileTopBar renders nothing, so a top-level route owns
+          // its own top inset (same reason the grok roster header does). In the
+          // PAGE variant (`/store`) reserve the iOS-PWA status-bar band on the
+          // sticky header so the title/search clear the notch — `max()` no-ops
+          // wherever the inset is 0 (desktop, browser tab), keeping the original
+          // `pt-4`. The SHEET variant sits inside a bottom sheet, never under the
+          // status bar, so it keeps its plain `pt-4`.
+          variant === 'page' ? 'pt-[max(1rem,env(safe-area-inset-top))]' : 'pt-4',
+        )}
+      >
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-[24px] font-semibold tracking-tight text-foreground sm:text-[28px]">Connectors</h1>

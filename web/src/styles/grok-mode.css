@@ -2234,6 +2234,19 @@
   position: relative;
   background: var(--gr-bg);
 }
+/* PRIORITY 2 — safe-area top, the DETAIL-PANE header. Same reasoning as the
+   `.gr-head` fix above: the shell's MobileTopBar renders nothing, and the phone
+   teammate route (`/team/:teamName/:agentId`, MemberPane) is full-bleed, so in an
+   installed iOS PWA (viewport-fit=cover, status bar overlays the webview) the
+   pane header's back button + name ran UNDER the battery/signal row. Reserve the
+   inset on the header. NOT roster-scoped — that route renders the pane OUTSIDE
+   `.grok-roster` — so it keys off the `[data-shell-pane]` every pane carries (the
+   desktop roster pane has it too). Gated on `[data-standalone]` (the PWA gate the
+   shell root sets) so browser-tab mobile is untouched; `max()` keeps it a no-op
+   wherever the inset is 0 (desktop, where the 18px base padding already applies). */
+[data-grok][data-standalone] [data-shell-pane] .gr-pane-hd {
+  padding-top: max(18px, env(safe-area-inset-top));
+}
 [data-grok] .grok-roster .gr-pane-hd::after {
   content: '';
   position: absolute;

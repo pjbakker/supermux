@@ -18,9 +18,10 @@
  *   • variant="pane"  — the desktop roster's right column.
  *   • variant="sheet" — the phone's bottom sheet (Phase 6a mounts it).
  *
- * Tabs: Overview (facepile · crew · task ledger · lead cost/context/dir) ·
- * Instructions (the LEAD's) · Connectors (the lead's grants, crew-scoped) ·
- * Activity (the team board — Phase 4).
+ * Tabs (mirrors BotPanel's three): Overview (facepile · crew · task ledger ·
+ * lead cost/context/dir) · Setup (the LEAD's instructions + the crew-scoped
+ * grants, folded — keyed `'instructions'` for router stability) · Activity (the
+ * team board — Phase 4).
  *
  * Data: `useTeams()` (SSE-live, via the `team` prop the roster passes down) +
  * `useSession(lead)`. NO new endpoints.
@@ -135,17 +136,24 @@ function Facepile({ team, size = 30 }: { team: Team; size?: number }) {
   )
 }
 
-/* ── the four tabs ─────────────────────────────────────────────────────────── */
+/* ── the three tabs ────────────────────────────────────────────────────────── */
 
-type TabKey = 'overview' | 'instructions' | 'tools' | 'activity'
+type TabKey = 'overview' | 'instructions' | 'activity'
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: 'Overview' },
-  { key: 'instructions', label: 'Instructions' },
-  // The key stays `'tools'` (router state + bench selectors); the WORD follows
-  // the bot panel's — see `bot-panel.tsx`'s `TABS`.
-  { key: 'tools', label: 'Connectors' },
+  // Setup folds the LEAD's instructions and the crew-scoped grants into one tab,
+  // exactly as the bot panel folds them; the key stays `'instructions'` (router
+  // state + bench selectors) even though the WORD is now "Setup".
+  { key: 'instructions', label: 'Setup' },
   { key: 'activity', label: 'Activity' },
 ]
+
+/** Re-point a legacy team deep-link (`'tools'` from the four-tab era) onto Setup. */
+function normalizeTeamTab(t?: string | null): TabKey {
+  if (t === 'tools' || t === 'instructions') return 'instructions'
+  if (t === 'overview' || t === 'activity') return t
+  return 'overview'
+}
 
 /* ── destructive verbs (Phase 4b) — the ONE armed-confirm idiom ────────────
    Both team management destructives (remove a teammate, dismiss the team) live
@@ -719,7 +727,7 @@ function TeamPanelBody({
 }) {
   const lead = team.lead_supermux_session
   const { session: leadSession } = useSession(lead ?? '')
-  const [tab, setTab] = React.useState<TabKey>(initialTab ?? 'overview')
+  const [tab, setTab] = React.useState<TabKey>(() => normalizeTeamTab(initialTab))
   const [restartAdvised, setRestartAdvised] = React.useState(false)
   const onRestartAdvised = React.useCallback(() => setRestartAdvised(true), [])
 
@@ -778,7 +786,7 @@ function TeamPanelBody({
       <div
         role="tablist"
         aria-label="Team"
-        className="flex shrink-0 items-center gap-1 border-b border-border px-4"
+        className="flex w-full shrink-0 items-stretch border-b border-border px-2"
       >
         {TABS.map((t, ti) => (
           <button
@@ -805,10 +813,10 @@ function TeamPanelBody({
                 ?.focus()
             }}
             className={cn(
-              'relative -mb-px min-h-11 px-3 text-[13px] font-medium transition-colors',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              'relative -mb-px min-h-11 flex-1 basis-0 px-2 text-center text-[13px] font-medium transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
               tab === t.key
-                ? 'text-foreground after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full after:bg-primary'
+                ? 'text-foreground after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:bg-primary'
                 : 'text-muted-foreground hover:text-foreground',
             )}
           >
@@ -846,25 +854,26 @@ function TeamPanelBody({
         )}
         {tab === 'instructions' &&
           (lead ? (
-            <InstructionsTab
-              name={lead}
-              session={leadSession}
-              onRestartAdvised={onRestartAdvised}
-            />
-          ) : (
-            <NoLead what="instructions" />
-          ))}
-        {tab === 'tools' &&
-          (lead ? (
+            // SETUP — the lead's instructions and the crew-scoped grants, folded
+            // into one tab (BotPanel's Setup, team-shaped). The crew inherits the
+            // lead's env, so its grants ARE the whole team's; a preamble says so
+            // before the shared `ToolsTab`.
             <div className="flex flex-col gap-6">
-              <p className="rounded-xl border border-border bg-card px-4 py-3 text-[13px] text-muted-foreground">
-                The crew inherits the lead's grants — a teammate pane runs inside the lead's
-                window and with its environment, so these are the whole team's tools.
-              </p>
-              <ToolsTab name={lead} session={leadSession} />
+              <InstructionsTab
+                name={lead}
+                session={leadSession}
+                onRestartAdvised={onRestartAdvised}
+              />
+              <div className="flex flex-col gap-6 border-t border-border pt-6">
+                <p className="rounded-xl border border-border bg-card px-4 py-3 text-[13px] text-muted-foreground">
+                  The crew inherits the lead's grants — a teammate pane runs inside the lead's
+                  window and with its environment, so these are the whole team's tools.
+                </p>
+                <ToolsTab name={lead} session={leadSession} />
+              </div>
             </div>
           ) : (
-            <NoLead what="connectors" />
+            <NoLead what="setup" />
           ))}
         {tab === 'activity' && <ActivityTab team={team} />}
 

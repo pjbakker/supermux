@@ -288,40 +288,46 @@ describe('no raw pictographs on an app surface', () => {
 })
 
 /**
- * T6.1 — the bot panel's fifth tab.
+ * T6.1 — the bot panel's Workflows tab, third of THREE.
  *
- * The tab used to be "Activity" and its first field was a `SchedulesList` that
- * opened a per-session schedules SHEET. The sheet is gone; the same question is
- * answered by the list itself, scoped to one bot. Issues and Git stay — losing
- * them to a rename would be a capability drop dressed as a refactor.
+ * The panel used to carry five tabs (Overview · Instructions · Connectors ·
+ * Memory · Workflows); the owner found five settings screens nerdy and
+ * redundant, so Instructions + Connectors + Memory folded into ONE "Setup" tab
+ * (keyed `'instructions'`, the durable router state), leaving three. Workflows
+ * is the last of them, and this guards that the fold did not quietly drop it —
+ * its bot-scoped list, its Recent runs, and Issues + Git all stay.
  *
  * The tab wiring is asserted against `TABS` (a real export, so a rename cannot
  * be "fixed" by editing the test's copy of the string) and the composition
  * against the source, because BotPanelBody needs a live session query to render.
  */
-describe('the bot panel tab is Workflows, not Activity', () => {
+describe('the bot panel folds to three tabs, and Workflows is the last', () => {
   const PANEL_SRC = readFileSync(
     new URL('../../src/components/roster/bot-panel.tsx', import.meta.url).pathname,
     'utf8',
   )
 
-  test('the five tabs, in order, and the last one is workflows', () => {
-    expect(BOT_TABS.map((t) => t.key)).toEqual([
-      'overview',
-      'instructions',
-      'tools',
-      'memory',
-      'workflows',
-    ])
-    expect(BOT_TABS[4].label).toBe('Workflows')
+  test('exactly three tabs, in order, keys stable and labels calm', () => {
+    expect(BOT_TABS.map((t) => t.key)).toEqual(['overview', 'instructions', 'workflows'])
+    expect(BOT_TABS.map((t) => t.label)).toEqual(['Overview', 'Setup', 'Workflows'])
   })
 
-  test('no "activity" tab key survives anywhere in the panel', () => {
+  test('the folded-away tab keys no longer render bodies of their own', () => {
+    // `tools` and `memory` were their own tabs; they are Setup now. No branch
+    // keys off them any more (a stale deep-link is re-pointed by normalizeTab).
+    expect(PANEL_SRC).not.toContain("tab === 'tools'")
+    expect(PANEL_SRC).not.toContain("tab === 'memory'")
+    // `activity` never was a bot-panel key.
     expect(PANEL_SRC).not.toContain("'activity'")
     expect(PANEL_SRC).not.toContain('ActivityTab')
   })
 
-  test('the tab renders the bot-scoped list, the recent runs, and keeps Issues + Git', () => {
+  test('Setup renders under the instructions key', () => {
+    expect(PANEL_SRC).toContain("{tab === 'instructions' && (")
+    expect(PANEL_SRC).toContain('<SetupTab')
+  })
+
+  test('the Workflows tab renders the bot-scoped list, recent runs, and keeps Issues + Git', () => {
     expect(PANEL_SRC).toContain('<WorkflowsView variant="panel" scope={name} />')
     expect(PANEL_SRC).toContain('label="Recent runs"')
     expect(PANEL_SRC).toContain('label="Issues"')

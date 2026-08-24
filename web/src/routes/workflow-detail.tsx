@@ -70,7 +70,11 @@ export function WorkflowDetail() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-background/85 px-3 py-2 backdrop-blur sm:px-5">
+      {/* The shell's MobileTopBar renders nothing, so this route header owns its
+          own top inset: reserve the iOS-PWA status-bar band on top so the title
+          and controls clear the notch. `max()` no-ops at env=0 (desktop, browser
+          tab), keeping the original 0.5rem; `pb-2` holds the bottom padding. */}
+      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-background/85 px-3 pb-2 pt-[max(0.5rem,env(safe-area-inset-top))] backdrop-blur sm:px-5">
         <Link
           to={WORKFLOWS_ROUTE}
           aria-label="Back to workflows"
