@@ -105,7 +105,16 @@ NAVIGATE_TOOL = {
     "inputSchema": {
         "type": "object",
         "properties": {
-            "url": {"type": "string", "description": "Absolute URL to open."}
+            "url": {"type": "string", "description": "Absolute URL to open."},
+            "tab": {
+                "type": "string",
+                "description": (
+                    "Optional. A shared tab id from browser_list_tabs (tb_...). "
+                    "Omit to use your OWN throwaway browser. Given, this acts on "
+                    "the human's already-signed-in tab — which requires that they "
+                    "granted you that specific tab."
+                ),
+            },
         },
         "required": ["url"],
     },
@@ -124,6 +133,15 @@ CLICK_TOOL = {
             "selector": {"type": "string", "description": "CSS selector to click."},
             "x": {"type": "number", "description": "Viewport x (CSS px)."},
             "y": {"type": "number", "description": "Viewport y (CSS px)."},
+            "tab": {
+                "type": "string",
+                "description": (
+                    "Optional. A shared tab id from browser_list_tabs (tb_...). "
+                    "Omit to use your OWN throwaway browser. Given, this acts on "
+                    "the human's already-signed-in tab — which requires that they "
+                    "granted you that specific tab."
+                ),
+            },
         },
     },
 }
@@ -150,6 +168,15 @@ READ_TOOL = {
                 "type": "boolean",
                 "description": "Return outerHTML instead of visible text.",
             },
+            "tab": {
+                "type": "string",
+                "description": (
+                    "Optional. A shared tab id from browser_list_tabs (tb_...). "
+                    "Omit to use your OWN throwaway browser. Given, this acts on "
+                    "the human's already-signed-in tab — which requires that they "
+                    "granted you that specific tab."
+                ),
+            },
         },
     },
 }
@@ -161,7 +188,20 @@ SCREENSHOT_TOOL = {
         "image you can look at — use it when the text read is not enough to "
         "tell what is on screen."
     ),
-    "inputSchema": {"type": "object", "properties": {}},
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "tab": {
+                "type": "string",
+                "description": (
+                    "Optional. A shared tab id from browser_list_tabs (tb_...). "
+                    "Omit to use your OWN throwaway browser. Given, this acts on "
+                    "the human's already-signed-in tab — which requires that they "
+                    "granted you that specific tab."
+                ),
+            },
+        },
+    },
 }
 
 TAKEOVER_TOOL = {
@@ -193,13 +233,44 @@ TAKEOVER_TOOL = {
                     "max 600). Call again to keep waiting."
                 ),
             },
+            "tab": {
+                "type": "string",
+                "description": (
+                    "Optional. A shared tab id from browser_list_tabs (tb_...). "
+                    "Omit to use your OWN throwaway browser. Given, this acts on "
+                    "the human's already-signed-in tab — which requires that they "
+                    "granted you that specific tab."
+                ),
+            },
         },
         "required": ["reason"],
     },
     "_meta": {REQUIRES_USER_INTERACTION_META: True},
 }
 
-TOOLS = [NAVIGATE_TOOL, CLICK_TOOL, READ_TOOL, SCREENSHOT_TOOL, TAKEOVER_TOOL]
+LIST_TABS_TOOL = {
+    "name": "browser_list_tabs",
+    "description": (
+        "List the human's shared browser tabs you are allowed to use. CALL THIS "
+        "FIRST. Each entry has a `tab` id to pass to the other tools, the page "
+        "title and URL, whether it is still signed in (`login_state`), and when "
+        "that was last verified. An empty list means you have not been granted "
+        "any shared tab — use your own browser instead (omit `tab`), or ask the "
+        "human to lend you one. A tab whose `login_state` is `needs_login` will "
+        "refuse your calls until the human signs in again; report that, do not "
+        "try to log in yourself."
+    ),
+    "inputSchema": {"type": "object", "properties": {}},
+}
+
+TOOLS = [
+    LIST_TABS_TOOL,
+    NAVIGATE_TOOL,
+    CLICK_TOOL,
+    READ_TOOL,
+    SCREENSHOT_TOOL,
+    TAKEOVER_TOOL,
+]
 
 
 # ── the forward ──────────────────────────────────────────────────────────────
@@ -282,11 +353,26 @@ def _call(tool, args, timeout=ACT_TIMEOUT_SECONDS):
     return payload
 
 
+def _tab_arg(args):
+    """The optional shared-tab id, forwarded verbatim.
+
+    Validation and — crucially — the per-tab GRANT check happen server-side, in
+    `tools.rs`, before the call reaches a page. This script is a forwarder; it
+    must never be the thing that decides what an agent may touch."""
+    tab = (args.get("tab") or "").strip()
+    return {"tab": tab} if tab else {}
+
+
+def tool_list_tabs(_args):
+    out = _call("list_tabs", {})
+    return out if "content" in out else _text_result(out.get("result", out))
+
+
 def tool_navigate(args):
     url = (args.get("url") or "").strip()
     if not url:
         return _error_result({"error": "browser_navigate needs a `url`"})
-    out = _call("navigate", {"url": url})
+    out = _call("navigate", {"url": url, **_tab_arg(args)})
     return out if "content" in out else _text_result(out.get("result", out))
 
 
@@ -300,6 +386,7 @@ def tool_click(args):
         payload["y"] = args.get("y")
     else:
         return _error_result({"error": "browser_click needs a `selector` or `x`+`y`"})
+    payload.update(_tab_arg(args))
     out = _call("click", payload)
     return out if "content" in out else _text_result(out.get("result", out))
 
@@ -312,12 +399,13 @@ def tool_read(args):
         payload["max_chars"] = args["max_chars"]
     if args.get("html"):
         payload["html"] = True
+    payload.update(_tab_arg(args))
     out = _call("read", payload)
     return out if "content" in out else _text_result(out.get("result", out))
 
 
-def tool_screenshot(_args):
-    out = _call("screenshot", {})
+def tool_screenshot(args):
+    out = _call("screenshot", _tab_arg(args))
     if "content" in out:
         return out
     result = out.get("result") or {}
@@ -352,13 +440,14 @@ def tool_takeover(args):
     park = max(5, min(MAX_PARK_SECONDS, park))
     out = _call(
         "request_human_takeover",
-        {"reason": reason, "timeout_seconds": park},
+        {"reason": reason, "timeout_seconds": park, **_tab_arg(args)},
         timeout=park + 15,
     )
     return out if "content" in out else _text_result(out.get("result", out))
 
 
 HANDLERS = {
+    "browser_list_tabs": tool_list_tabs,
     "browser_navigate": tool_navigate,
     "browser_click": tool_click,
     "browser_read": tool_read,

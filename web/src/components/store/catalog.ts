@@ -211,8 +211,12 @@ export const CURATED_FALLBACK: ConnectorCard[] = [
     // Short on purpose: this is the OFFLINE fallback line. The live row carries
     // the server's full copy (and this gate counts every byte of the fallback).
     description:
-      'One real Chrome, shared with your agents — and when a bot hits a login or 2FA it asks you to take the wheel.',
+      'One real Chrome you log into once — pin tabs, lend individual tabs to named agents, take the wheel on 2FA.',
     tools: [
+      {
+        name: 'browser_list_tabs',
+        description: "See which shared tabs you're allowed to use, and whether each is still signed in. Call this first.",
+      },
       { name: 'browser_navigate', description: 'Open a URL in the shared browser and wait for it to load.' },
       { name: 'browser_click', description: 'Click an element (CSS selector) or viewport coordinates.' },
       { name: 'browser_read', description: 'Read the page — visible text or HTML, whole page or one element.' },
