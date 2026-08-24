@@ -194,6 +194,16 @@ fn protected_router(state: AppState) -> Router {
         // (a member may grant `@company:<their id>` / an own-company session, but
         // not `*` / another company / a global connector definition).
         .merge(crate::connectors::router_for(state.clone()))
+        // Shared-browser WORKSPACE (`/api/browser/tabs…`) — the HUMAN's door:
+        // tab CRUD + per-tab grants, bearer-gated, owner/admin-only. The agent's
+        // door is the hook-token `/api/hook/browser/tool` router merged above;
+        // keeping them apart is what stops a bot granting itself a tab. The
+        // prefix is deliberately absent from `scope::member_may_reach`, so a
+        // member also hits the deny-by-default 404.
+        .merge(
+            crate::connectors::browser::api::router_for(state.clone())
+                .route_layer(from_fn(require_admin_mw)),
+        )
         // P2a connector-OAuth: guided per-company OAuth-app REGISTRATION
         // (`/api/oauth/apps`, owner/admin-only via `require_admin` INSIDE each
         // handler — a NEW prefix, deliberately absent from `member_may_reach`, so

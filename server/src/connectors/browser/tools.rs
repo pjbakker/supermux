@@ -434,7 +434,7 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// adds no crates): only `http`/`https` are recognised, and everything else —
 /// `javascript:`, `data:`, `file:`, a relative path, a userinfo trick — yields
 /// `None`, which the caller turns into a refusal. Fail closed.
-fn host_of(url: &str) -> Option<String> {
+pub(super) fn host_of(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;

@@ -1,23 +1,45 @@
-//! **Shared-Browser connector — phase 1: the browser service.**
+//! **Shared-Browser connector — the browser service.**
 //!
-//! A single long-lived `chrome-headless-shell`, owned by the Rust server, with
-//! one **isolated CDP browser context per agent session** and an
-//! **AGENT ⇄ HUMAN drive lock** per context.
+//! One long-lived Chromium, owned by the Rust server, running **two modes at
+//! once** over one process and one CDP socket:
 //!
 //! ```text
-//!   BrowserService  ── lazily spawns ──▶  chrome-headless-shell  (one process)
-//!        │                                        │
-//!        │  one browser WebSocket (CdpClient)  ───┘
+//!   BrowserService ── lazily spawns ──▶ chromium --headless=new   (ONE process,
+//!        │                                    │                    ONE durable
+//!        │  one browser WebSocket (CdpClient) ┘                    --user-data-dir)
 //!        │
-//!        ├─ contexts["alice"] → AgentContext { browserContextId, target, DriveLock }
-//!        └─ contexts["bob"]   → AgentContext { browserContextId, target, DriveLock }
+//!        ├─ tabs["tb_9f…"]  → Tab { durable id, target, DriveLock, grants }   WORKSPACE
+//!        ├─ tabs["tb_4c…"]  → Tab { … }        ↑ all in the DEFAULT context —
+//!        │                                       the profile on disk IS the jar
+//!        ├─ scratch["alice"] → AgentContext { browserContextId, target, lock } AGENT
+//!        └─ scratch["bob"]   → AgentContext { … }   ↑ incognito-equivalent, dies
+//!                                                     with the session
 //! ```
+//!
+//! # The two modes, and the one argument that chooses between them
+//!
+//! * **Agent scratch** — today's behaviour, byte for byte. A tool call with no
+//!   `tab` argument gets its own isolated context that is destroyed with the
+//!   session. Every isolation guarantee it ever had still holds: an
+//!   incognito-equivalent context does not persist, even on a durable profile.
+//! * **Workspace tab** — the human logs in once; tabs persist and pin; an agent
+//!   that is **explicitly granted a tab** reuses that authenticated tab. A tool
+//!   call naming a `tab` takes this path, and only after
+//!   [`tools::has_tab_grant`] says yes — reads and screenshots included, because
+//!   on a logged-in page reading IS the exfiltration.
+//!
+//! # A tab is durable; its target is not
+//!
+//! `tb_<uuid>` is minted once and stored in `browser_tabs`. The CDP `targetId`
+//! underneath changes on every rehydrate. The idle reaper therefore
+//! **dehydrates** rather than evicts (persist url/title → `closeTarget` → keep
+//! the row), and because the profile is on disk, the next access relaunches
+//! Chrome, reopens the stored URL, and the login is simply there.
 //!
 //! # Phase boundaries
 //!
-//! * **Phase 1 (here).** The process manager, the CDP client, the per-agent
-//!   context registry, the drive lock, leak safety. No HTTP routes, no MCP
-//!   tools — nothing outside this module calls it yet.
+//! * **Phase 1 (here).** The process manager, the CDP client, the registries,
+//!   the drive lock, leak safety.
 //! * **Phase 2 (shipped, [`takeover`]).** The takeover UI's data plane: a WS
 //!   relay that publishes [`context::ScreencastFrame`]s to an authenticated
 //!   client and feeds its taps back as [`lock::Actor::Human`] input. It does
@@ -66,6 +88,9 @@ pub mod takeover;
 /// Shared-browser v1: the persistent workspace **tab** — the unit a human pins
 /// and an agent is granted.
 pub mod tab;
+/// Shared-browser v1: the HUMAN's bearer-gated tab CRUD + per-tab grant API.
+/// Deliberately a different door from [`tools`], which is the agent's.
+pub mod api;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
