@@ -25,7 +25,7 @@ import {
   pruneQueued,
   queueDelayedSend,
   queuedFor,
-  schedulerPort,
+  workflowsPort,
   subscribeQueued,
   tickMs,
   type DelayOption,
@@ -47,18 +47,18 @@ export interface DelaySend {
   dismissError: () => void
   /** Queue the composer's text. No-op on blank text or while busy. */
   queue: (text: string, option: DelayOption) => void
-  /** Delete the schedule and put the words back in the composer. */
+  /** Delete the workflow and put the words back in the composer. */
   cancel: (id: string) => void
 }
 
 export interface UseDelaySendOptions {
-  /** The session slug — the schedule's target AND the queue's key. */
+  /** The session slug — the workflow's target AND the queue's key. */
   name: string
-  /** The scheduler, injectable so a test can assert the POST body. */
+  /** The workflows API, injectable so a test can assert the POST body. */
   port?: DelaySendPort
 }
 
-export function useDelaySend({ name, port = schedulerPort }: UseDelaySendOptions): DelaySend {
+export function useDelaySend({ name, port = workflowsPort }: UseDelaySendOptions): DelaySend {
   const queued = React.useSyncExternalStore(
     React.useCallback((fn) => subscribeQueued(name, fn), [name]),
     React.useCallback(() => queuedFor(name), [name]),
@@ -77,8 +77,8 @@ export function useDelaySend({ name, port = schedulerPort }: UseDelaySendOptions
   }, [])
 
   // THE COLD MOUNT. The store and its `sessionStorage` twin survive a remount
-  // and a reload, but not the tab closing — and the SCHEDULE survives all three.
-  // So on mount the chips are rebuilt from `GET /api/schedules` (shared across
+  // and a reload, but not the tab closing — and the WORKFLOW survives all three.
+  // So on mount the chips are rebuilt from `GET /api/workflows` (shared across
   // panes for 15s, `delay-send.ts::hydrateQueue`), which is also what makes Undo
   // able to hand back the real words after the tab that typed them is gone: the
   // message is the row's own `prompt`. A failed listing is silent — the local
@@ -147,7 +147,7 @@ export function useDelaySend({ name, port = schedulerPort }: UseDelaySendOptions
         try {
           // `nowMs: Date.now()`, not the ticker's clock: the guard that refuses
           // a DUE item has to read the real time, or a stale tick could let a
-          // cancel through a second after the runner took the message.
+          // cancel through a second after the engine took the message.
           const item = await cancelDelayedSend(port, { session: name, id, nowMs: Date.now() })
           // The words go back where they came from. A draft typed in the
           // meantime is not thrown away for it — the restored message joins it

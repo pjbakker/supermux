@@ -4,17 +4,17 @@
  * Three things are worth pinning here, and they are the three a screenshot
  * cannot see:
  *
- *   1. THE WIRE BODY. A delayed send is a ONE-SHOT SCHEDULE and nothing else:
- *      `kind: 'tmux'`, the typed text as `prompt`, no command, and a relative
- *      expression the server's own parser reads as `sched_type "once"`
- *      (`server/src/scheduler/parser.rs`, `RE_IN` + its unit table — both
+ *   1. THE WIRE BODY. A delayed send is a ONE-SHOT WORKFLOW and nothing else:
+ *      exactly one prompt-only step carrying the typed text, and a relative
+ *      expression the server's own parser reads as `trigger_kind "once"`
+ *      (`server/src/workflows/parser.rs`, `RE_IN` + its unit table — both
  *      restated here, so a rename on either side fails a test instead of
- *      shipping a schedule that never fires). No server change was needed for
+ *      shipping a workflow that never fires). No server change was needed for
  *      this feature, and this test is what says so out loud.
  *
- *   2. THE UNDO PATH. Cancel deletes the schedule by id and hands the MESSAGE
+ *   2. THE UNDO PATH. Cancel deletes the workflow by id and hands the MESSAGE
  *      back — verbatim, so the composer can restore it — and a DELETE that fails
- *      puts the receipt back, because a chip that vanished over a schedule the
+ *      puts the receipt back, because a chip that vanished over a workflow the
  *      server is still holding would be the one lie this feature must not tell.
  *
  *   3. THE COMPOSER'S OWN GATES. The clock is drawn beside Send, disabled with
@@ -33,7 +33,7 @@ import {
   cancelDelayedSend,
   countdownLabel,
   delayGateReason,
-  delayScheduleInput,
+  delayWorkflowInput,
   delayTitle,
   DELAY_OPTIONS,
   hydrateQueue,
@@ -48,49 +48,63 @@ import {
   type QueuedSend,
 } from '../../src/components/chat/delay-send'
 import type { DelaySend } from '../../src/components/chat/use-delay-send'
-import type { ScheduleCreateInput, ScheduleRow } from '../../src/lib/api/scheduler'
+import type {
+  WorkflowCreateInput,
+  WorkflowStepRow,
+  WorkflowWithSteps,
+} from '../../src/lib/api/workflows'
 import type { ComposerField, ComposerHandle } from '../../src/components/chat/use-composer'
 import type {
   StagedAttachment,
   UseStagedAttachmentsResult,
 } from '../../src/components/focus-mode/use-staged-attachments'
 
-// ── the fake scheduler ───────────────────────────────────────────────────────
+// ── the fake workflows API ───────────────────────────────────────────────────
 
-function row(over: Partial<ScheduleRow> = {}): ScheduleRow {
+/** One step row, as the server hands it back (JSON columns and all). */
+function step(over: Partial<WorkflowStepRow> = {}): WorkflowStepRow {
   return {
-    id: 'SCHED-abc12345',
-    title: 'Send later · hi',
-    session: 'release-train',
+    id: 'WFS-abc12345',
+    workflow_id: 'WF-abc12345',
+    position: 0,
+    title: '',
     command: '',
     prompt: 'hi',
-    kind: 'tmux',
-    boot_dir: '',
-    boot_provider: 'claude',
-    boot_worktree: 0,
-    bypass_permissions: 0,
-    sched_type: 'once',
-    recurrence: null,
-    run_at: null,
+    files: '[]',
+    connectors: '[]',
+    timeout_secs: 900,
+    on_complete: '{"kind":"none"}',
+    created: 0,
+    updated: 0,
+    ...over,
+  }
+}
+
+/** A workflow row with its steps — the flattened shape both `POST /api/workflows`
+ *  and `GET /api/workflows` return (`WorkflowWithSteps`, `#[serde(flatten)]`). */
+function row(over: Partial<WorkflowWithSteps> = {}): WorkflowWithSteps {
+  return {
+    id: 'WF-abc12345',
+    title: 'Send later · hi',
+    session: 'release-train',
+    company_id: null,
+    enabled: 1,
+    trigger_kind: 'once',
+    schedule_expr: 'in 10 minutes',
     next_run: '2026-08-24T10:10:00+00:00',
     last_run: null,
-    enabled: 1,
     run_count: 0,
-    schedule_expr: 'in 10 minutes',
-    watch: 0,
-    watch_timeout: 900,
-    done_pattern: null,
-    done_action: 'disable',
-    confirm_finish: 0,
+    on_complete: '{"kind":"none"}',
     created: 0,
     updated: 0,
     deleted: null,
+    steps: [step()],
     ...over,
   }
 }
 
 interface Spy extends DelaySendPort {
-  created: ScheduleCreateInput[]
+  created: WorkflowCreateInput[]
   removed: string[]
   listed: number
 }
@@ -106,7 +120,12 @@ function port(over: Partial<DelaySendPort> = {}): Spy {
     },
     create: async (input) => {
       spy.created.push(input)
-      return row({ prompt: input.prompt ?? '', schedule_expr: input.schedule_expr })
+      return row({
+        title: input.title,
+        session: input.session,
+        schedule_expr: input.schedule_expr ?? null,
+        steps: [step({ prompt: input.steps[0]?.prompt ?? '' })],
+      })
     },
     remove: async (id) => {
       spy.removed.push(id)
@@ -121,10 +140,11 @@ beforeEach(() => resetQueues())
 
 // ═══ 1 — the wire body ══════════════════════════════════════════════════════
 
-describe('the one-shot schedule a delay writes', () => {
+describe('the one-shot workflow a delay writes', () => {
   test('every offered delay is an expression the server parses as ONE-SHOT', () => {
-    // `server/src/scheduler/parser.rs`: `^in\s+(\d+)\s*([a-z]+)$` is the only
-    // branch that returns `sched_type: "once"`, and these are its units.
+    // `server/src/workflows/parser.rs`: `^in\s+(\d+)\s*([a-z]+)$` is the only
+    // branch that returns `sched_type: "once"` (→ `trigger_kind`), and these are
+    // its units (`unit_duration`).
     const RE_IN = /^in\s+(\d+)\s*([a-z]+)$/
     const UNITS = new Set([
       's', 'sec', 'secs', 'second', 'seconds',
@@ -150,25 +170,43 @@ describe('the one-shot schedule a delay writes', () => {
     }
   })
 
-  test('the create body is a prompt-only tmux job aimed at THIS session', () => {
-    const input = delayScheduleInput('release-train', 'ship the release notes', DELAY_OPTIONS[1]!)
+  test('the create body is ONE prompt step aimed at THIS session, nothing else', () => {
+    const input = delayWorkflowInput('release-train', 'ship the release notes', DELAY_OPTIONS[1]!)
     expect(input).toEqual({
       title: 'Send later · ship the release notes',
-      command: '',
-      prompt: 'ship the release notes',
-      kind: 'tmux',
       session: 'release-train',
+      trigger_kind: 'once',
       schedule_expr: 'in 1 hour',
+      steps: [{ prompt: 'ship the release notes' }],
     })
-    // Nothing else is offered — no shell, no boot, no watch, no done-action.
     expect(Object.keys(input).sort()).toEqual([
-      'command',
-      'kind',
-      'prompt',
       'schedule_expr',
       'session',
+      'steps',
       'title',
+      'trigger_kind',
     ])
+    // The step is a PROMPT and nothing else — no slash command, no files, no
+    // connectors, no per-step completion action.
+    expect(input.steps).toHaveLength(1)
+    expect(Object.keys(input.steps[0]!)).toEqual(['prompt'])
+    // And the removed dragon fields are not merely unused here — they are absent
+    // from the body, which is what `workflows/mod.rs::create` refuses BY NAME.
+    for (const field of [
+      'kind',
+      'command',
+      'prompt',
+      'boot_dir',
+      'boot_provider',
+      'boot_worktree',
+      'bypass_permissions',
+      'done_action',
+      'watch',
+      'done_pattern',
+      '_test_fire',
+    ]) {
+      expect(field in input).toBe(false)
+    }
   })
 
   test('the title quotes the message on one line, and never runs away', () => {
@@ -180,7 +218,7 @@ describe('the one-shot schedule a delay writes', () => {
     expect(delayTitle('   ')).toBe('Send later')
   })
 
-  test('queueing creates exactly one schedule and files the receipt', async () => {
+  test('queueing creates exactly one workflow and files the receipt', async () => {
     const api = port()
     const item = await queueDelayedSend(api, {
       session: 'release-train',
@@ -190,8 +228,10 @@ describe('the one-shot schedule a delay writes', () => {
     })
     expect(api.created).toHaveLength(1)
     expect(api.created[0]!.schedule_expr).toBe('in 10 minutes')
+    expect(api.created[0]!.trigger_kind).toBe('once')
     expect(api.created[0]!.session).toBe('release-train')
-    expect(api.created[0]!.prompt).toBe('hi')
+    expect(api.created[0]!.title).toBe('Send later · hi')
+    expect(api.created[0]!.steps).toEqual([{ prompt: 'hi' }])
     // The countdown is read off the SERVER's next_run, not off `now + delay`.
     expect(item.dueMs).toBe(Date.parse('2026-08-24T10:10:00+00:00'))
     expect(item.text).toBe('hi')
@@ -231,7 +271,7 @@ describe('the one-shot schedule a delay writes', () => {
 
 // ═══ 2 — cancel / undo ══════════════════════════════════════════════════════
 
-describe('cancel puts the schedule AND the words back', () => {
+describe('cancel puts the workflow AND the words back', () => {
   test('it deletes by id and hands the message back verbatim', async () => {
     const api = port()
     const queued = await queueDelayedSend(api, {
@@ -250,7 +290,7 @@ describe('cancel puts the schedule AND the words back', () => {
     expect(queuedFor('release-train')).toEqual([])
   })
 
-  test('a DELETE that fails RESTORES the receipt — the schedule is still live', async () => {
+  test('a DELETE that fails RESTORES the receipt — the workflow is still live', async () => {
     const api = port({
       remove: async () => {
         throw new Error('Can’t reach supermux-server.')
@@ -271,7 +311,7 @@ describe('cancel puts the schedule AND the words back', () => {
   test('cancelling an id that is not queued is a no-op, not a stray DELETE', async () => {
     const api = port()
     expect(
-      await cancelDelayedSend(api, { session: 'release-train', id: 'SCHED-ghost', nowMs: 1 }),
+      await cancelDelayedSend(api, { session: 'release-train', id: 'WF-ghost', nowMs: 1 }),
     ).toBeNull()
     expect(api.removed).toEqual([])
   })
@@ -281,10 +321,10 @@ describe('cancel puts the schedule AND the words back', () => {
 
 describe('the cancel window closes at dueMs, not at the end of the chip', () => {
   /**
-   * The race this guards: the runner delivers a due one-shot on its next tick
-   * (≤10s), and `DELETE /api/schedules/{id}` soft-deletes by id ALONE — it does
-   * not check `enabled` or `run_count`, and it must not (the Schedules admin
-   * legitimately deletes finished jobs). So a Cancel offered after `dueMs` can
+   * The race this guards: the engine delivers a due one-shot on its next tick
+   * (≤10s), and `DELETE /api/workflows/{id}` soft-deletes by id ALONE — it does
+   * not check `enabled` or `run_count`, and it must not (the Workflows view
+   * legitimately deletes finished ones). So a Cancel offered after `dueMs` can
    * come back 200 on a message that is already IN the session, and the composer
    * would hand the words back as though nothing had been sent — inviting a
    * duplicate. The guard is here, on the client, and it is time-based.
@@ -314,7 +354,7 @@ describe('the cancel window closes at dueMs, not at the end of the chip', () => 
     expect(undone).toBeNull()
     // The words are NOT handed back (the caller restores only what it is given)…
     expect(api.removed).toEqual([])
-    // …and the chip stays, because the schedule is not deleted either.
+    // …and the chip stays, because the workflow is not deleted either.
     expect(queuedFor('release-train')).toEqual([queued])
   })
 
@@ -336,14 +376,14 @@ describe('the cancel window closes at dueMs, not at the end of the chip', () => 
   })
 })
 
-// ═══ 2c — the cold mount (hydration from the schedules table) ═══════════════
+// ═══ 2c — the cold mount (hydration from the workflows table) ══════════════
 
 describe('the chips are rebuilt from the server on a cold mount', () => {
-  const live = (over: Partial<ScheduleRow> = {}) =>
+  const live = (over: Partial<WorkflowWithSteps> = {}) =>
     row({
-      id: 'SCHED-live1',
+      id: 'WF-live1',
       title: 'Send later · ship it',
-      prompt: 'ship it',
+      steps: [step({ prompt: 'ship it' })],
       next_run: new Date(50_000 + 3_600_000).toISOString(),
       ...over,
     })
@@ -353,31 +393,42 @@ describe('the chips are rebuilt from the server on a cold mount', () => {
     await hydrateQueue(api, 'release-train', 50_000)
     const queued = queuedFor('release-train')
     expect(queued).toHaveLength(1)
-    // The MESSAGE survives a closed tab because it is the row's own prompt —
-    // which is what lets Undo still hand back the real words.
+    // The MESSAGE survives a closed tab because it is the ONE step's own prompt
+    // — which is what lets Undo still hand back the real words.
     expect(queued[0]!.text).toBe('ship it')
-    expect(queued[0]!.id).toBe('SCHED-live1')
+    expect(queued[0]!.id).toBe('WF-live1')
     expect(queued[0]!.dueMs).toBe(Date.parse(live().next_run!))
   })
 
-  test('nothing else in the schedules table becomes a chip', () => {
+  test('nothing else in the workflows table becomes a chip', () => {
     const now = 50_000
     const ok = live()
     expect(isDelayRow(ok, 'release-train', now)).toBe(true)
-    // Another session's job, a recurring one, a boot/shell job, a disabled or
-    // deleted row, a job this feature did not write, and one already past.
+    // Another bot's workflow, a recurring or manual one, a multi-step chain, a
+    // step that runs a slash command, a stepless row, a disabled or deleted row,
+    // one this feature did not write, and one already past (the engine nulls
+    // `next_run` when a `once` workflow fires, which lands in the same branch).
     expect(isDelayRow(live({ session: 'other' }), 'release-train', now)).toBe(false)
-    expect(isDelayRow(live({ sched_type: 'recurring' }), 'release-train', now)).toBe(false)
-    expect(isDelayRow(live({ kind: 'shell' }), 'release-train', now)).toBe(false)
+    expect(isDelayRow(live({ trigger_kind: 'recurring' }), 'release-train', now)).toBe(false)
+    expect(isDelayRow(live({ trigger_kind: 'manual' }), 'release-train', now)).toBe(false)
+    expect(
+      isDelayRow(live({ steps: [step({ prompt: 'a' }), step({ prompt: 'b' })] }), 'release-train', now),
+    ).toBe(false)
+    expect(
+      isDelayRow(live({ steps: [step({ command: '/compact', prompt: 'ship it' })] }), 'release-train', now),
+    ).toBe(false)
+    expect(isDelayRow(live({ steps: [] }), 'release-train', now)).toBe(false)
+    expect(isDelayRow(live({ steps: [step({ prompt: '   ' })] }), 'release-train', now)).toBe(false)
     expect(isDelayRow(live({ enabled: 0 }), 'release-train', now)).toBe(false)
     expect(isDelayRow(live({ deleted: 1 }), 'release-train', now)).toBe(false)
     expect(isDelayRow(live({ title: 'Nightly digest' }), 'release-train', now)).toBe(false)
+    expect(isDelayRow(live({ next_run: null }), 'release-train', now)).toBe(false)
     expect(isDelayRow(live({ next_run: new Date(now - 1).toISOString() }), 'release-train', now)).toBe(false)
   })
 
   test('a message queued WHILE the listing was in flight is not eaten', async () => {
-    let release: (rows: ScheduleRow[]) => void = () => undefined
-    const api = port({ list: () => new Promise<ScheduleRow[]>((r) => (release = r)) })
+    let release: (rows: WorkflowWithSteps[]) => void = () => undefined
+    const api = port({ list: () => new Promise<WorkflowWithSteps[]>((r) => (release = r)) })
     const hydrating = hydrateQueue(api, 'release-train', 50_000)
     // The user taps a delay before the list comes back.
     const fresh = await queueDelayedSend(api, {
@@ -390,7 +441,7 @@ describe('the chips are rebuilt from the server on a cold mount', () => {
     await hydrating
     const ids = queuedFor('release-train').map((it) => it.id)
     expect(ids).toContain(fresh.id)
-    expect(ids).toContain('SCHED-live1')
+    expect(ids).toContain('WF-live1')
   })
 
   test('a failed listing changes nothing — the local view stands', async () => {
@@ -631,7 +682,7 @@ describe('the composer draws the clock beside Send, and says why when it cannot 
         handle={handle()}
         delay={delaySend({
           nowMs: now,
-          queued: [{ id: 'SCHED-1', text: 'ship it', dueMs: now + 3_600_000, optionKey: '1h' }],
+          queued: [{ id: 'WF-1', text: 'ship it', dueMs: now + 3_600_000, optionKey: '1h' }],
         })}
       />,
     )
@@ -652,7 +703,7 @@ describe('the composer draws the clock beside Send, and says why when it cannot 
         handle={handle()}
         delay={delaySend({
           nowMs: now,
-          queued: [{ id: 'SCHED-1', text: 'ship it', dueMs: now - 2_000, optionKey: '10m' }],
+          queued: [{ id: 'WF-1', text: 'ship it', dueMs: now - 2_000, optionKey: '10m' }],
         })}
       />,
     )

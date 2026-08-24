@@ -88,7 +88,7 @@ describe('the Connectors tab', () => {
     expect(src).toContain("{ key: 'tools', label: 'Connectors' }")
     expect(src).not.toContain("label: 'Tools'")
     // The key is still what the routes and the deep-link state speak.
-    expect(src).toContain("initialTab?: 'overview' | 'instructions' | 'tools' | 'memory' | 'activity'")
+    expect(src).toContain('initialTab?: TabKey')
     expect(src).toContain("{tab === 'tools' && <ToolsTab")
   })
 

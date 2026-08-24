@@ -1110,7 +1110,16 @@ const BUDGET_ENTRY_JS = 161 * KB
 // crumb, the HQ projects list, and the data layer (`mapWithLimit`, the bulk summary,
 // `companyForPath`, `useFilesLive`). ceil(measured)=355, the same rule every fase
 // since B3 used.
-const BUDGET_APP_JS = 355 * KB
+//
+// 355 → 384 at the BOT-MODE SUITE INTEGRATION: the six-feature branch (image
+// lightbox, bot-panel polish, composer delay-send, Workflows, Files, the shared-
+// browser workspace) lands together. Measured app-JS total 383.20 → ceil 384. The
+// whole delta is in LAZY chunks — the Workflow composer (step tree + cadence
+// grammar), the Files drive, the shared-browser workspace (takeover canvas +
+// socket), and their data layers — each paid for only by a visitor who opens that
+// surface. THE HERO PATH DID NOT MOVE: entry JS is 153.12 / 161 KB (95%), so none
+// of these six features lands on cold load. ceil(measured)=384, same rule as B3.
+const BUDGET_APP_JS = 384 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

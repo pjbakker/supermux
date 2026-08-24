@@ -32,7 +32,6 @@
 import { readFileSync } from 'node:fs'
 
 import { describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
 import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
@@ -459,24 +458,6 @@ describe('the chat-header workflow chip', () => {
   })
 
   test('the header renders the chip when a run IS in flight', () => {
- * The header NAME is the door to the bot's details.
- * ─────────────────────────────────────────────────────────────────────────────
- * The terminal chrome has had a title-click into the panel since
- * feat-session-info (`<FocusHeader onTitleClick>`); under CHAT the same header
- * slot was an inert `<span>`, so on the phone — where the chat card IS the
- * route's header — there was no way to reach the bot's settings at all. The pill
- * now takes the same optional handler, and the desktop seam (which does not pass
- * one) must keep the span it always had.
- */
-describe('the header name as the details door', () => {
-  test('without a handler the name stays an inert span', () => {
-    const out = pill(session())
-    expect(out).toContain(FOCUS)
-    expect(out).not.toContain('data-testid="chat-header-title"')
-    expect(out).not.toContain('aria-haspopup="dialog"')
-  })
-
-  test('with a handler the name is a real button with a 44px target', () => {
     const out = renderToStaticMarkup(
       <SessionHeaderPill
         name={FOCUS}
@@ -508,6 +489,32 @@ describe('the header name as the details door', () => {
       'utf8',
     )
     expect(api).toContain('/cancel')
+  })
+})
+
+/**
+ * The header NAME is the door to the bot's details.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The terminal chrome has had a title-click into the panel since
+ * feat-session-info (`<FocusHeader onTitleClick>`); under CHAT the same header
+ * slot was an inert `<span>`, so on the phone — where the chat card IS the
+ * route's header — there was no way to reach the bot's settings at all. The pill
+ * now takes the same optional handler, and the desktop seam (which does not pass
+ * one) must keep the span it always had.
+ */
+describe('the header name as the details door', () => {
+  test('without a handler the name stays an inert span', () => {
+    const out = pill(session())
+    expect(out).toContain(FOCUS)
+    expect(out).not.toContain('data-testid="chat-header-title"')
+    expect(out).not.toContain('aria-haspopup="dialog"')
+  })
+
+  test('with a handler the name is a real button with a 44px target', () => {
+    const out = renderToStaticMarkup(
+      <SessionHeaderPill
+        name={FOCUS}
+        session={session()}
         surface="phone"
         onTitleClick={() => undefined}
       />,

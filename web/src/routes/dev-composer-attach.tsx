@@ -13,13 +13,13 @@
 // `?surface=phone` renders the phone bar with the `+` add-menu (its Attach group
 // is what the mobile screenshot captures); default is the desktop pair with the
 // direct attach disc. `?delay=1` wires SEND LATER against an in-browser stub
-// scheduler, so the chooser (sheet on coarse, popover on fine), the queued chip's
-// countdown and its Cancel are all drivable with no server at all.
+// WORKFLOWS API, so the chooser (sheet on coarse, popover on fine), the queued
+// chip's countdown and its Cancel are all drivable with no server at all.
 import * as React from 'react'
 
 import { ChatComposer } from '@/components/chat/composer'
 import { DELAY_OPTIONS, type DelaySendPort } from '@/components/chat/delay-send'
-import type { ScheduleRow } from '@/lib/api/scheduler'
+import type { WorkflowWithSteps } from '@/lib/api/workflows'
 import { useDelaySend } from '@/components/chat/use-delay-send'
 import { useComposer } from '@/components/chat/use-composer'
 import { attachmentSentence } from '@/components/chat/composer-insert'
@@ -31,25 +31,26 @@ const noop = () => undefined
 
 /**
  * The SEND-LATER port, faked in the browser (`?delay=1`). It answers a create
- * the way `/api/schedules` does — an id and a `next_run` — so the rig can drive
- * the whole flow offline: pick a delay, watch the composer clear, read the chip's
- * countdown, cancel it and get the words back. Only `id` and `next_run` are read
- * (`delay-send.ts::queueDelayedSend`), hence the cast: a bench does not need to
- * invent the other twenty columns of a schedules row.
+ * the way `POST /api/workflows` does — a row with an id, a `next_run` and the
+ * one step it was given — so the rig can drive the whole flow offline: pick a
+ * delay, watch the composer clear, read the chip's countdown, cancel it and get
+ * the words back. Only a handful of columns are read (`delay-send.ts`:
+ * `queueDelayedSend` / `isDelayRow` / `rowToQueued`), hence the cast: a bench
+ * does not need to invent the rest of a workflows row.
  */
-const BENCH_ROWS = 'supermux-bench-schedules'
+const BENCH_ROWS = 'supermux-bench-workflows'
 
-/** The bench's "schedules table", in `localStorage` so it OUTLIVES the tab —
+/** The bench's "workflows table", in `localStorage` so it OUTLIVES the tab —
  *  which is the whole point of the cold-mount hydration this bench exercises. */
-function benchRows(): ScheduleRow[] {
+function benchRows(): WorkflowWithSteps[] {
   try {
     const raw = JSON.parse(localStorage.getItem(BENCH_ROWS) ?? '[]')
-    return Array.isArray(raw) ? (raw as ScheduleRow[]) : []
+    return Array.isArray(raw) ? (raw as WorkflowWithSteps[]) : []
   } catch {
     return []
   }
 }
-function writeBenchRows(rows: ScheduleRow[]): void {
+function writeBenchRows(rows: WorkflowWithSteps[]): void {
   try {
     localStorage.setItem(BENCH_ROWS, JSON.stringify(rows))
   } catch {
@@ -57,23 +58,28 @@ function writeBenchRows(rows: ScheduleRow[]): void {
   }
 }
 
-let benchSchedules = 0
+let benchWorkflows = 0
 const BENCH_PORT: DelaySendPort = {
   create: async (input) => {
     const option = DELAY_OPTIONS.find((o) => o.expr === input.schedule_expr)
     const row = {
-      id: `SCHED-bench${Date.now().toString(36)}${++benchSchedules}`,
+      id: `WF-bench${Date.now().toString(36)}${++benchWorkflows}`,
       title: input.title,
-      session: input.session ?? NAME,
-      prompt: input.prompt ?? '',
-      command: '',
-      kind: 'tmux',
-      sched_type: 'once',
+      session: input.session,
+      company_id: null,
       enabled: 1,
       deleted: null,
-      schedule_expr: input.schedule_expr,
+      trigger_kind: 'once',
+      schedule_expr: input.schedule_expr ?? null,
       next_run: new Date(Date.now() + (option?.ms ?? 600_000)).toISOString(),
-    } as unknown as ScheduleRow
+      steps: input.steps.map((step, i) => ({
+        id: `WFS-bench${i}`,
+        position: i,
+        title: '',
+        command: '',
+        prompt: step.prompt,
+      })),
+    } as unknown as WorkflowWithSteps
     writeBenchRows([...benchRows(), row])
     return row
   },
