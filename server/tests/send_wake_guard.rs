@@ -53,6 +53,8 @@ fn temp_config() -> (Config, PathBuf) {
         push_sub: None,
         github_token: None,
         statusline_tap: false,
+        isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
+        human_auth: Default::default(),
     };
     (config, dir)
 }
@@ -91,7 +93,7 @@ async fn a_send_may_not_wake_a_claude_session_whose_resume_link_is_gone() {
     let rt = state.runtime_for("ghost").await.unwrap();
     assert!(!rt.alive().await, "precondition: nothing is running, so the send would auto-wake");
 
-    let err = sessions::lifecycle::send_harness_text(&state, "ghost", "PROBE", None)
+    let err = sessions::lifecycle::send_harness_text(&state, "ghost", "PROBE", None, None)
         .await
         .expect_err("the seam must refuse rather than hand the prompt to a shell");
     let msg = format!("{err:?}");
@@ -143,6 +145,7 @@ async fn delegate_reports_undelivered_and_records_no_edge() {
 
     let err = supermux_server::agents::delegate::delegate(
         axum::extract::State(state.clone()),
+        supermux_server::scope::OptCtx(None),
         axum::Json(DelegateInput {
             from: "sender".into(),
             to: "receiver".into(),
@@ -340,6 +343,7 @@ async fn delegate_into_an_open_picker_records_no_edge() {
 
     let err = supermux_server::agents::delegate::delegate(
         axum::extract::State(state.clone()),
+        supermux_server::scope::OptCtx(None),
         axum::Json(DelegateInput {
             from: "sender".into(),
             to: "receiver".into(),

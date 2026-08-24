@@ -130,12 +130,42 @@ pub const SUPERMUX_TASK_SKILL: &str = include_str!("supermux-task.md");
 pub const SUPERMUX_SCHEDULE_NAME: &str = "supermux-schedule";
 pub const SUPERMUX_SCHEDULE_SKILL: &str = include_str!("supermux-schedule.md");
 
+/// The `/supermux-notify` command — the agent's surface for pinging its own
+/// human (fase C). Expands to a scoped `curl` against `POST /api/hook/notify`,
+/// authed by `$SUPERMUX_HOOK_TOKEN` and scope-locked by the server to the
+/// calling session's own pane. The SessionStart briefing names it; this file is
+/// the full how-to it loads on invoke.
+pub const SUPERMUX_NOTIFY_NAME: &str = "supermux-notify";
+pub const SUPERMUX_NOTIFY_SKILL: &str = include_str!("supermux-notify.md");
+
+/// The `/supermux-message` command — the agent's surface for messaging a
+/// same-company teammate (fase C). Expands to a scoped `curl` against
+/// `POST /api/hook/delegate`, authed by `$SUPERMUX_HOOK_TOKEN`; the server forces
+/// the sender to the calling session and refuses a cross-company target with a
+/// uniform 404. The SessionStart briefing names it (with the peer roster); this
+/// file is the full how-to it loads on invoke.
+pub const SUPERMUX_MESSAGE_NAME: &str = "supermux-message";
+pub const SUPERMUX_MESSAGE_SKILL: &str = include_str!("supermux-message.md");
+
+/// The `/supermux-connector` command — the agent's authoring guide for building a
+/// connector into supermux's store (the "Create your own connector" handoff points
+/// the bot here). It teaches the manifest shape, the MCP-server contract, secret
+/// handling via the vault, and the HONEST registration path: the bot authors +
+/// stages, then asks the OWNER to one-tap Register (the admin import), because a
+/// connector definition is GLOBAL and `POST /api/connectors` is `require_admin`.
+/// The SessionStart briefing names it; this file is the full how-to it loads.
+pub const SUPERMUX_CONNECTOR_NAME: &str = "supermux-connector";
+pub const SUPERMUX_CONNECTOR_SKILL: &str = include_str!("supermux-connector.md");
+
 /// The set of commands supermux manages + auto-installs. `(name, content)`.
 /// Adding a row here means it's seeded to `~/.claude/commands/<name>.md` on the
 /// next boot.
 pub const MANAGED_COMMANDS: &[(&str, &str)] = &[
     (SUPERMUX_TASK_NAME, SUPERMUX_TASK_SKILL),
     (SUPERMUX_SCHEDULE_NAME, SUPERMUX_SCHEDULE_SKILL),
+    (SUPERMUX_NOTIFY_NAME, SUPERMUX_NOTIFY_SKILL),
+    (SUPERMUX_MESSAGE_NAME, SUPERMUX_MESSAGE_SKILL),
+    (SUPERMUX_CONNECTOR_NAME, SUPERMUX_CONNECTOR_SKILL),
 ];
 
 /// Skill-name slug rule — no path separators, so a name can never escape the
@@ -366,11 +396,24 @@ pub struct SkillBody {
 }
 
 /// `POST /api/skills/{name}` — create or update; sync to both fs locations.
+///
+/// **P3d owner/admin-only.** A skill write lands attacker-controlled markdown in
+/// two GLOBAL locations — `~/.supermux/skills/<name>.md` and, load-bearingly,
+/// `~/.claude/commands/<name>.md`, the global Claude Code slash-command namespace
+/// that EVERY agent across ALL companies reads and expands into its prompt (a
+/// command `.md` can carry bash-exec). So a scoped member reaching this would be
+/// cross-company injection. Gate FIRST (before the name check) so a member gets
+/// the uniform `NotFound` a nonexistent route gets — no BadRequest oracle — while
+/// owner/admin (and the no-context unit-test caller) pass unchanged. `delegate`/
+/// `wait` on the same agents sub-router stay company-scoped and reachable — this
+/// gate is skills-specific, not a blanket admin route-layer.
 pub async fn upsert(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
     Path(name): Path<String>,
     Json(body): Json<SkillBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    crate::scope::require_admin(ctx.0.as_ref(), &format!("/api/skills/{name}"))?;
     if !valid_skill_name(&name) {
         return Err(AppError::BadRequest(
             "invalid skill name (allowed: letters, digits, '_', '.', '-')".into(),
@@ -382,10 +425,17 @@ pub async fn upsert(
 }
 
 /// `DELETE /api/skills/{name}` — remove from DB + both fs locations.
+///
+/// **P3d owner/admin-only** — same reasoning as [`upsert`]: this removes the
+/// GLOBAL `~/.claude/commands/<name>.md` (+ the supermux copy), so a member could
+/// otherwise sabotage every company's slash-command namespace. Gate first, uniform
+/// 404 for a member (no existence oracle), owner/admin bypass.
 pub async fn delete(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    crate::scope::require_admin(ctx.0.as_ref(), &format!("/api/skills/{name}"))?;
     if !valid_skill_name(&name) {
         return Err(AppError::BadRequest(
             "invalid skill name (allowed: letters, digits, '_', '.', '-')".into(),
@@ -728,6 +778,50 @@ mod tests {
             md.contains("does no natural-language interpretation"),
             "must say the agent parses and the server validates"
         );
+    }
+
+    #[test]
+    fn supermux_connector_template_teaches_authoring_and_the_admin_gate() {
+        // The file IS the bot's only documentation for authoring a connector into
+        // the store. It must carry the marker + frontmatter, name the real manifest
+        // fields + endpoints, and state the load-bearing security truth: a bot
+        // canNOT self-register a GLOBAL connector — the owner one-taps Register.
+        let md = SUPERMUX_CONNECTOR_SKILL;
+        assert!(md.contains(MANAGED_MARKER), "must carry the managed marker");
+
+        let fm = parse_frontmatter(md);
+        assert!(!fm.description.is_empty(), "needs a frontmatter description");
+        assert!(!fm.hint.is_empty(), "needs an argument-hint");
+
+        // The real endpoints this codebase exposes (cited accurately).
+        for ep in [
+            "/api/connectors",
+            "/api/connectors/import",
+            "/api/connectors/{id}/credential",
+            "/api/connectors/{id}/grant",
+        ] {
+            assert!(md.contains(ep), "guide must cite {ep}");
+        }
+        // The manifest vocabulary + the emit/${VAR} placeholder discipline.
+        for token in ["\"id\"", "credentials", "\"emit\"", "${", "agent_authored"] {
+            assert!(md.contains(token), "guide must teach {token}");
+        }
+        // The security invariants — stated in the bot's own terms.
+        assert!(md.contains("require_admin"), "must name the admin gate");
+        assert!(
+            md.to_lowercase().contains("global"),
+            "must say a connector definition is global"
+        );
+        assert!(
+            md.contains("@company:"),
+            "must show the company grant target"
+        );
+        assert!(
+            md.to_lowercase().contains("never inline") || md.to_lowercase().contains("never put a value"),
+            "must forbid inlining secrets"
+        );
+        // It hands off to the owner via the notify command (no self-register).
+        assert!(md.contains("/supermux-notify"), "must ping the owner to register");
     }
 
     #[test]

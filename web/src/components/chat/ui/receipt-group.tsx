@@ -40,7 +40,16 @@ export interface Receipt {
   /** `running` puts the spinner in the check slot. Default `done`. */
   state?: 'done' | 'running'
   /**
-   * The live status of a `running` line — `8s`, `3 subagents · 8s`.
+   * The call did NOT succeed (a genuine failure, not a user decline). Set by
+   * `toReceiptRows` from `ok === false`. The default renderer ignores it and
+   * still draws the check; the GROK SKIN reads the `data-failed` hook this puts
+   * on the row to swap the check for a cross and tint the outcome, so a failed
+   * step cannot read as a pass (the jury's honesty defect). Off grok the DOM
+   * gains only an inert attribute — the pixels are unchanged.
+   */
+  failed?: boolean
+  /**
+   * The STATIC half of a `running` line's status — `3 subagents`.
    *
    * This is what makes the running receipt the turn's ONE live representation
    * (daily-driver QA #7): before it, the elapsed clock lived on a separate
@@ -48,8 +57,25 @@ export interface Receipt {
    * — `◌ notes.md` and `••• notes.md 5s`. The clock belongs to the line that is
    * running, and when that line stops running it resolves into a receipt in
    * place, with the outcome landing where the clock was.
+   *
+   * A STRING, and deliberately only the part that changes on real events: the
+   * elapsed half moved to `statusClock` because it changes on a clock, and the
+   * two must not share a node (see below).
    */
   status?: string
+  /**
+   * The LIVE half — the elapsed clock, as a NODE.
+   *
+   * Split out of `status` because of what a running line IS: it sits inside the
+   * reader-selectable chat track, and re-printing a string here once a second
+   * replaced the text node a drag-select was anchored in, which collapses the
+   * selection on WebKit. The DATA layer hands this slot a component that
+   * advances by mutating its own text node in place (`chat/live-elapsed.tsx`),
+   * so nothing in this group re-renders for time passing. This primitive stays
+   * pure: it decides that the clock shares the `ml-auto` cell with `status`,
+   * and imports no clock of its own.
+   */
+  statusClock?: React.ReactNode
 }
 
 export interface CoalescedReceipt extends Receipt {
@@ -128,7 +154,11 @@ export function ReceiptGroup({ rows, max, onShowAll, surface, className }: Recei
   const { shown, hidden } = capReceipts(lines, max)
 
   return (
-    <Bubble padding="list" surface={surface} className={cn('flex flex-col gap-[7px]', className)}>
+    <Bubble
+      padding="list"
+      surface={surface}
+      className={cn('chat-receipt-group flex flex-col gap-[7px]', className)}
+    >
       {shown.map((line, i) => (
         <ReceiptLine key={`${line.tool}-${i}`} line={line} phone={surface === 'phone'} />
       ))}
@@ -171,6 +201,9 @@ export function ReceiptGroup({ rows, max, onShowAll, surface, className }: Recei
 function ReceiptLine({ line, phone }: { line: CoalescedReceipt; phone?: boolean }) {
   const [expanded, setExpanded] = React.useState(false)
   const running = line.state === 'running'
+  // A genuine failure (grok skin reads `data-failed`); a running line is never
+  // "failed" yet — it has no outcome.
+  const failed = line.failed === true && !running
   const condensed = phone && line.short !== undefined && !expanded
   const label = condensed ? line.short! : line.tool
   const outcome = expanded && line.full !== undefined ? line.full : line.outcome
@@ -178,7 +211,10 @@ function ReceiptLine({ line, phone }: { line: CoalescedReceipt; phone?: boolean 
 
   const body = (
     <>
-      <span className="flex flex-none pt-[3px] text-ink-2">
+      {/* The check slot. The grok skin hides this SVG and draws a cross via
+          `.chat-receipt-glyph::before` when the row is `data-failed`; off grok
+          the check shows unchanged. */}
+      <span className="chat-receipt-glyph flex flex-none pt-[3px] text-ink-2">
         {running ? <SpinnerIcon className="sm-spin" /> : <CheckIcon />}
       </span>
       {/* ONE inline flow, deliberately: the outcome follows the label the way a
@@ -194,13 +230,15 @@ function ReceiptLine({ line, phone }: { line: CoalescedReceipt; phone?: boolean 
             <span className="mx-[7px] inline-flex translate-y-[1px] text-ink-2">
               <ArrowIcon />
             </span>
-            <span className="tabular-nums tracking-[-0.1px] text-ink">{outcome}</span>
+            <span className="chat-receipt-outcome tabular-nums tracking-[-0.1px] text-ink">
+              {outcome}
+            </span>
           </>
         )}
       </span>
       {/* The running line's own clock, in the slot the outcome will take. It
           never competes with an outcome — a line that has one has finished. */}
-      {running && line.status && line.outcome === undefined && (
+      {running && (line.status || line.statusClock) && line.outcome === undefined && (
         <span
           data-testid="chat-receipt-status"
           // `ml-auto` as it always was: the clock sits on the bubble's right
@@ -209,6 +247,8 @@ function ReceiptLine({ line, phone }: { line: CoalescedReceipt; phone?: boolean 
           className="ml-auto flex-none whitespace-nowrap pt-[1px] tabular-nums text-[13px] text-ink-2"
         >
           {line.status}
+          {line.status && line.statusClock ? ' · ' : null}
+          {line.statusClock}
         </span>
       )}
     </>
@@ -217,7 +257,12 @@ function ReceiptLine({ line, phone }: { line: CoalescedReceipt; phone?: boolean 
   const className = 'flex w-full min-w-0 items-start gap-[9px] text-left leading-[1.5]'
   if (!more) {
     return (
-      <div data-testid="chat-receipt" data-state={line.state ?? 'done'} className={className}>
+      <div
+        data-testid="chat-receipt"
+        data-state={line.state ?? 'done'}
+        data-failed={failed || undefined}
+        className={className}
+      >
         {body}
       </div>
     )
@@ -227,6 +272,7 @@ function ReceiptLine({ line, phone }: { line: CoalescedReceipt; phone?: boolean 
       type="button"
       data-testid="chat-receipt"
       data-state={line.state ?? 'done'}
+      data-failed={failed || undefined}
       data-expanded={expanded || undefined}
       aria-expanded={expanded}
       onClick={() => setExpanded((e) => !e)}

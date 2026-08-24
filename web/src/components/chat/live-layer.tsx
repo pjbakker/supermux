@@ -42,21 +42,23 @@ import { SessionMark, type MarkPin } from '../../brand/marks'
 import { eases } from '../../lib/springs'
 
 import type { HarnessEvent } from '../../lib/api/harness'
-import type { PermissionRequestInfo, SessionMode } from '../../lib/api/sessions'
+import type { PermissionRequestInfo, QuestionRequestInfo, SessionMode } from '../../lib/api/sessions'
 import { modeChipLabel } from '../focus-mode/mode-labels'
 import type { TileSession } from '../session-tile/types'
 
 import type { DialogCardView } from './dialog-answer'
-import { formatElapsed, stripEmojiPrefix } from './entries'
+import { stripEmojiPrefix } from './entries'
 import { toReceiptRows } from './grouping'
-import { serverNowMs } from './latency'
+import { ELAPSED_AFTER_MS, LiveElapsed, useElapsedShown } from './live-elapsed'
 import type { OverlayLine } from './use-receipt-overlay'
 import { WorkingRow } from './working-row'
 import {
   CardCode,
   ChoiceCard,
+  ConnectCard,
   DelegationPill,
   FormCard,
+  TakeoverCard,
   InlineCode,
   MARK_SIZE,
   MessageRow,
@@ -190,6 +192,14 @@ export interface LiveLayerProps {
   dialogBusy?: number | 'escape' | null
   /** Index, or `'escape'` for the feedback affordance. */
   onChooseDialog?: (target: number | 'escape') => void
+  /**
+   * Answer the live AskUserQuestion (`session.question_request`) by choosing the
+   * option at this 0-based index. Wired to the `/keys` transport via
+   * `question-answer.ts` (`Down` × index, then `Enter`). Absent → the card draws
+   * its options but does not offer to press keys. Not called for a multi-select
+   * question, which the card draws inert (see `QuestionCard`).
+   */
+  onAnswerQuestion?: (optionIndex: number) => void
   /** What the card became once an answer landed. Dialog outcomes write nothing
    *  to the transcript (a0 §3), so this line is the only record. */
   dialogResolved?: string | null
@@ -207,6 +217,13 @@ export interface LiveLayerProps {
    * and now says the true thing — how long this turn has been waiting.
    */
   stalled?: string | null
+  /**
+   * The pty's live compaction hint (`peek-lens` `compacting`): CC is compacting
+   * the context window, a benign in-progress pause. Owns the working-row label
+   * exactly like `stalled` (they derive from the one `peek.lens.notice`, so at
+   * most one is non-null); labels the row `Compacting context…`.
+   */
+  compacting?: string | null
 }
 
 export function LiveLayer({
@@ -226,8 +243,10 @@ export function LiveLayer({
   dialog,
   dialogBusy = null,
   onChooseDialog,
+  onAnswerQuestion,
   dialogResolved,
   stalled = null,
+  compacting = null,
 }: LiveLayerProps) {
   // The turn is running AND anchored. The anchor is what the elapsed clause
   // counts from, so a row without one would have nothing honest to say.
@@ -235,8 +254,12 @@ export function LiveLayer({
   const target = pendingHandoff(handoff, events, name)
   // A STALL OWNS THE LABEL (see `stalled`). One expression, used by both the
   // overlay group's live line and the working row below it, so the two cannot
-  // disagree about what the session is doing.
-  const activity = stalled ?? session?.activity
+  // disagree about what the session is doing. A live compaction owns it next
+  // (a fixed, friendly label — the verbatim `compacting` line only needs to be
+  // present to fire it); `stalled` and `compacting` are mutually exclusive on
+  // the one PTY line, so their order here is immaterial.
+  const activity =
+    stalled ?? (compacting != null ? 'Compacting context…' : null) ?? session?.activity
 
   // THE ONE LIVE ROW (daily-driver QA #7).
   //
@@ -258,13 +281,23 @@ export function LiveLayer({
     working && !target && overlay.length > 0
       ? {
           label: activity ? stripEmojiPrefix(activity) : overlay[overlay.length - 1].label,
-          status: liveStatus(turnStart, session?.subagents, surface),
+          // The STATIC half only — the subagent count, which changes on an SSE
+          // frame. The elapsed half is `turnStartMs` below: a node the running
+          // line renders itself, so a second passing re-renders nothing here.
+          status: liveStatus(session?.subagents, surface),
+          turnStartMs: turnStart,
         }
       : undefined
 
   const phase = computeLivePhase({
     working,
-    asking: !!(dialog || session?.permission_request || session?.elicitation || signIn),
+    asking: !!(
+      dialog ||
+      session?.question_request ||
+      session?.permission_request ||
+      session?.elicitation ||
+      signIn
+    ),
     handoff: !!target,
   })
   // WHAT KIND of ask, for the one sentence that is spoken aloud. Same ordering
@@ -272,6 +305,7 @@ export function LiveLayer({
   const ask = askKind({
     form: !!session?.elicitation,
     dialog: dialog?.family,
+    question: !!session?.question_request,
     permission: !!session?.permission_request,
     signIn,
   })
@@ -317,7 +351,28 @@ export function LiveLayer({
           the turn does not end, no banner is drawn, and every other signal on
           this surface reads Idle. The peek lens cannot help here (the form is
           not a numbered dialog), so the hook IS the authority. */}
-      {session?.elicitation ? (
+      {session?.browser_takeover ? (
+        // A TAKEOVER ASK OUTRANKS EVEN THE CONNECT CARD — the agent is not
+        // asking for a credential, it is asking for a HUMAN on a page it has
+        // already reached and cannot pass (a login, a 2FA prompt, a CAPTCHA).
+        // The card opens the takeover panel; the drive lock is what actually
+        // pauses the agent while the human is on it.
+        <TakeoverCard
+          key={session.browser_takeover.id ?? `${session.browser_takeover.session}/${session.browser_takeover.reason}`}
+          ask={session.browser_takeover}
+          botName={name}
+        />
+      ) : session?.connect_request ? (
+        // A CONNECT ASK IS THE MOST SPECIFIC HUMAN-IN-THE-LOOP THERE IS — a bot's
+        // `connect(service)` tool that stopped for a credential. It renders the
+        // supermux-native Connect card (secure paste / sign-in → straight to the
+        // vault), NEVER an MCP elicitation. Keyed by request id like the form.
+        <ConnectCard
+          key={session.connect_request.id ?? session.connect_request.connector_id}
+          request={session.connect_request}
+          sessionName={name}
+        />
+      ) : session?.elicitation ? (
         <FormCard
           // A NEW ASK IS A NEW FORM. The card holds the half-typed values in
           // local state, and a session can be asked twice in a row by the same
@@ -343,12 +398,29 @@ export function LiveLayer({
           busy={dialogBusy}
           onChoose={onChooseDialog}
         />
+      ) : session?.question_request ? (
+        // A STRUCTURED QUESTION OUTRANKS THE GENERIC PERMISSION CARD. An
+        // AskUserQuestion reaches chat as `question_request` (the model's own
+        // sentence + its real options), parsed server-side from the tool call —
+        // NOT scraped off the pty like the permission `DialogCard`, because that
+        // scrape does not reliably sight this dialog on the current CC, which is
+        // exactly why it used to fall through to ``Run `AskUserQuestion`?`` with
+        // dead buttons. Drawn above `permission_request` (which the server also
+        // suppresses for this tool) so the answerable card always wins.
+        <QuestionCard ask={session.question_request} onAnswer={onAnswerQuestion} />
       ) : session?.permission_request ? (
         <PermissionCard
           request={session.permission_request}
           dir={session.dir}
           mode={session.permission_request.mode ?? session.mode}
         />
+      ) : session?.status === 'waiting' && session?.waiting_message ? (
+        // The needs-you Notification message, read-only, bound to Waiting. Last
+        // in the chain so a `permission_prompt` (which also raises the rich
+        // PermissionCard above) never double-renders — only `idle_prompt` /
+        // `agent_needs_input`, which have no card, land here. Gating on Waiting
+        // keeps any stale value invisible once the session leaves Waiting.
+        <SystemLine>{session.waiting_message}</SystemLine>
       ) : (
         dialogResolved && <SystemLine>{dialogResolved}</SystemLine>
       )}
@@ -366,7 +438,7 @@ export function LiveLayer({
           // elapsed clock and the subagent count.
           live={
             liveRow
-              ? { label: liveRow.label, status: liveRow.status }
+              ? { label: liveRow.label, status: liveRow.status, turnStartMs: liveRow.turnStartMs }
               : undefined
           }
         />
@@ -488,11 +560,17 @@ export const ASK_SAY: Record<AskKind, string> = {
 export function askKind(s: {
   form: boolean
   dialog?: DialogCardView['family']
+  /** The STRUCTURED AskUserQuestion ask (`session.question_request`). Ranked with
+   *  the dialog's `question` family — it IS a question — and ABOVE `permission`,
+   *  because announcing "Claude is asking for permission" over a content question
+   *  is the one word that would make somebody answer differently. */
+  question?: boolean
   permission: boolean
   signIn: boolean
 }): AskKind {
   if (s.form) return 'form'
   if (s.dialog) return s.dialog
+  if (s.question) return 'question'
   if (s.permission) return 'permission'
   if (s.signIn) return 'sign-in'
   return 'unknown'
@@ -734,6 +812,70 @@ export function commandChip(command: string): string {
 /* ── the ask ─────────────────────────────────────────────────────────────── */
 
 /**
+ * The ANSWERABLE question card — an AskUserQuestion, as the real question with
+ * its real options as clickable buttons.
+ *
+ * This is the fix for verify-matrix finding 4 as it appeared in PRODUCTION: the
+ * card used to depend on a pty sighting (`dialog`, the `question` family) that
+ * the current Claude Code does not reliably produce, so a live AskUserQuestion
+ * fell through to the generic ``Run `AskUserQuestion`?`` permission card with
+ * three inert buttons and "chat can't answer this one yet". `question_request` is
+ * the STRUCTURED payload the server parses straight off the tool call, so the
+ * question and its options are on the card regardless of what the terminal draws.
+ *
+ * It reuses `ChoiceCard` — the same visual family as the permission / connect /
+ * form cards — so a question reads as one of them: the header is the eyebrow, the
+ * question is the ask, each option is a pill. Clicking option `i` answers it in
+ * the pty via `onAnswer(i)` (`Down` × i, then `Enter`; see `question-answer.ts`).
+ *
+ * MULTISELECT is drawn but not pressed (yet): its options carry the terminal
+ * hint and the card offers no `onChoose`, because a multi-select question is
+ * toggled with Space and confirmed with Enter — `Down×i + Enter` would submit a
+ * single choice and answer the WRONG thing. A wrong answer here is worse than the
+ * old dead-end, so the single-select case ships correct and multi-select is a
+ * clearly-marked follow-up rather than a guess.
+ */
+export function QuestionCard({
+  ask,
+  onAnswer,
+}: {
+  ask: QuestionRequestInfo
+  onAnswer?: (optionIndex: number) => void
+}) {
+  const multi = ask.multi_select
+  const options: ChoiceOption[] = ask.options.map((label, i) => ({
+    label,
+    // The first option is the model's own default on a single-select question;
+    // a multi-select card highlights nothing, because nothing is chosen for you.
+    primary: i === 0 && !multi,
+    // A hint, never sent — the digit CC prints beside the row, so the card and
+    // the terminal read the same 1-2-3.
+    kbd: String(i + 1),
+    disabled: multi,
+    hint: multi ? MULTISELECT_HINT : undefined,
+  }))
+  return (
+    <div data-testid="chat-question-card" data-vr="qq-card" data-multi={multi ? 'true' : undefined}>
+      <ChoiceCard
+        eyebrow={ask.header}
+        question={ask.question || 'Claude is asking you to choose.'}
+        options={options}
+        onChoose={onAnswer && !multi ? onAnswer : undefined}
+      />
+      {multi && (
+        <p className="ml-11 mt-[7px] text-[12.6px] tracking-[-0.05px] text-ink-2">
+          {MULTISELECT_HINT}
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** The single line a multi-select question wears until chat can toggle-and-confirm
+ *  it — see `QuestionCard`. Same terminal-first voice the other refusals use. */
+const MULTISELECT_HINT = 'Pick more than one in the terminal — chat answers a single choice for now.'
+
+/**
  * A pending permission dialog, as the one thing on screen that is asking.
  *
  * `permission_request` is the wire OBJECT (`{tool, summary, kind, mode?}`) —
@@ -819,24 +961,20 @@ function shortDir(dir: string): string {
 
 /* ── the hook receipts ───────────────────────────────────────────────────── */
 
-/** The elapsed clause the working row used to carry, on the same two rules: it
- *  counts from the SEND (server clock, not from mount) and it stays off screen
- *  for the first 5s, because a fast turn that prints 1s, 2s, 3s feels slow. */
-const ELAPSED_AFTER_MS = 5_000
-
-function liveStatus(
-  turnStartMs: number | null,
-  subagents?: number,
-  surface?: 'desktop' | 'phone',
-): string | undefined {
+/**
+ * The STATIC clause of the running line's status — everything that is NOT the
+ * clock. The elapsed half the working row used to carry is a `LiveElapsed` node
+ * now (`live-elapsed.tsx`), rendered beside this in the same `ml-auto` cell and
+ * advancing without a render; the two rules it kept are unchanged (it counts
+ * from the SEND on the server clock, and it stays off screen for the first 5s
+ * because a fast turn that prints 1s, 2s, 3s feels slow).
+ */
+function liveStatus(subagents?: number, surface?: 'desktop' | 'phone'): string | undefined {
   // The clock shares the line with the tool label now, and on the phone that
   // line has a 266px bubble to live in. `3 subagents` costs a third of it, and
   // WHAT is running matters more than how many helpers it has — so the count is
   // a desktop clause and the clock is everywhere.
-  const clause = surface !== 'phone' && subagents && subagents >= 2 ? `${subagents} subagents` : ''
-  const elapsedMs = turnStartMs == null ? 0 : serverNowMs() - turnStartMs
-  const elapsed = elapsedMs >= ELAPSED_AFTER_MS ? formatElapsed(elapsedMs) : ''
-  return [clause, elapsed].filter(Boolean).join(' · ') || undefined
+  return surface !== 'phone' && subagents && subagents >= 2 ? `${subagents} subagents` : undefined
 }
 
 /**
@@ -862,10 +1000,14 @@ export function OverlayReceipts({
   pin?: MarkPin
   surface?: 'desktop' | 'phone'
   /** What the last (running) line is doing right now — the label as of this
-   *  frame, and the clock the working row used to carry (QA #7). Absent on a
-   *  group whose turn has ended, where nothing is running any more. */
-  live?: { label: string; status?: string }
+   *  frame, the static status clause, and the turn anchor the clock the working
+   *  row used to carry counts from (QA #7). Absent on a group whose turn has
+   *  ended, where nothing is running any more. */
+  live?: { label: string; status?: string; turnStartMs?: number | null }
 }) {
+  // The 5s rung is a LAYOUT decision (no cell, no gap, under it), so it is made
+  // here and flipped by one scheduled timeout — not by a per-second tick.
+  const showClock = useElapsedShown(live?.turnStartMs, ELAPSED_AFTER_MS)
   const rows = React.useMemo<Receipt[]>(() => {
     const labelled = lines.map((line, i) => ({
       uuid: `${line.at}-${i}`,
@@ -874,12 +1016,24 @@ export function OverlayReceipts({
     const base = toReceiptRows(labelled)
     return base.map((row, i) =>
       i === base.length - 1
-        ? { ...row, state: 'running' as const, status: live?.status }
+        ? {
+            ...row,
+            state: 'running' as const,
+            status: live?.status,
+            // The clock as a NODE: `LiveElapsed` is memoised and mutates its own
+            // text node, so this group re-rendering (a new receipt, a new label)
+            // never disturbs it, and time passing never re-renders this group.
+            statusClock:
+              showClock && live?.turnStartMs != null ? (
+                <LiveElapsed turnStartMs={live.turnStartMs} afterMs={ELAPSED_AFTER_MS} />
+              ) : undefined,
+          }
         : row,
     )
-  }, [lines, live])
+  }, [lines, live, showClock])
   return (
     <MessageRow
+      surface={surface}
       gutter={<SessionMark seed={seed} pin={pin} size={MARK_SIZE.gutter} state="working" label={null} />}
     >
       <ReceiptGroup rows={rows} max={RECEIPT_DEFAULT_MAX} surface={surface} />

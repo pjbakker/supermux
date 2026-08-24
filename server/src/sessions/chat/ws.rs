@@ -44,7 +44,7 @@
 //! and is the one path that serializes an unsealed body — bounded by the
 //! parser's own [`MAX_LINE_BYTES`](super::model::MAX_LINE_BYTES) line ceiling.
 
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -92,17 +92,27 @@ pub const SEED_WARMUP: Duration = Duration::from_millis(1_500);
 /// * `provider == "claude"` — nothing else writes a Claude Code transcript.
 /// * `host_id is None` — a remote session's transcript is on the remote box, so
 ///   the tailer would silently read a local file that is not this conversation.
-/// * not a team lead — a lead's window is multiplexed across teammate panes,
-///   which the A2 single-conversation data plane does not model.
-pub fn chat_eligible(provider: &str, host_id: Option<i64>, team_name: Option<&str>) -> bool {
-    // `team_name` alone is NOT a team signal: with the global agent-teams pref
-    // on, CC ≥2.1.178 writes an implicit solo team for every plain session and
-    // the watcher stamps the column — refusing on the column made the chat
-    // plane 4404-unreachable on real sessions (found live). Only a lead with an
-    // ACTUAL roster (≥1 teammate besides the lead) is refused.
-    provider == "claude"
-        && host_id.is_none()
-        && !team_name.is_some_and(crate::teams::scan::real_team)
+///
+/// **A team LEAD is eligible** (it used to be refused). The refusal's stated
+/// reason — "a lead's window is multiplexed across teammate panes" — does not
+/// hold at the file level: a teammate is a `split-window` pane running its OWN
+/// Claude process with its OWN `sessionId`, so it writes its OWN
+/// `<project>/<uuid>.jsonl`. It is NOT a subagent of the lead (those live under
+/// `<project>/<conv-id>/subagents/` and the tailer already merges them). The
+/// lead's `<project>/<cc_conversation_id>.jsonl` is therefore already exactly
+/// "the lead's own conversation" — the tailer needs no filtering and no new
+/// scope to serve a lead.
+///
+/// What WAS multiplexed is one level down: the POINTER. Teammate panes inherit
+/// `$SUPERMUX_SESSION` + `$SUPERMUX_HOOK_TOKEN` from the tmux session env
+/// (measured live — see `~/team-gap/PHASE0-PROBE.md`), so a teammate's
+/// `SessionStart` used to repoint the LEAD's `cc_conversation_id` at the
+/// teammate's transcript. That is fixed at the source by the pane-attributed
+/// adoption guard in [`crate::hooks::track_conversation_pointer`] (S2), which is
+/// what makes serving a lead here safe. Remote (`host_id`) and non-Claude
+/// refusals are unchanged.
+pub fn chat_eligible(provider: &str, host_id: Option<i64>) -> bool {
+    provider == "claude" && host_id.is_none()
 }
 
 /// Load `name`'s row and refuse anything the chat data plane does not serve.
@@ -115,17 +125,24 @@ async fn eligible_row(state: &AppState, name: &str) -> Result<db::sessions::Sess
     let row = db::sessions::get(&state.pool, name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("session {name}")))?;
-    if !chat_eligible(&row.provider, row.host_id, row.team_name.as_deref()) {
+    if !chat_eligible(&row.provider, row.host_id) {
         return Err(AppError::NotFound(format!("chat is unavailable for session {name}")));
     }
     Ok(row)
 }
 
-/// The session's transcript file, per the DB conversation pointer. A session
-/// with no pointer yet resolves to a path that cannot exist, which every reader
-/// below treats as "empty", never as an error.
+/// The session's transcript file for an explicit `dir` + conversation id. A
+/// session with no pointer yet resolves to a path that cannot exist, which every
+/// reader below treats as "empty", never as an error. Split out from
+/// [`transcript_path`] because the seed path follows the CURRENT conversation
+/// (which can move under an open socket) rather than the row snapshot.
+fn transcript_path_of(dir: &str, conv: &str) -> PathBuf {
+    resumable::project_dir_for(dir).join(format!("{conv}.jsonl"))
+}
+
+/// The session's transcript file, per the DB conversation pointer.
 fn transcript_path(row: &db::sessions::Session) -> PathBuf {
-    resumable::project_dir_for(&row.dir).join(format!("{}.jsonl", row.cc_conversation_id))
+    transcript_path_of(&row.dir, &row.cc_conversation_id)
 }
 
 // ── the history cursor ──────────────────────────────────────────────────────
@@ -293,14 +310,83 @@ pub(crate) fn seed_page(ring: Vec<WireEntry>, oldest_main_offset: Option<u64>, c
     }
 }
 
+/// The seed page for an attached ring, falling back to a windowed disk read of
+/// the transcript tail when the ring produced NOTHING.
+///
+/// A server restart clears the in-memory ring, and the tailer's cold seed can
+/// then degenerate to an empty ring (an over-budget final line snapping the
+/// cursor to EOF — see [`super::tailer`]), or the whole seed window can be
+/// non-renderable. A ring-only seed would show a session that HAS a transcript
+/// as "No conversation yet." for the life of the socket — and, carrying no
+/// cursor, the client never reaches the history route to self-rescue. So when
+/// the ring seed is empty, fall back to the SAME windowed read the history route
+/// serves ([`history_page`], DRY — the windowed-read logic is not duplicated):
+/// it restores `entries` + `has_more` + `next_before`, so the client renders the
+/// tail AND can page `/chat/history`. Defence in depth: this hides an empty ring
+/// from ANY cause, not only the `seed_offset` degeneration.
+pub(crate) fn seed_page_or_disk(
+    ring: Vec<WireEntry>,
+    oldest_main_offset: Option<u64>,
+    path: &FsPath,
+    conv: &str,
+) -> Page {
+    let page = seed_page(ring, oldest_main_offset, conv);
+    if !page.entries.is_empty() {
+        return page;
+    }
+    let disk = history_page(path, conv, u64::MAX, HISTORY_DEFAULT_LIMIT);
+    if disk.entries.is_empty() {
+        page
+    } else {
+        disk
+    }
+}
+
+/// How far back from `before` [`history_page`] parses before falling back to a
+/// whole-file read. A page is `limit` ≤ [`RING_CAP`] entries; a few MB of
+/// transcript holds far more than that, so the newest page (and every early
+/// scroll-back page near EOF) is answered from this window instead of parsing a
+/// 55 MB main transcript from byte 0 — the read that peaked ~1.8 GB RSS on this
+/// host. The window's output is byte-for-byte identical to the full read
+/// whenever it holds MORE than `limit` below-entries (see [`history_page`]); a
+/// page that would need more history than the window covers reparses from 0.
+pub(crate) const HISTORY_TAIL_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
+/// First byte at or after `pos` that begins a transcript line (i.e. just past
+/// the next `\n`), so a windowed parse never starts mid-line. `0` maps to `0`.
+/// `None` when the file cannot be read or `pos` is at/after EOF with no newline.
+fn line_start_at_or_after(path: &FsPath, pos: u64) -> Option<u64> {
+    if pos == 0 {
+        return Some(0);
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(std::io::SeekFrom::Start(pos)).ok()?;
+    let mut buf = Vec::new();
+    let n = BufReader::new(f)
+        .take(super::model::MAX_LINE_BYTES as u64 + 1)
+        .read_until(b'\n', &mut buf)
+        .ok()?;
+    (buf.last() == Some(&b'\n')).then_some(pos + n as u64)
+}
+
 /// The disk backlog **strictly below** `before`, newest-last.
 ///
-/// The tailer owns the live path, so this never competes with it: it re-reads
-/// the file from byte 0 and answers a bounded window. That whole-file read is
-/// the deliberate trade for an explicit, user-driven "scroll further back"
-/// action (it runs on the blocking pool, never per tile — see Task 5's
-/// `chat_tail`, which is ring-only for exactly this reason).
+/// The tailer owns the live path, so this never competes with it. It answers a
+/// bounded window on the blocking pool (never per tile — see Task 5's
+/// `chat_tail`, which is ring-only for exactly this reason), for an explicit,
+/// user-driven "scroll further back" action.
+///
+/// It seeks to a [`HISTORY_TAIL_WINDOW_BYTES`] window ending at `before` and
+/// parses only that; it reparses the whole file from byte 0 **only** when that
+/// window did not hold more than `limit` entries — i.e. when the answer really
+/// does need older history than the window covers (a deep scroll-back, or a
+/// `before` near the start of the file). The newest page and every early
+/// scroll-back page are served from the tail, so a 55 MB team-lead transcript is
+/// not parsed whole to show its last 200 messages.
 pub(crate) fn history_page(path: &FsPath, conv: &str, before: u64, limit: usize) -> Page {
+    if let Some(page) = history_page_windowed(path, conv, before, limit) {
+        return page;
+    }
     let Ok(file) = std::fs::File::open(path) else {
         return Page::empty();
     };
@@ -316,7 +402,46 @@ pub(crate) fn history_page(path: &FsPath, conv: &str, before: u64, limit: usize)
     if below.is_empty() {
         return Page::empty();
     }
-    let window = history_window_start(&below, limit);
+    page_from_below(&below, conv, limit)
+}
+
+/// Try to answer from a [`HISTORY_TAIL_WINDOW_BYTES`] window ending at `before`,
+/// without parsing the whole file.
+///
+/// Returns `Some` only when the window holds **more** than `limit` below-entries
+/// — the exact condition under which its answer is byte-for-byte what the
+/// full-file read would produce: [`history_window_start`] then drops all but the
+/// newest `limit`, and the entries above that cut (the ones a whole-file read
+/// would also have discarded) are the only thing the window is missing. When the
+/// window does NOT hold more than `limit` entries the true page may need older
+/// history, so this returns `None` and the caller reparses from byte 0.
+fn history_page_windowed(path: &FsPath, conv: &str, before: u64, limit: usize) -> Option<Page> {
+    let len = std::fs::metadata(path).ok()?.len();
+    let end = before.min(len);
+    let win_start = line_start_at_or_after(path, end.saturating_sub(HISTORY_TAIL_WINDOW_BYTES))?;
+    if win_start == 0 {
+        // The window already reaches byte 0 — the full read is no more work and
+        // is unconditionally correct, so let the caller do it.
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(std::io::SeekFrom::Start(win_start)).ok()?;
+    let (entries, _) = parse_stream(BufReader::new(file), win_start);
+    let below: Vec<&ChatEntry> = entries
+        .iter()
+        .filter(|e| e.offset < before && !e.is_sidechain)
+        .collect();
+    // `>` not `>=`: a full page needs at least one entry ABOVE the returned
+    // window, both so `has_more`/`next_before` are correct and so the newest
+    // `limit` entries are provably complete within the window.
+    (below.len() > limit).then(|| page_from_below(&below, conv, limit))
+}
+
+/// Seal the newest `limit`-worth of `below` (newest-last), apply the page byte
+/// budget and line alignment, and stamp the paging cursor. Shared by the
+/// windowed and whole-file [`history_page`] paths so both cap and cut the same.
+fn page_from_below(below: &[&ChatEntry], conv: &str, limit: usize) -> Page {
+    let window = history_window_start(below, limit);
     // Both caps, on the same code path the seed uses: `seal` per entry, then
     // the page byte budget, then line alignment.
     let sealed: Vec<WireEntry> = below[window..]
@@ -533,7 +658,10 @@ pub async fn handle_chat_ws(
     headers: HeaderMap,
 ) -> Response {
     let origin_ok = crate::ws::origin_allowed(&state, &headers);
-    ws.on_upgrade(move |socket| chat_socket(socket, name, state, origin_ok))
+    // P3b — resolve the human company scope from the pre-upgrade cookie (same as
+    // the terminal socket); `None` ⇒ the in-band owner-bearer path.
+    let human_scope = crate::ws::resolve_ws_scope(&state, &headers).await;
+    ws.on_upgrade(move |socket| chat_socket(socket, name, state, origin_ok, human_scope))
 }
 
 async fn send_frame(socket: &mut WebSocket, v: &Value) -> bool {
@@ -563,6 +691,7 @@ fn status_frame(kind: &str, status: TailStatus, extra: &[(&str, Value)]) -> Valu
 async fn push_seed(
     socket: &mut WebSocket,
     store: &ChatStore,
+    dir: &str,
     conv: &str,
     status: TailStatus,
     resync_reason: Option<&str>,
@@ -577,7 +706,18 @@ async fn push_seed(
     let att = store.attach();
     let high_water = att.high_water;
     let rx = att.rx;
-    let page = seed_page(att.ring, att.oldest_main_offset, conv);
+    // The seed compose runs on the blocking pool: it is the same disk-backed
+    // read the history route already spawn_blocking's, and even the ring-only
+    // path serializes every ring entry to measure the byte budget.
+    let path = transcript_path_of(dir, conv);
+    let conv_owned = conv.to_string();
+    let ring = att.ring;
+    let oldest = att.oldest_main_offset;
+    let page = tokio::task::spawn_blocking(move || {
+        seed_page_or_disk(ring, oldest, &path, &conv_owned)
+    })
+    .await
+    .unwrap_or_else(|_| Page::empty());
     let mut frame = page.json();
     if let Some(obj) = frame.as_object_mut() {
         obj.insert("type".to_string(), json!("seed"));
@@ -646,17 +786,32 @@ fn stop_close_code(retry: bool) -> u16 {
     }
 }
 
-async fn chat_socket(mut socket: WebSocket, name: String, state: AppState, origin_ok: bool) {
+async fn chat_socket(
+    mut socket: WebSocket,
+    name: String,
+    state: AppState,
+    origin_ok: bool,
+    human_scope: Option<crate::scope::Scope>,
+) {
     use crate::ws::{close, verify_auth_frame, AUTH_TIMEOUT, CLOSE_NOT_RUNNING, PING_EVERY, PONG_DEADLINE};
 
     if !origin_ok {
         close(&mut socket, close_code::POLICY, "origin not allowed").await;
         return;
     }
-    // First-frame auth — byte-identical contract to the terminal socket.
-    let authed = match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(t)))) => verify_auth_frame(&state, t.as_str()),
-        _ => false,
+    // First-frame auth — byte-identical contract to the terminal socket. A human
+    // resolved from the cookie pre-upgrade is already authenticated; its first
+    // frame is consumed (never injected) but not required to be a bearer.
+    let first = match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
+        Ok(Some(Ok(Message::Text(t)))) => Some(t),
+        _ => None,
+    };
+    let authed = match human_scope {
+        Some(_) => true,
+        None => first
+            .as_deref()
+            .map(|t| verify_auth_frame(&state, t))
+            .unwrap_or(false),
     };
     if !authed {
         close(&mut socket, close_code::POLICY, "auth required").await;
@@ -685,7 +840,17 @@ async fn chat_socket(mut socket: WebSocket, name: String, state: AppState, origi
             return;
         }
     };
-    if !chat_eligible(&row.provider, row.host_id, row.team_name.as_deref()) {
+    // P3b company gate. A scoped human may open only their own company's chat.
+    // The row is already loaded here (before the tailer subscribe), so gate it
+    // in place; a mismatch closes with the SAME 4404 "no session" a nonexistent
+    // slug gets (hide existence). Owner/admin (Scope::All / no cookie) bypass.
+    if let Some(scope @ crate::scope::Scope::Company(_)) = human_scope {
+        if !scope.sees(row.company_id) {
+            close(&mut socket, CLOSE_NOT_RUNNING, CLOSE_REASON_NO_SESSION).await;
+            return;
+        }
+    }
+    if !chat_eligible(&row.provider, row.host_id) {
         tracing::debug!(session = %name, provider = %row.provider, "chat ws refused: ineligible");
         close(&mut socket, CLOSE_NOT_RUNNING, CLOSE_REASON_INELIGIBLE).await;
         return;
@@ -715,7 +880,7 @@ async fn chat_socket(mut socket: WebSocket, name: String, state: AppState, origi
         return;
     }
     let Some((mut high_water, mut rx)) =
-        push_seed(&mut socket, &store, &conv, status, None).await
+        push_seed(&mut socket, &store, &row.dir, &conv, status, None).await
     else {
         return;
     };
@@ -748,7 +913,7 @@ async fn chat_socket(mut socket: WebSocket, name: String, state: AppState, origi
                     Forward::Skip => {}
                     Forward::Resync => {
                         refresh_conv(&state, &name, &mut conv).await;
-                        match push_seed(&mut socket, &store, &conv, lease.status(), Some("lagged")).await {
+                        match push_seed(&mut socket, &store, &row.dir, &conv, lease.status(), Some("lagged")).await {
                             Some((hw, fresh)) => { high_water = hw; rx = fresh; }
                             None => break,
                         }
@@ -775,7 +940,7 @@ async fn chat_socket(mut socket: WebSocket, name: String, state: AppState, origi
                             // NEW id or the history route will 409 it.
                             epoch = status.resync_epoch;
                             refresh_conv(&state, &name, &mut conv).await;
-                            match push_seed(&mut socket, &store, &conv, status, Some("conversation changed")).await {
+                            match push_seed(&mut socket, &store, &row.dir, &conv, status, Some("conversation changed")).await {
                                 Some((hw, fresh)) => { high_water = hw; rx = fresh; }
                                 None => break,
                             }
@@ -955,29 +1120,41 @@ mod tests {
     #[test]
     fn chat_eligibility_matches_the_client_guard() {
         // web/src/components/chat/flag.ts: `provider === 'claude' && host_id ==
-        // null && !isTeamLead`. The client guard hides the UI; THIS one is what
-        // makes it a guard — a hand-rolled socket cannot tail a codex session,
-        // a remote host's transcript, or a team lead's spliced pane.
-        assert!(chat_eligible("claude", None, None));
-        assert!(!chat_eligible("codex", None, None), "provider must be claude");
+        // null`. The client guard hides the UI; THIS one is what makes it a
+        // guard — a hand-rolled socket cannot tail a codex session or a remote
+        // host's transcript.
+        assert!(chat_eligible("claude", None));
+        assert!(!chat_eligible("codex", None), "provider must be claude");
         // A legacy row carrying a provider supermux no longer ships must be
         // handled as "not eligible", never as an unknown that falls through.
-        assert!(!chat_eligible("a-retired-provider", None, None));
-        assert!(!chat_eligible("shell", None, None));
+        assert!(!chat_eligible("a-retired-provider", None));
+        assert!(!chat_eligible("shell", None));
         assert!(
-            !chat_eligible("claude", Some(3), None),
+            !chat_eligible("claude", Some(3)),
             "a remote host's transcript is not on this filesystem"
         );
-        // `Some(team_name)` alone no longer refuses: the column is polluted by
-        // CC's implicit solo teams (one per plain session with agent-teams on).
-        // With no on-disk roster for "squad", it's not a real team → eligible.
+    }
+
+    /// S1 (§R2.2): a team LEAD is a first-class chat thread. The old rule
+    /// refused any session whose `team_name` resolved to a real on-disk roster;
+    /// the parameter is gone entirely, so no team shape can refuse — while the
+    /// two refusals that are about the DATA PLANE (not the team model) stay.
+    #[test]
+    fn a_team_lead_is_chat_eligible_but_codex_and_remote_still_are_not() {
+        // The lead of a real, multi-member team: eligible. Its own
+        // `<project>/<cc_conversation_id>.jsonl` is exactly the file the tailer
+        // already serves; the pointer is kept honest by the pane-attributed
+        // adoption guard in `hooks::track_conversation_pointer`.
         assert!(
-            chat_eligible("claude", None, Some("squad")),
-            "a rosterless team_name (the solo-implicit pollution) must stay eligible"
+            chat_eligible("claude", None),
+            "a team lead must be a first-class bot thread (S1)"
         );
-        // A REAL team (roster with a teammate) still refuses — proven at the
-        // path-parameterized level in teams::scan::tests (real_team_in); the
-        // fs-backed default resolver is exercised here only for the None path.
+        // …and lifting the refusal must not lift the other two.
+        assert!(!chat_eligible("codex", None), "a codex lead has no Claude transcript");
+        assert!(
+            !chat_eligible("claude", Some(7)),
+            "a remote lead's transcript lives on the remote box"
+        );
     }
 
     // ── the history cursor ──────────────────────────────────────────────────
@@ -1161,6 +1338,126 @@ mod tests {
             page.entries.iter().map(|w| w.uuid()).collect::<Vec<_>>(),
             ["u0", "u1"],
             "sidechain lines are the subagent files' content, not the main thread's"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── the seed's disk fallback: an empty ring never blanks a real transcript ─
+
+    #[test]
+    fn an_empty_ring_seeds_the_tail_from_disk_when_a_transcript_exists() {
+        // The exact restart-cleared / degenerate-cold-seed state: the ring is
+        // empty but a transcript is on disk. A ring-only seed would show
+        // "No conversation yet." for the socket's whole life, with no cursor for
+        // the client to page /chat/history. The fallback must reuse `history_page`
+        // to restore entries + has_more + next_before.
+        let dir = tmp_dir("seeddiskfallback");
+        let path = dir.join("conv-a.jsonl");
+        // More than HISTORY_DEFAULT_LIMIT lines, so the newest page leaves older
+        // ones below it (has_more) and hands out a cursor (next_before).
+        let lines: Vec<String> =
+            (0..300).map(|i| user_line(&format!("u{i}"), "a modest line")).collect();
+        write_lines(&path, &lines);
+
+        let page = seed_page_or_disk(Vec::new(), None, &path, "conv-a");
+        assert!(!page.entries.is_empty(), "an existing transcript must never seed blank");
+        assert!(page.has_more, "older entries remain below the tail page");
+        assert!(page.next_before.is_some(), "…and the client is handed a paging cursor");
+        assert_eq!(page.entries.last().unwrap().uuid(), "u299", "the tail ends at EOF");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_disk_fallback_only_fires_for_an_empty_ring() {
+        // A populated ring is served verbatim; the disk is not even consulted.
+        let dir = tmp_dir("seedringwins");
+        let path = dir.join("conv-a.jsonl");
+        write_lines(&path, &[user_line("d0", "on disk")]);
+        let ring = vec![wire(1, "r0", 0, "from the ring")];
+        let page = seed_page_or_disk(ring, Some(0), &path, "conv-a");
+        assert_eq!(
+            page.entries.iter().map(|w| w.uuid()).collect::<Vec<_>>(),
+            ["r0"],
+            "a non-empty ring is authoritative — no disk read"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_empty_ring_and_no_transcript_stays_empty() {
+        // No file on disk (a session never spoken to): the fallback finds nothing
+        // and the seed is a well-formed empty page — never an error.
+        let dir = tmp_dir("seednodisk");
+        let path = dir.join("conv-a.jsonl"); // deliberately never created
+        let page = seed_page_or_disk(Vec::new(), None, &path, "conv-a");
+        assert!(page.entries.is_empty());
+        assert!(!page.has_more);
+        assert!(page.next_before.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_tail_window_matches_a_full_read_on_a_large_transcript() {
+        // The tail-seek must be an OPTIMISATION, never a behaviour change: on a
+        // main transcript larger than the window, the newest page it answers from
+        // an 8 MB tail must be byte-for-byte what a whole-file parse produces —
+        // and the whole-file read of a 55 MB team-lead transcript is exactly what
+        // this avoids (it peaked ~1.8 GB RSS on this host).
+        let dir = tmp_dir("histwindow");
+        let path = dir.join("conv-a.jsonl");
+        // A file comfortably past HISTORY_TAIL_WINDOW_BYTES.
+        let pad = "y".repeat(160);
+        let n = ((HISTORY_TAIL_WINDOW_BYTES / 200) + 20_000) as usize;
+        {
+            let mut fh = std::fs::File::create(&path).unwrap();
+            for i in 0..n {
+                writeln!(fh, "{}", user_line(&format!("u{i}"), &pad)).unwrap();
+            }
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > HISTORY_TAIL_WINDOW_BYTES);
+
+        // The whole-file expectation, computed the long way.
+        let full_page = |before: u64, limit: usize| -> Page {
+            let (entries, _) = parse_stream(BufReader::new(std::fs::File::open(&path).unwrap()), 0);
+            let below: Vec<&ChatEntry> =
+                entries.iter().filter(|e| e.offset < before && !e.is_sidechain).collect();
+            page_from_below(&below, "conv-a", limit)
+        };
+
+        // Newest page: the window MUST answer it, and identically.
+        let win = history_page_windowed(&path, "conv-a", u64::MAX, 200)
+            .expect("a file past the window must answer its newest page from the tail");
+        let full = full_page(u64::MAX, 200);
+        assert_eq!(
+            win.entries.iter().map(|w| w.uuid()).collect::<Vec<_>>(),
+            full.entries.iter().map(|w| w.uuid()).collect::<Vec<_>>(),
+            "windowed newest page must equal the full read"
+        );
+        assert_eq!(win.next_before, full.next_before);
+        assert_eq!(win.has_more, full.has_more);
+        assert_eq!(win.entries.last().unwrap().uuid(), format!("u{}", n - 1), "…ending at EOF");
+
+        // The public entry point returns the same thing.
+        let public = history_page(&path, "conv-a", u64::MAX, 200);
+        assert_eq!(
+            public.entries.iter().map(|w| w.uuid()).collect::<Vec<_>>(),
+            full.entries.iter().map(|w| w.uuid()).collect::<Vec<_>>(),
+        );
+
+        // A `before` deep enough that fewer than `limit` entries sit below it →
+        // the window cannot prove completeness, so it declines and the caller
+        // reparses from 0 (which the public path does, correctly).
+        let deep = 50u64 * 200; // ~byte offset of the 50th entry
+        assert!(
+            history_page_windowed(&path, "conv-a", deep, 200).is_none(),
+            "a page needing more history than the window covers must fall back"
+        );
+        let public_deep = history_page(&path, "conv-a", deep, 200);
+        let full_deep = full_page(deep, 200);
+        assert_eq!(
+            public_deep.entries.iter().map(|w| w.uuid()).collect::<Vec<_>>(),
+            full_deep.entries.iter().map(|w| w.uuid()).collect::<Vec<_>>(),
+            "the fallback still serves the correct page"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

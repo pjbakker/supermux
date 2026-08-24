@@ -32,7 +32,9 @@
 import { useParams, useSearchParams } from 'react-router-dom'
 
 import { MobileFocus } from '@/routes/focus/mobile'
+import { useViewportShellVars } from '@/hooks/use-keyboard-viewport'
 import { MOCK_TILES } from '@/components/session-tile/mock'
+import { mockTeamsForLead } from '@/routes/dev-teams.fixture'
 import { useUI } from '@/stores/ui-store'
 import {
   DEFAULT_KEY_BAR_STATE,
@@ -60,8 +62,21 @@ try {
 const FOCUS_NAME =
   MOCK_TILES.find((t) => t.name === 'web-app')?.name ?? MOCK_TILES[0]?.name ?? ''
 
+// A mock team whose lead maps to the FIRST mock tile, exactly as /dev/focus
+// does (Phase 0.2). Without it the phone focus bench renders the teammate strip
+// empty, so the one surface that has to be reviewed at 390px — a lead WITH a
+// crew — was the one surface the bench could not show.
+const MOCK_FOCUS_TEAMS = mockTeamsForLead(MOCK_TILES[0]?.name ?? '')
+
 export default function DevFocusMobile() {
   const { name } = useParams()
+  // This bench renders <MobileFocus> DIRECTLY, outside <Layout> — which is the
+  // ONLY place the app mounts the viewport-shell-var publisher (layout.tsx:424).
+  // Mount it here too so `--vvh` / `--vv-offset-top` are LIVE-published off
+  // `window.visualViewport` exactly as in production, letting an offline rig fake
+  // the visual viewport and verify MobileSheet's visual-viewport pin end to end.
+  // DEV-only route → tree-shaken from prod; the base app is untouched.
+  useViewportShellVars()
   // `?chat=1` — seed the experiment ON for this review. Written during render on
   // purpose: `useUI` is read by <MobileFocus> in the SAME pass, so an effect
   // would paint one frame of the terminal composition into every screenshot.
@@ -70,12 +85,27 @@ export default function DevFocusMobile() {
   // reviewer who wants it off again drops the param and flips the Settings
   // toggle, which is the same switch).
   const [params] = useSearchParams()
-  if (params.get('chat') === '1' && !useUI.getState().chatRenderer) {
-    useUI.setState({ chatRenderer: true })
+  // `?grok=1` (DEV-only) — stamp `data-grok` on the wrapper so the grok-scoped
+  // chat CSS applies here (this route renders <MobileFocus> DIRECTLY, outside
+  // <Layout>, which is the only place the app stamps `data-grok` —
+  // layout.tsx:418 — so without this the grok chat surface never gets its skin).
+  // Bare `data-grok`, mirroring /dev/store · /dev/roster · /dev/pickers (never
+  // `data-grok-root`, whose shell-root substrate is not this bench's ground).
+  // Byte-inert when off: production + the base app are untouched.
+  const grok = import.meta.env.DEV && params.get('grok') === '1'
+  // `?chat=1` — and `?grok=1` — seed the fase-A5 bot composition ON so the CHAT
+  // surface (header card + transcript + composer) renders under the skin, not
+  // the terminal focus. Written during render on purpose (see below).
+  if ((params.get('chat') === '1' || grok) && !useUI.getState().botMode) {
+    useUI.setState({ botMode: true })
   }
   return (
-    <div className="h-dvh w-full">
-      <MobileFocus mockSessions={MOCK_TILES} mockName={name || FOCUS_NAME} />
+    <div {...(grok ? { 'data-grok': '' } : {})} className="h-dvh w-full">
+      <MobileFocus
+        mockSessions={MOCK_TILES}
+        mockTeams={MOCK_FOCUS_TEAMS}
+        mockName={name || FOCUS_NAME}
+      />
     </div>
   )
 }

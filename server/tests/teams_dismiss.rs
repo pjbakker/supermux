@@ -45,6 +45,8 @@ async fn dismiss_parks_unmapped_team_under_archived() {
         push_sub: None,
         github_token: None,
         statusline_tap: false,
+        isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
+        human_auth: Default::default(),
     };
     let pool = db::init(&config).await.expect("db init");
     let app = http::router(AppState::new(pool, config));

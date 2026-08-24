@@ -324,6 +324,108 @@ impl NativeSession {
         env: &HashMap<String, String>,
         shell: &str,
     ) -> Result<()> {
+        self.spawn_confined(dir, env, shell, None).await.map(|_| ())
+    }
+
+    /// Like [`spawn`](Self::spawn), plus an optional per-spawn OS-sandbox
+    /// confinement (companies §4.4) applied INSIDE the holder child, post-fork /
+    /// pre-exec, so it is inherited across `exec` and is unescapable by the
+    /// agent. `plan` is `Some` only for a COMPANY session under a non-`Off`
+    /// isolation mode.
+    ///
+    /// The holder must bind its unix socket and write its spool under
+    /// [`self.dir`](Self::dir), so that dir is granted RW on the plan before it
+    /// is moved into the child (otherwise a *fully-enforced* Landlock jail would
+    /// deny the holder its own socket). On THIS box the confinement measures
+    /// `None` (the `@system-service` filter blocks `landlock_*`), so the child
+    /// execs unconfined — fail-open per §4.4.
+    /// Returns `Ok(true)` when the confined holder could NOT boot under the jail
+    /// and was RETRIED unconfined (the fail-safe), so the caller can record the
+    /// applied isolation level as `None`/degraded; `Ok(false)` on a clean start.
+    pub async fn spawn_confined(
+        &self,
+        dir: &Path,
+        env: &HashMap<String, String>,
+        shell: &str,
+        plan: Option<crate::isolation::ConfinePlan>,
+    ) -> Result<bool> {
+        let confined = plan.is_some();
+        match self.spawn_holder_once(dir, env, shell, plan).await {
+            // The confined holder BOOTED. Belt-and-suspenders agent-exec fail-safe
+            // (companies §4.4): the holder itself came up, but a jailed AGENT whose
+            // provider binary is not reachable under the Landlock allow-list execs,
+            // fails immediately, and the holder's child dies within a short window.
+            // Watch that window; if the session died abnormally right after boot,
+            // retry UNCONFINED so the bot still starts and record the degradation.
+            Ok(()) if confined => {
+                if self.confined_agent_died_quickly().await && !self.alive().await {
+                    tracing::error!(
+                        session = %self.name,
+                        "company isolation degraded: the confined agent exited immediately \
+                         after boot (provider binary likely unreachable under the Landlock \
+                         jail), retrying UNCONFINED — check the allow-list (server/src/isolation)"
+                    );
+                    self.spawn_holder_once(dir, env, shell, None).await?;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Ok(()) => Ok(false),
+            // FAIL-SAFE (companies §4.4): a company bot must NEVER be left
+            // un-startable because of isolation. If the confined holder could not
+            // boot under the Landlock jail — the "holder did not come up in time"
+            // timeout, or an exec / pre_exec failure at boot — retry the spawn
+            // UNCONFINED so the agent still starts, and signal the degradation so
+            // the applied level is recorded honestly (None) by the caller.
+            Err(e) if confined => {
+                // Race guard: if the confined holder actually came up JUST after
+                // the timeout, keep it — isolation is intact, no degradation.
+                if self.alive().await {
+                    return Ok(false);
+                }
+                tracing::error!(
+                    session = %self.name,
+                    error = %format!("{e:#}"),
+                    "company isolation degraded: holder failed under Landlock, started \
+                     unconfined — check the allow-list (server/src/isolation)"
+                );
+                self.spawn_holder_once(dir, env, shell, None).await?;
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// After a confined holder BOOTS, watch a short window for the AGENT exiting
+    /// abnormally — the failure mode the holder-boot fail-safe cannot see, where
+    /// the holder came up but the jailed provider binary is unreachable, so the
+    /// holder's child execs, fails, and dies within milliseconds. Returns `true`
+    /// if the session died inside the window. A session that stays alive (the
+    /// normal case) returns `false` after the window; the bounded wait keeps the
+    /// added start latency small and never fires on a healthy long-running agent.
+    async fn confined_agent_died_quickly(&self) -> bool {
+        const WINDOW: Duration = Duration::from_millis(400);
+        const STEP: Duration = Duration::from_millis(20);
+        let deadline = std::time::Instant::now() + WINDOW;
+        while std::time::Instant::now() < deadline {
+            if self.dead().await {
+                return true;
+            }
+            tokio::time::sleep(STEP).await;
+        }
+        false
+    }
+
+    /// One holder-spawn attempt with an optional confinement `plan`. The retry
+    /// seam ([`spawn_confined`](Self::spawn_confined)) calls this up to twice: once
+    /// confined, then — only if that could not boot — once unconfined.
+    async fn spawn_holder_once(
+        &self,
+        dir: &Path,
+        env: &HashMap<String, String>,
+        shell: &str,
+        mut plan: Option<crate::isolation::ConfinePlan>,
+    ) -> Result<()> {
         if self.alive().await {
             bail!("native session '{}' is already running", self.name);
         }
@@ -388,16 +490,48 @@ impl NativeSession {
         // future non-main entry point) cannot reintroduce it.
         // See `sessions::lifecycle::AGENT_NESTING_ENV`.
         for key in crate::sessions::lifecycle::AGENT_NESTING_ENV {
-            if !env.contains_key(*key) {
-                cmd.env_remove(key);
+            // UNCONDITIONAL. The old `if !env.contains_key` guard PRESERVED a
+            // marker whenever the per-session `env` map itself carried it — and
+            // on the nested-daemon path that map is built from an unscrubbed
+            // snapshot that still holds CLAUDE_CODE_SESSION_ID / _CHILD_SESSION,
+            // so the guard skipped the removal and every holder shipped with
+            // CLAUDE_CODE_CHILD_SESSION=1. That turns Claude's transcript
+            // saving OFF, and the chat plane (whose only data source is that
+            // transcript) renders empty for a session whose pty is perfectly
+            // alive. `env_remove` after `envs(env)` wins, so this strips the
+            // marker no matter how it reached the map.
+            cmd.env_remove(key);
+        }
+        // Belt-and-suspenders: force Claude's transcript persistence on even if
+        // some ancestor disabled it. Harmless for providers that ignore it.
+        cmd.env("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1");
+        // COMPANY-SESSION CONFINEMENT (companies §4.4). Grant the holder its own
+        // spool/socket dir RW so a fully-enforced Landlock jail does not deny it
+        // its socket, then move the plan into the pre-exec closure below. `None`
+        // for main/PA bots and under isolation_mode=off — the closure then does
+        // only the historical `setsid`. The holder BINARY path (current_exe) is
+        // on the allow-list via `SandboxSpec::for_company`; the socket's PARENT
+        // dir is granted RW just below — both required for a FULLY-enforced jail
+        // to let the holder re-exec + bind its socket.
+        if let Some(p) = plan.as_mut() {
+            p.allow_rw(self.dir.clone());
+            if let Some(parent) = self.socket.parent() {
+                p.allow_rw(parent.to_path_buf());
             }
         }
         // SAFETY: `setsid` is async-signal-safe. It detaches the holder from
         // the daemon's session/process group so a signal aimed at the daemon
-        // (or its group) can never reach a holder or its agent.
+        // (or its group) can never reach a holder or its agent. The optional
+        // `plan.apply_in_child()` runs Landlock `restrict_self()` on the forked
+        // child (pre-exec): it performs only Landlock syscalls + `open(2)` on
+        // pre-owned paths, and under BestEffort it fails OPEN (never aborts the
+        // spawn) — a `None`/blocked measurement still lets the child exec.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 libc::setsid();
+                if let Some(p) = plan.as_ref() {
+                    p.apply_in_child()?;
+                }
                 Ok(())
             });
         }

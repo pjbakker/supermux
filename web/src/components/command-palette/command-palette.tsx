@@ -48,12 +48,14 @@ import * as React from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Archive,
+  Bot,
   CalendarClock,
   Command as CommandIcon,
   FolderClosed,
   FolderPlus,
   LayoutGrid,
   Moon,
+  Plug,
   ServerCog,
   Settings as SettingsIcon,
   SlidersHorizontal,
@@ -76,7 +78,9 @@ import { type ApiSession, type SlashCommand } from '@/lib/api'
 import { SessionFace } from '@/components/roster/session-face'
 import { useArchivedSheet } from '@/stores/archived-sheet-store'
 import { useNewGroupAction } from '@/stores/new-group-store'
+import { useNewSessionAction } from '@/stores/new-session-store'
 import { useAgentToolsSheet } from '@/stores/claude-tools-store'
+import { useOverlayGate } from '@/stores/overlay-gate-store'
 import { AgentToolsHost } from '@/components/claude-tools/claude-tools-host'
 import { SnippetsManagerHost } from '@/components/snippets/snippets-manager-host'
 import { Kbd } from '@/components/ui/kbd'
@@ -88,6 +92,9 @@ import { rankEntities, type RankText } from '@/lib/rank'
 import { composerKeyIntent, jumpTarget } from '@/components/chat/composer-keys'
 import { useTheme } from '@/components/theme-provider'
 import { useMediaQuery } from '@/hooks/use-media-query'
+import { useUI } from '@/stores/ui-store'
+import { botModeOn, BOT_KILL_SWITCH_KEY } from '@/lib/bot-mode-flag'
+import { GROK_KILL_SWITCH_KEY } from '@/lib/grok-mode-flag'
 
 // ── Rows ─────────────────────────────────────────────────────────────────────
 //
@@ -192,6 +199,7 @@ export function CommandPalette() {
   // The Overview installs its handler while mounted; absent on every other
   // route, so the "New group" row is conditionally surfaced below.
   const newGroupAction = useNewGroupAction((s) => s.action)
+  const newSessionAction = useNewSessionAction((s) => s.action)
 
   const { toast } = useToast()
   const { resolvedTheme, setTheme } = useTheme()
@@ -203,6 +211,25 @@ export function CommandPalette() {
   // inset and no allowance for a soft keyboard. Same fork every other sheet in
   // the app uses.
   const coarse = useMediaQuery('(pointer: coarse)')
+
+  // GROK MODE — the palette is a Radix Dialog PORTALLED to <body>, a sibling of
+  // the shell root, so the `data-grok` attribute layout puts on that root cannot
+  // reach it (styles/grok-mode.css WS7). Read the flag once at mount — the same
+  // decision (`grokModeOn`) and the same "read once, don't re-render on toggle"
+  // discipline layout.tsx uses — and stamp `data-grok` on the Content ITSELF
+  // below, so the picker's glass rules apply to the portalled box. Absent when
+  // off, so the default palette's DOM is byte-identical.
+  const [grok] = React.useState(() =>
+    botModeOn(
+      useUI.getState().botMode,
+      typeof localStorage === 'undefined'
+        ? null
+        : localStorage.getItem(BOT_KILL_SWITCH_KEY),
+      typeof localStorage === 'undefined'
+        ? null
+        : localStorage.getItem(GROK_KILL_SWITCH_KEY),
+    ),
+  )
 
   const [query, setQuery] = React.useState('')
   // `viaKey` rides with the index because the picker scrolls the active row
@@ -254,6 +281,16 @@ export function CommandPalette() {
     el.focus()
   }, [])
 
+  // Raise the shared overlay gate while the palette is open, so top-anchored
+  // coachmarks (the onboarding WelcomeBanner) suppress themselves instead of
+  // rendering over the palette's search input + first rows. The cleanup lowers
+  // the gate on close (open→false) AND on unmount, and the store is a counter so
+  // a second overlay can't let this one's close prematurely re-show the banner.
+  React.useEffect(() => {
+    if (!open) return
+    return useOverlayGate.getState().openOverlay()
+  }, [open])
+
   // ⌘K toggles THROUGH the wrapper, so the reset-on-open above is the one and
   // only definition of "the palette opened" (fase B3 T1.4).
   useGlobalCommandKey(React.useCallback(() => setOpen((v) => !v), [setOpen]))
@@ -291,6 +328,7 @@ export function CommandPalette() {
       go('/', 'Overview', 'home sessions roster tiles dashboard start', LayoutGrid),
       go('/focus', 'Focus', 'terminal session pane current agent', Terminal),
       go('/files', 'Files', 'file tree browse edit diff working directory', FolderClosed),
+      go('/store', 'Connectors', 'connector store mcp integrations add tools plugins connect catalog', Plug),
       go('/settings', 'Settings', 'preferences config options update theme', SettingsIcon),
       go(
         '/settings#schedules',
@@ -337,6 +375,19 @@ export function CommandPalette() {
       group: 'Actions',
     })
     const base = [
+      // The create verb — FIRST, so ⌘K has an obvious way to start a bot. Only
+      // present while a surface (roster/overview) has installed the opener.
+      ...(newSessionAction
+        ? [
+            mk(
+              'action:new-bot',
+              'New bot',
+              'new bot session create hire agent start spawn',
+              Bot,
+              newSessionAction,
+            ),
+          ]
+        : []),
       mk(
         'action:view-archived',
         'View archived sessions',
@@ -369,7 +420,7 @@ export function CommandPalette() {
       )
     }
     return base
-  }, [openArchived, openClaudeTools, sessions, newGroupAction])
+  }, [openArchived, openClaudeTools, sessions, newGroupAction, newSessionAction])
 
   // Merge the slash-command list (built-ins + supermux skills) with the registry's
   // file commands (e.g. ~/.claude/commands/*.md, project commands) — deduped by
@@ -686,13 +737,21 @@ export function CommandPalette() {
         onOpenAutoFocus={(e) => e.preventDefault()}
         // …and hand focus back to the opener on the way out.
         onCloseAutoFocus={restoreFocus}
+        // WS7 — the grok gate on the portalled box. Only present when grok is on,
+        // so the default palette's DOM is unchanged.
+        data-grok={grok ? '' : undefined}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>
         {/* pr-11 on the row, not on the chip: the dialog's own close ✕ is
             `absolute right-4 top-4` and was overlapping the "Esc" Kbd by 16px
             at every desktop width, so the chip rendered as "Es✕". The row has
             to reserve the corner the ✕ occupies. */}
-        <div className="flex items-center gap-3 border-b border-border py-3 pl-4 pr-11">
+        <div
+          className="flex items-center gap-3 border-b border-border py-3 pl-4 pr-11"
+          // WS7 hook — under grok the seam becomes a 0.5px hairline. Marker only
+          // present when grok is on, so the default DOM is untouched.
+          data-grok-search={grok ? '' : undefined}
+        >
           <CommandIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
           <input
             autoFocus

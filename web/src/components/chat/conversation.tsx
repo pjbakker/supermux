@@ -39,6 +39,10 @@ import type { HarnessEvent } from '../../lib/api/harness'
 import { motionOff, tweens } from '../../lib/springs'
 import { cn } from '../../lib/utils'
 import type { TileSession } from '../session-tile/types'
+// Type-only (erased before resolution) — no `@/` alias, same reason as
+// `chat-surface.tsx`: this module is rendered by `bun test` (root tsconfig has
+// no `paths`).
+import type { KbLayoutComponent } from '../focus-mode/kb-modes/contract'
 
 import type { AttentionCause, AttentionContext } from './attention'
 import { AttentionOverlay, AttentionRow } from './attention-card'
@@ -152,6 +156,13 @@ export interface ChatConversationProps {
    * Data, not a slot: `grouping.ts` decides which rows become lines, purely.
    */
   events?: readonly HarnessEvent[]
+  /**
+   * Show the per-message action bar (Copy · Share · More) under assistant
+   * bubbles. Bot/Grok-mode only — `chat-panel.tsx` passes `true`; the benches
+   * default it off so the primitives read as before. Threaded straight to
+   * `TranscriptItem`.
+   */
+  showActions?: boolean
   /** Go to another session — the destination of a harness line's chip. */
   onOpenSession?: (slug: string) => void
   /** Open this session's Schedules sheet — the destination of a `⏱` chip
@@ -237,11 +248,17 @@ export interface ChatConversationProps {
   dialog?: DialogCardView | null
   dialogBusy?: number | 'escape' | null
   onChooseDialog?: (target: number | 'escape') => void
+  /** Answer the live AskUserQuestion (`session.question_request`) by option index
+   *  — straight through to the live band's `QuestionCard` (`live-layer.tsx`). */
+  onAnswerQuestion?: (optionIndex: number) => void
   /** The line the card became once an answer landed. */
   dialogResolved?: string | null
   /** The pty's stall line, straight through to the live band's working row
    *  (`live-layer.tsx` `stalled`). */
   stalled?: string | null
+  /** The pty's live compaction hint, straight through to the working row
+   *  (`live-layer.tsx` `compacting`); mutually exclusive with `stalled`. */
+  compacting?: string | null
   /** Send it again (the hook re-runs the pre-send gate). */
   onRetryPending?: (id: string) => void
   /** Stop showing this failure — the user has read it. */
@@ -266,6 +283,10 @@ export interface ChatConversationProps {
    *  back button and the renderer switch (`routes/focus/mobile.tsx`). */
   headerLeading?: React.ReactNode
   headerTrailing?: React.ReactNode
+  /** The quiet data-plane chip ("Not up to date" / "Offline"), separated from
+   *  `headerTrailing` (the renderer toggle) so the phone header groups the status
+   *  bits and gives the toggle its own place (mobile polish #1). */
+  headerStatus?: React.ReactNode
   /** The chat data plane has GIVEN UP (`ChatPresentation === 'offline'`, A6):
    *  greys the header presence dot so it stops reading as a live green "ready"
    *  next to the "Offline" chip. Composer gating is the panel's job (it owns the
@@ -276,6 +297,11 @@ export interface ChatConversationProps {
   scrollRef?: React.Ref<HTMLDivElement>
   onScroll?: React.UIEventHandler<HTMLDivElement>
   testId?: string
+  /** The keyboard-layout handler (`KbLayout`), threaded straight through to
+   *  `ChatSurface`. The MOBILE focus route passes the mode-9 root-resize layout;
+   *  every other caller (desktop, benches, unit tests) omits it and the surface
+   *  renders its current DOM byte-for-byte. */
+  layout?: KbLayoutComponent
 
   // ── back-pagination (daily-driver QA #3) ─────────────────────────────────
   // Data + callbacks, not a slot: the whole affordance is one of four states
@@ -306,6 +332,7 @@ export function ChatConversation({
   mentions,
   names,
   events,
+  showActions = false,
   onOpenSession,
   onOpenSchedule,
   handoff,
@@ -327,8 +354,10 @@ export function ChatConversation({
   dialog,
   dialogBusy,
   onChooseDialog,
+  onAnswerQuestion,
   dialogResolved,
   stalled,
+  compacting,
   onRetryPending,
   onDismissPending,
   onOpenTerminal,
@@ -340,11 +369,13 @@ export function ChatConversation({
   isLoading,
   headerLeading,
   headerTrailing,
+  headerStatus,
   offline = false,
   stat,
   scrollRef,
   onScroll,
   testId = 'chat-surface',
+  layout,
   hasOlder = false,
   loadingOlder = false,
   olderError = false,
@@ -439,6 +470,9 @@ export function ChatConversation({
       name={name}
       session={session}
       pin={pin}
+      // The active keyboard-layout MODE — only the mobile focus route sets it;
+      // absent everywhere else, so the surface DOM is unchanged there.
+      layout={layout}
       scrollRef={scrollRef}
       onScroll={onScroll}
       // The header FLOATS, on both compositions. That is what the boards draw:
@@ -448,6 +482,17 @@ export function ChatConversation({
       // pays for it in top padding, and the header is chat-only, so nothing
       // outside this surface moves.
       headerOverlay
+      // The phone floats the header card below the notch; the reservation of
+      // the iOS safe-area lives ONCE here as the overlay's top offset (see
+      // `--safe-top`). Off-phone the card pins to the pane top.
+      //
+      // The gap under the safe area is 6px, not 12: at 12 the card sat a visible
+      // ~17px clear of the iOS status bar and read as "floating too far down,
+      // empty above" (owner device feedback). 6px pulls it up snug against the
+      // top so it reads as anchored, while still clearing the notch. The grok
+      // transcript's own top mask (`grok-mode.css`) fades whatever scrolls into
+      // the remaining strip so nothing bleeds hard against the status bar.
+      headerOverlayInsetTop={phone ? 'calc(var(--safe-top, 0px) + 6px)' : undefined}
       header={
         <SessionHeaderPill
           name={name}
@@ -456,7 +501,19 @@ export function ChatConversation({
           surface={phone ? 'phone' : 'desktop'}
           leading={headerLeading}
           trailing={headerTrailing}
+          connection={headerStatus}
           offline={offline}
+          // The live turn signal, straight from the chat plane: a running turn
+          // (`turnStart != null` while active) is the honest "streaming now" the
+          // status field only approximates. Grok wears it as the header's live
+          // activity light; inert off grok.
+          streaming={session?.status === 'active' && turnStart != null}
+          // The tail itself could not be read (`isError`): the status we hold is
+          // a stale claim, so under the grok skin the presence dot stops reading
+          // as a live green "ready" beside a "Couldn't load this conversation."
+          // body (the jury's worst honesty break). Inert off grok — the base
+          // app's dot is unchanged.
+          tailError={isError}
         />
       }
       footer={
@@ -525,8 +582,19 @@ export function ChatConversation({
         // of the pane with 600px of paper under it.
         //
         // The BOTTOM is measured, not a constant (QA #12 — see `trackBottom`).
-        className={`flex min-h-full flex-col ${phone ? 'px-[14px] pt-[86px]' : 'px-6 pt-[80px]'}`}
-        style={{ paddingBottom: reserve }}
+        className={`flex min-h-full flex-col ${phone ? 'px-[14px]' : 'px-6 pt-[80px]'}`}
+        style={{
+          paddingBottom: reserve,
+          // Phone: clear the FLOATING header card, which is notch-aware now.
+          // The card floats at `safe-top + 6` and is ~62px tall, so its bottom
+          // sits at ~`safe-top + 68`; the pad tracks `--safe-top` and adds a
+          // ~18px breath so the first message lands just under the glass rather
+          // than scrolling behind it. (`+86px` at env=0 keeps the old budget's
+          // intent under the now higher-sitting card.)
+          ...(phone
+            ? { paddingTop: 'calc(var(--safe-top, 0px) + 86px)' }
+            : null),
+        }}
       >
         {/* Bottom-anchored, like every board: the column sits on the floor of
             the pane and grows upward. */}
@@ -565,6 +633,7 @@ export function ChatConversation({
               names={names}
               rawUrl={rawUrl}
               pinFor={pinFor}
+              showActions={showActions}
               onOpenSession={onOpenSession}
               onOpenSchedule={onOpenSchedule}
               onOpenTerminal={onOpenTerminal}
@@ -604,8 +673,10 @@ export function ChatConversation({
             dialog={dialog}
             dialogBusy={dialogBusy}
             onChooseDialog={onChooseDialog}
+            onAnswerQuestion={onAnswerQuestion}
             dialogResolved={dialogResolved}
             stalled={stalled}
+            compacting={compacting}
             attention={
               attention && (
                 <AttentionRow
@@ -881,7 +952,7 @@ export function PendingEchoes({
             // screen.
             transition={reduce ? motionOff : tweens.swap}
           >
-            <MessageRow me>
+            <MessageRow me surface={surface}>
               <div className="flex min-w-0 flex-col items-end">
                 <Bubble
                   variant="user"

@@ -331,6 +331,7 @@ pub(crate) async fn emit_board(state: &AppState) {
     if let Ok(board) = load_board(state, 0).await {
         let _ = state.sse_tx.send(SseEvent {
             event: "board".to_string(),
+            company_id: None,
             payload: serde_json::to_value(&board).unwrap_or(serde_json::Value::Null),
         });
     }
@@ -340,6 +341,7 @@ pub(crate) async fn emit_board(state: &AppState) {
 fn emit_alert(state: &AppState, session: &str, detail: &str) {
     let _ = state.sse_tx.send(SseEvent {
         event: "alerts".to_string(),
+        company_id: None,
         payload: json!([{ "level": "info", "session": session, "detail": detail }]),
     });
 }
@@ -956,6 +958,8 @@ async fn start_handler(
                 host_id: None,
                 // Board-spawned sessions take the default (tmux) runtime.
                 runtime: None,
+                model: None,
+                company_id: None,
             };
             crate::sessions::create(&state, create_input).await?;
             // Boot it so the steering deliver-loop has a live pane to talk to.
@@ -1405,7 +1409,26 @@ async fn tag_completion_handler(
 
 // ── iCal export (PUBLIC) ──────────────────────────────────────────────────────
 
-async fn calendar_handler(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+async fn calendar_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    // P3b — the iCal feed is OWNER-ONLY. It lives outside the bearer layer (a
+    // calendar client cannot send `Authorization`), so it is reachable by a raw
+    // GET on a trusted transport (the owner's Tailscale). But board issues carry
+    // NO company_id, so there is no per-company feed to serve — a scoped human
+    // must not read the global one. If the request carries a VALID human session
+    // cookie, 404 it (hide the endpoint); a request with no human cookie (the
+    // owner's calendar app) is served exactly as before.
+    let cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    if crate::auth_human::resolve_cookie_identity(&state, cookie)
+        .await
+        .is_some()
+    {
+        return Err(AppError::NotFound("not found".to_string()));
+    }
     let issues = db::board::issues_with_due(&state.pool).await?;
     let body = ical::render(&issues);
     Ok(([(header::CONTENT_TYPE, "text/calendar; charset=utf-8")], body))
@@ -1571,6 +1594,8 @@ mod tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = db::init(&config).await.expect("init pool");

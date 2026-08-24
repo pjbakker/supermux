@@ -13,6 +13,7 @@ import type { SessionInput } from '../../lib/session-input'
 
 import {
   bindComposerField,
+  type ComposerField,
   getDraft,
   growTextarea,
   insertIntoComposer,
@@ -35,6 +36,7 @@ export const DRAFT_PREVIEW_CHARS = 60
 // hook — and React, and delegate-intent, and the session-input plumbing — into
 // their chunks. NOT re-exported: a barrel here would undo exactly that.
 import { composerKeyIntent } from './composer-keys'
+import { useMediaQuery } from '../../hooks/use-media-query'
 
 // ── The hook ────────────────────────────────────────────────────────────────
 
@@ -255,6 +257,20 @@ export function stopGate(lens: PeekLens | null): SendGate {
 }
 
 /**
+ * Should a Stop reconcile the client's live turn to idle?
+ *
+ * `delivered` is whether `sendKey('Escape')` resolved (the interrupt reached the
+ * session) or threw (it did not). A delivered interrupt reconciles — either it
+ * ended a running turn, or there was nothing to end and the stale "thinking" must
+ * clear; a THROWN one does not, because that is the genuine "the turn is still
+ * running" case the `stop-failed` notice is for. One line, pulled out so the
+ * decision is asserted without driving an async hook through a live DOM.
+ */
+export function stopReconcile(delivered: boolean): boolean {
+  return delivered
+}
+
+/**
  * What stays in the box after a send of `raw`.
  *
  * Subtraction, not assignment: a peek plus a POST is two round-trips and people
@@ -307,9 +323,35 @@ export interface UseComposerOptions {
   /** The shared peek lens (T2). Omitted on a bench/test render — then the
    *  pre-send verification is skipped exactly as it is on a peek failure. */
   peek?: { refresh: () => Promise<PeekLens | null> }
-  /** Session status is `active` — a turn is running, so the trailing control is
-   *  Stop and a bare Escape interrupts. */
+  /** A live turn is running (the reconciled `status === 'active' && turnStart`,
+   *  NOT raw status) — so the trailing control is Stop and a bare Escape
+   *  interrupts. Reconciled so a session whose status is stuck at `active` after
+   *  its turn ended does not keep offering a Stop that fires into nothing. */
   active: boolean
+  /**
+   * Reconcile the local live turn to idle — the honest half of Stop. Called
+   * AFTER a delivered interrupt: if the turn was genuinely running the Escape
+   * ended it and the client agrees; if it was already over (a stuck-`active`
+   * status), this is what makes Stop visibly DO something instead of firing an
+   * Escape into a pty with nothing to interrupt. NOT called when the interrupt
+   * throws — that is the real "still running" case the `stop-failed` notice owns.
+   */
+  onInterrupt?: () => void
+  /**
+   * Text to PREPEND to the outgoing message, computed at submit time — the
+   * composer upgrade's attachment seam (`attachmentSentence(readyPaths())`: the
+   * quoted absolute upload paths, space-separated, one trailing space). Folded
+   * in INSIDE `submit`, before `input.submit`, so the attachment flows through
+   * the same peek / slash / hand-off gates a typed message does — never around
+   * them. Absent ⇒ `submit` is byte-identical to today.
+   */
+  getOutgoingPrefix?: () => string
+  /**
+   * Called once the POST resolves successfully (`staged.reset` clears the
+   * chips) — mirrors how the draft is subtracted only AFTER a resolved send, so
+   * a rejected send keeps both the words and the attachments to retry.
+   */
+  onSent?: () => void
   /** The session's hook-driven `permission_request` is live, i.e. a choice card
    *  is on screen above this composer. Second source for the pre-send gate —
    *  see `sendGate`. */
@@ -368,7 +410,7 @@ export interface ComposerPickerState {
 export interface ComposerHandle {
   draft: string
   setDraft: (value: string) => void
-  ref: React.RefObject<HTMLTextAreaElement | null>
+  fieldRef: React.RefObject<ComposerField | null>
   /** A POST is in flight. The control disables so a slow pty cannot be
    *  double-fired; it is NOT a delivery claim (that is T4's watchdog). */
   sending: boolean
@@ -401,11 +443,11 @@ export interface ComposerHandle {
   handoffPending: { to: string; atMs: number } | null
   /** The `@`/`/` surface (fase A4 T9). */
   picker: ComposerPickerState
-  onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void
-  onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void
+  onChange: (e: { target: ComposerField }) => void
+  onKeyDown: (e: React.KeyboardEvent<Element>) => void
   /** Caret moves (arrow keys, clicks) — the trigger is read at the CARET, not
    *  at the end of the draft. */
-  onSelect: (e: React.SyntheticEvent<HTMLTextAreaElement>) => void
+  onSelect: (e: { currentTarget: ComposerField }) => void
 }
 
 export function useComposer({
@@ -416,13 +458,16 @@ export function useComposer({
   dialogCard = false,
   formCard = false,
   handoff,
+  onInterrupt,
+  getOutgoingPrefix,
+  onSent,
 }: UseComposerOptions): ComposerHandle {
   const draft = React.useSyncExternalStore(
     React.useCallback((fn) => subscribeDraft(name, fn), [name]),
     React.useCallback(() => getDraft(name), [name]),
     React.useCallback(() => getDraft(name), [name]),
   )
-  const ref = React.useRef<HTMLTextAreaElement | null>(null)
+  const ref = React.useRef<ComposerField | null>(null)
   const [sending, setSending] = React.useState(false)
   const [notice, setNotice] = React.useState<ComposerNotice | null>(null)
   // The caret, mirrored into state because the TRIGGER is read at it. It starts
@@ -438,6 +483,13 @@ export function useComposer({
   // offset: clearing the box and typing `@` again is a new question.
   const [closed, setClosed] = React.useState<{ start: number; text: string } | null>(null)
   const pickerApi = React.useRef<ComposerPickerApi | null>(null)
+  // COARSE POINTER = the soft-keyboard contract: a bare Enter breaks the line and
+  // the send DISC is the send (like every native chat app), so Enter-to-send never
+  // fires on the reflexive key a thumb hits reaching for the next word (the field
+  // shows a Return key — `enterKeyHint` in composer.tsx). Gated on the pointer, NOT
+  // the surface — the grok chat pane is `surface="desktop"` (a real <textarea>) yet
+  // runs on the phone. Desktop (fine pointer) keeps Enter=submit, unchanged.
+  const coarse = useMediaQuery('(pointer: coarse)')
 
   // Publish the field so `insertIntoComposer` (and therefore every insert
   // surface in the app) can find this session's caret.
@@ -478,7 +530,11 @@ export function useComposer({
     // flight — see the clear below.
     const raw = getDraft(name)
     const text = raw.trim()
-    if (text.length === 0 || sendingRef.current) return
+    // The attachment prefix (quoted upload paths) is computed HERE, at submit
+    // time, so an image staged one keystroke before Enter is still counted. An
+    // image alone is a valid message — empty text but a non-empty prefix sends.
+    const prefix = getOutgoingPrefix?.() ?? ''
+    if ((text.length === 0 && prefix.length === 0) || sendingRef.current) return
     setNotice(null)
     // THE HAND-OFF BRANCH (fase B4 T4), beside the slash gate and before it:
     // `@patch /clear` is a message to a colleague, not a slash command this
@@ -559,7 +615,10 @@ export function useComposer({
         // POST so it is on screen for the whole round-trip, and overridable by
         // the slash receipt below, which is about the same delivery.
         if (gate.notice) setNotice(gate.notice)
-        await input.submit(text)
+        // The attachment paths go on the wire FIRST, then the user's prose —
+        // quoted absolute paths Claude's Read/vision tool resolves, exactly the
+        // shape the dock and terminal drag/paste have always injected.
+        await input.submit(prefix + text)
         // Cleared only AFTER the POST resolves: a rejected send keeps the
         // user's words in the box, where they can retry them.
         //
@@ -570,6 +629,9 @@ export function useComposer({
         // gate exists to prevent, on the other side of the wire. So only the
         // sent prefix goes; anything typed after it stays in the box.
         setDraft(name, draftAfterSend(getDraft(name), raw))
+        // Chips clear only now, on a resolved POST — the same rule the draft
+        // follows, so a rejected send keeps the attachments to retry.
+        onSent?.()
         // A command that is not one of Claude's built-ins WENT — as text, which
         // is what a project/skill command is. The receipt exists so a typo
         // (`/compct`) does not quietly become a message nobody meant to write.
@@ -595,7 +657,7 @@ export function useComposer({
         setSending(false)
       }
     })()
-  }, [dialogCard, formCard, handoff, input, name, peek, readIntent])
+  }, [dialogCard, formCard, getOutgoingPrefix, handoff, input, name, onSent, peek, readIntent])
 
   const stop = React.useCallback(() => {
     // Escape is the interrupt every one of the three TUIs understands; the
@@ -622,8 +684,16 @@ export function useComposer({
       // agent kept going" is the one failure this surface must never absorb into
       // a console warning — and on the REST plane a 404/409 (session gone,
       // restarted under the same name) is exactly how it arrives.
+      //
+      // A DELIVERED interrupt reconciles the local live turn to idle
+      // (`onInterrupt`). Two cases, one honest outcome: a genuinely-running turn
+      // is interrupted and the client agrees it is over; an already-cancelled
+      // turn whose status is stuck at `active` gets its stale "thinking" cleared,
+      // so Stop is never a silent no-op. Only a THROWN send is left "still
+      // running" — that is what `stop-failed` means, and it must not reconcile.
       try {
         await input.sendKey('Escape')
+        if (stopReconcile(true)) onInterrupt?.()
       } catch (err) {
         setNotice({
           kind: 'stop-failed',
@@ -631,7 +701,7 @@ export function useComposer({
         })
       }
     })()
-  }, [input, peek])
+  }, [input, onInterrupt, peek])
 
   const insert = React.useCallback(
     (text: string) => {
@@ -681,7 +751,7 @@ export function useComposer({
   }, [])
 
   const onChange = React.useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    (e: { target: ComposerField }) => {
       set(e.target.value)
       setCaret(e.target.selectionStart ?? e.target.value.length)
       growTextarea(e.target)
@@ -690,13 +760,13 @@ export function useComposer({
     [notice, set],
   )
 
-  const onSelect = React.useCallback((e: React.SyntheticEvent<HTMLTextAreaElement>) => {
+  const onSelect = React.useCallback((e: { currentTarget: ComposerField }) => {
     const el = e.currentTarget
     setCaret(el.selectionStart ?? el.value.length)
   }, [])
 
   const onKeyDown = React.useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    (e: React.KeyboardEvent<Element>) => {
       const intent = composerKeyIntent(e, {
         draft: getDraft(name),
         active,
@@ -706,7 +776,13 @@ export function useComposer({
         // message they still want to send.
         notice: notice !== null,
       })
-      if (intent === 'pass' || intent === 'newline') return // the browser types it
+      // MOBILE (coarse pointer): a bare Enter breaks the line — the send DISC is
+      // the send. Fold it into the `pass`/`newline` early return, so a plain
+      // submit-Enter falls through to the browser, which inserts the line break
+      // (the same path Shift+Enter takes). Desktop leaves `coarse` false, so
+      // Enter=submit is byte-identical to before. (The `@`/`/` popover, when it is
+      // open, keeps its own Enter — completing the highlighted row — below.)
+      if (intent === 'pass' || intent === 'newline' || (coarse && intent === 'submit')) return
       // A picker Enter that has nothing to accept must still SEND. The
       // preventDefault therefore waits until the outcome is known — the one
       // place in this handler where the order matters.
@@ -716,7 +792,10 @@ export function useComposer({
           e.preventDefault()
           return
         }
-        if (e.key === 'Tab') return // nothing to complete: Tab keeps its browser meaning
+        // Nothing to complete: Tab keeps its browser meaning; and on mobile a bare
+        // Enter breaks the line rather than sending — both fall through to the
+        // browser, so only a desktop (fine-pointer) Enter reaches submit.
+        if (e.key === 'Tab' || coarse) return
         e.preventDefault()
         submit()
         return
@@ -736,7 +815,7 @@ export function useComposer({
       else if (intent === 'picker-close') closePicker()
       else if (intent === 'notice-dismiss') setNotice(null)
     },
-    [active, closePicker, name, notice, pickerOpen, set, stop, submit],
+    [active, closePicker, coarse, name, notice, pickerOpen, set, stop, submit],
   )
 
   // Derived, never stored — the same discipline as `trigger`. A second copy of
@@ -752,7 +831,7 @@ export function useComposer({
   return {
     draft,
     setDraft: set,
-    ref,
+    fieldRef: ref,
     sending,
     notice,
     dismissNotice,

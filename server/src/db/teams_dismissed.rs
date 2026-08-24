@@ -85,6 +85,8 @@ mod tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = crate::db::init(&config).await.expect("init pool");

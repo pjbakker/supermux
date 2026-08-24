@@ -14,7 +14,7 @@
 //! the live-pane scan to MAP a team to the supermux session hosting its lead:
 //! whichever `supermux-<name>` window contains the team's member panes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +57,12 @@ pub fn spawn(state: AppState) {
         let _watcher = arm_fs_watcher(fs_wake.clone());
 
         let mut last_payload: Option<serde_json::Value> = None;
+        // The last SUCCESSFULLY-READ opted-in host set. Carried across ticks so a
+        // transient `db::sessions::list()` failure STOPS UPDATING the teams
+        // surface (reuses this) instead of CLEARING it to empty — the change-only
+        // broadcast at the bottom of the loop would otherwise latch that empty
+        // payload until the next diff (ec1ce9e fail-closed regression, FIX 1).
+        let mut prev_opted: HashSet<String> = HashSet::new();
         // Deregister safety: per team, how many CONSECUTIVE ticks it has been
         // absent from the detected set. Reset to 0 the instant a team reappears;
         // a team is only torn down after DEREGISTER_AFTER_ABSENT_TICKS straight
@@ -101,23 +107,38 @@ pub fn spawn(state: AppState) {
             // description edit doesn't alter member status — so the board must
             // reconcile independently). Defensive: each team's reconcile swallows
             // its own errors; one bad team never blocks the rest or the broadcast.
+            // Opt-in gate (fix): an implicit subagent "team" — a normal session
+            // whose Task subagents Claude Code recorded as tmux-pane members —
+            // has a host that never tagged itself `team`. Keep only teams whose
+            // resolved host explicitly opted in, so board registration +
+            // deregistration AND the sidebar all skip implicit ones; an
+            // already-created implicit board is then torn down ONCE by
+            // `reconcile_deregistrations` (it goes absent from the filtered set).
+            // The backlink reaper below is deliberately left on the RAW set: the
+            // raw scan's `persist_team_name` still maintains an implicit team's
+            // backlink each tick, so reaping against the filtered set would thrash
+            // it (clear → rewrite → clear …). See [`retain_opted_in_team_hosts`].
+            let teams = retain_opted_in_team_hosts(&state, &all_teams, &mut prev_opted).await;
+
             let mut board_changed = false;
-            for team in &all_teams {
+            for team in &teams {
                 board_changed |= super::board_sync::reconcile_team(&state, team).await;
             }
             board_changed |=
-                reconcile_deregistrations(&state, &all_teams, &mut absent_ticks).await;
+                reconcile_deregistrations(&state, &teams, &mut absent_ticks).await;
             // …and the same conservatism for the `team_name` BACKLINK, which
-            // outlives the team dir that justified it.
+            // outlives the team dir that justified it. Keyed off the RAW set to
+            // stay in lockstep with the raw scan's backlink WRITER
+            // (`persist_team_name`), never the opt-in-filtered view.
             reap_orphan_backlinks(&state, &all_teams, &mut absent_backlinks).await;
             if board_changed {
                 crate::board::emit_board(&state).await;
             }
 
-            // Build the display-filtered sidebar view by CONSUMING the raw set now
-            // that reconciliation is done with it: hide rosterless teams, then
+            // Build the display-filtered sidebar view by CONSUMING the opted-in
+            // set now that reconciliation is done: hide rosterless teams, then
             // collapse duplicate host mappings (see [`scan_and_enrich`]).
-            let display = dedup_by_host(drop_rosterless(all_teams));
+            let display = dedup_by_host(drop_rosterless(teams));
             let payload = serde_json::to_value(&display).unwrap_or(serde_json::Value::Null);
 
             // Change-only broadcast (keep it cheap). The
@@ -125,6 +146,7 @@ pub fn spawn(state: AppState) {
             if last_payload.as_ref() != Some(&payload) {
                 let _ = state.sse_tx.send(SseEvent {
                     event: "teams".to_string(),
+                    company_id: None,
                     payload: payload.clone(),
                 });
                 last_payload = Some(payload);
@@ -208,12 +230,13 @@ pub async fn scan_and_enrich_raw(state: &AppState) -> Vec<Team> {
         //
         // A ROSTERLESS team is never backlinked, and an existing backlink to
         // one is REMOVED. It is hidden from the sidebar anyway (`drop_rosterless`),
-        // but the row it wrote is not cosmetic: `team_name` is what
-        // `sessions::chat::ws::chat_eligible` reads to refuse the chat data
-        // plane for a lead window — so an implicit solo "team" silently 404s
-        // chat history + the chat WS for a perfectly ordinary Claude session,
-        // and the surface mounts on a conversation that can never arrive.
-        // Measured on this host: 17 of 38 live sessions carried such a backlink.
+        // but the row it wrote is not cosmetic: `team_name` is the column every
+        // team-shaped decision keys off (it used to make `chat_eligible` 404 the
+        // chat plane for an ordinary Claude session — measured: 17 of 38 live
+        // sessions on this host; that refusal is gone since S1, but the column
+        // now gates the pane-attributed pointer guard
+        // (`hooks::track_conversation_pointer`), so a phantom backlink would put
+        // an ordinary session on the team path for nothing).
         // What is lost by not writing it: `lifecycle::archive` no longer parks
         // that team dir under `.archived/` — a dir holding nothing but the
         // lead's own record, invisible in the UI either way.
@@ -242,7 +265,100 @@ pub async fn scan_and_enrich_raw(state: &AppState) -> Vec<Team> {
 /// These filters affect ONLY what renders. Board + deregistration lifecycle key
 /// off [`scan_and_enrich_raw`] (on-disk truth), never this filtered set.
 pub async fn scan_and_enrich(state: &AppState) -> Vec<Team> {
-    dedup_by_host(drop_rosterless(scan_and_enrich_raw(state).await))
+    let raw = scan_and_enrich_raw(state).await;
+    // One-shot request path (no cross-tick state): a fresh empty carry set means a
+    // DB error yields an empty view for THIS response only — there is no SSE latch
+    // to clear here (that is the watcher loop's concern, where the carry lives).
+    let opted = retain_opted_in_team_hosts(state, &raw, &mut HashSet::new()).await;
+    dedup_by_host(drop_rosterless(opted))
+}
+
+/// Keep only teams whose resolved host session explicitly OPTED IN to being a
+/// team — the display/lifecycle gate that stops a normal subagent-spawning
+/// session from being surfaced (and relabelled) as a team.
+///
+/// With the experimental Agent Teams feature enabled globally, Claude Code
+/// records every session's Task subagents as tmux-pane "members" in
+/// `~/.claude/teams/session-<id>/config.json`. That populates the roster of an
+/// ordinary solo session, so `drop_rosterless` (the only other guard) lets it
+/// through and it surfaces as a team card relabelled with the Claude auto-name
+/// `session-<id8>` instead of the session's own name. The reliable,
+/// already-persisted discriminator between an explicit team and an implicit
+/// subagent one is the HOST session's `team` tag (set by `start_team` /
+/// `convert_to_team` before boot), with `creator == "team"` as a secondary
+/// signal. Load the session list once, build the opted-in name set, and keep a
+/// team iff its resolved `lead_supermux_session` is in it.
+///
+/// A host-unresolved (`None`) team is dropped too, which is desired: a genuine
+/// team's host is tagged the instant it is created (before its teammates even
+/// spawn), so it never needs the unmapped placeholder to represent it.
+///
+/// A DB error CARRIES THE PREVIOUS tick's opted-in set forward (FIX 1) rather
+/// than fail-closing to empty: distinguishing "DB unreadable this tick" from "no
+/// teams opted in" means a momentary SQLite-pool error STOPS UPDATING the teams
+/// surface instead of CLEARING it (the change-only broadcast in [`spawn`] would
+/// otherwise latch the empty payload until the next diff). The opt-in TEST itself
+/// is unchanged — only the error branch differs. Borrows the raw set so the
+/// caller can still key the backlink reaper off it (see [`spawn`]); clones only
+/// the — typically few — opted-in teams it keeps. `prev_opted` is refreshed on a
+/// successful read and reused on failure.
+async fn retain_opted_in_team_hosts(
+    state: &AppState,
+    teams: &[Team],
+    prev_opted: &mut HashSet<String>,
+) -> Vec<Team> {
+    let fresh: Option<HashSet<String>> = match db::sessions::list(&state.pool).await {
+        Ok(sessions) => Some(
+            sessions
+                .into_iter()
+                .filter(|s| {
+                    s.creator == "team"
+                        || serde_json::from_str::<Vec<String>>(&s.tags)
+                            .map(|t| t.iter().any(|x| x == "team"))
+                            .unwrap_or(false)
+                })
+                .map(|s| s.name)
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "teams watcher: opt-in session list failed; carrying previous opted-in set forward this tick",
+            );
+            None
+        }
+    };
+
+    retain_with_carried_opt_in(teams, fresh, prev_opted)
+}
+
+/// Pure core of [`retain_opted_in_team_hosts`] (unit-testable without a DB).
+///
+/// `fresh` is `Some(set)` for a successful `db::sessions::list()` read and `None`
+/// when the read ERRORED this tick. On success the carried set is REPLACED with
+/// the fresh one; on error the previously-carried set is reused, so a transient
+/// DB error never clears the teams surface. Either way, only teams whose resolved
+/// host is in the (possibly carried-forward) opted-in set survive — the invariant
+/// that a non-opted-in / implicit-subagent team stays hidden holds on both arms.
+fn retain_with_carried_opt_in(
+    teams: &[Team],
+    fresh: Option<HashSet<String>>,
+    prev_opted: &mut HashSet<String>,
+) -> Vec<Team> {
+    if let Some(set) = fresh {
+        *prev_opted = set;
+    }
+    let opted = &*prev_opted;
+
+    teams
+        .iter()
+        .filter(|t| {
+            t.lead_supermux_session
+                .as_deref()
+                .is_some_and(|h| opted.contains(h))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Drop every team whose roster is EMPTY (fix 1). After the per-team loop has
@@ -618,9 +734,10 @@ async fn reconcile_deregistrations(
 /// [`clear_rosterless_backlink`] heals a session whose team is still THERE and
 /// merely empty; this is the other half — the team dir is gone (deleted,
 /// renamed, archived by hand) and nothing will ever scan it again, so no other
-/// pass can reach the row. The backlink then sits there forever, and
-/// `sessions::chat::ws::chat_eligible` reads it as "this is a team lead window"
-/// and refuses the chat data plane for good.
+/// pass can reach the row. The backlink then sits there forever, and every
+/// consumer reads it as "this is a team lead window" — today that means the
+/// pane-attributed pointer guard (`hooks::track_conversation_pointer`) treats an
+/// ordinary session as a team host for good.
 ///
 /// Same conservatism as [`reconcile_deregistrations`], and for the same reason:
 /// a dropped FS event or a half-written `config.json` makes a live team blink
@@ -794,6 +911,8 @@ mod tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = db::init(&config).await.expect("init pool");
@@ -975,6 +1094,8 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                model: None,
+                company_id: None,
             },
         )
         .await
@@ -1019,6 +1140,8 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                model: None,
+                company_id: None,
             },
         )
         .await
@@ -1055,12 +1178,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The chat data plane's blocker: Claude Code writes a
+    /// The implicit-solo-team pollution: Claude Code writes a
     /// `~/.claude/teams/session-<id>/` for EVERY session once agent teams are
     /// enabled, whose only record is the lead's own row. `scan` strips that row,
     /// so the team arrives here ROSTERLESS — and the backlink it used to write
     /// made `chat_eligible` refuse chat history + the chat WS for an ordinary
     /// solo Claude session (measured: 17 of 38 live sessions on the dev host).
+    /// The refusal is gone (S1), but the column still selects the team path, so
+    /// the hygiene this proves is still load-bearing.
     ///
     /// Proves both halves: a rosterless team never writes a backlink, and an
     /// EXISTING one is cleared — while a backlink to a DIFFERENT (real) team is
@@ -1085,6 +1210,8 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                model: None,
+                company_id: None,
             },
         )
         .await
@@ -1151,6 +1278,8 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                model: None,
+                company_id: None,
             },
         )
         .await
@@ -1227,6 +1356,8 @@ mod tests {
             worktree: None,
             host_id: None,
             runtime: None,
+            model: None,
+            company_id: None,
         };
         crate::sessions::create(&state, mk("old-host", "/old")).await.unwrap();
         crate::sessions::create(&state, mk("new-host", "/new")).await.unwrap();
@@ -1738,6 +1869,169 @@ mod tests {
         assert!(
             out.is_empty(),
             "all three lead-only cards vanish (empty-drop before dedup)",
+        );
+    }
+
+    // ── opt-in gate: normal subagent sessions stay normal ───────────────────────
+
+    /// Seed a session row with the given `tags` JSON and `creator` so the opt-in
+    /// gate has a DB to read. Uses the full create path so both discriminators
+    /// (`tags` + `creator`) are persisted.
+    async fn seed_session(state: &AppState, name: &str, tags: &str, creator: &str) {
+        db::sessions::create(
+            &state.pool,
+            &db::sessions::NewSession {
+                name: name.into(),
+                display_name: name.into(),
+                dir: format!("/tmp/{name}"),
+                desc: String::new(),
+                provider: "claude".into(),
+                creator: creator.into(),
+                flags: String::new(),
+                tags: tags.into(),
+                branch: String::new(),
+                mcp: String::new(),
+                worktree: false,
+                worktree_repo: String::new(),
+                host_id: None,
+                runtime: "native".into(),
+                model: String::new(),
+                company_id: None,
+            },
+        )
+        .await
+        .expect("seed session");
+    }
+
+    /// A working teammate so the team is NOT rosterless — the opt-in gate is the
+    /// only thing that can drop it.
+    fn one_member(agent: &str) -> Vec<Member> {
+        vec![member_with(agent, MemberStatus::Working)]
+    }
+
+    /// The reported bug: `ipc` is a normal session (tags `[]`, creator `""`) that
+    /// merely spawned subagents. Its implicit team resolves its host to `ipc`, but
+    /// `ipc` never opted in → the team is dropped, so `ipc` renders as its own
+    /// normal tile with its own name (not relabelled `session-<id8>`).
+    #[tokio::test]
+    async fn implicit_subagent_team_dropped_when_host_untagged() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "ipc", "[]", "").await;
+
+        let implicit = host_team("session-78e8f229", Some("ipc"), one_member("a@ipc"), 0);
+        let out = retain_opted_in_team_hosts(&state, &[implicit], &mut HashSet::new()).await;
+
+        assert!(out.is_empty(), "a normal session's implicit team is not a team");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A genuine team's host carries the `team` tag (set at start_team /
+    /// convert_to_team). It is kept, so real teams keep working.
+    #[tokio::test]
+    async fn genuine_team_kept_when_host_tagged_team() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "supermux", "[\"team\"]", "").await;
+
+        let genuine = host_team("session-62644456", Some("supermux"), one_member("a@sm"), 0);
+        let out = retain_opted_in_team_hosts(&state, &[genuine], &mut HashSet::new()).await;
+
+        let names: Vec<&str> = out.iter().map(|t| t.team_name.as_str()).collect();
+        assert_eq!(names, vec!["session-62644456"], "tag-`team` host keeps its team");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `creator == "team"` is the secondary opt-in signal (a team whose host row
+    /// records the team creator even if the tag were somehow absent).
+    #[tokio::test]
+    async fn creator_team_is_a_second_opt_in_signal() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "crew", "[]", "team").await;
+
+        let genuine = host_team("session-aaaa1111", Some("crew"), one_member("a@crew"), 0);
+        let out = retain_opted_in_team_hosts(&state, &[genuine], &mut HashSet::new()).await;
+
+        assert_eq!(out.len(), 1, "creator=team host keeps its team");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A host-unresolved (`None`) team is dropped — a genuine team's host is
+    /// tagged the instant it is created, so it never needs the unmapped placeholder.
+    #[tokio::test]
+    async fn host_unresolved_team_is_dropped() {
+        let (state, dir) = test_state().await;
+
+        let unmapped = host_team("session-orphan", None, one_member("a@x"), 0);
+        let out = retain_opted_in_team_hosts(&state, &[unmapped], &mut HashSet::new()).await;
+
+        assert!(out.is_empty(), "unmapped team drops (never the placeholder)");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Mixed tick: only the opted-in team survives; the implicit one and the
+    /// unmapped one both drop. Proves the gate is per-team, not all-or-nothing.
+    #[tokio::test]
+    async fn only_opted_in_teams_survive_a_mixed_tick() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "ipc", "[]", "").await;
+        seed_session(&state, "supermux", "[\"team\"]", "").await;
+
+        let implicit = host_team("session-78e8f229", Some("ipc"), one_member("a@ipc"), 0);
+        let genuine = host_team("session-62644456", Some("supermux"), one_member("a@sm"), 0);
+        let unmapped = host_team("session-orphan", None, one_member("a@x"), 0);
+
+        let out = retain_opted_in_team_hosts(&state, &[implicit, genuine, unmapped], &mut HashSet::new()).await;
+        let names: Vec<&str> = out.iter().map(|t| t.team_name.as_str()).collect();
+        assert_eq!(names, vec!["session-62644456"], "only the tag-`team` host's team survives");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// FIX 1 (f). On a simulated `db::sessions::list()` Err (`fresh == None`) the
+    /// previously-carried opted-in set is REUSED — the teams surface stops updating
+    /// instead of collapsing to empty (the ec1ce9e fail-closed regression) — while
+    /// a non-opted-in host still stays excluded. Exercises the pure carry core.
+    #[test]
+    fn retain_carries_previous_opt_in_forward_on_db_error() {
+        // Last successful read had exactly `supermux` opted in.
+        let mut prev: HashSet<String> = HashSet::new();
+        prev.insert("supermux".to_string());
+
+        let genuine = host_team("session-genuine", Some("supermux"), one_member("a@sm"), 0);
+        let implicit = host_team("session-implicit", Some("ipc"), one_member("a@ipc"), 0);
+
+        // Simulated DB error this tick → `fresh = None` → carry `prev` forward.
+        let out = retain_with_carried_opt_in(
+            &[genuine, implicit],
+            None,
+            &mut prev,
+        );
+        let names: Vec<&str> = out.iter().map(|t| t.team_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["session-genuine"],
+            "the carried-forward opted-in host survives (NOT empty); a non-opted-in host stays excluded",
+        );
+        // The carry set is untouched by an error tick (still just `supermux`).
+        assert!(prev.contains("supermux") && prev.len() == 1);
+
+        // CONTROL: a SUCCESSFUL read (`fresh = Some`) REPLACES the carry set.
+        let genuine2 = host_team("session-genuine", Some("supermux"), one_member("a@sm"), 0);
+        let mut fresh: HashSet<String> = HashSet::new();
+        fresh.insert("other-host".to_string());
+        let out2 = retain_with_carried_opt_in(&[genuine2], Some(fresh), &mut prev);
+        assert!(out2.is_empty(), "after a fresh read `supermux` is no longer opted in");
+        assert!(
+            prev.contains("other-host") && !prev.contains("supermux"),
+            "a successful read refreshes the carried set",
         );
     }
 }

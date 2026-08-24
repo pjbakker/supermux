@@ -7,7 +7,8 @@
 //! `lib.rs` so the binary and integration tests share them.
 
 use supermux_server::{
-    agents, config, db, external_edit, http, scheduler, sessions, state, teams,
+    agents, bot_memory, config, connectors, db, external_edit, http, scheduler, sessions, state,
+    teams,
 };
 
 #[tokio::main]
@@ -20,6 +21,29 @@ async fn main() -> anyhow::Result<()> {
     // exits cleanly. The temp-file path is the last argv after `__edit`.
     if std::env::args().nth(1).as_deref() == Some("__edit") {
         return external_edit::run_bridge(std::env::args().nth(2)).await;
+    }
+
+    // BOT MEMORY hooks/CLI. The recall hook (`UserPromptSubmit`/`SessionStart`)
+    // and the `supermux-memory` write CLI both `exec` THIS binary with a hidden
+    // subcommand (version-matched, no separate artifact), same as `__edit`.
+    // Dispatched here so the hook process stays lean — no DB, no listener — and
+    // resolves its store purely from `BOT_MEMORY_*` env. The recall path is
+    // best-effort: it prints nothing and exits 0 on any failure so a broken
+    // store can never wedge the user's prompt.
+    match std::env::args().nth(1).as_deref() {
+        Some("__memory-recall") => {
+            let _ = bot_memory::run::run_recall_hook();
+            return Ok(());
+        }
+        Some("__memory-save") => {
+            let argv: Vec<String> = std::env::args().skip(2).collect();
+            if let Err(e) = bot_memory::run::run_save_cli(&argv) {
+                eprintln!("supermux-memory: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        _ => {}
     }
 
     // NATIVE (tmux-less) session runtime: the pty holder. The daemon spawns
@@ -63,6 +87,12 @@ async fn main() -> anyhow::Result<()> {
     // disables the edit-in-native-editor affordance (logged), never the server.
     external_edit::install_bridge_script(&config.data_dir);
 
+    // Install the bot-memory recall hook + `supermux-memory` write CLI wrappers
+    // (`<data_dir>/bin/{bot-memory-recall,supermux-memory}`) that the per-session
+    // config-dir seam wires into a bot's `settings.json`/env. Idempotent; a
+    // failure only degrades memory recall/save (logged), never the server.
+    bot_memory::install_scripts(&config.data_dir);
+
     // Session survival across restarts/deploys. tmux keeps its control
     // socket under $TMUX_TMPDIR (default `/tmp`). Under the systemd hardening
     // `PrivateTmp=true`, `/tmp` is recreated fresh on every (re)start, so a new
@@ -87,6 +117,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pool = db::init(&config).await?;
+
+    // P3a: rebind the seeded `owner@localhost` sentinel to the owner's real email
+    // (per the 0032 header) when one is configured. Idempotent — touches only the
+    // still-sentinel owner row. Non-fatal.
+    if let Some(owner_email) = config.human_auth.owner_email.as_deref() {
+        match db::human_users::bind_owner_email(&pool, owner_email).await {
+            Ok(true) => tracing::info!("bound owner human_users row to configured owner_email"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "could not bind owner_email"),
+        }
+    }
+
     let bind = config.bind;
 
     let state = state::AppState::new(pool, config);
@@ -127,6 +169,18 @@ async fn main() -> anyhow::Result<()> {
     // agent's board-write surface is present with no manual step. Idempotent +
     // non-clobbering (preserves a co-located user command of the same name).
     agents::skills::seed_managed_commands().await;
+    // Seed the first agent-authored connector — iCloud Mail (spec §10): write its
+    // embedded stdio MCP server to the data dir and upsert its manifest so the
+    // store lists it as a grantable card. Idempotent + best-effort.
+    connectors::icloud::seed(&state).await;
+    // Seed the generic IMAP/SMTP mail family (Gmail-IMAP / Outlook / Fastmail):
+    // write the shared embedded stdio MCP server once and upsert one Form card per
+    // provider. iCloud keeps its own card above. Idempotent + best-effort.
+    connectors::imap_connector::seed(&state).await;
+    // The built-in Shared Browser connector card (kind `builtin_browser`).
+    // Seeding the row starts NO browser: chrome is spawned lazily, and only by a
+    // granted session's first tool call.
+    connectors::browser::mcp::seed(&state).await;
     // Start the HostPool reaper. Sweeps every 60s,
     // tears down SSH ControlMasters that have been idle > 10min AND have no
     // live session row pointing at them. Cheap no-op while no remote hosts

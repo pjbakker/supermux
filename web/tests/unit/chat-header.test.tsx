@@ -128,6 +128,20 @@ describe('the slot cannot shift', () => {
     expect(PHONE.head.height).toBe(19 + 3 + 26 + 12)
   })
 
+  test('the phone card does NOT reserve the notch as internal padding', () => {
+    // The floating card floats BELOW the safe area — the reservation is the
+    // overlay wrapper's `top` offset (`chat-surface.tsx`,
+    // `calc(var(--safe-top) + 6px)`), NOT `pt-safe` inside the card. A
+    // `pt-safe` here painted ~47px of empty glass above the name and doubled the
+    // card's height on a notched device (invisible in the env=0 review rig).
+    const phone = renderToStaticMarkup(
+      <SessionHeaderPill name={FOCUS} session={session()} surface="phone" />,
+    )
+    expect(phone).not.toContain('pt-safe')
+    // Desktop is not notched; the pinned bar keeps its harmless-at-env=0 inset.
+    expect(pill(session())).toContain('pt-safe')
+  })
+
   test('the inner is addressed by the slug — the crossfade re-keys on it', () => {
     // React keys do not reach the markup; this attribute is their proxy, and it
     // is what a bench screenshot diff can be cropped on.
@@ -246,13 +260,12 @@ describe('honesty — the offline dot (st-conn-offline)', () => {
 })
 
 describe('the renderer switch', () => {
-  // Fase A5 T2 added the third cell (`auto`) and the `resolved` prop; these
-  // A3 assertions are re-pointed at it rather than rewritten, so the metrics
-  // and the e2e hooks stay pinned. The tri-specific behaviour has its own file
-  // (`chat-renderer-switch.test.tsx`).
+  // A binary Chat ⇄ Terminal toggle (`auto` retired). These A3 assertions keep
+  // the metrics and the e2e hooks pinned; the switch's own behaviour has its own
+  // file (`chat-renderer-switch.test.tsx`).
   const html = (value: 'chat' | 'terminal') =>
     renderToStaticMarkup(
-      <RendererSwitch value={value} resolved={value} onChange={() => undefined} />,
+      <RendererSwitch value={value} onChange={() => undefined} />,
     )
 
   test('keeps the hooks the e2e suite clicks', () => {
@@ -276,7 +289,7 @@ describe('the renderer switch', () => {
     expect(out).toContain('h-[30px]')
     expect(out).toContain('border-hairline')
     expect(out).toContain('text-[13.4px]')
-    expect(text(out)).toBe('Auto Chat Terminal')
+    expect(text(out)).toBe('Chat Terminal')
   })
 })
 
@@ -302,7 +315,6 @@ describe('the phone header gives its width to the name (QA #6)', () => {
               size="sm"
               labels="selected"
               value="chat"
-              resolved="chat"
               onChange={() => undefined}
             />
           )
@@ -311,26 +323,53 @@ describe('the phone header gives its width to the name (QA #6)', () => {
     )
 
   test('the name carries a floor on the phone, and none on the desktop', () => {
-    expect(phone(session({ display_name: 'Release Train' }))).toContain('min-width:112px')
+    // The floor dropped to a small legible stub (56px) when the trailing cluster
+    // went INLINE (single row): a wide reconnecting chip + the renderer toggle
+    // beside a hard 112px floor overflowed the card, so the name yields first and
+    // truncates the rest. The floor still exists — it just guards a stub, not a
+    // full name.
+    expect(phone(session({ display_name: 'Release Train' }))).toContain('min-width:56px')
     expect(pill(session({ display_name: 'Release Train' }))).not.toContain('min-width')
   })
 
-  test('the mode chip stacks over the trailing slot instead of beside it', () => {
-    // `ipc` in bypass mode was the worst case: chip + switch took 187px of a
-    // 342px row. Stacked, the pair costs the WIDER of the two, not their sum.
+  test('the trailing cluster is ONE inline row, not a stacked column', () => {
+    // The header is a single iOS-style bar: the renderer toggle sits inline on
+    // the one row, `flex-none` keeping the cluster's intrinsic width so the name
+    // gives first.
     const out = phone(session({ display_name: 'ipc', mode: 'bypass' }))
-    expect(out).toContain('flex-col')
+    expect(out).not.toContain('flex-col')
+    expect(out).toContain('flex-none')
     expect(text(out)).toContain('ipc')
-    expect(text(out)).toContain('Bypass')
-    // …and the cluster can still give way when even that is not enough.
-    expect(out).toContain('shrink')
   })
 
-  test('a header with neither a mode nor a trailing slot grows no empty cell', () => {
+  test('the mobile chat header shows NO mode dot (owner: back · avatar · name · pill, no dots)', () => {
+    // The owner stripped the phone chat header to its essentials — the mode dot
+    // (condensed glyph or worded chip) no longer rides this cluster at all. Even
+    // a `bypass` session paints no mode affordance in the header; the mode still
+    // reaches the desktop header's worded `ModeChip` (below) and every other
+    // caller, just not this bar.
+    const out = phone(session({ display_name: 'ipc', mode: 'bypass' }))
+    expect(out).not.toContain('Bypass mode')
+    expect(text(out)).not.toContain('Bypass')
+  })
+
+  test('the mobile chat header shows NO presence dot (owner: no dots)', () => {
+    // The presence dot was dropped from the phone chat header along with the mode
+    // and connection dots — the header is back · avatar · name · Chat/Console
+    // pill, nothing else. The dot survives on the desktop name row (next test)
+    // and on the overview tile.
     const out = renderToStaticMarkup(
       <SessionHeaderPill name={FOCUS} session={session()} surface="phone" />,
     )
+    expect(out).not.toContain('bg-status-ready')
+    expect(out).not.toContain('sm-status-spinner')
+  })
+
+  test('the desktop keeps the presence dot on the name row', () => {
+    // Only the phone strips its dots; the desktop header is unchanged, dot inline.
+    const out = pill(session())
     expect(out).not.toContain('flex-col')
+    expect(out).toContain('bg-status-ready')
   })
 
   test('labels="selected" drops the unselected WORD, never its name', () => {
@@ -339,22 +378,21 @@ describe('the phone header gives its width to the name (QA #6)', () => {
         size="sm"
         labels="selected"
         value="chat"
-        resolved="chat"
         onChange={() => undefined}
       />,
     )
-    // The `A` is the auto cell's glyph — the one word-cell rule applies to the
-    // two renderer names, which is what the phone header's width budget needs.
-    expect(text(out)).toBe('A Chat')
+    // Only the active cell keeps its word; the unselected renderer condenses to
+    // a glyph, which is what the phone header's width budget needs.
+    expect(text(out)).toBe('Chat')
     expect(out).toContain('aria-label="Terminal"')
     expect(out).toContain('data-testid="renderer-terminal"')
     // The default is untouched — the desktop seam still reads both words.
     expect(
       text(
         renderToStaticMarkup(
-          <RendererSwitch value="chat" resolved="chat" onChange={() => undefined} />,
+          <RendererSwitch value="chat" onChange={() => undefined} />,
         ),
       ),
-    ).toBe('Auto Chat Terminal')
+    ).toBe('Chat Terminal')
   })
 })

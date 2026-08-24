@@ -25,6 +25,7 @@ import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import { ChatComposer } from '../../src/components/chat/composer'
+import { composeActionRows, sessionActionRows } from '../../src/components/chat/chat-actions'
 import { ChatConversation } from '../../src/components/chat/conversation'
 import type { PeekLens, PtyNotice } from '../../src/components/chat/peek-lens'
 import {
@@ -41,6 +42,7 @@ import {
 } from '../../src/components/chat/composer-draft'
 import { emptyCopy, EntityPickerView } from '../../src/components/chat/entity-picker'
 import { TranscriptItem } from '../../src/components/chat/transcript-item'
+import { MessageActions } from '../../src/components/chat/ui/message-actions'
 import {
   atRows,
   pickerOptionId,
@@ -374,11 +376,15 @@ const composer = (over: Partial<ComposerHandle> = {}, active = false) =>
 const text = (html: string) => html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
 
 describe('the composer, live', () => {
-  test('at rest the boards’ mic keeps its cell — no send button on an empty draft', () => {
+  test('at rest — no send button on an empty draft; the mic is gated on Web Speech', () => {
     const html = composer()
-    expect(html).toContain('sm-mic')
+    // No send/stop control while the box is empty and no turn runs.
     expect(html).not.toContain('data-testid="chat-send"')
     expect(html).not.toContain('data-testid="chat-stop"')
+    // The rest-state mic is a dictation affordance, gated on the Web Speech API
+    // (mobile polish #3): absent in this SSR env (the iPhone case), so no mic
+    // glyph. Its presence-when-supported is covered by chat-composer-mic.test.tsx.
+    expect(html).not.toContain('sm-mic')
   })
 
   test('a draft arms Send', () => {
@@ -448,6 +454,18 @@ describe('the composer, live', () => {
     const html = composer({ draft: '' }, true)
     expect(html).toContain('data-testid="chat-stop"')
     expect(html).not.toContain('data-testid="chat-send"')
+  })
+
+  test('the Stop control follows the RECONCILED live turn, not raw status', () => {
+    // The stop-state honesty fix: `chat-panel` feeds `active` the reconciled
+    // `status === 'active' && turnStart != null`, and the user's Stop drops the
+    // anchor (`endTurn`). So a session whose status is stuck at `active` after a
+    // cancel presents NO Stop button — the control cannot be a no-op that fires
+    // an Escape into a pty with nothing left to interrupt. Turn ended → the mic
+    // is back, not a dead square.
+    const ended = composer({ draft: '' }, false)
+    expect(ended).not.toContain('data-testid="chat-stop"')
+    expect(ended).not.toContain('data-testid="chat-send"')
   })
 
   test('a draft during a turn shows SEND, not Stop — the button does what the box says', () => {
@@ -875,8 +893,90 @@ describe('the slash refusal, said out loud', () => {
     expect(html).not.toContain('data-testid="chat-composer-open-terminal"')
   })
 
-  test('the composer’s `+` is a real control now — it opens the mention picker', () => {
-    expect(composer()).toContain('data-testid="chat-composer-at"')
+  test('no-`actions` FALLBACK keeps a DIRECT `@` mention button (benches / read-only)', () => {
+    // The single `+` add-menu is drawn whenever `actions` is wired — which every
+    // shipping surface now does (mobile.tsx + desktop-split.tsx). Absent it (a
+    // bench, the read-only preview), the leading control falls back to the direct
+    // pair: an `@` that inserts the trigger, drawn as an `@`, not a `+`.
+    const html = composer()
+    expect(html).toContain('data-testid="chat-composer-at"')
+    // …and it is NOT the add-menu opener: no `actions`, no folded menu.
+    expect(html).not.toContain('data-testid="chat-composer-add"')
+  })
+
+  test('desktop WITH `actions`: the trio collapses to ONE `+` add-menu (no bare @/clock)', () => {
+    // The winner brings the single `+` to the desktop chat pane too (a fine
+    // pointer ⇒ the anchored Radix popover). Mention / slash / attach / schedule
+    // move INTO the menu, so the bar shows one leading disc and the field
+    // reclaims the trio's width. `onSwitchSession` is OMITTED on desktop.
+    const html = renderToStaticMarkup(
+      <ChatComposer
+        name={NAME}
+        label="Release Train"
+        handle={handle()}
+        onSchedule={() => {}}
+        actions={{ onCommandPalette: () => {} }}
+      />,
+    )
+    expect(html).toContain('data-testid="chat-composer-add"')
+    // The add control announces its menu (a11y), closed at rest.
+    expect(html).toContain('aria-haspopup="menu"')
+    expect(html).toContain('aria-expanded="false"')
+    // No direct mention / schedule discs on the bar — they live in the menu.
+    expect(html).not.toContain('data-testid="chat-composer-at"')
+    expect(html).not.toContain('data-testid="chat-composer-schedule"')
+  })
+
+  test('the add-menu draws ONE shared row list (the sheet === the popover)', () => {
+    // Both shells (Vaul sheet on coarse, Radix popover on fine) map the SAME
+    // authored rows from `chat-actions.ts`, so the two surfaces can never drift.
+    const h = {
+      onMention: () => {},
+      onSlash: () => {},
+      onSnippets: () => {},
+      onSchedule: () => {},
+      onSwitchSession: () => {},
+      onCommandPalette: () => {},
+    }
+    expect(composeActionRows(h).map((r) => r.label)).toEqual([
+      'Mention a file or session',
+      'Slash command',
+      'Insert a snippet',
+      'Schedule for later',
+    ])
+    expect(sessionActionRows(h).map((r) => r.label)).toEqual(['Switch session', 'Command palette'])
+    // Progressive gating: an unwired handler never draws a dead row. Desktop
+    // omits switch-session, so that row simply gates out.
+    expect(composeActionRows({ onMention() {}, onSlash() {}, onCommandPalette() {} }).map((r) => r.label)).toEqual([
+      'Mention a file or session',
+      'Slash command',
+    ])
+    expect(
+      sessionActionRows({ onMention() {}, onSlash() {}, onCommandPalette() {} }).map((r) => r.label),
+    ).toEqual(['Command palette'])
+  })
+
+  test('mobile with `actions`: ONE `+` owns the add-menu; the bare @/clock leave the bar', () => {
+    // Owner feedback #1 + the consolidation goal: the phone bar is a single
+    // leading control (`+` = "add something") that opens the menu. Mention,
+    // command and schedule move INTO that menu, so the three-button cluster is
+    // gone from the bar itself.
+    const html = renderToStaticMarkup(
+      <ChatComposer
+        name={NAME}
+        label="Release Train"
+        surface="phone"
+        handle={handle()}
+        onSchedule={() => {}}
+        actions={{ onSwitchSession: () => {}, onCommandPalette: () => {} }}
+      />,
+    )
+    expect(html).toContain('data-testid="chat-composer-add"')
+    // The add control announces its disclosure, closed at rest.
+    expect(html).toContain('aria-expanded="false"')
+    // No direct mention / schedule buttons on the bar — they live in the menu.
+    expect(html).not.toContain('data-testid="chat-composer-at"')
+    expect(html).not.toContain('data-testid="chat-composer-schedule"')
   })
 
   test('the popover mounts only when the handle says it is open', () => {
@@ -1029,6 +1129,65 @@ describe('the transcript does not re-render on every keystroke', () => {
     // the fix; this is the reminder in the diff.
     expect(props.has('draft')).toBe(false)
     expect(props.has('composer')).toBe(false)
+  })
+})
+
+describe('the per-message action bar mounts as a stable sibling, gated', () => {
+  // A confirmed assistant turn, shaped like a `buildTranscript` node.
+  const assistantNode = {
+    kind: 'item' as const,
+    key: 'a1',
+    item: { type: 'assistant' as const, uuid: 'u1', ts: 1, text: 'Answer from the model' },
+    speaker: 'agent' as const,
+    grouped: false,
+    showGutter: true,
+    sender: undefined,
+  }
+
+  test('OFF by default — the base transcript is byte-identical (no action column at all)', () => {
+    const html = renderToStaticMarkup(<TranscriptItem node={assistantNode} name={NAME} />)
+    expect(html).toContain('Answer from the model')
+    // No hover-group wrapper and no bar hook: the AgentRow output is exactly the
+    // bare bubble it was before this feature.
+    expect(html).not.toContain('group/msg')
+    expect(html).not.toContain('data-msg-actions')
+  })
+
+  test('ON in bot mode — the bubble gains a sibling action column (never inside <Prose>)', () => {
+    const html = renderToStaticMarkup(
+      <TranscriptItem node={assistantNode} name={NAME} showActions />,
+    )
+    // The hover-group column wraps the bubble + the lazily-mounted bar as
+    // SIBLINGS; the bar itself is a separate lazy chunk (so it does not weigh on
+    // the transcript's main chunk and does not render under sync SSR — asserted
+    // directly on <MessageActions> below).
+    expect(html).toContain('group/msg')
+    expect(html).toContain('Answer from the model')
+  })
+})
+
+describe('the per-message action bar — the presentational component', () => {
+  // Rendered with NO <ToastProvider>: the bar reads the toast context directly
+  // and falls back to a no-op, so it renders anywhere (benches, this test).
+  test('desktop: Copy + a More trigger, hidden-until-hover, with the skin hooks', () => {
+    const html = renderToStaticMarkup(<MessageActions text="raw **markdown**" />)
+    expect(html).toContain('data-msg-actions')
+    expect(html).toContain('data-surface="desktop"')
+    expect(html).toContain('data-msg-action="copy"')
+    expect(html).toContain('data-msg-action="more"')
+    expect(html).toContain('aria-label="Copy message"')
+    // Hidden at rest, revealed by CSS only (no React state on the reveal path).
+    expect(html).toContain('opacity-0')
+    expect(html).toContain('group-hover/msg:opacity-100')
+  })
+
+  test('phone: the bar is persistent (no opacity-0 reveal) and 44pt', () => {
+    const html = renderToStaticMarkup(<MessageActions text="x" surface="phone" />)
+    expect(html).toContain('data-surface="phone"')
+    // Persistent, not hover-gated.
+    expect(html).not.toContain('opacity-0')
+    // 44pt targets.
+    expect(html).toContain('size-11')
   })
 })
 

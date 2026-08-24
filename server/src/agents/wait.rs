@@ -48,12 +48,22 @@ pub struct WaitResult {
 /// Long-poll for `name` to reach `q.state`.
 pub async fn wait(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
     Path(name): Path<String>,
     Query(q): Query<WaitQuery>,
 ) -> Result<Json<WaitResult>, AppError> {
+    // P3b — this `{name}` route lives on the agents router (not the sessions
+    // scope layer). The company fence 404s a scoped human whose session is in
+    // another company. But `authorize_session_for_human` only touches the DB in
+    // the `Scope::Company` branch — for `Scope::All` (owner / admin-all / no
+    // human context) it returns Ok WITHOUT checking existence, so it does NOT
+    // subsume the missing-row 404 on the owner path. Keep the explicit `exists`
+    // check so an unknown session 404s uniformly in EVERY scope (else the loop
+    // below long-polls a phantom row and returns 200 `stopped`).
     if !db::sessions::exists(&state.pool, &name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
     }
+    crate::scope::authorize_session_for_human(&state, ctx.0.as_ref(), &name).await?;
     let want = parse_want(&q.state)?;
     let timeout = Duration::from_secs(q.timeout.unwrap_or(MAX_TIMEOUT_SECS).min(MAX_TIMEOUT_SECS));
     let deadline = tokio::time::Instant::now() + timeout;

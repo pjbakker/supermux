@@ -20,15 +20,22 @@
 pub mod activity;
 pub mod auto_actions;
 pub mod chat;
+pub mod connect_ask;
+pub mod connector_config;
 pub mod elicitation;
 pub mod host_pool;
 pub mod lifecycle;
 pub mod login;
+pub mod memory;
 pub mod pty;
 pub mod pty_state;
 pub mod recall;
 pub mod resumable;
+pub mod send_dedup;
 pub mod status;
+/// The Shared Browser connector's `request_human_takeover(reason)` detector —
+/// the `PreToolUse` payload that raises the in-chat "take the wheel" card.
+pub mod takeover_ask;
 pub mod steering;
 pub mod teams;
 pub mod tmux;
@@ -59,6 +66,41 @@ use crate::db;
 use crate::db::sessions::{NewSession, Session, SessionRuntime};
 use crate::error::AppError;
 use crate::state::{AppState, SessionActivity};
+
+/// P3b — the per-company REST funnel for EVERY `/api/sessions/{name}/…` route.
+///
+/// Applied as ONE layer on the whole sessions sub-router (below), so a new
+/// name-addressed handler is scoped the moment it is registered — there is no
+/// per-handler call to forget, which is the "single choke point so none is
+/// missed" the security review asks for (design §3 row 3). It reads the `{name}`
+/// path param the router already captured and the `AuthContext` the auth layer
+/// already stamped, and calls [`crate::scope::authorize_session_for_human`]:
+/// a scoped human hitting another company's session gets the uniform 404,
+/// byte-identical to a nonexistent slug; owner/admin bypass; a route with no
+/// `{name}` param (`/api/sessions`, `/api/sessions/archived`, the statusline
+/// routes) is passed straight through.
+async fn scope_session_middleware(
+    State(state): State<AppState>,
+    params: axum::extract::RawPathParams,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, AppError> {
+    let name = params
+        .iter()
+        .find(|(k, _)| *k == "name")
+        .map(|(_, v)| v.to_string());
+    if let Some(name) = name {
+        let ctx = req
+            .extensions()
+            .get::<crate::auth_human::AuthContext>()
+            .cloned();
+        // Load-and-gate. Owner/admin (or no ctx) → Ok and continue; a scoped
+        // human off their company → the uniform NotFound returned here, before
+        // the handler runs (no bytes, no existence tell).
+        crate::scope::authorize_session_for_human(&state, ctx.as_ref(), &name).await?;
+    }
+    Ok(next.run(req).await)
+}
 
 /// Build the sessions sub-router (no auth layer — applied by `http::router`).
 pub fn router_for(state: AppState) -> Router {
@@ -94,6 +136,20 @@ pub fn router_for(state: AppState) -> Router {
             get(login_state_handler).post(login_action_handler),
         )
         .route("/api/sessions/{name}/recall", get(recall::handler))
+        // ── the bot's ARCHIVAL memory (read-only browse + search) ──
+        // The CORE notes ride on the session row (`config` PATCH above); these
+        // three read the on-disk store the bot writes itself, unioning its
+        // private tier with its role's shared one exactly as the recall hook
+        // does — and searching with that same scorer, so the Memory panel shows
+        // what the bot would actually recall. Registered `/memory/search` and
+        // `/memory/notes` BEFORE `/memory/notes/{slug}` so the literal segments
+        // are never captured as a slug.
+        .route("/api/sessions/{name}/memory/notes", get(memory::list_handler))
+        .route("/api/sessions/{name}/memory/search", get(memory::search_handler))
+        .route(
+            "/api/sessions/{name}/memory/notes/{slug}",
+            get(memory::note_handler),
+        )
         // ── the per-session harness-event feed ──
         // Replayable provenance for everything the harness did TO or FROM this
         // session (delegations, renames, schedule fires). SSE only says "look
@@ -139,6 +195,14 @@ pub fn router_for(state: AppState) -> Router {
         .route("/api/sessions/{name}/unarchive", post(unarchive_handler))
         // ── switch the Claude permission mode from the ⋯ menu ──
         .route("/api/sessions/{name}/mode", post(mode_handler))
+        // ── store→chat CONNECT handoff ──
+        // Push the SAME per-session live-state a bot's own `connect()` tool sets,
+        // so the existing `ConnectCard` renders it untouched. No secret on this
+        // route — only the connector id + the `{name}` target.
+        .route(
+            "/api/sessions/{name}/connect_request",
+            post(connect_request_handler),
+        )
         // ── reopen a past Claude conversation for the dir ──
         .route(
             "/api/sessions/{name}/resumable",
@@ -168,6 +232,14 @@ pub fn router_for(state: AppState) -> Router {
                 .post(steer_add_handler)
                 .delete(steer_clear_handler),
         )
+        // P3b — scope EVERY `{name}` route through the company funnel in one
+        // place. `.layer` here is INNER to the `auth_context_middleware` applied
+        // by `http::protected_router`, so `AuthContext` is already stamped when
+        // this runs; a route with no `{name}` param is a no-op pass-through.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            scope_session_middleware,
+        ))
         .with_state(state)
 }
 
@@ -225,12 +297,36 @@ pub struct SessionView {
     pub mcp: String,
     pub worktree: bool,
     pub creator: String,
+    /// The company this session belongs to (migration 0032), or `null` for a
+    /// main/PA bot. This is the read-path addition `host_id` never got — the
+    /// company switcher reads it to scope the roster client-side. Always present
+    /// on the wire (serialised as `null` for a main bot).
+    pub company_id: Option<i64>,
     /// Which terminal backend drives this session (migration 0024): `"tmux"` or
     /// `"native"`. ADDITIVE field — always present, `"tmux"` for the entire
     /// existing fleet, so no client that ignores it sees any change. Exposed so
     /// the UI can badge a native session (and so a native-vs-tmux bug report
     /// carries the answer without a DB dump).
     pub runtime: String,
+    /// The launch-line model selection (migration 0030 / bot identity), e.g.
+    /// `"opus"`. Empty = provider default. Injected as `--model <id>` at launch;
+    /// changing it is a launch-line change (see [`restart_required`]).
+    pub model: String,
+    /// The bot's "Notes it keeps" (migration 0030) — free text injected READ-ONLY
+    /// into the agent's system prompt at launch, after the role (`desc`). v1 is
+    /// read-only; a write-back path is a later phase.
+    pub memory: String,
+    /// Reserved per-bot skills selection (migration 0030): a JSON array. Nothing
+    /// consumes it yet; surfaced so the editor can round-trip it.
+    pub skills: Vec<String>,
+    /// TRUE only on a config PATCH response whose change is a LAUNCH-LINE property
+    /// (model, or the role/notes now injected at launch): the UI shows "Applies on
+    /// next start" instead of relaunching the agent under the user. Always `false`
+    /// on `get`/`list`/SSE rows (a session does not "need a restart" as a standing
+    /// property), and OMITTED from the wire when false so those shapes are
+    /// unchanged — it is purely the PATCH result's advisory bit.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub restart_required: bool,
     /// Last 6 lines of `last_capture`, ANSI-stripped.
     pub preview_lines: Vec<String>,
     /// Same last 6 lines, with SGR escape sequences preserved — the colour-true
@@ -262,6 +358,16 @@ pub struct SessionView {
     /// when 0 (the common case) so a resting session's wire shape is unchanged.
     #[serde(skip_serializing_if = "is_zero", default)]
     pub subagents: u32,
+    /// TRUE when a BACKGROUND workflow is provably running RIGHT NOW — a
+    /// `subagents/agent-*.jsonl` append (the tailer ground truth) OR an open
+    /// subagent hook within `SUBAGENT_LIVE_WINDOW`
+    /// ([`crate::state::AppState::subagents_live`]). Unlike `subagents` (the raw
+    /// count, torn down historically on the main `Stop`) this SURVIVES the main
+    /// agent returning to its prompt, so the roster + notifications can read a
+    /// left-open workflow as WORKING rather than done/idle. Omitted when false (the
+    /// common case) so a resting session's wire shape is unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub subagents_live: bool,
     /// The LIVE permission dialog, from the `PermissionRequest` hook: Claude is
     /// displaying a permission prompt for this tool call and is blocked on a
     /// human. In-memory only; cleared as soon as anything proves the dialog
@@ -279,6 +385,43 @@ pub struct SessionView {
     /// asking, so a resting session's wire shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elicitation: Option<elicitation::ElicitationAsk>,
+    /// **The live connect ask**, from the `PreToolUse` hook: a bot's
+    /// `connect(service)` tool (the store's credential affordance, spec §8)
+    /// stopped for a human. Names WHICH connector stalled; the web `ConnectCard`
+    /// resolves the display name / tool count / OAuth capability from the
+    /// secret-free card schema. In-memory only, and the credential NEVER touches
+    /// this plane (the card POSTs it straight to the vault). Omitted when nothing
+    /// is asking, so a resting session's wire shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_request: Option<connect_ask::ConnectAsk>,
+    /// **The live browser takeover ask**: a granted bot called the Shared
+    /// Browser's `request_human_takeover(reason)` and is waiting for a human to
+    /// finish a login / 2FA / CAPTCHA on its page. Carries the agent's own
+    /// sentence and the session whose browser context the takeover panel must
+    /// attach to. Raised by the `PreToolUse` detector
+    /// ([`takeover_ask::parse`]) AND by the tool endpoint when the call really
+    /// runs; cleared by the same "something after it happened" events as
+    /// [`connect_request`](Self::connect_request). Omitted when nothing is
+    /// asking, so a resting session's wire shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_takeover: Option<takeover_ask::TakeoverAsk>,
+    /// **The live question ask**, from the `AskUserQuestion` `PreToolUse` hook: the
+    /// agent asked a multiple-choice question and is blocked on a human. Carries
+    /// the question, its option LABELS (in dialog order) and `multiSelect`, built
+    /// from the STRUCTURED payload so chat can draw the real choices as clickable
+    /// buttons rather than the generic tool-permission prompt. In-memory only;
+    /// cleared by the same events as [`permission_request`](Self::permission_request).
+    /// The generic permission dialog for AskUserQuestion is suppressed while this
+    /// is live. Omitted when nothing is asking, so a resting session's wire shape
+    /// is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_request: Option<activity::QuestionAsk>,
+    /// The Notification `message` for the needs-you family (permission_prompt /
+    /// idle_prompt / agent_needs_input) while the session sits Waiting. In-memory,
+    /// display-only; rendered read-only in the attention region on Waiting.
+    /// Omitted when absent, so a resting session's wire shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_message: Option<String>,
     /// The Claude Code permission MODE parsed from the persistent status bar in
     /// `last_capture`: `normal` / `accept_edits` / `plan` / `bypass`.
     /// `None` until the first capture (the menu then defaults to `normal`). Drives
@@ -432,6 +575,12 @@ fn view(
     s: &Session,
     rt: Option<&SessionRuntime>,
     act: Option<SessionActivity>,
+    // Is a background workflow provably running right now
+    // ([`crate::state::AppState::subagents_live`])? Threaded in like `act` /
+    // `statusline` so `view` stays a pure function of its arguments (its ground
+    // truth — the tailer's `subagent_active_at` map — lives on the state the
+    // caller holds, not on `act`).
+    subagents_live: bool,
     // The statusline snapshot, when the opt-in tap is installed AND has fired
     // for this session. Threaded in rather than fetched here so `view` stays a
     // pure function of its arguments (every caller already holds the state).
@@ -478,6 +627,9 @@ fn view(
         mcp: s.mcp.clone(),
         worktree: s.worktree != 0,
         creator: s.creator.clone(),
+        // The read-path addition host_id never got: the switcher reads this to
+        // scope the roster. NULL for a main bot; the whole existing fleet.
+        company_id: s.company_id,
         // Rows written before migration 0024 (and the test-only
         // `insert_minimal`) can read back empty; present them as the tmux
         // default so the field is never blank on the wire.
@@ -486,11 +638,21 @@ fn view(
         } else {
             s.runtime.clone()
         },
+        // Bot identity (migration 0030). `skills` is a JSON-array string in the
+        // column; parse it with the same tolerant helper as `tags` so a junk
+        // value degrades to `[]` rather than failing the read.
+        model: s.model.clone(),
+        memory: s.memory.clone(),
+        skills: parse_tags(&s.skills),
+        // Only ever flipped true by `config_patch` on a launch-line change; every
+        // other construction path (get/list/SSE) leaves it false → omitted.
+        restart_required: false,
         preview_lines: preview_lines(last_capture),
         preview_ansi: last_n_lines(last_capture_ansi, 20),
         activity: act.as_ref().and_then(|a| a.activity.clone()),
         activity_kind: act.as_ref().and_then(|a| a.activity_kind.clone()),
         subagents: act.as_ref().map(|a| a.subagents).unwrap_or(0),
+        subagents_live,
         permission_request: act.as_ref().and_then(|a| {
             a.permission.as_ref().map(|ask| PermissionRequestInfo {
                 tool: ask.tool.clone(),
@@ -500,6 +662,10 @@ fn view(
             })
         }),
         elicitation: act.as_ref().and_then(|a| a.elicitation.clone()),
+        connect_request: act.as_ref().and_then(|a| a.connect_request.clone()),
+        browser_takeover: act.as_ref().and_then(|a| a.browser_takeover.clone()),
+        question_request: act.as_ref().and_then(|a| a.question_request.clone()),
+        waiting_message: act.as_ref().and_then(|a| a.waiting_message.clone()),
         error: act.and_then(|a| a.error.map(|(error_type, message)| ErrorInfo {
             error_type,
             message,
@@ -768,6 +934,7 @@ async fn events_handler(
 pub fn emit_harness(state: &AppState, sessions: &[&str], entry: &crate::db::runtime_state::AuditEntry) {
     let _ = state.sse_tx.send(crate::state::SseEvent {
         event: "harness".into(),
+        company_id: None,
         payload: json!({ "sessions": sessions, "entry": entry }),
     });
 }
@@ -806,6 +973,7 @@ pub async fn list(state: &AppState) -> Result<Vec<SessionView>, AppError> {
                 s,
                 rt_map.get(&s.name),
                 state.session_activity(&s.name),
+                state.subagents_live(&s.name),
                 state.statusline(&s.name),
             )
         })
@@ -821,6 +989,7 @@ pub async fn get(state: &AppState, name: &str) -> Result<SessionView, AppError> 
         &s,
         rt.as_ref(),
         state.session_activity(name),
+        state.subagents_live(name),
         state.statusline(name),
     ))
 }
@@ -843,6 +1012,7 @@ pub async fn list_archived(state: &AppState) -> Result<Vec<SessionView>, AppErro
                 s,
                 rt_map.get(&s.name),
                 state.session_activity(&s.name),
+                state.subagents_live(&s.name),
                 state.statusline(&s.name),
             )
         })
@@ -963,6 +1133,21 @@ pub struct CreateInput {
     /// they timed out.
     #[serde(default)]
     pub runtime: Option<String>,
+    /// Per-bot MODEL selection (migration 0030), e.g. `"opus"`. NOT free text:
+    /// resolved against the provider's hardcoded allowlist
+    /// ([`lifecycle::resolve_model_flag`]) and stored as the mapped real id, which
+    /// is what lands on the launch line as `--model <id>` (SEC-01 — an unknown
+    /// value is a 400 and writes no row). Absent = provider default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The company a new session is created into (migration 0032). Absent /
+    /// null => a main bot (`company_id` NULL). When set, the create path forces
+    /// `dir` under the company's `root_dir/<name>/`, IGNORING (overriding, never
+    /// rejecting) any client-supplied `dir`.
+    /// Membership is fixed at create — `ConfigInput` deliberately has no
+    /// `company_id`, so `PATCH …/config` cannot reassign it.
+    #[serde(default)]
+    pub company_id: Option<i64>,
 }
 
 pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView, AppError> {
@@ -1017,14 +1202,42 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         )));
     }
 
-    let dir = input
+    // The main/HQ default dir: the caller-supplied dir, or $HOME. Used only for
+    // main bots (`company_id` NULL) — a company bot's dir is server-owned and
+    // OVERRIDES this below.
+    let default_dir = input
         .dir
+        .clone()
         .filter(|d| !d.trim().is_empty())
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| ".".into())
         });
+
+    // Company sessions live under their company's `root_dir/<name>/`. The server
+    // OWNS this dir: hiring a bot in a company just works, so ANY client-supplied
+    // `input.dir` is IGNORED and the dir is FORCED to `<root_dir>/<name>/` — the
+    // client never has to get it right, and a company bot can never land outside
+    // its company root. Main bots (`company_id` NULL) keep the free-form
+    // default-to-$HOME dir above, byte-identical.
+    let dir = if let Some(cid) = input.company_id {
+        let company = db::companies::get(&state.pool, cid)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("no company {cid}")))?;
+        if company.archived != 0 {
+            return Err(AppError::BadRequest("company is archived".into()));
+        }
+        // OVERRIDE, never compare/reject: whatever the client sent (or nothing),
+        // the derived dir is `<root_dir>/<name>/`.
+        let forced = std::path::Path::new(&company.root_dir).join(&name);
+        std::fs::create_dir_all(&forced).map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("mkdir {}: {e}", forced.display()))
+        })?;
+        forced.display().to_string()
+    } else {
+        default_dir
+    };
     let tags = input.tags.unwrap_or_default();
     let display_name = input
         .display_name
@@ -1047,6 +1260,15 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
             .trim()
             .to_string();
     }
+    // Per-bot MODEL (migration 0030): resolve the selection against the provider's
+    // allowlist and store the mapped real id. NEVER free text on the launch line
+    // (SEC-01) — an unknown selection is a 400, checked before the DB write so a
+    // rejected value never becomes a stored row. Empty = provider default.
+    let model = match lifecycle::resolve_model_flag(&provider, input.model.as_deref().unwrap_or("")) {
+        Ok(Some(id)) => id.to_string(),
+        Ok(None) => String::new(),
+        Err(msg) => return Err(AppError::BadRequest(msg)),
+    };
     let new = NewSession {
         name: name.clone(),
         display_name,
@@ -1061,7 +1283,9 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         worktree: input.worktree.unwrap_or(false),
         worktree_repo: String::new(),
         host_id: input.host_id,
+        company_id: input.company_id,
         runtime: runtime_kind,
+        model,
     };
     db::sessions::create(&state.pool, &new).await?;
     let hook_token = gen_hook_token();
@@ -1098,6 +1322,11 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         row["archived"] = json!(false);
         let _ = state.sse_tx.send(crate::state::SseEvent {
             event: "sessions".to_string(),
+            // P3b — a create is a session-scoped event; stamp the new session's
+            // company so members of that company (and the owner) see it and
+            // members of another company never do. `view.company_id` is already
+            // in hand, so this costs nothing.
+            company_id: view.company_id,
             payload: json!({ "delta": [row] }),
         });
     }
@@ -1154,6 +1383,7 @@ pub async fn delete(state: &AppState, name: &str) -> Result<(), AppError> {
     // green Idle dot and enabled composer stale until an unrelated resync.
     let _ = state.sse_tx.send(crate::state::SseEvent {
         event: "sessions".to_string(),
+        company_id: None,
         payload: json!({
             "delta": [{ "name": name, "removed": true }],
         }),
@@ -1214,6 +1444,23 @@ pub async fn duplicate(
         )));
     }
     db::sessions::duplicate(&state.pool, src, new_name).await?;
+    // §4.1 — `duplicate()` bypasses `create()`'s dir-forcing and copies `dir`
+    // verbatim. For a clone that INHERITED a non-NULL `company_id`, re-derive its
+    // own `root_dir/<new_name>/` and mkdir it, so two company agents never share
+    // a working folder. A main-bot clone (`company_id` NULL) keeps the
+    // verbatim-copied dir, unchanged.
+    if let Some(row) = db::sessions::get(&state.pool, new_name).await? {
+        if let Some(cid) = row.company_id {
+            if let Some(company) = db::companies::get(&state.pool, cid).await? {
+                let forced = std::path::Path::new(&company.root_dir).join(new_name);
+                std::fs::create_dir_all(&forced).map_err(|e| {
+                    AppError::Internal(anyhow::anyhow!("mkdir {}: {e}", forced.display()))
+                })?;
+                db::sessions::set_dir(&state.pool, new_name, &forced.display().to_string())
+                    .await?;
+            }
+        }
+    }
     // T6.2 — the schedules come too, DISABLED. Before B5 no child row was
     // cloned at all, so "duplicate this agent" silently dropped its jobs. They
     // arrive disabled because a copy that immediately starts firing cron jobs
@@ -1290,6 +1537,20 @@ pub struct ConfigInput {
     /// coercion — mis-typing this would quietly change whether the user's phone
     /// rings, which is exactly the class of failure that must be loud.
     pub notif: Option<String>,
+    /// Per-bot MODEL selection (migration 0030), e.g. `"opus"`. Resolved against
+    /// the provider's allowlist ([`lifecycle::resolve_model_flag`]) — an unknown
+    /// value is a 400. `Some("")` clears it back to the provider default. Changing
+    /// it is a LAUNCH-LINE change → the PATCH returns `restart_required: true` and
+    /// the live agent is NOT relaunched under the user.
+    pub model: Option<String>,
+    /// The bot's "Notes it keeps" (migration 0030). Injected READ-ONLY into the
+    /// system prompt at launch, so — like `model` and `desc` — a change here is a
+    /// launch-line change and returns `restart_required: true`.
+    pub memory: Option<String>,
+    /// Reserved per-bot skills selection (migration 0030), a list of skill names.
+    /// Stored as a JSON array. Nothing injects it yet, so unlike model/memory it
+    /// does NOT set `restart_required`.
+    pub skills: Option<Vec<String>>,
 }
 
 pub async fn config_patch(
@@ -1300,6 +1561,13 @@ pub async fn config_patch(
     ensure_session(state, name).await?;
     let mut current = name.to_string();
     let mut changed = false;
+    // Set when the patch touches a LAUNCH-LINE property (model, or the role/notes
+    // now injected at launch). The response carries this as `restart_required` so
+    // the UI shows "Applies on next start" — we DELIBERATELY do not relaunch a
+    // live agent under the user (see the module doc on the bypass-restart pattern
+    // this mirrors: a launch-line change is applied by the next start, not by
+    // yanking the agent out from under a running turn).
+    let mut restart_required = false;
 
     if let Some(target) = patch.rename.as_deref() {
         let target = target.trim();
@@ -1404,6 +1672,10 @@ pub async fn config_patch(
     }
     if let Some(v) = patch.desc {
         db::sessions::set_desc(&state.pool, &current, &v).await?;
+        // The role (`desc`) is now injected into the agent's system prompt at
+        // launch (migration 0030 — "sluit rol nu echt aan"), so editing it is a
+        // launch-line change that takes effect on the next start.
+        restart_required = true;
         changed = true;
     }
     if let Some(v) = patch.dir {
@@ -1446,6 +1718,38 @@ pub async fn config_patch(
         db::sessions::set_notif_policy(&state.pool, &current, parsed).await?;
         changed = true;
     }
+    if let Some(v) = patch.model {
+        // Resolve against the provider's allowlist (the provider is fixed at
+        // create), store the mapped real id. `""` clears back to the default.
+        // Never free text on the launch line (SEC-01) — an unknown value is a 400,
+        // checked before the write so a rejected value never lands.
+        let provider = db::sessions::get(&state.pool, &current)
+            .await?
+            .map(|s| s.provider)
+            .unwrap_or_default();
+        let id = match lifecycle::resolve_model_flag(&provider, v.trim()) {
+            Ok(Some(id)) => id.to_string(),
+            Ok(None) => String::new(),
+            Err(msg) => return Err(AppError::BadRequest(msg)),
+        };
+        db::sessions::set_model(&state.pool, &current, &id).await?;
+        restart_required = true;
+        changed = true;
+    }
+    if let Some(v) = patch.memory {
+        // The notes are injected READ-ONLY into the system prompt at launch, so a
+        // change is a launch-line change (mirrors `desc`/`model`).
+        db::sessions::set_memory(&state.pool, &current, &v).await?;
+        restart_required = true;
+        changed = true;
+    }
+    if let Some(v) = patch.skills {
+        // Reserved: stored but not yet injected anywhere, so NOT a launch-line
+        // change (no `restart_required`).
+        let json = serde_json::to_string(&v).unwrap_or_else(|_| "[]".into());
+        db::sessions::set_skills(&state.pool, &current, &json).await?;
+        changed = true;
+    }
     if patch.toggle_pin.is_some() {
         db::sessions::toggle_pin(&state.pool, &current).await?;
         changed = true;
@@ -1458,7 +1762,12 @@ pub async fn config_patch(
     if !changed {
         return Err(AppError::BadRequest("no recognized config field".into()));
     }
-    get(state, &current).await
+    let mut view = get(state, &current).await?;
+    // The PATCH result's advisory bit: a launch-line change was made, so the UI
+    // shows "Applies on next start" rather than relaunching the live agent. Only
+    // ever set here — `get`/`list`/SSE rows leave it false (omitted on the wire).
+    view.restart_required = restart_required;
+    Ok(view)
 }
 
 // ── git status ───────────────────────────────────────────────────────────────
@@ -1538,14 +1847,39 @@ async fn git_info(dir: &str) -> GitInfo {
 
 async fn list_handler(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
 ) -> Result<Json<Envelope<Vec<SessionView>>>, AppError> {
-    Ok(ok(list(&state).await?))
+    // P3d — the roster is company-scoped for a MEMBER: they see ONLY their own
+    // company's sessions (mirrors `GET /api/companies`'s own-filter and the SSE
+    // per-subscriber filter). Owner/admin (`Scope::All`) see the whole fleet,
+    // unchanged. `Scope::sees(None)` is false for a member, so an unstamped
+    // main/PA bot never appears in a member's roster (fail-closed).
+    let scope = crate::scope::Scope::of(ctx.0.as_ref());
+    let rows: Vec<SessionView> = list(&state)
+        .await?
+        .into_iter()
+        .filter(|s| scope.sees(s.company_id))
+        .collect();
+    Ok(ok(rows))
 }
 
 async fn list_archived_handler(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
 ) -> Result<Json<Envelope<Vec<SessionView>>>, AppError> {
-    Ok(ok(list_archived(&state).await?))
+    // P3d — the archived sheet is company-scoped for a MEMBER exactly like the
+    // live roster (`list_handler`): they see ONLY their own company's archived
+    // sessions. Owner/admin (`Scope::All`) see every company's, unchanged.
+    // `Scope::sees(None)` is false for a member, so an unstamped archived row
+    // never leaks into a member's list (fail-closed). This is the `{name}`-less
+    // sibling of the sessions scope layer, which cannot fence a listing.
+    let scope = crate::scope::Scope::of(ctx.0.as_ref());
+    let rows: Vec<SessionView> = list_archived(&state)
+        .await?
+        .into_iter()
+        .filter(|s| scope.sees(s.company_id))
+        .collect();
+    Ok(ok(rows))
 }
 
 async fn get_handler(
@@ -1557,8 +1891,23 @@ async fn get_handler(
 
 async fn create_handler(
     State(state): State<AppState>,
-    Json(input): Json<CreateInput>,
+    ctx: crate::scope::OptCtx,
+    Json(mut input): Json<CreateInput>,
 ) -> Result<impl IntoResponse, AppError> {
+    // P3d: a scoped MEMBER may create/spawn agents ONLY in their OWN company.
+    //   * `company_id` defaults to theirs when omitted;
+    //   * an explicit `company_id` for ANOTHER company is a uniform 404 (a member
+    //     cannot even learn another company exists by probing create).
+    // Owner/admin (Scope::All) are unrestricted — any/no company as before.
+    if let crate::scope::Scope::Company(hc) = crate::scope::Scope::of(ctx.0.as_ref()) {
+        match input.company_id {
+            None => input.company_id = Some(hc),
+            Some(c) if c == hc => {}
+            Some(other) => {
+                return Err(AppError::NotFound(format!("company id={other}")));
+            }
+        }
+    }
     let v = create(&state, input).await?;
     Ok((StatusCode::CREATED, ok(v)))
 }
@@ -1655,14 +2004,70 @@ async fn stop_handler(
 #[derive(Debug, Deserialize)]
 struct SendInput {
     text: String,
+    /// Client-generated idempotency key (chat composer). The server dedups on it
+    /// so a Retry of an already-typed message can never duplicate it. Optional:
+    /// callers that omit it get the un-deduped path unchanged.
+    #[serde(default)]
+    send_id: Option<String>,
 }
 
 async fn send_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    // Stamped by `auth_human::auth_context_middleware` on every `protected_router`
+    // request (`http.rs`), so the extractor never fails here. It is the ONLY
+    // authority on who is sending — the author is resolved from it, never from
+    // `SendInput` (a body-supplied author is exactly the forgery this closes).
+    axum::Extension(ctx): axum::Extension<crate::auth_human::AuthContext>,
     Json(input): Json<SendInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    lifecycle::send_text(&state, &name, &input.text).await?;
+    match ctx {
+        // A scoped/known human colleague: server-stamp the `<supermux-human>`
+        // provenance wrapper from the resolved identity, and attribute the action
+        // to a real person + company in the audit ledger (P3c).
+        crate::auth_human::AuthContext::Human {
+            user_id,
+            company_id,
+            ..
+        } => {
+            // The display name is not on the AuthContext — resolve it from the
+            // `human_users` row (the hue seed on the render side is the immutable
+            // id, never this mutable name).
+            let display_name = db::human_users::get(&state.pool, user_id)
+                .await?
+                .map(|u| u.display_name)
+                .unwrap_or_default();
+            lifecycle::send_human_text(
+                &state,
+                &name,
+                &input.text,
+                user_id,
+                &display_name,
+                company_id,
+                input.send_id.as_deref(),
+            )
+            .await?;
+            // Forensic attribution — no `emit_harness`: the message already
+            // carries its own provenance in the transcript via the wrapper, so
+            // this is a ledger row, not a second system line in chat.
+            db::audit::log_authored(
+                &state.pool,
+                "user",
+                "session.send",
+                &name,
+                json!({}),
+                user_id,
+                company_id,
+            )
+            .await?;
+        }
+        // The owner (bearer / ?_token). Byte-identical to the pre-P3c path: no
+        // human wrapper, no per-person audit attribution.
+        crate::auth_human::AuthContext::Owner => {
+            lifecycle::send_chat_text(&state, &name, &input.text, input.send_id.as_deref())
+                .await?;
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1976,6 +2381,84 @@ async fn mode_handler(
     Ok(Json(json!({ "ok": true, "data": result })))
 }
 
+// ── store→chat CONNECT handoff ────────────────────────────────────────────────
+
+/// Body of `POST /api/sessions/{name}/connect_request`: just the connector id to
+/// raise the inline Connect card for. No secret ever rides this route — the
+/// credential still flows ONLY through the vault write
+/// (`POST /api/connectors/{id}/credential`) the card performs later.
+#[derive(Debug, Deserialize)]
+struct ConnectRequestBody {
+    connector_id: String,
+}
+
+/// `POST /api/sessions/{name}/connect_request {connector_id}` — the store→chat
+/// handoff. A human tap in the store PUSHES the same per-session live-state a
+/// bot's own `connect(service)` tool sets ([`connect_ask::ConnectAsk`]), so the
+/// existing web `ConnectCard` renders the pushed card with ZERO new render code.
+///
+/// **Two fences, both reused, no new scoping logic.**
+///   1. The sessions sub-router's [`scope_session_middleware`] already ran
+///      [`crate::scope::authorize_session_for_human`] for this `{name}` route
+///      BEFORE the handler — a member targeting a foreign-company bot got the
+///      uniform `NotFound("session '{name}'")` and never reaches here.
+///   2. In-handler [`crate::scope::authorize_connector_target`] (mirrors `grant`)
+///      re-confirms the target session is a member's own-company connector target
+///      (`*`/foreign → uniform 404); owner/admin → no-op.
+///
+/// The OWNER path skips BOTH scope loads, so the explicit `db::sessions::get`
+/// existence check is what stops a typo'd/nonexistent name from leaking a phantom
+/// `session_activity` entry via [`AppState::set_connect_request`].
+async fn connect_request_handler(
+    State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
+    Path(name): Path<String>,
+    Json(body): Json<ConnectRequestBody>,
+) -> Result<Json<Envelope<serde_json::Value>>, AppError> {
+    let id = body.connector_id.trim().to_string();
+    // Same caps/charset guard `grant` uses — the id becomes the card's key.
+    if !crate::connectors::manifest::valid_connector_id(&id) {
+        return Err(AppError::BadRequest("invalid connector id".into()));
+    }
+    // Fence 2: a member's connect target must be an own-company session (a real
+    // session slug here — never `*`/`@company:` given the name charset), so this
+    // reduces to `authorize_session_for_human`. Owner/admin: no-op.
+    crate::scope::authorize_connector_target(&state, ctx.0.as_ref(), &name).await?;
+    // Unknown session → 404. Needed because the OWNER path skipped fence 1, and
+    // `set_connect_request` would otherwise create a phantom activity entry for a
+    // name that has no row.
+    db::sessions::get(&state.pool, &name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("session '{name}'")))?;
+    // Unknown connector → 404. Resolve like `connectors::api::get_one`: an
+    // installed DB row, else the catalog mirror (a bot can `connect()` an
+    // un-installed catalog id, and the card renders from the mirror), else 404.
+    let known = crate::db::connectors::get(&state.pool, &id)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
+        .is_some()
+        || crate::connectors::catalog::mirror()
+            .cached_cards()
+            .await
+            .iter()
+            .any(|c| c.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str()));
+    if !known {
+        return Err(AppError::NotFound(format!("connector '{id}'")));
+    }
+    // The ONLY write — the same live-state the hook producer sets, built the same
+    // way (`id: None` → the web keys the card on `connector_id`).
+    let changed = state.set_connect_request(
+        &name,
+        connect_ask::ConnectAsk { id: None, connector_id: id.clone() },
+    );
+    if changed {
+        // The exact `sessions` SSE delta the hook producer fires (carries
+        // `connect_request`), so the roster/chat update live with no refetch.
+        crate::hooks::broadcast_activity_delta(&state, &name);
+    }
+    Ok(ok(json!({ "connector_id": id })))
+}
+
 // ── resume picker ────────────────────────────────────────────────────────────
 
 /// `GET /api/sessions/{name}/resumable` — past Claude conversations for the
@@ -2274,6 +2757,8 @@ mod tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = crate::db::init(&config).await.expect("init pool");
@@ -2296,7 +2781,121 @@ mod tests {
             worktree: None,
             host_id: None,
             runtime: None,
+            model: None,
+            company_id: None,
         }
+    }
+
+    /// Seed a company row directly in the DB and return `(id, root_dir)`. The
+    /// `root_dir` is a real temp dir so the create-path `mkdir` + canonicalize
+    /// checks operate on an existing tree.
+    async fn seed_company(state: &AppState, slug: &str) -> (i64, String) {
+        let root = std::env::temp_dir()
+            .join(format!("supermux-co-root-{}", uuid::Uuid::new_v4()))
+            .join(slug);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.display().to_string();
+        let c = db::companies::create(&state.pool, slug, slug, &root)
+            .await
+            .unwrap();
+        (c.id, root)
+    }
+
+    /// §4.1 — a company session's `dir` is FORCED under `<root_dir>/<name>/`.
+    /// The server OWNS the company session dir: any client-supplied `dir` is
+    /// IGNORED (overridden, never a 400) so hiring a bot in a company just
+    /// works. A main bot (no company) keeps its free-form dir.
+    #[tokio::test]
+    async fn company_session_dir_is_forced_under_root_ignoring_client_dir() {
+        let (state, dir) = test_state().await;
+        let (acme, root) = seed_company(&state, "acme").await;
+
+        // No supplied dir → forced to <root>/bot-a.
+        let mut a = input("bot-a");
+        a.dir = None;
+        a.company_id = Some(acme);
+        let view = create(&state, a).await.expect("create bot-a");
+        let want = std::path::Path::new(&root).join("bot-a").display().to_string();
+        assert_eq!(view.dir, want, "dir forced under root_dir/<name>");
+        assert_eq!(view.company_id, Some(acme));
+        assert!(std::path::Path::new(&want).is_dir(), "forced folder mkdir'd");
+
+        // A bogus client dir outside the root is IGNORED, not rejected: the bot
+        // is created (200) and its dir is overridden to <root>/bot-b.
+        let mut b = input("bot-b");
+        b.dir = Some("/tmp/whatever-not-under-root".into());
+        b.company_id = Some(acme);
+        let bview = create(&state, b).await.expect("create bot-b (client dir ignored)");
+        let want_b = std::path::Path::new(&root).join("bot-b").display().to_string();
+        assert_eq!(bview.dir, want_b, "client dir ignored, forced under root_dir/<name>");
+        assert_eq!(bview.company_id, Some(acme));
+        assert!(std::path::Path::new(&want_b).is_dir(), "forced folder mkdir'd");
+
+        // A main bot (no company) keeps its supplied dir, unchanged.
+        let mut m = input("main-x");
+        m.dir = Some("/tmp".into());
+        let mview = create(&state, m).await.expect("create main-x");
+        assert_eq!(mview.dir, "/tmp");
+        assert_eq!(mview.company_id, None);
+
+        // An unknown company id is a 404, not a silent create.
+        let mut g = input("ghost");
+        g.company_id = Some(999_999);
+        match create(&state, g).await {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected NotFound for unknown company, got {other:?}"),
+        }
+
+        crate::sessions::native::forget("bot-a");
+        crate::sessions::native::forget("bot-b");
+        crate::sessions::native::forget("main-x");
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §4.1 — `duplicate()` bypasses `create()`'s dir-forcing; a duplicated
+    /// COMPANY session gets its own re-derived `<root_dir>/<new>/` (never the
+    /// source's folder), while a main-bot duplicate copies `dir` verbatim.
+    #[tokio::test]
+    async fn duplicate_of_company_session_gets_its_own_forced_dir() {
+        let (state, dir) = test_state().await;
+        let (acme, root) = seed_company(&state, "acme").await;
+
+        let mut a = input("bot-a");
+        a.dir = None;
+        a.company_id = Some(acme);
+        let src_dir = create(&state, a).await.expect("create bot-a").dir;
+
+        let copy = duplicate(&state, "bot-a", "bot-a-copy")
+            .await
+            .expect("duplicate");
+        let want = std::path::Path::new(&root)
+            .join("bot-a-copy")
+            .display()
+            .to_string();
+        assert_eq!(copy.dir, want, "clone dir re-derived under root_dir/<new>");
+        assert_ne!(copy.dir, src_dir, "clone does NOT share the source dir");
+        assert_eq!(copy.company_id, Some(acme));
+        assert!(std::path::Path::new(&want).is_dir(), "clone folder mkdir'd");
+
+        // A main-bot duplicate copies `dir` verbatim.
+        let mut m = input("main-x");
+        m.dir = Some("/tmp".into());
+        create(&state, m).await.expect("create main-x");
+        let mcopy = duplicate(&state, "main-x", "main-x-copy")
+            .await
+            .expect("duplicate main");
+        assert_eq!(mcopy.dir, "/tmp", "main-bot clone copies dir verbatim");
+        assert_eq!(mcopy.company_id, None);
+
+        crate::sessions::native::forget("bot-a");
+        crate::sessions::native::forget("bot-a-copy");
+        crate::sessions::native::forget("main-x");
+        crate::sessions::native::forget("main-x-copy");
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The column threads CreateInput → NewSession → INSERT → `Session` row →
@@ -2448,6 +3047,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Bot identity (migration 0030): a MODEL selection is allowlist-validated on
+    /// create — a known value is stored as its mapped id and surfaces on the view;
+    /// an unknown one is a 400 that writes NO row.
+    #[tokio::test]
+    async fn model_selection_is_allowlisted_on_create() {
+        let (state, dir) = test_state().await;
+
+        let mut good = input("with-model");
+        good.provider = Some("claude".into());
+        good.model = Some("opus".into());
+        let view = create(&state, good).await.expect("a valid model creates");
+        assert_eq!(view.model, "opus");
+        let row = db::sessions::get(&state.pool, "with-model").await.unwrap().unwrap();
+        assert_eq!(row.model, "opus");
+
+        let mut bad = input("bad-model");
+        bad.provider = Some("claude".into());
+        bad.model = Some("gpt-4-turbo".into());
+        let err = create(&state, bad).await.expect_err("an unknown model is refused");
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+        assert!(!db::sessions::exists(&state.pool, "bad-model").await.unwrap());
+
+        for n in ["with-model"] {
+            crate::sessions::native::forget(n);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The restart-required contract: changing a LAUNCH-LINE property (model, role
+    /// `desc`, or notes `memory`) returns `restart_required: true` — the UI shows
+    /// "Applies on next start" and the live agent is NOT relaunched under the user.
+    /// A pure-metadata change (tags, skills) does not.
+    #[tokio::test]
+    async fn launch_line_config_changes_are_restart_required() {
+        let (state, dir) = test_state().await;
+        let mut inp = input("bot");
+        inp.provider = Some("claude".into());
+        create(&state, inp).await.expect("create");
+
+        // Role (desc) is now launch-injected → restart_required.
+        let mut p = blank_config();
+        p.desc = Some("You are a triage bot.".into());
+        let v = config_patch(&state, "bot", p).await.expect("patch desc");
+        assert!(v.restart_required, "a role change must require a restart");
+
+        // Notes (memory) likewise.
+        let mut p = blank_config();
+        p.memory = Some("Keep replies terse.".into());
+        let v = config_patch(&state, "bot", p).await.expect("patch memory");
+        assert!(v.restart_required, "a notes change must require a restart");
+        assert_eq!(v.memory, "Keep replies terse.");
+
+        // Model likewise, and it validates + surfaces.
+        let mut p = blank_config();
+        p.model = Some("sonnet".into());
+        let v = config_patch(&state, "bot", p).await.expect("patch model");
+        assert!(v.restart_required, "a model change must require a restart");
+        assert_eq!(v.model, "sonnet");
+
+        // An unknown model is a 400.
+        let mut p = blank_config();
+        p.model = Some("nope".into());
+        let err = config_patch(&state, "bot", p).await.expect_err("bad model");
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+
+        // Skills (reserved) round-trips WITHOUT requiring a restart.
+        let mut p = blank_config();
+        p.skills = Some(vec!["reviewer".into(), "planner".into()]);
+        let v = config_patch(&state, "bot", p).await.expect("patch skills");
+        assert!(!v.restart_required, "a skills change is not a launch-line change");
+        assert_eq!(v.skills, vec!["reviewer".to_string(), "planner".to_string()]);
+
+        // Tags (pure metadata) likewise.
+        let mut p = blank_config();
+        p.tags = Some(vec!["x".into()]);
+        let v = config_patch(&state, "bot", p).await.expect("patch tags");
+        assert!(!v.restart_required, "a tags change is not a launch-line change");
+
+        crate::sessions::native::forget("bot");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An all-`None` ConfigInput — each test overrides just the field it exercises.
+    fn blank_config() -> ConfigInput {
+        ConfigInput {
+            rename: None,
+            display_name: None,
+            desc: None,
+            dir: None,
+            branch: None,
+            mcp: None,
+            tags: None,
+            toggle_pin: None,
+            mark_pin: None,
+            notif: None,
+            toggle_auto_continue: None,
+            model: None,
+            memory: None,
+            skills: None,
+        }
+    }
+
     /// Fake a native session's on-disk state: `<data>/native/<name>/meta.json`
     /// with `pid` (our own pid = "running"; `0` = gone) and, optionally, the
     /// exit marker a holder writes when its child dies.
@@ -2507,6 +3208,9 @@ mod tests {
                 mark_pin: None,
                 notif: None,
                 toggle_auto_continue: None,
+                model: None,
+                memory: None,
+                skills: None,
             },
         )
         .await
@@ -2548,6 +3252,9 @@ mod tests {
                 mark_pin: None,
                 notif: None,
                 toggle_auto_continue: None,
+                model: None,
+                memory: None,
+                skills: None,
             },
         )
         .await
@@ -2687,6 +3394,9 @@ mod tests {
             mark_pin: Some(value.into()),
             notif: None,
             toggle_auto_continue: None,
+            model: None,
+            memory: None,
+            skills: None,
         }
     }
 
@@ -2719,6 +3429,9 @@ mod tests {
             mark_pin: None,
             notif: None,
             toggle_auto_continue: None,
+            model: None,
+            memory: None,
+            skills: None,
         }
     }
 

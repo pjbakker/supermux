@@ -1,6 +1,12 @@
 import type { SessionSummary } from '@/lib/api'
 import type { ElicitationAsk } from '@/components/chat/elicitation'
-import type { ChatTail, PermissionRequestInfo } from '@/lib/api/sessions'
+import type {
+  BrowserTakeoverInfo,
+  ChatTail,
+  ConnectRequestInfo,
+  PermissionRequestInfo,
+  QuestionRequestInfo,
+} from '@/lib/api/sessions'
 import type { RateLimits } from '@/lib/rate-limits'
 
 /** Display fields the hero tile layers on top of the canonical `SessionSummary`.
@@ -54,6 +60,20 @@ export interface TileSession extends SessionSummary {
   /** A third-party MCP server is demanding a typed form (`Elicitation` hook) and
    *  the session is parked on it. Same delta, same `null`-clears rule. */
   elicitation?: ElicitationAsk | null
+  /** A bot's `connect(service)` tool is parked waiting for a human — supermux
+   *  renders the inline Connect card. Same delta, same `null`-clears rule. */
+  connect_request?: ConnectRequestInfo | null
+  /** An `AskUserQuestion` tool call is blocked on a human — supermux renders the
+   *  answerable question card (the real question + its options as clickable
+   *  buttons). Same delta, same `null`-clears rule. */
+  question_request?: QuestionRequestInfo | null
+  /** The live shared-browser takeover ask — a bot needs a human on its page. */
+  browser_takeover?: BrowserTakeoverInfo | null
+  /** The Notification `message` for the needs-you family (permission_prompt /
+   *  idle_prompt / agent_needs_input) while the session sits Waiting. Same
+   *  `sessions` delta, same `null`-clears rule; rendered read-only in the
+   *  attention region, gated on `status === 'waiting'`. */
+  waiting_message?: string | null
   /** Server-clock ms stamp on the latest activity delta — the fase-A1
    *  hook→UI latency anchor. */
   activity_at?: number

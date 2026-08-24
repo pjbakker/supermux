@@ -98,7 +98,7 @@ export function attentionDotSeat(
 /**
  * Facepile geometry.
  *
- * `cluster` is the mockup's crew mark: a 40px box holding three 18px members in
+ * `cluster` is the mockup's crew mark: a 40px box holding three 20px members in
  * a 1-over-2 arrangement, each stroked with a page-coloured keyline — it stands
  * in for a single mark in a roster row, so it must occupy exactly one mark's
  * footprint. `row.overlap` is §11.9's −24% margin, used when a pile is inline in
@@ -107,28 +107,54 @@ export function attentionDotSeat(
 export const FACEPILE = {
   cluster: {
     box: 40,
-    size: MARK_SIZE.facepile,
+    // 20px members (bumped from the facepile's 18px): the crew badge stands in for
+    // a 40px roster mark, so its members were reading small and the boxy/green one
+    // got lost at phone density (jury R3 #5). 20px in the same 40px box packs the
+    // 1-over-2 stack tighter with a fuller footprint — still one mark's box, still
+    // keyline-separated — so each face (and its red `needs` halo) is legible on a
+    // phone. Offsets re-seated to keep all three inside the box at the new size.
+    size: 20,
     /** [left, top] in box px, in z order 1 / 2 / 3 (the top member paints last). */
     offsets: [
-      [11, 0],
-      [0, 15],
-      [22, 15],
+      [10, 0],
+      [0, 16],
+      [20, 16],
     ],
   },
   row: { overlap: -0.24 },
 } as const
 
 /**
- * Bubble ceilings, in px. The assistant bubble is allowed to be wide because it
- * carries receipts, code and frames; the user bubble is deliberately narrower so
- * a human sentence never spans the column (mockup `.bubble` / `.msg.me .bubble`).
+ * Bubble ceilings. The assistant bubble is allowed to be wide because it carries
+ * receipts, code and frames; the user bubble is deliberately narrower so a human
+ * sentence never spans the column (mockup `.bubble` / `.msg.me .bubble`).
+ *
+ * DESKTOP is a px ceiling — the 744px track is wider than a comfortable measure,
+ * so the number is what stops a line from running too long.
+ *
+ * THE PHONE IS NOT A CEILING PROBLEM. It used to be: both sides carried the
+ * artboard's literal 266 / 250, lifted off `mobile-light.png`. On a real 390pt
+ * screen those px turned into a SECOND indent stacked on the track's own 14px
+ * gutter — the assistant bubble stopped 66px short of the right edge and the
+ * text column came out at 232px, 59% of the screen, inset on BOTH sides. A
+ * transcript is the one surface where horizontal room IS the product.
+ *
+ * So the phone reads like Grok instead, and the asymmetry does the work the two
+ * ceilings were doing:
+ *   · the agent runs the column — `100%`, i.e. only the track's gutter insets it,
+ *   · the human's own line is right-aligned and capped PROPORTIONALLY (`84%`),
+ *     so the indent is ~16% of whatever phone it is on rather than 126px on a
+ *     390 and nothing on a 320.
+ * Percentages, not px, because `max-width` here is resolved against the row —
+ * which is exactly the box that varies between phones.
  */
 export const BUBBLE_MAX = {
   assistant: 648,
   user: 420,
-  /** The phone column is 390 − 28 of gutter; `mobile-light.png`'s `.phone .bubble`. */
-  phoneAssistant: 266,
-  phoneUser: 250,
+  /** Phone, agent side: the column, less the track's own 14px gutter. */
+  phoneAssistant: '100%',
+  /** Phone, human side: right-aligned, indented ~16% — never a px cliff. */
+  phoneUser: '84%',
 } as const
 
 /**

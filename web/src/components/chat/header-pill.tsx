@@ -41,6 +41,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 
 import { SessionMark, type MarkPin, type MarkState } from '../../brand/marks'
 import type { SessionStatus } from '../../lib/api'
+import { attentionFor } from '../../lib/mark-status'
 import { motionOff, tweens } from '../../lib/springs'
 import { cn } from '../../lib/utils'
 import { modeChipLabel } from '../focus-mode/mode-labels'
@@ -86,8 +87,14 @@ const BAR_MIN_H = 64
  * the width of `0`, which in this face is 11px against an average glyph's 9.1px,
  * so a `14ch` floor reserves ~17 characters' worth and pushes the switch off the
  * card at 390 — measured, not assumed.
+ *
+ * SINGLE-ROW REVISION: with the trailing cluster now INLINE (one row, not a
+ * stacked column), the name is the member that yields so the row stays one line
+ * — a wide reconnecting chip + the renderer toggle beside a hard 112px floor
+ * would have overflowed the card, so the floor drops to a small, still-legible
+ * stub (a couple of characters + ellipsis) and the name truncates the rest.
  */
-const NAME_MIN = 112
+const NAME_MIN = 56
 
 /**
  * The permission mode, as a chip. Extracted so the phone can STACK it over the
@@ -149,6 +156,15 @@ export interface SessionHeaderPillProps {
   leading?: React.ReactNode
   trailing?: React.ReactNode
   /**
+   * The quiet status bits — the data-plane chip (`<ConnectionNote>`: "Not up to
+   * date", "Offline", …). Separated from `trailing` (the renderer toggle) so the
+   * phone header can GROUP the status bits together and give the toggle its own
+   * clear place, instead of stacking chip-over-chip-over-toggle into one tall
+   * tower jammed against the card's edge (mobile polish #1). Rendered inline on
+   * the desktop, exactly where the bundled node used to sit.
+   */
+  connection?: React.ReactNode
+  /**
    * The chat data plane has GIVEN UP (`ChatPresentation === 'offline'`, A6) —
    * the socket is terminal or exhausted its redials. The status we hold is now
    * a stale claim, so the presence dot must stop reading as a live green
@@ -157,6 +173,23 @@ export interface SessionHeaderPillProps {
    * dot must not contradict it (showcase honesty: green dot beside "Offline").
    */
   offline?: boolean
+  /**
+   * The transcript itself could not be READ (`isError`) — a distinct failure
+   * from `offline` (the socket giving up): the session may be alive, but the
+   * status we hold is a stale claim we cannot vouch for. Under the GROK SKIN the
+   * presence dot is greyed to the neutral "unknown" tone so it stops reading as a
+   * live green "ready" beside a "Couldn't load this conversation." body (the
+   * jury's worst honesty break). Off grok the dot is UNCHANGED — the wrapper this
+   * adds is an inert `data-tail-error-dot` hook with no pixels of its own, so the
+   * base app stays byte-identical.
+   */
+  tailError?: boolean
+  /**
+   * A live turn is streaming right now (the chat plane's `turnStart != null`).
+   * Accepted-but-inert: the header face maps from `status` alone. Retained so the
+   * chat surface can keep feeding the signal without a type break.
+   */
+  streaming?: boolean
   className?: string
 }
 
@@ -167,7 +200,9 @@ export function SessionHeaderPill({
   surface = 'desktop',
   leading,
   trailing,
+  connection,
   offline = false,
+  tailError = false,
   className,
 }: SessionHeaderPillProps) {
   const phone = surface === 'phone'
@@ -184,6 +219,18 @@ export function SessionHeaderPill({
   // reads "Normal" is one more thing to look past.
   const mode = session?.mode && session.mode !== 'normal' ? modeChipLabel(session.mode) : null
 
+  // The presence dot — green "ready" / the busy spinner / the grey offline disc.
+  // It doubles as the ACTIVITY spinner (busy states spin it), so there is one
+  // indicator, not two. On the desktop it rides the name row; on the phone it
+  // joins the grouped status cluster on the right (mobile polish #1), so it stops
+  // floating alone in the middle of the bar.
+  const dot = status ? offline ? <OfflineDot /> : <StatusDot status={status} /> : null
+  // When the tail could not be read (and the socket is not already flagged
+  // offline), wrap the dot in an inert `data-tail-error-dot` hook so the grok
+  // skin can grey it to the "unknown" tone. Off grok the wrapper is a bare inline
+  // span with no pixels — the dot renders exactly as before (byte-identical).
+  const presence = dot && tailError && !offline ? <span data-tail-error-dot="">{dot}</span> : dot
+
   return (
     <header
       data-testid="chat-header-pill"
@@ -193,14 +240,25 @@ export function SessionHeaderPill({
       // the two writes cannot drift into two different "session colours".
       style={sessionAccentVarsFor({ name }, pin)}
       className={cn(
-        'shrink-0 bg-surface pt-safe',
+        'shrink-0 bg-surface',
         // The boards' glass: the transcript scrolls UNDER this bar (already on
         // the phone; on the desktop once A5 makes the header an overlay), and
         // the blur is what keeps a captured frame from smearing across it.
         'backdrop-blur-[80px] backdrop-saturate-[180%]',
         phone
+          // The phone header is a FLOATING glass card (`mobile-light.png`: a
+          // 60px card inset 12px UNDER the status bar). The safe-area inset is
+          // therefore NOT this card's padding — a `pt-safe` here reserved the
+          // notch INSIDE the card, painting ~47px of empty glass above the name
+          // and doubling the card's height to ~115px on a notched device (the
+          // env=0 review rig never showed it). The reservation now lives ONCE,
+          // as the overlay wrapper's `top` offset in `chat-surface.tsx`
+          // (`calc(var(--safe-top) + 12px)`), so the card keeps its 60px floor
+          // and floats clear of the notch.
           ? 'mx-3 rounded-[22px] border-[0.5px] border-hairline'
-          : 'border-b-[0.5px] border-hairline',
+          // Desktop is not notched (`env()`=0); the bar pins to the pane top and
+          // keeps `pt-safe` for the harmless-at-env=0 additive reservation.
+          : 'border-b-[0.5px] border-hairline pt-safe',
         className,
       )}
     >
@@ -254,6 +312,9 @@ export function SessionHeaderPill({
                 pin={pin}
                 size={MARK_SIZE.gutter}
                 state={status ? MARK_STATE[status] : 'idle'}
+                // The decoupled attention halo: the header mark raises the red
+                // ring when this session needs you (Grok skin only).
+                attention={attentionFor({ status })}
                 // The name is right there; a second announcement is noise.
                 label={null}
               />
@@ -277,7 +338,9 @@ export function SessionHeaderPill({
                   the live dot stands down for the neutral offline dot: a green
                   "ready" disc beside an "Offline" chip is the exact contradiction
                   the honesty pass is closing. */}
-              {status && (offline ? <OfflineDot /> : <StatusDot status={status} />)}
+              {/* On the phone the presence dot moves into the grouped status
+                  cluster below; on the desktop it stays on the name row. */}
+              {!phone && presence}
               {/* THE UNRECOVERED AGENT ERROR, AS A LEGIBLE CHIP — not a bare dot.
                   `session.error` is the durable `StopFailure` field the roster,
                   the list row and the focus header all render as an amber badge;
@@ -302,33 +365,40 @@ export function SessionHeaderPill({
                 <WarningChip text={session.limit_warning} />
               )}
               {!session?.blocked && <UsageChip session={session} />}
-              {/* THE TRAILING CLUSTER, and on the phone it STACKS.
-                  The mode chip used to sit beside the renderer switch, and the
-                  two together took 187px of a 342px row: `ipc` in bypass mode
-                  rendered as `i…` (QA #6). Stacked, the pair costs the width of
-                  the WIDER of the two instead of their sum plus a gap, and the
-                  60px card has the height for both (26 + 3 + ~20). On the
-                  desktop nothing moves: the chip keeps its `ml-auto` and the row
-                  keeps its order. */}
+              {/* THE TRAILING CLUSTER — ONE ROW on the phone (single-row header).
+                  It used to be a flex-COLUMN: the grouped status bits (presence,
+                  mode, connection) on tier 1 and the renderer TOGGLE on tier 2.
+                  Two tiers make the card two rows tall the moment a connection
+                  chip appears (the reconnecting money-shot: a 60px card grew to
+                  ~80px, the name floating in a half-empty top). A phone header is
+                  a single iOS-style bar, so the status bits and the toggle now sit
+                  INLINE on the one row, right-aligned; the name (flex-1) is the
+                  member that yields and truncates when the row is tight. `flex-none`
+                  so the cluster keeps its intrinsic width and the name gives first.
+                  On the desktop nothing moves: the chip keeps its `ml-auto`, then
+                  the connection chip, then the toggle. */}
               {phone ? (
-                (mode || trailing) && (
-                  // `shrink`, not `flex-none`: below ~370px the name has hit its
-                  // floor and something must give — and it is this, by design.
-                  <div className="flex min-w-0 shrink flex-col items-end gap-[3px]">
-                    {/* Tighter than the desktop chip: stacked, the pair has 60px
-                        of card to live in, and the chip is a label rather than a
-                        control — it does not owe anybody a 34px tap target. */}
-                    {mode && (
-                      <ModeChip className="px-[7px] py-0 text-[11px] leading-[17px]">
-                        {mode}
-                      </ModeChip>
-                    )}
+                // THE MOBILE CHAT HEADER SHOWS NO STATUS DOTS (owner's call).
+                // The trailing cluster used to carry three condensed dots — the
+                // glyph-only mode dot, the compact connection dot and the
+                // presence dot — beside the renderer toggle. The owner wants the
+                // header stripped to its essentials: back · avatar · name · the
+                // binary Chat/Console pill, and NO dots. So the phone cluster now
+                // renders only the renderer switch (`trailing`); mode, connection
+                // and presence are dropped from this render path (the presence
+                // dot and connection chip still live on other surfaces — the
+                // desktop name row below, and the overview tile — untouched).
+                // `flex-none` keeps the toggle's intrinsic width; the name
+                // (flex-1) is what yields when the row is tight.
+                trailing && (
+                  <div className="flex flex-none items-center justify-end gap-1.5">
                     {trailing}
                   </div>
                 )
               ) : (
                 <>
                   {mode && <ModeChip className="ml-auto">{mode}</ModeChip>}
+                  {connection}
                   {trailing}
                 </>
               )}

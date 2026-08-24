@@ -19,7 +19,7 @@
 // compared against are server-stamped. Wire entries carry `ts` in SECONDS
 // (`recall.rs parse_ts`); the conversion happens here, exactly once.
 
-import type { ChatEntry } from './entries'
+import { newestAgentTs, type ChatEntry } from './entries'
 
 export type PendingState = 'sending' | 'unconfirmed' | 'undelivered'
 
@@ -37,6 +37,22 @@ export interface PendingSend {
    *  below reads it — it exists so the row can say something more useful than
    *  "undelivered" when the reason is known (a rejected POST, a refused retry). */
   note?: string
+  /**
+   * The failure was a TRANSPORT failure — the POST left this client but no
+   * response came back (`SessionError` status 0: `fetch` threw, or the server
+   * went away mid-request). Unlike a server REFUSAL (a 409 with a definite
+   * body), a status-0 failure is genuinely AMBIGUOUS about delivery: the
+   * request may have reached the pty and been typed, with only the reply lost
+   * on the flaky link — the exact lost-response case behind the false
+   * "Can't reach supermux-server" over a message that was delivered AND
+   * answered.
+   *
+   * It is what lets `settleUndelivered` clear ONLY a lost-response row on
+   * transcript evidence while a hard refusal keeps its verdict: a 409 said
+   * "no", so no amount of later agent output confirms a delivery that the
+   * server itself declined.
+   */
+  transportError?: boolean
   /**
    * The uuids of the confirmed entries that were ALREADY on screen when this
    * send left — the clock-free half of reconciliation (A4 review).
@@ -59,6 +75,16 @@ export interface PendingSend {
   /** The session's `last_send_at` (server epoch SECONDS) as it read when this
    *  send left — the baseline the delivery receipt is compared against. */
   receiptAtS?: number
+  /**
+   * The client-generated idempotency key carried on `POST /send` (`send_id`).
+   *
+   * Stable across the send AND its retries: the server dedups on it, so a Retry
+   * (or a mis-tapped double-send) of a message it already typed is a no-op
+   * instead of a duplicate prompt in the agent's queue. Never a server id — it
+   * is minted here, before the POST, precisely so it survives a POST whose
+   * response never comes back.
+   */
+  sendId?: string
   /** The SERVER confirmed it typed this text into the pty (`set_last_send`,
    *  written by `/send` after the paste + Enter). Transport-independent, so it
    *  survives exactly the failure the watchdog cannot see through. */
@@ -106,12 +132,33 @@ export const PROMPT_CLAMP_CHARS = 8_000
 export const FUTURE_TOLERANCE_MS = 60_000
 
 /**
- * The chat view's user-authored kinds (`recall.rs read_chat_turns` keeps
- * `Prompt | Command | Teammate`). `teammate` is excluded on purpose: that turn
- * was authored by another agent, so matching one to our send would confirm a
- * delivery that never happened.
+ * The display kinds a promoted/echoed USER message can carry — the candidates
+ * `reconcile` matches an optimistic send against in the confirmed transcript.
+ * This is the user-INITIATED set `wire-entries.ts::SURVIVING_KINDS` keeps (the
+ * twin of `recall.rs::Kind::is_user_initiated`) MINUS `teammate`, plus the
+ * `notification`/`image` wrapper kinds `toDisplayList` also draws as `user`.
+ *
+ * `teammate` is excluded on purpose: that turn was authored by ANOTHER agent,
+ * so matching one to our send would confirm a delivery that never happened.
+ *
+ * The rest are all a deliberate human action on THIS session's behalf — a typed
+ * prompt, a slash `command`, a colleague's `@`-handoff (`delegation`), a
+ * `schedule` this owner set earlier, an attached `image`, a `notification`. The
+ * previous list was `['prompt', 'command']` only, so a queued send Claude Code
+ * promoted to a `delegation`/`schedule` (or any non-`prompt`) user entry stayed
+ * invisible to `reconcile` and its optimistic row parked forever BESIDE the
+ * confirmed bubble — the #13 duplicate. Every kind here renders as one `user`
+ * bubble in `toDisplayList`, so reconciling against it removes the placeholder
+ * and leaves the transcript copy as the sole survivor.
  */
-const USER_KINDS: readonly string[] = ['prompt', 'command']
+const USER_KINDS: readonly string[] = [
+  'prompt',
+  'command',
+  'delegation',
+  'schedule',
+  'notification',
+  'image',
+]
 
 /**
  * Trailing/leading whitespace + CRLF collapsed; nothing else.
@@ -265,6 +312,28 @@ export function receiptClaims(p: PendingSend, receipt: SendReceipt | null): bool
  * the server states it typed the text. Leaving the accusation up would leave a
  * Retry button over a message that landed, which is how the duplicate happens.
  *
+ * BURST BACK-FILL (the false-"didn't reach" fix). `last_send`/`last_send_at` is
+ * a single last-writer-wins scalar: when several sends are POSTed inside one
+ * turn, only the LAST one's text survives in the receipt, so only the last is
+ * text-matched here. The earlier members lose their receipt — their text was
+ * overwritten and/or their `last_send_at` collides at 1-second granularity —
+ * and later escalate to the false "This didn't reach the session" even though
+ * they were delivered and answered.
+ *
+ * They WERE delivered, and the receipt proves it: `POST /send` is processed
+ * SERIALLY under a per-session lock and `last_send_at` is monotonic, so once the
+ * server confirms ANY send at `receipt.atS`, every OLDER still-`unconfirmed`
+ * send (its own POST resolved 200, and it was submitted before this one) was
+ * necessarily typed into the pty before it. So when the receipt text-matches a
+ * pending, back-fill the receipt onto every older `unconfirmed` send too: they
+ * all become "queued behind that turn" (the correct line), and — being
+ * `receipted` — none escalates and none offers the duplicating Retry.
+ *
+ * Restricted to `unconfirmed` on purpose: an `undelivered` earlier send may be
+ * a genuinely REFUSED one (a 409 rejected its POST, and no `last_send` was ever
+ * written for it), which the atS ordering alone must not confirm. Only an exact
+ * text match (via `receiptClaims`) un-escalates an `undelivered` row.
+ *
  * Same reference back when nothing moved.
  */
 export function applyReceipt(
@@ -272,19 +341,181 @@ export function applyReceipt(
   receipt: SendReceipt | null,
 ): readonly PendingSend[] {
   if (!receipt) return pending
+  // The newest send the receipt text-matches. Older `unconfirmed` sends were
+  // serialized ahead of it, so they are delivered too. `-Infinity` = the receipt
+  // matched nothing, so there is no burst to back-fill and behaviour is exactly
+  // as before (a receipt for text no pending sent confirms nothing).
+  let matchedMaxAtMs = -Infinity
+  for (const p of pending) {
+    if (p.receipted || p.state === 'sending') continue
+    if (receiptClaims(p, receipt) && p.atMs > matchedMaxAtMs) matchedMaxAtMs = p.atMs
+  }
   let changed = false
   const next = pending.map((p) => {
     if (p.receipted || p.state === 'sending') return p
-    if (!receiptClaims(p, receipt)) return p
+    if (receiptClaims(p, receipt)) {
+      changed = true
+      return p.state === 'undelivered'
+        ? {
+            ...p,
+            receipted: true,
+            state: 'unconfirmed' as const,
+            note: 'It reached the session after all.',
+          }
+        : { ...p, receipted: true }
+    }
+    // Back-fill: an older unconfirmed send from the same burst.
+    if (p.state === 'unconfirmed' && p.atMs < matchedMaxAtMs) {
+      changed = true
+      return { ...p, receipted: true }
+    }
+    return p
+  })
+  return changed ? next : pending
+}
+
+/**
+ * Settle-and-REMOVE a receipted row the transcript has demonstrably moved past —
+ * the window-eviction exit `applyReceipt` was missing, and the core of #45.
+ *
+ * `receipted` proves the server typed the text into the pty. It correctly stops
+ * the false "didn't reach the session" escalation, but it also pins the row at
+ * `unconfirmed` FOREVER (`watchdogState`, "if (p.receipted) return
+ * 'unconfirmed'"), and its only removal path is `reconcile` matching the
+ * promoted user echo in the confirmed transcript. On a long, tool-heavy turn
+ * (Claude runs 30–100 calls/turn) that echo is buried below — or evicted
+ * entirely from — the bounded recall window before `reconcile` ever sees it, so
+ * the row parks on "queued behind that turn" with a live receipt line under an
+ * answer that has already come and gone. That is the reported IMG_2441 stuck
+ * state: delivered AND answered, yet the optimistic row never clears.
+ *
+ * The exit: a receipted send whose message has DEMONSTRABLY been handled is
+ * done, echo in-window or not. "Handled" = the session has since returned to
+ * IDLE and an agent turn produced output stamped AFTER the send. Claude Code
+ * drains its input queue at the turn boundary (a0-findings §5: enqueue →
+ * dequeue → the promoted `user` entry, same text → the answer), so `receipted` +
+ * a newer agent turn + no turn still running is exactly "delivered and
+ * answered".
+ *
+ * WHY IDLE IS LOAD-BEARING, and not the `newestAgentTs > send` test on its own:
+ * a send QUEUED behind a still-running turn is GENUINELY still queued, and that
+ * turn is itself emitting agent entries stamped after the send. Clearing on
+ * those would yank the correct "queued behind that turn" indicator out from
+ * under a message that has not been reached yet — the exact live state the row
+ * exists to show. While the queued-behind turn runs the session reads active, so
+ * this stays its hand; it fires only once the queue has drained to idle, which
+ * cannot happen before the message has been consumed. Idle here DEFERS a
+ * removal, it never manufactures one: the delivery is already PROVEN by
+ * `receipted`, never inferred from status (the module's inverted-detection rule
+ * is intact — status only ever holds a removal back, never asserts one).
+ *
+ * Same reference back when nothing settled — the caller runs this off its own
+ * output and must not loop.
+ */
+export function settleReceipted(
+  pending: readonly PendingSend[],
+  entries: readonly ChatEntry[],
+  ctx: { active: boolean },
+): readonly PendingSend[] {
+  // A turn is still running: any queued send is legitimately still queued, and
+  // an agent entry after it belongs to the turn it is queued behind. Wait.
+  if (ctx.active) return pending
+  // `newestAgentTs` is epoch SECONDS (0 when the tail has no agent turn); the
+  // row's stamp is server-clock ms. No agent output after the send yet ⇒ no
+  // answer to settle against.
+  const agentMs = newestAgentTs(entries) * 1000
+  if (agentMs === 0) return pending
+  let changed = false
+  const next = pending.filter((p) => {
+    if (p.receipted && agentMs > p.atMs) {
+      changed = true
+      return false
+    }
+    return true
+  })
+  return changed ? next : pending
+}
+
+/** Is any USER-initiated entry stamped at/after this send (within the wire's
+ *  truncation skew)? Then a matching echo — this send's OWN, or a LATER send's —
+ *  is visible, and `reconcile` is the one allowed to act on it. Used to keep the
+ *  eviction exit below OUT of every case `reconcile` can already decide, so it
+ *  fires only in the true window-eviction gap. */
+function hasUserEntryAfter(entries: readonly ChatEntry[], atMs: number): boolean {
+  return entries.some(
+    (e) => USER_KINDS.includes(e.kind) && e.ts * 1000 >= atMs - CONFIRM_SKEW_MS,
+  )
+}
+
+/**
+ * Settle-and-REMOVE a LOST-RESPONSE row whose delivery the transcript has since
+ * proven, when its own echo has been EVICTED from the recall window — the
+ * transport-error twin of `settleReceipted`, and the core of the second false
+ * "Can't reach supermux-server" (IMG_2451).
+ *
+ * The stuck state: a send whose POST reached the server (typed, queued, ANSWERED)
+ * but whose HTTP RESPONSE was lost on a flaky link. `input.submit` rejects with a
+ * status-0 `SessionError`, so the row escalates to `undelivered` with the
+ * "Can't reach supermux-server. Retry / Dismiss" line — over a message that
+ * landed and was answered. `applyReceipt` clears this the moment the server's
+ * `last_send` receipt still names the text; `reconcile` clears it the moment the
+ * echo is in the window. Both are defeated together on a long, tool-heavy turn
+ * (Claude runs 30–100 calls/turn): the promoted user echo is evicted from the
+ * bounded window before `reconcile` sees it, and a LATER send has overwritten the
+ * single last-writer-wins receipt scalar. The row then parks forever with a false
+ * failure and a duplicating Retry, exactly the #45 eviction gap — but for the
+ * undelivered state `settleReceipted` deliberately never touches.
+ *
+ * The exit, and why each gate is load-bearing for the ONE guarantee that must
+ * not bend — a genuinely-lost send (POST failed, never delivered) STILL says so:
+ *   · `transportError` — ONLY a status-0 lost-response row. A hard refusal (409)
+ *     is a definite server "no"; later agent output never confirms a delivery the
+ *     server itself declined.
+ *   · `activeAtSend === false` — the send was made into an IDLE session. A
+ *     genuinely-lost send into an idle session types nothing, so the session
+ *     produces NO turn and no agent output after it — the row correctly stays.
+ *     A send made MID-TURN is excluded outright: the running turn's own output is
+ *     trivially "after the send" and proves nothing about THIS message.
+ *   · `!ctx.active` + `agentMs > p.atMs` — the session has returned to idle AND
+ *     an agent turn produced output after the send: something ran and finished.
+ *   · `ctx.sawActiveSince(p.atMs)` — the aliveness ledger witnessed the session
+ *     go active AFTER the send. Delivery into idle is what turns the session
+ *     active; a lost send into idle never does (nothing was typed), so this is
+ *     false and the row stays.
+ *   · `!hasUserEntryAfter` — the decisive attribution guard. If ANY user echo is
+ *     visible after the send (this send's own, or a LATER send's), the answer may
+ *     belong to that other send, and `reconcile` — not this — owns that case. So
+ *     this fires ONLY when no user echo is in the window at all, i.e. the true
+ *     eviction gap, and can never mistake a later message's turn for this one's.
+ *
+ * The residual it does NOT cover, stated plainly: a lost idle send whose turn was
+ * started instead by a `teammate` handoff (the one user-ish kind outside
+ * `USER_KINDS`) landing in the same window could be cleared on that turn's
+ * output. That is a rare cross-author coincidence, not the reported bug; every
+ * self-authored path (prompt / command / delegation / schedule / notification /
+ * image) is caught by `hasUserEntryAfter` and deferred to `reconcile`.
+ *
+ * Same reference back when nothing settled — the caller runs this off its own
+ * output and must not loop.
+ */
+export function settleUndelivered(
+  pending: readonly PendingSend[],
+  entries: readonly ChatEntry[],
+  ctx: { active: boolean; sawActiveSince: (ms: number) => boolean },
+): readonly PendingSend[] {
+  if (ctx.active) return pending
+  const agentMs = newestAgentTs(entries) * 1000
+  if (agentMs === 0) return pending
+  let changed = false
+  const next = pending.filter((p) => {
+    if (p.state !== 'undelivered' || !p.transportError) return true
+    if (p.activeAtSend !== false) return true
+    if (agentMs <= p.atMs) return true
+    if (!ctx.sawActiveSince(p.atMs)) return true
+    // Any user echo in the window (this send's or a later one's) → reconcile's.
+    if (hasUserEntryAfter(entries, p.atMs)) return true
     changed = true
-    return p.state === 'undelivered'
-      ? {
-          ...p,
-          receipted: true,
-          state: 'unconfirmed' as const,
-          note: 'It reached the session after all.',
-        }
-      : { ...p, receipted: true }
+    return false
   })
   return changed ? next : pending
 }

@@ -46,6 +46,8 @@ fn temp_config() -> (Config, PathBuf) {
         push_sub: None,
         github_token: None,
         statusline_tap: false,
+        isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
+        human_auth: Default::default(),
     };
     (config, dir)
 }
@@ -72,6 +74,8 @@ fn new_session(name: &str, dir: &std::path::Path) -> db::sessions::NewSession {
         worktree_repo: String::new(),
         host_id: None,
         runtime: "native".to_string(),
+        model: String::new(),
+        company_id: None,
     }
 }
 
@@ -215,7 +219,7 @@ async fn send_text_refuses_an_archived_session_instead_of_starting_it() {
         .await
         .unwrap();
 
-    let err = sessions::lifecycle::send_harness_text(&state, "hidden", "hello", None)
+    let err = sessions::lifecycle::send_harness_text(&state, "hidden", "hello", None, None)
         .await
         .expect_err("an archived session is not a send target");
     let msg = format!("{err:?}");

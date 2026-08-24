@@ -1,0 +1,3544 @@
+/* ══ GROK MODE — the scoped token layer (WS1 foundation) ═════════════════════
+   Puts supermux's whole app into Grok Bot's visual language, gated behind the
+   Settings "Grok mode" toggle (default OFF). Every value here is extracted from
+   Grok's shipped CSS (see docs/grok-design/tokens.md §1–12). This is the verbatim
+   contract for the token layer (GROK-MODE-SPEC §2).
+
+   THE ONE INVARIANT: every rule is scoped under `[data-grok]`, an attribute the
+   shell root only carries while `lib/grok-mode-flag.ts` says so. Nothing outside
+   `[data-grok]` is touched, so removing the attribute is a BYTE-EXACT REVERT to
+   today's app with no rebuild — the same guarantee `data-substrate` gives.
+
+   THEME SELECTOR ADAPTATION (deviation from the spec's `[data-theme="dark"]`):
+   supermux applies theme as a `.dark` / `.light` CLASS on <html>
+   (components/theme-provider.tsx), not a `data-theme` attribute — and it applies
+   one ALWAYS, before first paint (even "system" resolves to a concrete class).
+   `[data-grok]` lives on a shell <div> DESCENDANT of that <html>. So:
+     · light (default)  →  `[data-grok]`
+     · dark             →  `.dark [data-grok]`   (ancestor `.dark`, descendant gate)
+   Because a class is ALWAYS present, the spec's `@media (prefers-color-scheme)`
+   mirror is intentionally omitted here — there is no bare "system" state to catch,
+   and adding it would double-apply. `.dark [data-grok]` (0,2,0) also out-specifies
+   the light `[data-grok]` (0,1,0), so the dark swap wins regardless of order.
+
+   This file is `@import`ed from styles/globals.css (the Tailwind v4 entry) so its
+   `@theme` utilities are Tailwind-processed; the token blocks below are plain
+   custom properties and are the SOURCE OF TRUTH (spec §2.1). */
+
+/* ── Tailwind @theme aliases (so utilities exist for WS2+) ────────────────────
+   `@theme` is GLOBAL and cannot be scoped under `[data-grok]`, and several names
+   the spec lists (`--color-primary/secondary/accent`, `--radius-sm/md/lg`) ALREADY
+   exist in globals.css's `@theme inline` block, mapped to the default (shadcn/iOS)
+   palette. Redefining them here would clobber the DEFAULT app's utilities app-wide
+   — a regression. So ONLY the non-colliding, Grok-new names are aliased. WS2+
+   consumes the semantic-name tokens directly via `--sm-*` (the source of truth) or
+   `*-[var(--sm-…)]` arbitrary values. `inline` so the utility references the var
+   and resolves per-scope under `[data-grok]` (undefined elsewhere, but no default
+   markup uses these names, so nothing emits outside Grok mode). */
+@theme inline {
+  --color-substrate: var(--sm-substrate);
+  --color-chrome: var(--sm-bg-chrome);
+  --color-editor: var(--sm-bg-editor);
+  --color-elevated: var(--sm-bg-elevated);
+  --color-tertiary: var(--sm-text-tertiary);
+  --radius-xs: 6px;
+}
+
+/* ── Core token block — LIGHT (ship as-is, spec §2.1 / tokens.md §1–12) ──────── */
+[data-grok] {
+  color-scheme: light;
+
+  /* ground & elevation (tokens.md §1)
+     MEASURED-GAP FIX (light figure/ground): the three near-white grounds used to
+     sit at #fbfbfb / #fcfcfc / #fcfcfc — a <1-point spread that read as ONE flat
+     white (the chat jury: "pane/panel/header all #ffffff, rail #fcfcfc — near-zero
+     layering"). Give them a faint, faintly-warm STEP so rail < editor < raised
+     layer the way Grok's warm off-white does. Deepest ground carries the most
+     tint; the raised surface is the brightest. */
+  --sm-substrate: #f7f7f5a6;
+  --sm-bg-chrome: #f4f4f2;
+  --sm-bg-editor: #fafaf8;
+  --sm-bg-elevated: #ffffff;
+  --sm-bg-card: #0000000a;
+  --sm-bg-tertiary: #0000000d;
+  --sm-bg-hover: #0000000a;
+  --sm-bg-active: #00000014;
+
+  /* text (§2) */
+  --sm-text-primary: #0a0a0a;
+  --sm-text-secondary: #0000008c;
+  --sm-text-tertiary: #00000059;
+  --sm-ink-on-emphasis: #fff;
+
+  /* sidebar's own warmer ink ramp (§2) */
+  --sm-sidebar-text-primary: #141414;
+  --sm-sidebar-text-secondary: #14141499;
+  --sm-sidebar-text-tertiary: #14141466;
+  --sm-sidebar-tint: #fbfbfb59;
+  --sm-sidebar-separator: #14141426;
+
+  /* accent — links/focus/info ONLY (§3) */
+  --sm-accent: #0a84ff;
+  --sm-accent-fill: #006ceb;
+  /* text drawn ON a filled-accent surface (the New-bot pill). White clears
+     4.8:1 on the darker light-theme fill; the dark theme's fill is a bright
+     blue, so its on-accent ink is a dark navy instead. */
+  --gr-onaccent: #ffffff;
+
+  /* borders — always applied at 0.5px (§4) */
+  --sm-border: #0000001a;
+
+  /* semantic tones — consumed ONLY as color-mix(...14%) fill + full-strength text (§5) */
+  --sm-tone-accent: #0a84ff;
+  --sm-tone-success: #1f8a65;
+  /* AA fix: #b26a00 was 3.85:1 on the #f4f4f2 pane (fails 4.5). Darkened to
+     #8a5200 → 5.80:1. Dark-theme amber (#e8a33d, 8.54:1) is left untouched. */
+  --sm-tone-warning: #8a5200;
+  --sm-tone-danger: #c0362c;
+
+  /* --gr-* status/surface aliases — hoisted here (from `.grok-roster`) so they
+     resolve for any `[data-grok]` subtree, INCLUDING the body-portalled wizard
+     sheets (invite/enable-signin) whose StatusChip/CopyField/stepper consume them
+     outside the roster. Straight aliases onto the `--sm-*` layer above (theme-swap
+     for free); `.grok-roster` keeps only its row-anatomy-specific tokens. */
+  --gr-surf: var(--sm-bg-elevated);      /* raised: ring centre, glance card */
+  --gr-surf2: var(--sm-bg-tertiary);     /* hover wash + detail-pane ground  */
+  --gr-sel: var(--sm-bg-active);         /* selection — WARM GREY, not accent */
+  --gr-line: var(--sm-border);           /* the only hairline                */
+  --gr-track: var(--sm-bg-active);       /* context-ring remainder           */
+  --gr-work: var(--sm-tone-warning);
+  --gr-need: var(--sm-tone-danger);
+  --gr-done: var(--sm-tone-success);
+  --gr-block: var(--sm-tone-danger);
+  --gr-idle: var(--sm-text-tertiary);
+
+  /* fills & bubbles (§7) */
+  --sm-fill-emphasis: #111110;
+  --sm-fill-secondary: #1010000a;
+  --sm-bubble-user: #111110;
+  --sm-bubble-user-ink: #fff;
+  --sm-bubble-agent: #0000000a;
+
+  /* radii (§8) */
+  --sm-r-pill: 9999px;
+  --sm-r-lg: 12px;
+  --sm-r-md: 10px;
+  --sm-r-sm: 8px;
+  --sm-r-xs: 6px;
+  --sm-r-code: 4px;
+  --sm-r-overlay: 22px;
+  --sm-r-window: 24px;
+
+  /* type (§9) */
+  --sm-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    Roboto, system-ui, "Helvetica Neue", Arial, sans-serif;
+  --sm-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+  --sm-fw-regular: 400;
+  --sm-fw-medium: 500;
+  --sm-fw-semibold: 600;
+  /* composite type tokens (tokens.md §9.1) */
+  --sm-text-name: 500 14px / 20px var(--sm-font-sans);
+  --sm-text-body: 400 14px / 20px var(--sm-font-sans);
+  --sm-text-meta: 400 12px / 16px var(--sm-font-sans);
+  --sm-text-badge: 500 13px / 18px var(--sm-font-sans);
+  --sm-text-sys: 400 13px / 16px var(--sm-font-sans);
+
+  /* spacing scale (tokens.md §10) */
+  --sm-space-0_5: 2px;
+  --sm-space-1: 4px;
+  --sm-space-1_5: 6px;
+  --sm-space-2: 8px;
+  --sm-space-2_5: 10px;
+  --sm-space-3: 12px;
+  --sm-space-3_5: 14px;
+  --sm-space-4: 16px;
+
+  /* fixed geometry (§10) — align two columns to the pixel */
+  --sm-toolbar-h: 44px;
+  --sm-titlebar-inset: 52px;
+  --sm-sidebar-w: 280px;
+  --sm-list-fade: 36px;
+
+  /* glass recipes (tokens.md §1.2) — ONE substrate blur; columns never re-blur */
+  --sm-glass-substrate: blur(80px) saturate(180%);
+  --sm-glass-top: blur(24px) saturate(120%);
+  --sm-glass-raised: blur(20px) saturate(160%);
+  --sm-glass-title: blur(28px) saturate(165%);
+  --sm-chat-fill: color-mix(in srgb, var(--sm-bg-elevated) 86%, transparent);
+  --sm-raised-fill: color-mix(in srgb, var(--sm-bg-elevated) 70%, transparent);
+  --sm-title-fill: color-mix(in srgb, var(--sm-bg-elevated) 78%, transparent);
+
+  /* shadows — ONLY the window + true overlays (§11) */
+  --sm-shadow-window: 0 14px 40px #00000029, 0 0 0 0.5px #0000000d;
+  --sm-shadow-popover: 0 1px 2px #0000000f, 0 14px 36px -10px #00000047;
+  --sm-shadow-overlay: 0 20px 52px -16px #00000059;
+  /* The floating phone tab-bar's own lift (light). A layered soft shadow — a
+     tight contact shadow + two progressively softer ambient layers — so the
+     capsule reads as an object hovering above the surface, not a strip welded to
+     the edge. `--sm-shadow-popover` (its previous shadow) was near-invisible on a
+     phone; this is the deliberate exception the design bar asks for. */
+  --sm-nav-shadow: 0 1px 2px #0000000f, 0 8px 20px -6px #00000024,
+    0 20px 44px -14px #0000002e;
+
+  /* per-agent hue (spec §2.2) — DEFAULTS only. The focused session's identity
+     colour is written as INLINE custom properties on the shell root at runtime
+     (one variable write re-skins ~6 surfaces), derived from the immutable session
+     slug via roster-marks. That runtime write is WS4/WS5; these neutral fallbacks
+     (the single accent) keep every consumer defined before any session is focused,
+     and preserve the firewall: with no per-agent write, two focused sessions
+     produce byte-identical page pixels. */
+  --sm-agent-tint: var(--sm-accent);
+  --sm-agent-accent: var(--sm-accent);
+  --sm-agent-bubble: var(--sm-accent);
+  --sm-agent-ink: #fff;
+  --sm-agent-coat: var(--sm-accent);
+
+  /* needs-you halo (WS4 / overview.md §4) — a soft red ring around a mark whose
+     session is WAITING on you, not a badge. A low-alpha red, distinct from the
+     tone family: the halo is an ATTENTION cue on the identity mark, and the mark
+     is a non-semantic surface, so it carries the halo without the firewall
+     colliding (status words still own `--sm-tone-danger`). Lifted on dark. */
+  --sm-halo: rgba(197, 56, 79, 0.22);
+
+  /* in-hue WORKING/STREAMING glow (WS4 expression). The COLOR FIREWALL's busy
+     half: a soft drop-shadow in the agent's OWN pigment (red is reserved for the
+     needs-you/error halo above). This is the neutral fallback; each mark overrides
+     it to its own body colour via a `[data-hue]` map below, so a roster of working
+     bots is a calm rainbow of their own colours — never a wall of one alert red. */
+  --sm-agent-glow: color-mix(in srgb, var(--sm-agent-tint) 55%, transparent);
+
+  font-family: var(--sm-font-sans);
+  color: var(--sm-text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Core token block — DARK (spec §2.1 dark; `.dark` ancestor swaps the half) ──
+   THEME PARITY (jury round-2 light-wash blocker): the half was keyed ONLY on the
+   ancestor `.dark` CLASS. But globals.css also honours a `[data-theme]` ATTRIBUTE
+   as the SUBTREE switch (a light board rendered inside a dark app — design
+   surfaces, the /dev store bench, and any nested light region). grok-mode.css
+   ignored it, so a `[data-theme='light']` subtree living under an ancestor `.dark`
+   still inherited the DARK grok tokens — the mid-grey-on-mid-grey wash on every
+   bot-context surface. Fix, mirroring globals.css exactly: dark also answers to
+   `[data-theme='dark']`, and a `[data-theme='light']` subtree re-asserts the light
+   half below (placed after this block so the equal-specificity tie resolves to
+   light). Production is untouched — it swaps the whole app via the `.dark`/`.light`
+   class, never `data-theme`, so these attribute rules are inert there. */
+.dark [data-grok],
+[data-theme='dark'] [data-grok] {
+  color-scheme: dark;
+
+  --sm-substrate: #1c1c1a9e;
+  --sm-bg-chrome: #141414;
+  --sm-bg-editor: #1c1c1c;
+  --sm-bg-elevated: #262626;
+  --sm-bg-card: #ffffff0f;
+  --sm-bg-tertiary: #ffffff12;
+  --sm-bg-hover: #ffffff0f;
+  --sm-bg-active: #ffffff1f;
+
+  --sm-text-primary: #f2f2f2;
+  --sm-text-secondary: #ffffff94;
+  --sm-text-tertiary: #ffffff5c;
+  --sm-ink-on-emphasis: #141414;
+
+  --sm-sidebar-text-primary: #ffffffe6;
+  --sm-sidebar-text-secondary: #ffffff8c;
+  --sm-sidebar-text-tertiary: #ffffff52;
+  --sm-sidebar-tint: #14141447;
+  --sm-sidebar-separator: #ffffff1f;
+
+  --sm-accent: #64b5ff;
+  --sm-accent-fill: #64b5ff;
+  --gr-onaccent: #08243a;
+
+  --sm-border: #ffffff1f;
+
+  --sm-tone-accent: #64b5ff;
+  --sm-tone-success: #4cc79b;
+  --sm-tone-warning: #e8a33d;
+  --sm-tone-danger: #ff6b5e;
+
+  --sm-fill-emphasis: #f0f0f0;
+  --sm-fill-secondary: #ffffff0f;
+  --sm-bubble-user: #ecece8;
+  --sm-bubble-user-ink: #141414;
+  --sm-bubble-agent: #ffffff0f;
+
+  /* dark-only glass fills + title saturation (tokens.md §1.2) */
+  --sm-chat-fill: color-mix(in srgb, var(--sm-bg-elevated) 84%, transparent);
+  --sm-raised-fill: color-mix(in srgb, var(--sm-bg-elevated) 68%, transparent);
+  --sm-title-fill: color-mix(in srgb, var(--sm-bg-elevated) 76%, transparent);
+  --sm-glass-title: blur(28px) saturate(150%);
+
+  /* needs-you halo, lifted for the dark ground (overview.md §4). */
+  --sm-halo: rgba(255, 128, 150, 0.24);
+
+  /* Floating tab-bar lift, deepened for the dark ground: dark elevation needs
+     more spread and alpha to read at all against a near-black substrate. */
+  --sm-nav-shadow: 0 1px 2px #00000052, 0 10px 24px -6px #00000073,
+    0 24px 52px -14px #00000082;
+}
+
+/* ── Core token block — LIGHT subtree re-assertion (theme parity) ──────────────
+   Mirrors globals.css's `[data-theme='light']` subtree switch for the grok token
+   half. Same specificity as `.dark [data-grok]` (0,2,0) and placed AFTER it, so a
+   `[data-theme='light']` board WINS the light half even under an ancestor `.dark`.
+   Only the tokens the DARK block overrode are re-declared — the light VALUES from
+   the base `[data-grok]` block above (radii/type/spacing don't flip, so they are
+   not repeated). This is the fix for the round-2 light-wash blocker on the five
+   bot-context surfaces (store grid, install sheet, inline connect-card, bot-panel
+   Tools + Memory). Inert in production (class-driven theme, never `data-theme`). */
+[data-theme='light'] [data-grok] {
+  color-scheme: light;
+
+  --sm-substrate: #f7f7f5a6;
+  --sm-bg-chrome: #f4f4f2;
+  --sm-bg-editor: #fafaf8;
+  --sm-bg-elevated: #ffffff;
+  --sm-bg-card: #0000000a;
+  --sm-bg-tertiary: #0000000d;
+  --sm-bg-hover: #0000000a;
+  --sm-bg-active: #00000014;
+
+  --sm-text-primary: #0a0a0a;
+  --sm-text-secondary: #0000008c;
+  --sm-text-tertiary: #00000059;
+  --sm-ink-on-emphasis: #fff;
+
+  --sm-sidebar-text-primary: #141414;
+  --sm-sidebar-text-secondary: #14141499;
+  --sm-sidebar-text-tertiary: #14141466;
+  --sm-sidebar-tint: #fbfbfb59;
+  --sm-sidebar-separator: #14141426;
+
+  --sm-accent: #0a84ff;
+  --sm-accent-fill: #006ceb;
+  --gr-onaccent: #ffffff;
+
+  --sm-border: #0000001a;
+
+  --sm-tone-accent: #0a84ff;
+  --sm-tone-success: #1f8a65;
+  --sm-tone-warning: #8a5200;
+  --sm-tone-danger: #c0362c;
+
+  --sm-fill-emphasis: #111110;
+  --sm-fill-secondary: #1010000a;
+  --sm-bubble-user: #111110;
+  --sm-bubble-user-ink: #fff;
+  --sm-bubble-agent: #0000000a;
+
+  --sm-chat-fill: color-mix(in srgb, var(--sm-bg-elevated) 86%, transparent);
+  --sm-raised-fill: color-mix(in srgb, var(--sm-bg-elevated) 70%, transparent);
+  --sm-title-fill: color-mix(in srgb, var(--sm-bg-elevated) 78%, transparent);
+  --sm-glass-title: blur(28px) saturate(165%);
+
+  --sm-halo: rgba(197, 56, 79, 0.22);
+
+  --sm-nav-shadow: 0 1px 2px #0000000f, 0 8px 20px -6px #00000024,
+    0 20px 44px -14px #0000002e;
+}
+
+/* ══ WS2 — SHELL & NAV CHROME (foundation for every route) ════════════════════
+   Restyles the app shell into Grok's glass system, ENTIRELY scoped under
+   `[data-grok]`. The default (non-grok) shell keeps its exact pre-existing look —
+   every rule below is inert until the shell root carries `data-grok`, so removing
+   the attribute (or the `@import` in globals.css) is a byte-exact revert.
+
+   Anatomy it targets (all already in components/layout.tsx):
+     [data-grok]            → the shell root <div> (the window / ground)
+     [data-shell-rail]      → desktop 64px icon nav (<SideNav>)
+     [data-shell-main]      → the content column wrapper (rail's sibling; WS2 hook)
+     [data-shell-content]   → <main> (the route surface / "chat" column)
+     [data-shell-tabs]      → mobile bottom tab bar (<BottomNav>)
+     [data-shell-pane]      → side-panes raised by <ShellOverlay variant="pane">
+     [data-nav-active]      → the active-item pill/indicator (rail + tabs)
+
+   THE ONE SUBSTRATE BLUR — and why it is NOT on a shell column. Grok's shell
+   blurs once (blur(80px)); its columns are translucent tints on top and NEVER
+   re-blur (tokens.md §0/§15 anti-pattern #4). But `backdrop-filter` on a shell
+   COLUMN makes that column the containing block for every `position:fixed`
+   descendant — the tour overlay, the command palette, floating tips, the
+   connection overlay are all fixed children of the shell root — whose viewport
+   math would silently break. globals.css:1072 encodes exactly this lesson for
+   `[data-substrate]` ("the substrate is PAINT, NEVER BLUR"). So the single blur
+   lives on a LEAF `::before` pseudo (it has no fixed descendants → containing-
+   block-safe), and the shell root itself gets NO filter and so stays a normal
+   containing block for its fixed overlays. One blur, zero hazard. */
+
+/* The window / ground. Opaque chrome desk behind the glass; an isolated stacking
+   context so the substrate pseudo (z:0) sits cleanly behind the columns (z:1).
+   NO backdrop-filter here (see above) — the shell root must remain a valid
+   viewport containing block for its fixed-position overlay children.
+
+   SHELL-ROOT-SCOPED (`[data-grok][data-grok-root]`), NOT bare `[data-grok]`.
+   The ⌘K command palette (a Radix Dialog PORTALLED to <body>) also carries
+   `data-grok` so the token/skin layer reaches it — but it is NOT the ground.
+   A bare `[data-grok] { position: relative }` here clobbered Tailwind's `.fixed`
+   on that portalled box, dragging the palette to mid-viewport; and the `::before`
+   substrate below painted a full glass layer OVER the palette's own list. Both
+   rules assume "this element is the full-window ground", so both are pinned to
+   the one element that actually is — the shell root, which carries
+   `data-grok-root` (layout.tsx). Tokens (line 48) stay bare so the skin still
+   cascades to the dialog; only these structural/paint rules are ground-scoped. */
+[data-grok][data-grok-root] {
+  position: relative;
+  isolation: isolate;
+  background: var(--sm-bg-chrome);
+  /* SAFARI SCROLL FIX — the grok shell root IS the fixed viewport frame (sole app
+     child of #root). The inner scrollers already engage in Safari (the thread's
+     `.chat-track` scrolls, the composer pins), but Safari — unlike Chrome — does
+     NOT infer `overflow:hidden` on the frame, so the nested `flex:1 + min-height:0`
+     chain is allowed to grow the frame and the body scrolls the WHOLE page (rail +
+     roster + header slide off, the thread scrolls alone). Chrome clamps this
+     implicitly; Safari needs it stated. Two things fix it, both required:
+       1. an EXPLICIT definite height (`100dvh`, `100vh` fallback for pre-dvh
+          Safari) so the frame is viewport-locked and the `height:100%`/flex chain
+          below resolves against a solid anchor instead of Chrome's implicit one;
+       2. an EXPLICIT `overflow:hidden` so the frame physically cannot scroll — any
+          Safari over-grow is clipped to the frame rather than paged onto the body.
+     Behaviourally correct in BOTH grok modes (the shell already fills the viewport)
+     and byte-inert for the base app (no `data-grok`). On desktop the `padding:10px`
+     window gutter is inside `100dvh` via border-box; the `::before` window shadow
+     spills into that in-bounds gutter, so it is not clipped. */
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+/* The one substrate blur — a leaf pseudo, behind every column. `saturate(180%)`
+   gives the tints life over supermux's flat ground (no wallpaper; tokens.md §13).
+   -webkit- BEFORE standard so LightningCSS emits BOTH (globals.css:578 lesson).
+   SHELL-ROOT-SCOPED (see the ground block above): the substrate glass is the
+   full-window ground layer, so it must paint ONLY on the shell root and never on
+   the portalled palette (whose own `data-grok` would otherwise get a glass sheet
+   over its list, dropping session-name contrast below AA). */
+[data-grok][data-grok-root]::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: var(--sm-substrate);
+  -webkit-backdrop-filter: var(--sm-glass-substrate);
+  backdrop-filter: var(--sm-glass-substrate);
+}
+/* Reduce-Transparency / no-support fallback: opaque chrome, no blur — the same
+   accessibility gate `.glass` uses (globals.css:591). */
+@media (prefers-reduced-transparency: reduce) {
+  [data-grok][data-grok-root]::before {
+    background: var(--sm-bg-chrome);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  [data-grok][data-grok-root]::before {
+    background: var(--sm-bg-chrome);
+  }
+}
+
+/* Columns ride ABOVE the substrate pseudo. Only the two shell-root children that
+   are the actual columns are lifted (rail + content-column wrapper); the mobile
+   tab bar lives inside the wrapper. Overlays (palette, archived sheet) are later
+   siblings / higher-z fixed and paint above regardless. */
+[data-grok] [data-shell-rail],
+[data-grok] [data-shell-main] {
+  position: relative;
+  z-index: 1;
+}
+
+/* ── The nav rail (desktop) — a tinted glass column, hairline seam ──────────────
+   `bg-card` + `border-r border-border` are the default classes on <SideNav>;
+   under grok we neutralise the 1px border (a 1px line is a Grok tell — tokens.md
+   §4/§15 #2) and repaint onto the translucent sidebar tint so the substrate blur
+   reads through it. The right-edge seam becomes a 0.5px `::after` strip. */
+[data-grok] [data-shell-rail] {
+  background: var(--sm-sidebar-tint);
+  border-right-width: 0;
+  color: var(--sm-sidebar-text-tertiary);
+}
+[data-grok] [data-shell-rail]::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 0 auto;
+  width: 0.5px;
+  background: var(--sm-sidebar-separator);
+  pointer-events: none;
+}
+/* Align the rail's first row (logo slot, default h-16=64px) to the shared 44px
+   toolbar token so the rail header and a route's 44px header sit on one line
+   (tokens.md §10 — `--sm-toolbar-h` is shared by both columns). */
+[data-grok] [data-shell-rail] > div:first-child {
+  height: var(--sm-toolbar-h);
+}
+
+/* ── Content column — the "chat" tint ─────────────────────────────────────────
+   The route surface region. Translucent chat-fill so the substrate shows
+   through; routes paint their own surfaces on top (restyled by WS5/WS8). */
+[data-grok] [data-shell-content] {
+  background: var(--sm-chat-fill);
+}
+
+/* ── Mobile bottom tab bar — same tint, hairline on its TOP edge ───────────────
+   Mirrors the rail: kill the 1px `border-t`, repaint onto the sidebar tint, draw
+   a 0.5px top `::after`. `pb-safe` (already on the element) keeps the safe-area
+   floor under the home indicator. */
+[data-grok] [data-shell-tabs] {
+  position: relative;
+  z-index: 1;
+  background: var(--sm-sidebar-tint);
+  border-top-width: 0;
+  color: var(--sm-sidebar-text-tertiary);
+}
+[data-grok] [data-shell-tabs]::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 0.5px;
+  background: var(--sm-sidebar-separator);
+  pointer-events: none;
+}
+
+/* ── Side-panes — 6% agent wash + left hairline ───────────────────────────────
+   Panes raised by <ShellOverlay variant="pane"> carry `data-shell-pane`. The
+   per-agent tint is written on the shell root at runtime (WS4/WS5); until then it
+   falls back to the accent (grok-mode.css root). A pane owns its own positioning
+   (it is `absolute inset-y-0 right-0`), so we don't set `position` here — we only
+   need it to already BE positioned for the `::after` to anchor (globals.css:1118
+   lesson). */
+[data-grok] [data-shell-pane] {
+  background: color-mix(in srgb, var(--sm-agent-tint) 6%, var(--sm-bg-elevated));
+}
+[data-grok] [data-shell-pane]::after {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0.5px;
+  background: var(--sm-sidebar-separator);
+  pointer-events: none;
+}
+
+/* ── The desktop floating window (≥md) ────────────────────────────────────────
+   Grok floats its app as one rounded glass window on a neutral desk (reference
+   dark-hero-04 / crop-hero-app). supermux is full-bleed, so we inset the columns
+   with a chrome gutter (padding on the root) and let the substrate pseudo become
+   the floating card: rounded `--sm-r-window`, carrying `--sm-shadow-window` — the
+   ONLY card-level shadow in the app (tokens.md §11; jury row "window shadow
+   only"). The rail rounds its outer-left corners, the content column its outer-
+   right, so the two tinted columns read as one window with a 0.5px seam between.
+
+   `overflow:hidden` on the columns clips their in-flow/absolute content to the
+   rounded window but does NOT clip `position:fixed` descendants (no transform/
+   filter/backdrop-filter here → the columns are not fixed-containing-blocks), so
+   the fixed overlays still escape to the viewport unharmed.
+
+   Mobile stays full-bleed: the rail is `hidden` (`md:flex`), the tab bar owns the
+   bottom, and a rounded/inset window on a phone would just waste the screen. */
+@media (min-width: 768px) {
+  [data-grok][data-grok-root] {
+    padding: 10px;
+  }
+  [data-grok][data-grok-root]::before {
+    inset: 10px;
+    border-radius: var(--sm-r-window);
+    box-shadow: var(--sm-shadow-window);
+  }
+  [data-grok] [data-shell-rail] {
+    border-radius: var(--sm-r-window) 0 0 var(--sm-r-window);
+    overflow: hidden;
+  }
+  [data-grok] [data-shell-main] {
+    border-radius: 0 var(--sm-r-window) var(--sm-r-window) 0;
+    overflow: hidden;
+  }
+}
+
+/* ── The icon nav rail's active affordance (rail) ─────────────────────────────
+   Default: a saturated `bg-primary` plate + white icon (`text-primary-foreground`).
+   Grok's restraint forbids a saturated fill for a chrome-selected state — the
+   accent is links/focus/info only, and even those as surface go through a ~12%
+   mix (tokens.md §3, §15 #6). So the active pill becomes a SOFT accent wash on a
+   10px plate (stepped down from the icon's own 12px radius — nested radii step
+   down, §8) and the active icon takes the accent as TEXT. */
+[data-grok] [data-shell-rail] [data-nav-active] {
+  /* #17 — a SOFT, INSET rounded highlight, not an edge-to-edge plate. The base
+     mark is `absolute inset-0` (a full-tile `bg-primary` block); a 12% wash over
+     the whole 44px tile still read as a coloured BLOCK behind the icon (owner:
+     "heavy blue-block"). Pulling it in 3px on every side turns it into a calm
+     rounded selection pill that hugs the glyph with air around it — the same
+     low-alpha, corner-safe treatment the phone capsule chip already uses — and
+     10% (down from 12%) settles it further into "premium/calm". */
+  inset: 3px;
+  background: color-mix(in srgb, var(--sm-accent) 10%, transparent);
+  border-radius: var(--sm-r-md);
+}
+[data-grok] [data-shell-rail] a[aria-current='page'] {
+  color: var(--sm-accent);
+}
+/* Rest + hover ink use the sidebar's own warmer ramp (tokens.md §2). Both halves
+   are needed because these unlayered rules out-specify Tailwind's `hover:` layer,
+   so the hover state must be restated or it would never change. */
+[data-grok] [data-shell-rail] a:not([aria-current='page']) {
+  color: var(--sm-sidebar-text-tertiary);
+}
+[data-grok] [data-shell-rail] a:not([aria-current='page']):hover {
+  color: var(--sm-sidebar-text-primary);
+}
+
+/* ── The mobile tab bar's active affordance (tabs) — "Liquid Rail" ────────────
+   The grok indicator is NOT the base Material top-underline; it is ONE persistent
+   glass pill (`[data-nav-pill]`) that physically SLIDES between tabs (see the
+   floated block below). Hide the base underline under grok so it never
+   double-draws behind the pill. Label colours below are the ink half of the
+   redundant, non-colour-only active tell (icon fill + weight + lift carry the
+   rest); they hold AA in both themes.
+
+   AA: active label `--sm-accent-fill` (light #006ceb ≈ 4.58:1 on the tab tint;
+   dark #64b5ff already high-contrast); inactive `--sm-sidebar-text-secondary`
+   (≈4.67:1 light, high on dark) — tertiary read only 2.47:1. Grok-scoped, so the
+   base tab bar is untouched. */
+[data-grok] [data-shell-tabs] [data-nav-active] {
+  display: none;
+}
+[data-grok] [data-shell-tabs] a[aria-current='page'] {
+  color: var(--sm-accent-fill);
+}
+[data-grok] [data-shell-tabs] a:not([aria-current='page']) {
+  color: var(--sm-sidebar-text-secondary);
+}
+/* ══ GROK MODE — the mobile bottom nav, FLOATED (phone only) ══════════════════
+   Everything below is `[data-grok]` + `@media (max-width:767px)` — the desktop
+   rail and the base (non-grok) tab bar are untouched at every breakpoint.
+
+   WHY: the base bar is, line-for-line, a Material `BottomNavigationView` — a
+   full-bleed flat slab welded to the screen edge, icon-over-10px-label cells and
+   a `h-1 w-8` TOP-underline active mark (layout.tsx:206-273). The rules above
+   only re-skinned its SURFACE (tint + hairline); its SHAPE still read Android.
+   Grok's 2026 phone nav is the opposite: a detached rounded glass capsule
+   hovering above the safe-area floor, with a soft accent TINT CHIP behind the
+   active tab — the exact grammar the desktop rail already uses (:528-531). This
+   block changes the shape without touching a byte of layout.tsx: the unlayered
+   grok rules out-specify Tailwind's `@layer utilities` classes on the elements.
+
+   CONTAINING-BLOCK CAVEAT (the lesson at :252-262 / globals.css:1072, restated):
+   `backdrop-filter` makes an element the containing block for every
+   `position:fixed` DESCENDANT. That is why the shell COLUMNS must never blur —
+   the palette, the tour and the connection overlay are fixed children of the
+   shell root. The tab bar is safe to blur because it has no fixed descendants
+   (its children are flow + one `position:absolute` chip), so the blur is a leaf
+   effect exactly like the substrate `::before`. */
+@media (max-width: 767px) {
+  /* A. Float it off the floor. `pb-safe` stops being a floor-filler: the
+     safe-area becomes the capsule's OUTER bottom margin, so the bar clears the
+     home indicator instead of tucking a tinted strip under it. The `padding`
+     shorthand is what neutralises `pb-safe` (one declaration, no !important). */
+  [data-grok] [data-shell-tabs] {
+    position: fixed;
+    z-index: 30;
+    right: 12px;
+    bottom: calc(env(safe-area-inset-bottom) + 10px);
+    left: 12px;
+    /* Horizontal padding is 8px, NOT 4px (owner: the active tint-chip on the
+       leftmost tab spills the capsule's rounded corner). The capsule corner is a
+       22px radius; the end cells butt against it, and at 4px padding the active
+       chip's own rounded corner (10px) sat only ~11px from the capsule edge —
+       inside the 22px curve's reach, so its corner crowded / broke the capsule's
+       rounded shape bottom-left. 8px pushes every cell (and thus the end chips)
+       clear of the corner curve, so the chip nests fully inside with a consistent
+       margin in EVERY tab position. Vertical stays 6px (it neutralises `pb-safe`
+       and the top/bottom chip inset is already clear). */
+    padding: 6px 8px;
+    /* Rounded-rect, not a full pill: 4 LABELLED cells in a 366px capsule read
+       better with the 22px overlay radius than with `--sm-r-pill` (design §6.3). */
+    border: 0.5px solid var(--sm-sidebar-separator);
+    border-radius: var(--sm-r-overlay);
+    /* A raised glass FILL, not the flat sidebar tint: the capsule floats over
+       scrolling content, so it needs enough body to read as its own surface
+       (the bare sidebar tint at ~0.28α vanished into the ground). `--sm-raised-fill`
+       is the elevated-surface glass the popovers use; the backdrop-blur behind it
+       still carries the blurred content through. */
+    background: var(--sm-raised-fill);
+    -webkit-backdrop-filter: var(--sm-glass-raised);
+    backdrop-filter: var(--sm-glass-raised);
+    /* The deliberate lift (design bar): a layered soft drop shadow so the bar
+       hovers above the surface instead of reading as a welded strip. */
+    box-shadow: var(--sm-nav-shadow);
+  }
+  /* GLASS BEVEL — a 1px inner top-edge highlight, the cheap Liquid-Glass tell,
+     so the capsule reads as lit glass rather than a flat plate. The base top-only
+     hairline `::after` is dropped (the border ring replaces it). */
+  [data-grok] [data-shell-tabs]::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 22%, transparent);
+  }
+  [data-grok] [data-shell-tabs]::after {
+    content: none;
+  }
+
+  /* Cells + Search paint ABOVE the sliding pill (the pill is z-0, an earlier
+     absolute sibling; glyphs/labels must stay crisp over it). */
+  [data-grok] [data-shell-tabs] > a,
+  [data-grok] [data-shell-tabs] > button {
+    position: relative;
+    z-index: 1;
+  }
+
+  /* B. THE HERO — one persistent glass pill that physically SLIDES between tabs
+     ("Liquid Rail"). Equal `flex-1` cells make its position pure arithmetic: the
+     pill is exactly one cell wide and translated by WHOLE cells via a single
+     `--nav-i` custom prop — no JS measure, no FLIP, no ResizeObserver, no
+     framer-motion. It is a persistent sibling (never unmounted between tabs), so
+     the browser interpolates its `transform` — a genuine physical move of ONE
+     node, interruptible: a re-tap mid-flight retargets `--nav-i` and the
+     transition redirects from the current value, like a spring.
+
+     It is NOT a view-transition element (`view-transition-name: none`): it slides
+     on the LIVE DOM, which sidesteps the WebKit backdrop-filter snapshot artifact
+     that forced the old chip to cross-fade instead of slide. */
+  [data-grok] [data-shell-tabs] [data-nav-pill] {
+    position: absolute;
+    z-index: 0;
+    /* 6px vertical inset inside the capsule's 6px padding; 8px left matches the
+       8px side padding, so the pill's travel origin sits on the first cell. */
+    top: 6px;
+    bottom: 6px;
+    left: 8px;
+    /* One cell wide: the padding-box width minus 2×8px side padding, / cell count.
+       translateX(100%) == exactly one pill width == one cell, so whole-cell travel
+       needs no measurement and recomputes for free on rotate / dynamic-type. */
+    width: calc((100% - 16px) / var(--nav-n));
+    transform: translateX(calc(var(--nav-i) * 100%));
+    box-sizing: border-box;
+    /* Transparent 4px border = a 4px visual inset WITHOUT changing the 100% travel
+       unit (the wash fills only inside it via padding-box clip). */
+    border: 4px solid transparent;
+    background: color-mix(in srgb, var(--sm-accent) 12%, transparent);
+    background-clip: padding-box;
+    /* GRAFT (#3): a 0.5px accent ring so the pill keeps a crisp edge while gliding
+       over glass — the tint never reads as a mushy plate. */
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--sm-accent) 22%, transparent);
+    border-radius: var(--sm-r-pill);
+    /* THE GLIDE: `transform` on an overshoot curve + a DIFFERENT (standard) curve
+       on `width` → the pill stretches then settles as it lands, the iOS-26
+       stretch-and-settle "liquid" signature in two CSS properties, no morph
+       engine. 260ms == grokDur.morph; overshoot == grokEases.overshoot. */
+    transition:
+      transform 0.26s cubic-bezier(0.2, 0.9, 0.3, 1.15),
+      width 0.26s cubic-bezier(0.4, 0, 0.2, 1);
+    will-change: transform;
+    view-transition-name: none;
+    pointer-events: none;
+  }
+
+  /* C. Icons: 22px, with a redundant, non-colour-only active tell —
+     stroke-weight + accent ink + an interior "filled" whisper + a 2px lift/pop
+     that lands WITH the pill (same dur + curve). Lucide ships no filled variant,
+     so CSS `fill` overrides its `fill="none"` presentation attr — no 2nd icon set,
+     no reflow. Inactive icon ink is set here explicitly (independent of the label
+     colour) so it reads tertiary while the label reads secondary. */
+  [data-grok] [data-shell-tabs] svg {
+    width: 22px;
+    height: 22px;
+    stroke-width: 1.75;
+    color: var(--sm-sidebar-text-tertiary);
+    transition:
+      transform 0.26s cubic-bezier(0.2, 0.9, 0.3, 1.15),
+      stroke-width 0.18s ease,
+      fill 0.18s ease,
+      color 0.18s ease;
+  }
+  [data-grok] [data-shell-tabs] a[aria-current='page'] svg[data-active] {
+    color: var(--sm-accent);
+    stroke-width: 2.25;
+    fill: color-mix(in srgb, var(--sm-accent) 14%, transparent);
+    transform: translateY(-2px) scale(1.1);
+  }
+
+  /* D. Labels: label under the ACTIVE tab only (Grok/Linear compact look). The
+     label is always in the DOM (for the arrival transition + a11y); inactive
+     ROUTE cells collapse it to zero height and fade it out → icon-only. Search
+     keeps its label always (the only always-labelled control, aids discovery).
+     `position:relative` is LOAD-BEARING: the pill is an absolute earlier sibling,
+     so a static label would paint underneath it. */
+  [data-grok] [data-shell-tabs] [data-nav-label] {
+    position: relative;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    max-height: 14px;
+    opacity: 1;
+    transition:
+      opacity 0.18s ease,
+      max-height 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+      color 0.18s ease;
+  }
+  [data-grok] [data-shell-tabs] a:not([aria-current='page']) [data-nav-label] {
+    opacity: 0;
+    max-height: 0;
+    pointer-events: none;
+  }
+
+  /* E'. Press-down ack (all cells incl. Search), <100ms — a light physical
+     confirmation before the route commits. */
+  [data-grok] [data-shell-tabs] a:active,
+  [data-grok] [data-shell-tabs] button:active {
+    transform: scale(0.94);
+    transition: transform 0.09s cubic-bezier(0.4, 0, 0.6, 1);
+  }
+
+  /* E. Content clearance — the ONE non-cosmetic rule (design §6.2). The bar no
+     longer occupies flow, so `<main>` must reserve its footprint or a route's
+     last row hides behind the glass. 92px = the capsule's MEASURED 70px (6 + the
+     cells' `min-h-14` 56 + 6 + the 0.5px ring twice) + its 10px lift + 12px of
+     ground, matching the 12px side inset so the capsule floats in an even margin.
+     (84px was the paper estimate; the rig measured a 70px bar, leaving 4px of air
+     that re-read as a second stacked toolbar under the overview's account strip.)
+     On top of that sits the safe-area the capsule now floats above.
+     `:has([data-shell-tabs])` is the point: the FOCUS route renders no bottom nav
+     (layout.tsx:469) and its `<main>` is `overflow-hidden`, so padding there would
+     shrink a full-screen surface for a bar that is not on screen. Pad only when
+     the bar is actually mounted. (`:has()` is already used at :2424.) */
+  [data-grok] [data-shell-main]:has([data-shell-tabs]) [data-shell-content] {
+    padding-bottom: calc(env(safe-area-inset-bottom) + 92px);
+  }
+}
+
+/* Reduced motion — drop the slide + morph + lift/pop + press; the pill teleports
+   to the correct tab and every state stays legible (instant, no motion). Route
+   view-transitions are already disabled wholesale under reduced motion in
+   globals.css, so nothing double-runs. */
+@media (prefers-reduced-motion: reduce) {
+  [data-grok] [data-shell-tabs] [data-nav-pill],
+  [data-grok] [data-shell-tabs] svg,
+  [data-grok] [data-shell-tabs] [data-nav-label],
+  [data-grok] [data-shell-tabs] a:active,
+  [data-grok] [data-shell-tabs] button:active {
+    transition: none;
+  }
+  [data-grok] [data-shell-tabs] a[aria-current='page'] svg[data-active] {
+    transform: none;
+  }
+}
+
+/* Reduce-Transparency / no-backdrop-filter fallback — opaque elevated fill, no
+   blur. Same accessibility gate the substrate uses (:290-302). */
+@media (max-width: 767px) and (prefers-reduced-transparency: reduce) {
+  [data-grok] [data-shell-tabs] {
+    background: var(--sm-bg-elevated);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  @media (max-width: 767px) {
+    [data-grok] [data-shell-tabs] {
+      background: var(--sm-bg-elevated);
+    }
+  }
+}
+/* ══ GROK MODE — MOTION (WS3, the CSS half) ══════════════════════════════════
+   The stylesheet counterpart of `lib/grok-motion.ts`. That file owns the
+   framer-motion vocabulary (durations, curves in array + css-string form, the
+   `transition` presets); this owns the KEYFRAMES and the `[data-grok]`-scoped
+   animation utilities that later workstreams (WS5 roster, WS6 rows, WS8 chat,
+   WS9 states) attach to elements. Split for the same reason `springs.ts` ↔
+   `globals.css` are split: a framer transition cannot live in a stylesheet and a
+   `@keyframes` cannot live in TS. `tests/unit/grok-motion.test.ts` keeps the two
+   halves numerically honest, exactly as `motion-tokens.test.ts` does for the
+   default bank.
+
+   THE SPEC'S THREE RULES (spec §4 / tokens.md §12 / mechanics.md §8):
+     1. Three speeds, exits always faster than entries.
+     2. Axis is identity — the transcript enters VERTICALLY, roster rows slide in
+        HORIZONTALLY, popovers scale, same-cell state swaps are pure opacity. The
+        axis is encoded here, in the keyframes.
+     3. One slow identity settle — `.60s` on the mascot recolour, the slowest
+        motion in Grok mode.
+
+   SCOPING & REVERT. `@keyframes` are global by nature (CSS gives no way to scope
+   a keyframe), so they are DEFINED globally but inert until referenced; every
+   APPLICATION (`animation:` / `transition:`) is scoped under `[data-grok]`, so
+   removing the attribute is a byte-exact revert — the file-wide invariant. Names
+   reuse the spec's `sm-*` vocabulary and were verified free of collision with
+   globals.css's existing keyframes (`sm-breathe`, `sm-blip`, `sm-spin`,
+   `sm-status-spin`, `sm-skeleton-sweep`). The 2.4s tool spinner is the existing
+   global `.sm-spin` / `@keyframes sm-spin` — reused, never redefined.
+
+   OFFSCREEN PAUSE is inherited, not re-declared: globals.css ships
+   `[data-offscreen] *,::before,::after { animation-play-state: paused }`, and
+   every Grok keyframe below is an ordinary CSS animation under that subtree, so
+   an offscreen roster tile pauses its typing wave for free.
+
+   REDUCED MOTION. Transitions (hover, swap, the `.grok-identity` recolour) are
+   already neutralised by globals.css's app-wide `* { transition-duration: 0.01ms
+   }` blanket, so they need no twin here. The keyframe ANIMATIONS below — which
+   the blanket deliberately does NOT touch, because `animation` is where the
+   functional/decorative line lives — each get a COLOCATED
+   `prefers-reduced-motion` twin that stops the loop AND restores the informative
+   static end-state (never a blanket kill that also kills information). */
+
+/* ── Keyframes (global definitions, inert until referenced under [data-grok]) ── */
+@keyframes sm-entry-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes sm-row-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes sm-receipt-check {
+  from {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes sm-pending-label {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes sm-mount-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes sm-typing-dot {
+  0%,
+  55%,
+  100% {
+    opacity: 0.25;
+  }
+  25% {
+    opacity: 0.7;
+  }
+}
+
+/* ── The [data-grok]-scoped animation utilities ───────────────────────────────
+   Consumers attach these to already-mounted elements; the `both` fill means the
+   from-state is held before the first frame WITHOUT the consumer pre-hiding the
+   element with `opacity:0` (which would strand it invisible under the
+   reduced-motion twin). Durations/curves are the exact values from
+   `grok-motion.ts` — `grok-motion.test.ts` pins each pair. */
+
+/* Transcript entry — VERTICAL pop with a slight overshoot; .28s, .42s fresh. */
+[data-grok] .grok-entry {
+  animation: sm-entry-enter 0.28s cubic-bezier(0.2, 0.9, 0.3, 1.15) both;
+}
+[data-grok] .grok-entry[data-fresh] {
+  animation-duration: 0.42s;
+}
+
+/* Container mount fade — the one-shot settle behind a freshly-opened transcript. */
+[data-grok] .grok-mount-fade {
+  animation: sm-mount-fade 1s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Roster row — HORIZONTAL slide from the rail's own edge; .45s, the slowest
+   arrival (a new colleague is a bigger event than a new message). A DIFFERENT
+   AXIS than the transcript above, by design — axis is identity. */
+[data-grok] .grok-row-enter {
+  animation: sm-row-enter 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* The ✓ on a completed tool-call receipt — a small scale-up pop; .28s. */
+[data-grok] .grok-receipt {
+  animation: sm-receipt-check 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* The pending/thinking label — staggered after its .28s avatar on a softer
+   curve; .35s. */
+[data-grok] .grok-pending-label {
+  animation: sm-pending-label 0.35s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+}
+
+/* Typing dots — three dots, staggered by delay; 1.3s ease-in-out loop. The
+   `<i>` children carry it; the container is `.grok-typing`. */
+[data-grok] .grok-typing i {
+  animation: sm-typing-dot 1.3s ease-in-out infinite;
+}
+[data-grok] .grok-typing i:nth-child(2) {
+  animation-delay: 0.16s;
+}
+[data-grok] .grok-typing i:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+/* The ONE slow identity transition — .60s on the mascot/monogram recolour when
+   the focused session or the theme flips. A transition (not a keyframe), so the
+   reduced-motion transition blanket in globals.css neutralises it for free. */
+[data-grok] .grok-identity {
+  transition:
+    fill 0.6s cubic-bezier(0.4, 0, 0.2, 1),
+    color 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ── Reduced-motion twins (colocated; stop the loop, keep the information) ───── */
+@media (prefers-reduced-motion: reduce) {
+  /* Entrances collapse to their end-state: present, unmoved. `animation: none`
+     drops the `both` fill, so the element rests at its natural CSS (opacity 1,
+     no transform) — the informative static form of "it is here". */
+  [data-grok] .grok-entry,
+  [data-grok] .grok-entry[data-fresh],
+  [data-grok] .grok-mount-fade,
+  [data-grok] .grok-row-enter,
+  [data-grok] .grok-pending-label {
+    animation: none;
+  }
+  /* The completed-tool ✓ STILL SHOWS — it is information (the call finished),
+     not decoration; only its scale-up pop is removed. */
+  [data-grok] .grok-receipt {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+  /* Typing dots keep their .25/.45/.7 stagger so the row still reads as three
+     dots mid-wave, not three identical dots (Grok's standard — the same fix
+     globals.css applies to `.sm-dots`). */
+  [data-grok] .grok-typing i {
+    animation: none;
+  }
+  [data-grok] .grok-typing i:nth-child(1) {
+    opacity: 0.25;
+  }
+  [data-grok] .grok-typing i:nth-child(2) {
+    opacity: 0.45;
+  }
+  [data-grok] .grok-typing i:nth-child(3) {
+    opacity: 0.7;
+  }
+}
+
+/* ══ WS4 — IDENTITY MARK, GROK EXPRESSION ═════════════════════════════════════
+   The character engine (`brand/marks/*`) already ships the substance the spec
+   demands and this workstream does NOT re-draw it: `hash(slug) → shape × hue ×
+   eye` (deterministic, rename-stable — `character.ts` keys every channel off the
+   immutable slug), FLAT body fill with WHITE eyes (`bodyColor` is a single flat
+   read, `EYE_INK = #fff`), the six expressions mapped from `last_status`
+   (`mark-status.ts`: starting/active→working, idle→idle, waiting→waiting,
+   stopped→stopped, error→failed), and the breathe/blink life (`ticker.ts` +
+   globals.css `sm-breathe`). All of that is correct in BOTH skins and must stay
+   byte-identical off grok — so everything below is scoped under `[data-grok]`
+   and does three things the default app deliberately does NOT:
+
+     1. NEEDS-YOU HALO. A session WAITING on you gets a soft red ring on its mark
+        (overview.md §4) — an attention cue, not a badge. Rendered as a stacked
+        `drop-shadow` on the SVG so it follows the actual silhouette (the 9 shapes
+        are arbitrary paths; a `box-shadow` ring would draw the mark's square box,
+        not its outline). The halo colour is `--sm-halo` (low-alpha red, lifted on
+        dark) — kept OFF the tone family on purpose: the mark is a non-semantic
+        surface, so it may carry attention without the status/identity firewall
+        colliding (the state WORD still owns `--sm-tone-danger`).
+
+     2. BREATHE ONLY WHILE WORKING. The default app breathes on every live state
+        (idle/working/waiting — `isLive`). Grok's roster is calmer: the mark
+        breathes only while it is actually working/thinking (overview.md §4 table;
+        there is no separate "thinking" status, so `working` is the live face).
+        Idle sits still and slightly dimmed (`saturate .72 / opacity .9` — the
+        spec's idle read); waiting does not breathe (it wears the halo instead).
+        The blink/saccade (JS, `ticker.ts`) is untouched — a still mark still has
+        life in its eyes, it just does not rise and fall unless it is working.
+
+     3. THE 0.6s IDENTITY SETTLE for the hue write. Switching the focused session
+        rewrites `--sm-agent-*` on the shell root (lib/grok-agent-hue.ts); the
+        side-pane wash that reads `--sm-agent-tint` cross-fades over .6s so a
+        switch FEELS like a place changing, not a list re-rendering (mechanics.md
+        §2.1). The mascot's own `fill` recolour is the WS3 `.grok-identity`
+        transition, applied by whichever persistent element (the header pill) is
+        re-seeded — a per-seed `<SessionMark>` remounts and so needs none here.
+
+   SPECIFICITY. globals.css `@import`s this file at its head, so its own
+   `.sm-mark …` rules sit LATER in source order; every rule here therefore leads
+   with `[data-grok]` (one extra attribute) to out-specify the base at equal
+   structure and win the override — verified against `.sm-mark[data-live='1'] svg`
+   (0,2,1) < `[data-grok] .sm-mark[data-live='1'] svg` (0,3,1). */
+
+/* Kill the base breathe for every live state under grok… */
+[data-grok] .sm-mark[data-live='1'] svg {
+  animation: none;
+}
+/* …then restore it for WORKING only, at Grok's 3.4s cadence (overview.md §4).
+   Reuses the existing `sm-breathe` keyframe — the refined translate/rotate
+   breathe the brand tuned to "read as breathing, not a wobbling icon", never a
+   scale pop. Higher specificity (0,4,1) than the kill above (0,3,1). */
+[data-grok] .sm-mark[data-state='working'][data-live='1'] svg,
+[data-grok] .sm-mark[data-state='streaming'][data-live='1'] svg {
+  animation: sm-breathe 3.4s ease-in-out infinite;
+}
+/* Thinking breathes slower (pondering, not producing). */
+[data-grok] .sm-mark[data-state='thinking'][data-live='1'] svg {
+  animation: sm-breathe 4.2s ease-in-out infinite;
+}
+
+/* NEEDS-YOU / BLOCKED HALO — the soft red ring, following the silhouette. Stacked
+   so the ring reads at roster (18–26px) and detail (42–48px) sizes without a blur
+   bloom swallowing the mark. `overflow:visible` on the svg (globals.css) lets it
+   spill past the box.
+
+   REBOUND to `data-attention`, not `data-state='waiting'` (audit #4/#5): the halo
+   is the DECOUPLED attention signal (`attentionFor` reads the real error /
+   permission / elicitation / waiting fields), so a permission-blocked or errored
+   session raises it too — not only a waiting one. `needs` PULSES (a demand),
+   `blocked` is STEADY at a higher alpha (an open dialog). */
+[data-grok] .sm-mark[data-attention='needs'] svg {
+  filter: drop-shadow(0 0 2px var(--sm-halo)) drop-shadow(0 0 4px var(--sm-halo));
+  animation: sm-attention-pulse 2s ease-in-out infinite;
+}
+[data-grok] .sm-mark[data-attention='blocked'] svg {
+  filter: drop-shadow(0 0 2px var(--sm-halo)) drop-shadow(0 0 5px var(--sm-halo))
+    drop-shadow(0 0 5px var(--sm-halo));
+}
+
+/* IDLE — dimmed and desaturated, sitting quietly (overview.md §4 idle read). */
+[data-grok] .sm-mark[data-state='idle'] svg {
+  filter: saturate(0.72);
+  opacity: 0.9;
+}
+
+/* THE 0.6s SETTLE — the side-pane wash (the one surface that reads the focused
+   session's `--sm-agent-tint`) cross-fades when the hue write changes on a
+   session switch. Additive: WS2 owns the pane's `background`; this only adds the
+   transition, so it stays a clean revert. */
+[data-grok] [data-shell-pane] {
+  transition: background-color 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Reduced-motion twin (colocated): the working breathe stops, but the mark stays
+   exactly where it is (the eye geometry alone carries "working", so no
+   information is lost) and the settle collapses to instant. The halo and the
+   idle dim are static filters — nothing to disable. */
+@media (prefers-reduced-motion: reduce) {
+  [data-grok] .sm-mark[data-state='working'][data-live='1'] svg,
+  [data-grok] .sm-mark[data-state='streaming'][data-live='1'] svg,
+  [data-grok] .sm-mark[data-state='thinking'][data-live='1'] svg {
+    animation: none;
+  }
+  [data-grok] [data-shell-pane] {
+    transition: none;
+  }
+}
+
+/* ══ WS4b — AGENT-MARK EMOTION (mouth · streaming · error · connecting · glow) ══
+   The expression upgrade on top of WS4's halo/breathe. One new feature only — a
+   MOUTH — plus the motion that makes a roster scan read who-is-doing-what
+   pre-attentively. Everything is scoped `[data-grok]`; base app byte-identical.
+
+   THE THREE CHANNELS (all legible FROZEN — motion is only "alive", never
+   load-bearing; every animation ships a colocated reduced-motion twin that keeps
+   the static end-state):
+     · MOUTH — painted only on streaming/done/failed (the geometry is emitted by
+       `mouthFor`/`mouthPath`; here we only animate it). streaming = an open
+       lozenge that scaleY-PULSES (talking); done = a static smile that POPS in;
+       failed = a static wilt.
+     · MOTION — streaming mouth pulse, the one-shot error shake on entry, the
+       attention halo pulse (above), the done mouth pop.
+     · IN-HUE GLOW — working/streaming glow in the mark's OWN pigment
+       (`--sm-agent-glow`, per-`data-hue`), the colour firewall's busy half. */
+
+/* ── Keyframes (global; inert until referenced under [data-grok]) ───────────── */
+@keyframes sm-stream-mouth {
+  0%,
+  100% {
+    transform: scaleY(0.55);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+@keyframes sm-error-shake {
+  0% {
+    transform: translateX(0) rotate(0deg);
+  }
+  20% {
+    transform: translateX(-1.5px) rotate(-1.2deg);
+  }
+  40% {
+    transform: translateX(1.5px) rotate(1.2deg);
+  }
+  60% {
+    transform: translateX(-1px) rotate(-0.8deg);
+  }
+  80% {
+    transform: translateX(1px) rotate(0.8deg);
+  }
+  100% {
+    transform: translateX(0) rotate(0deg);
+  }
+}
+@keyframes sm-attention-pulse {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 2px var(--sm-halo)) drop-shadow(0 0 4px var(--sm-halo));
+  }
+  50% {
+    filter: drop-shadow(0 0 1px var(--sm-halo)) drop-shadow(0 0 2px var(--sm-halo));
+  }
+}
+@keyframes sm-mouth-pop {
+  from {
+    transform: scale(0.4);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+@keyframes sm-mark-arrive {
+  from {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+@keyframes sm-mark-leave {
+  from {
+    transform: none;
+    opacity: 1;
+  }
+  to {
+    transform: scale(0.7);
+    opacity: 0;
+  }
+}
+
+/* ── IN-HUE working/streaming glow — the colour firewall's "busy" half ─────────
+   Each mark carries `data-hue`; map it to its own pigment so the glow is the
+   agent's OWN colour, never a shared alert red. A soft, un-animated drop-shadow
+   (the breathe carries the life); cheap even with a handful of working marks. */
+[data-grok] .sm-mark[data-hue='28'] {
+  --sm-agent-glow: #ec6d608c;
+}
+[data-grok] .sm-mark[data-hue='75'] {
+  --sm-agent-glow: #e89f168c;
+}
+[data-grok] .sm-mark[data-hue='158'] {
+  --sm-agent-glow: #42b67c8c;
+}
+[data-grok] .sm-mark[data-hue='190'] {
+  --sm-agent-glow: #00a7a08c;
+}
+[data-grok] .sm-mark[data-hue='265'] {
+  --sm-agent-glow: #4171ed8c;
+}
+[data-grok] .sm-mark[data-hue='292'] {
+  --sm-agent-glow: #7d53e18c;
+}
+[data-grok] .sm-mark[data-hue='350'] {
+  --sm-agent-glow: #db5fa18c;
+}
+[data-grok] .sm-mark[data-state='working'] svg,
+[data-grok] .sm-mark[data-state='streaming'] svg {
+  filter: drop-shadow(0 0 3px var(--sm-agent-glow));
+}
+
+/* ── The mouth ink layer (visual base — the path itself is emitted by React) ───
+   Revealed here: the base app hides `.sm-mark__mouth` (globals.css), so the mouth
+   is a purely Grok-scoped feature and a base `failed` mark stays byte-identical. */
+[data-grok] .sm-mark__mouth {
+  display: block;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* STREAMING — the mouth talks: a scaleY pulse on the lozenge path. This is the
+   single biggest "alive" win (Grok's face never moves while it works). */
+[data-grok] .sm-mark[data-state='streaming'] .sm-mark__mouth {
+  animation: sm-stream-mouth 0.9s ease-in-out infinite;
+}
+
+/* DONE — the smile POPS in once, then rests (delight). */
+[data-grok] .sm-mark[data-state='done'] .sm-mark__mouth {
+  animation: sm-mouth-pop 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* FAILED — one micro-shake on entry, then rests on the static wilt (+ the red
+   halo rides the attention layer). Audit #3: today `failed` has zero motion. */
+[data-grok] .sm-mark[data-state='failed'] svg {
+  animation: sm-error-shake 0.4s ease-out 1;
+}
+
+/* CONNECTING — a faint neutral treatment; the gaze SWEEP is JS (ticker), so the
+   still frame already reads as mid-scan. Slightly dimmed like idle, but alive. */
+[data-grok] .sm-mark[data-state='connecting'] svg {
+  filter: saturate(0.85);
+}
+
+/* ARRIVE / LEAVE — a teammate joining or leaving a pile. Consumers add the class;
+   `both` holds the from-state before the first frame without pre-hiding. */
+[data-grok] .sm-mark.sm-arrive {
+  animation: sm-mark-arrive 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+[data-grok] .sm-mark.sm-leave {
+  animation: sm-mark-leave 0.2s cubic-bezier(0.4, 0, 0.6, 1) both;
+}
+
+/* ── Reduced-motion twins (colocated; stop the loop, keep the information) ───── */
+@media (prefers-reduced-motion: reduce) {
+  /* Streaming: the mouth rests HALF-OPEN — still "speaking", statically. */
+  [data-grok] .sm-mark[data-state='streaming'] .sm-mark__mouth {
+    animation: none;
+    transform: scaleY(0.75);
+  }
+  /* Done: the smile is simply present (no pop). */
+  [data-grok] .sm-mark[data-state='done'] .sm-mark__mouth {
+    animation: none;
+  }
+  /* Failed: the wilt + red halo stay; only the shake is dropped. */
+  [data-grok] .sm-mark[data-state='failed'] svg {
+    animation: none;
+  }
+  /* Needs-you: the halo stays (static), the pulse stops — info preserved. */
+  [data-grok] .sm-mark[data-attention='needs'] svg {
+    animation: none;
+  }
+  /* Arrive/leave collapse to their end-state. */
+  [data-grok] .sm-mark.sm-arrive {
+    animation: none;
+  }
+  [data-grok] .sm-mark.sm-leave {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+/* FROZEN — the deterministic reduced-motion end-state, forced (for the /dev/marks
+   side-by-side column and any screenshot that must not depend on the OS setting).
+   It mirrors the reduced-motion twins above so the frozen column reads exactly as
+   a reduced-motion user sees it: loops stop, the streaming mouth rests half-open,
+   every state stays legible. `!important` because it deliberately overrides the
+   live animation rules regardless of source order. */
+[data-grok] .sm-frozen .sm-mark svg,
+[data-grok] .sm-frozen .sm-mark .sm-mark__mouth {
+  animation: none !important;
+}
+[data-grok] .sm-frozen .sm-mark[data-state='streaming'] .sm-mark__mouth {
+  transform: scaleY(0.75);
+}
+
+/* ══ WS5 + WS6 — OVERVIEW / ROSTER (the headline surface) ═════════════════════
+   The radical inbox-of-bots overview. `GrokRoster` (routes/overview.tsx picks it
+   by the flag) replaces today's CI-board-of-terminal-cards with Grok's messaging
+   cadence — a face-led two-line row whose second line IS the live tail — while
+   KEEPING supermux's density edges (per-agent context/tokens on the quiet L3,
+   grouping, sort, tags, the needs-you rollup). Every selector is scoped under
+   `[data-grok]`, so with the attribute gone the default overview is byte-exact.
+
+   The component consumes the WS1 `--sm-*` token layer directly; the handful of
+   `--gr-*` aliases below exist only to read the row anatomy cleanly (surface,
+   selection, hairline, track), and each is a straight alias — no new palette.
+   (spec §3.2, overview.md §6 Row A / §7 detail pane / §11 palette.) */
+[data-grok] .grok-roster {
+  /* surfaces — the rail's own ground. The rest of the `--gr-*` surface/state
+     aliases now live on `[data-grok]` (above) so they resolve in portalled sheets
+     too; this block keeps only the tokens specific to the roster rail. */
+  --gr-bg: var(--sm-bg-chrome);          /* the rail's own ground            */
+  /* MEASURED-GAP FIX (row contrast): the roster used to carry TWO sub-AA grey
+     tiers under the name — the right meta (timestamp + token) at tertiary
+     (~2.2:1 light / ~2.8:1 dark) and the provider/ctx tag line even fainter
+     (~1.6:1 light). Grok uses ONE AA-compliant sub-grey, not two faint ones. This
+     is that grey: an opaque tone that clears 4.5:1 on the rail ground in both
+     themes. Light #6b7280 actually measured 4.39:1 on #f4f4f2 (right on the AA
+     line); nudged to #5f6773 → 5.19:1 for margin. Dark override (#9a9a9a ≈
+     6.55:1 on #141414) already clears and is left as-is. */
+  --gr-meta: #5f6773;
+  /* inactive segmented-toggle label ink. Secondary alpha-ink composited to
+     4.49:1 on the seg track in LIGHT — a hair under AA — so light pins the solid
+     meta grey (>=4.5 on the track); dark keeps secondary (already ~6.2:1). */
+  --gr-seg-ink: #5f6773;
+
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  position: relative; /* containing block for the scroll-away header */
+  background: var(--gr-bg);
+  color: var(--sm-text-primary);
+  font-family: var(--sm-font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+/* Dark half of the one AA sub-grey (the aliases above are theme-swapped via
+   --sm-*, but --gr-meta is a fixed tone, so it needs its own dark value). */
+.dark [data-grok] .grok-roster {
+  --gr-meta: #9a9a9a;
+  /* dark seg-inactive keeps secondary (composites to ~6.2:1 on the dark track). */
+  --gr-seg-ink: var(--sm-text-secondary);
+}
+
+/* ── header — brand · live count · search · display · + ─────────────────────── */
+[data-grok] .grok-roster .gr-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px 12px;
+  flex: none;
+  position: relative;
+}
+[data-grok] .grok-roster .gr-head::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 0.5px;
+  background: var(--sm-sidebar-separator);
+}
+/* PRIORITY 2 — safe-area top. The shell's MobileTopBar renders nothing, so each
+   route owns its own top inset; the grok roster never did, so in an installed
+   iOS PWA (viewport-fit=cover, status bar overlays the webview) the header's
+   "+ New bot" pill + count + controls ran UNDER the battery/signal row. Reserve
+   the inset on the header. Scoped to `[data-standalone]` (the PWA gate the shell
+   root sets) so browser-tab mobile — where the URL bar already offsets the page
+   — is untouched; `max()` keeps it a no-op wherever the inset is 0. */
+[data-grok][data-standalone] .grok-roster .gr-head {
+  padding-top: max(14px, env(safe-area-inset-top));
+}
+/* `.gr-brand` (the "supermux" wordmark block) and the roster `.gr-spark` (its
+   invented conic rainbow tile) were retired: the overview title is now the
+   CompanySwitcher (active team name), and HQ renders the real blue-S `<HqMark>`
+   (component `company-mark.tsx`, styled inline) instead of the spark. No `.gr-brand`
+   / `.gr-spark` markup remains. */
+[data-grok] .grok-roster .gr-count {
+  font-size: 13px;
+  /* AA fix: the '… bots' subtitle was tertiary ink — 2.41:1 light / 3.35:1 dark,
+     both fail 4.5. Secondary ink clears it in both themes (4.63:1 on #f4f4f2 /
+     6.74:1 on #141414). The bold count inside (`.gr-count b`) keeps its own hue. */
+  color: var(--sm-text-secondary);
+  font-weight: 500;
+}
+[data-grok] .grok-roster .gr-count b {
+  color: var(--gr-need);
+  font-weight: 650;
+}
+[data-grok] .grok-roster .gr-head-sp {
+  flex: 1;
+}
+[data-grok] .grok-roster .gr-search {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  max-width: 320px;
+}
+[data-grok] .grok-roster .gr-search svg {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 15px;
+  height: 15px;
+  color: var(--sm-text-tertiary);
+  pointer-events: none;
+}
+[data-grok] .grok-roster .gr-search input {
+  width: 100%;
+  height: 34px;
+  border-radius: 10px;
+  border: 0.5px solid var(--gr-line);
+  background: var(--gr-surf2);
+  padding: 0 12px 0 30px;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+  color: var(--sm-text-primary);
+  outline: none;
+}
+[data-grok] .grok-roster .gr-search input::placeholder {
+  color: var(--sm-text-tertiary);
+}
+[data-grok] .grok-roster .gr-search input:focus-visible {
+  border-color: transparent;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sm-accent) 45%, transparent);
+}
+
+/* segmented controls in the header (sort · density) — quiet, hairline pills */
+[data-grok] .grok-roster .gr-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  background: var(--gr-surf2);
+  border-radius: 9px;
+  padding: 2px;
+  flex: none;
+}
+[data-grok] .grok-roster .gr-seg button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  /* AA fix (overview minor): inactive segmented labels (A-Z / Compact)
+     at tertiary read 3.23:1 dark / 2.36:1 light — both fail 4.5. `--gr-seg-ink`
+     clears 4.5 on the seg track in both themes (light solid meta grey ~4.6:1,
+     dark secondary ~6.2:1); hover steps to primary so the state still moves. */
+  color: var(--gr-seg-ink);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: color 0.12s, background-color 0.12s;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+[data-grok] .grok-roster .gr-seg button:hover {
+  color: var(--sm-text-primary);
+}
+[data-grok] .grok-roster .gr-seg button[aria-pressed='true'] {
+  color: var(--sm-text-primary);
+  background: var(--gr-surf);
+  box-shadow: 0 1px 2px #0000000f;
+}
+/* the create verb — a LABELLED accent-FILLED primary pill, left-anchored by the
+   count. `+ New bot` reads as the next action, not a lone glyph. */
+[data-grok] .grok-roster .gr-newbot {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 34px;
+  min-width: 34px;
+  padding: 0 13px;
+  border-radius: 10px;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--gr-onaccent);
+  background: var(--sm-accent-fill);
+  transition: filter 0.12s, background-color 0.12s;
+}
+[data-grok] .grok-roster .gr-newbot:hover {
+  filter: brightness(1.06);
+}
+[data-grok] .grok-roster .gr-newbot:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--gr-bg), 0 0 0 4px color-mix(in srgb, var(--sm-accent) 55%, transparent);
+}
+/* the label folds away on a narrow header; the 44×44 phone rule keeps the tap */
+@media (max-width: 520px) {
+  [data-grok] .grok-roster .gr-newbot {
+    padding: 0 9px;
+  }
+  [data-grok] .grok-roster .gr-newbot-lbl {
+    display: none;
+  }
+}
+
+/* ── company identity mark + HQ/company switcher (Companies, Bot Mode) ───────── */
+/* The rounded-SQUARE monogram tile geometry lives INLINE in `<CompanyMark>` /
+   `<HqMark>` (`identityTileStyle`), NOT in a `[data-grok]`-scoped rule: both marks
+   render inside `<ResponsiveSheet>` bodies that portal to `document.body` outside
+   this subtree, where a scoped `.gr-cmark` never matched → a bare unstyled square
+   in the mobile switcher rows + the create-preview. The old `[data-grok] .gr-cmark`
+   rule was deleted for exactly that reason. */
+
+/* The trigger — an always-visible scope chip in `.gr-head`, matching the
+   `.gr-search` / `.gr-seg` hairline family (34px, `--sm-r-md`, surf2, 0.5px
+   line). It reads as one of the header's quiet controls, not a loud button. */
+[data-grok] .grok-roster .gr-company {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  min-width: 34px;
+  padding: 4px 10px 4px 6px;
+  border-radius: var(--sm-r-md);
+  border: 0.5px solid var(--gr-line);
+  background: var(--gr-surf2);
+  cursor: pointer;
+  font: inherit;
+  color: var(--sm-text-primary);
+  transition: background-color 0.12s, border-color 0.12s;
+}
+[data-grok] .grok-roster .gr-company:hover {
+  background: var(--gr-surf);
+}
+[data-grok] .grok-roster .gr-company:focus-visible {
+  outline: none;
+  border-color: transparent;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sm-accent) 45%, transparent);
+}
+[data-grok] .grok-roster .gr-company .gr-company-lbl {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  max-width: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-grok] .grok-roster .gr-company .gr-company-cv {
+  color: var(--sm-text-tertiary);
+  flex: none;
+}
+/* HQ's mark is now the real blue-S `<HqMark>` (sized inline at 22px on the
+   trigger), not a `.gr-spark` tile — the old `.gr-company .gr-spark` sizing rule
+   is retired with the spark. */
+/* The switcher is now the SOLE overview title, so its label stays visible at
+   every width (it used to fold below 520px when the `.gr-brand` wordmark still
+   carried the identity) — the active team name (HQ by default) must always read
+   next to the mark. The 44×44 tap target is preserved on the phone. */
+@media (max-width: 520px) {
+  [data-grok] .grok-roster .gr-company {
+    min-height: 44px;
+    padding: 4px 8px;
+  }
+}
+
+/* the anchored menu — the SAME raw idiom the team-overflow menu uses (costs the
+   token budget nothing). Only the mount animation is bespoke. */
+@keyframes gr-cmenu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+[data-grok] .gr-cmenu {
+  transform-origin: top left;
+  animation: gr-cmenu-in 0.15s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-grok] .gr-cmenu {
+    animation: none;
+  }
+}
+
+/* the ≤6% company pigment wash at the rail HEAD (fades over `--sm-list-fade`).
+   Anchored to the list's border box (default `background-attachment`), so it
+   stays at the top as rows scroll under it. HQ writes no `data-company`, so its
+   rail is byte-identically neutral — the firewall's "no company hue on a status
+   surface" made visible as the difference between HQ and a company. */
+[data-grok] .grok-roster .gr-rail[data-company] .gr-list {
+  background-image: linear-gradient(
+    to bottom,
+    color-mix(in oklab, var(--sm-agent-tint) 6%, transparent) 0,
+    transparent var(--sm-list-fade)
+  );
+  background-repeat: no-repeat;
+}
+
+/* ── two-pane body — rail (list) + detail pane ─────────────────────────────── */
+[data-grok] .grok-roster .gr-two {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+[data-grok] .grok-roster .gr-rail {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  width: 372px;
+  min-height: 0;
+  position: relative;
+}
+/* when nothing is selected (or on phone) the rail is the whole width */
+[data-grok] .grok-roster[data-detail='0'] .gr-rail,
+[data-grok] .grok-roster .gr-rail[data-solo] {
+  flex: 1;
+  width: auto;
+}
+[data-grok] .grok-roster .gr-rail::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 0.5px;
+  background: var(--sm-sidebar-separator);
+}
+[data-grok] .grok-roster[data-detail='0'] .gr-rail::after {
+  display: none;
+}
+
+/* the scrolling list, with mask-gradient edge fades (no shadows on glass) */
+[data-grok] .grok-roster .gr-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  /* MEASURED-GAP FIX (jury e): a 28px edge-mask faded the topmost row's title
+     into the ground (~2:1) while it was still meant to be read. Shorten the fade
+     so the transparent lip is a hairline hint of "more above/below", never deep
+     enough to swallow a line of text. */
+  --sm-fade: 14px;
+}
+[data-grok] .grok-roster .gr-list[data-fade-top][data-fade-bottom] {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--sm-fade),
+    #000 calc(100% - var(--sm-fade)),
+    transparent 100%
+  );
+}
+[data-grok] .grok-roster .gr-list[data-fade-top]:not([data-fade-bottom]) {
+  mask-image: linear-gradient(to bottom, transparent 0, #000 var(--sm-fade));
+}
+[data-grok] .grok-roster .gr-list[data-fade-bottom]:not([data-fade-top]) {
+  mask-image: linear-gradient(to top, transparent 0, #000 var(--sm-fade));
+}
+
+/* ── section headers — a hairline idiom, no boxed cards, no "Pinned" text ────── */
+/* MEASURED-GAP FIX (alignment): the section labels used to start at the row's own
+   left pad (x≈20) while the row TITLES start past the avatar (row pad 18 + mark 42
+   + gap 13 = 73) — a ~53px zig between the two content verticals. Share ONE
+   vertical: hang the label at the title edge. The hairline (`.ln`) simply starts
+   further in; the count rides with the label. */
+[data-grok] .grok-roster .gr-grp {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 15px 20px 6px 73px;
+}
+[data-grok] .grok-roster .gr-grp .lbl {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  /* AA fix (overview minor): the ACTIVE / DONE TODAY eyebrows were tertiary ink —
+     2.41:1 light / 3.31:1 dark, both fail 4.5. Secondary ink clears it in both
+     themes (4.63:1 on the rail ground / 6.74:1 dark). The `[data-need]` variant
+     below still overrides to the danger tone; the count (`.ct`) stays quiet. */
+  color: var(--sm-text-secondary);
+}
+[data-grok] .grok-roster .gr-grp[data-need] .lbl {
+  color: var(--gr-need);
+}
+[data-grok] .grok-roster .gr-grp .ct {
+  font-size: 11.5px;
+  font-weight: 600;
+  /* AA fix (overview minor): the section-count digits (NEEDS YOU 3 / ACTIVE 4)
+     at tertiary read 3.31:1 dark — fails 4.5. Match the eyebrow's secondary ink
+     (4.63:1 light / 6.74:1 dark) so the count reads as strongly as its label. */
+  color: var(--sm-text-secondary);
+}
+[data-grok] .grok-roster .gr-grp .ln {
+  flex: 1;
+  height: 0.5px;
+  background: var(--sm-sidebar-separator);
+}
+
+/* ── ROW A — inbox rows (the recommended default) ──────────────────────────── */
+[data-grok] .grok-roster .gr-rowA {
+  display: flex;
+  gap: 13px;
+  padding: 11px 18px;
+  align-items: center;
+  position: relative;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  transition: background-color 0.12s cubic-bezier(0.4, 0, 0.2, 1);
+}
+[data-grok] .grok-roster .gr-rowA:hover {
+  background: var(--sm-bg-hover);
+}
+/* selection AND keyboard highlight are the identical visual — warm grey, never
+   the accent (mechanics.md §3.1: pointer and arrow-key cannot disagree). */
+[data-grok] .grok-roster .gr-rowA[data-active],
+[data-grok] .grok-roster .gr-rowA[data-highlighted] {
+  background: var(--gr-sel);
+}
+[data-grok] .grok-roster .gr-rowA .gr-mark {
+  flex: none;
+}
+
+/* ── SPLIT HIT TARGET (§2.1): a full-bleed base button opens the thread; the
+   NAME is its own button opening the settings panel. `.gr-rowA` isolates so the
+   two z-layers compare locally. `.gr-top` is `display:contents` in the inbox
+   densities, so content is made pointer-transparent on its real children — every
+   click but the name falls through to the base button. */
+[data-grok] .grok-roster .gr-rowA {
+  isolation: isolate;
+}
+[data-grok] .grok-roster .gr-rowA > .gr-row-open {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  border-radius: inherit;
+}
+[data-grok] .grok-roster .gr-rowA > .gr-row-open:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--sm-accent) 45%, transparent);
+}
+[data-grok] .grok-roster .gr-rowA .gr-mark,
+[data-grok] .grok-roster .gr-rowA .col {
+  pointer-events: none;
+}
+/* The name reclaims pointer events and lifts above the base button; it inherits
+   the `.nm` type, so here we only strip button chrome and add the affordance. */
+[data-grok] .grok-roster .gr-rowA .gr-nm-btn {
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  text-underline-offset: 2px;
+}
+[data-grok] .grok-roster .gr-rowA .gr-nm-btn:hover {
+  text-decoration: underline;
+}
+[data-grok] .grok-roster .gr-rowA .gr-nm-btn:focus-visible {
+  outline: none;
+  border-radius: 4px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sm-accent) 55%, transparent);
+}
+
+/* ── restored per-session actions: the ⋯ menu trigger on an inbox row ──────────
+   <SessionActionsMenu variant="tile"> ships a top-right overlay tuned for the
+   card grid (always-on on coarse). On the grok inbox row that would sit over the
+   timestamp / cost, so grok re-homes it: vertically centred at the right edge,
+   HOVER/FOCUS-revealed on desktop, and — crucially — `pointer-events: none` at
+   rest so an invisible trigger never eats a row tap or the start of a scroll on
+   touch (there the long-press IS the affordance). It re-appears while the menu
+   is open (`data-state="open"`) so the anchor stays put under the open sheet. */
+[data-grok] .grok-roster .gr-rowA .gr-tile-kebab {
+  position: absolute;
+  right: 12px;
+  /* Multi-line densities (comfortable + cards): BOTTOM-anchor the 34px kebab so
+     it sits on the lower half of the row, its top edge clearly below the top-line
+     timestamp — the two never overlap and the timestamp stays fully visible.
+     Compact (single-line ~34px row) has no lower half, so it re-centres below. */
+  top: auto;
+  bottom: 10px;
+  transform: none;
+  z-index: 3;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  opacity: 0;
+  pointer-events: none;
+  color: var(--gr-meta);
+  background: color-mix(in srgb, var(--gr-bg) 82%, transparent);
+  transition: opacity 0.12s cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* COMPACT (ultra-compact single-line): the row collapses to ~34px with no lower
+   half for the kebab to drop into — keep it vertically centred at the right edge
+   (the timestamp steps aside for it instead; see the compact-scoped `.tm` fade
+   below). */
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA .gr-tile-kebab {
+  top: 50%;
+  bottom: auto;
+  transform: translateY(-50%);
+}
+[data-grok] .grok-roster .gr-rowA:hover .gr-tile-kebab,
+[data-grok] .grok-roster .gr-rowA:focus-within .gr-tile-kebab,
+[data-grok] .grok-roster .gr-rowA .gr-tile-kebab:focus-visible,
+[data-grok] .grok-roster .gr-rowA .gr-tile-kebab[data-state='open'] {
+  opacity: 1;
+  pointer-events: auto;
+}
+[data-grok] .grok-roster .gr-rowA .gr-tile-kebab:hover {
+  color: var(--sm-text);
+  background: var(--gr-sel);
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-grok] .grok-roster .gr-rowA .gr-tile-kebab {
+    transition: none;
+  }
+}
+
+/* ── the persistent HIRE ghost row (pinned above Teams) ─────────────────────── */
+[data-grok] .grok-roster .gr-ghost {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  width: calc(100% - 24px);
+  margin: 8px 12px 4px;
+  padding: 11px 14px;
+  border: 1px dashed var(--gr-line);
+  border-radius: 14px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  transition: border-color 0.12s, background-color 0.12s;
+}
+[data-grok] .grok-roster .gr-ghost:hover {
+  border-color: color-mix(in srgb, var(--sm-accent) 55%, var(--gr-line));
+  background: color-mix(in srgb, var(--sm-accent) 5%, transparent);
+}
+[data-grok] .grok-roster .gr-ghost:focus-visible {
+  outline: none;
+  border-color: transparent;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--sm-accent) 45%, transparent);
+}
+[data-grok] .grok-roster .gr-ghost-mark {
+  flex: none;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--gr-line);
+  color: var(--sm-accent);
+}
+[data-grok] .grok-roster .gr-ghost-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+[data-grok] .grok-roster .gr-ghost-t {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  color: var(--sm-text-primary);
+}
+[data-grok] .grok-roster .gr-ghost-s {
+  font-size: 13px;
+  color: var(--sm-text-secondary);
+}
+/* the compact feed is a dense scan — the hire affordance lives in the header
+   pill there, so the ghost row folds away (comfortable + cards keep it). */
+[data-grok] .grok-roster[data-density='compact'] .gr-ghost {
+  display: none;
+}
+[data-grok] .grok-roster .gr-rowA .col {
+  flex: 1;
+  min-width: 0;
+  container-type: inline-size;
+}
+[data-grok] .grok-roster .gr-rowA .l1 {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+[data-grok] .grok-roster .gr-rowA .nm {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+[data-grok] .grok-roster .gr-rowA .tm {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--gr-meta);
+  flex: none;
+  font-weight: 500;
+  transition: opacity 0.12s cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* COMPACT-ONLY: de-overlap the ⋯ kebab and the "13h" timestamp. Only in the
+   ultra-compact single-line density does the row collapse to ~34px so the
+   centred kebab paints directly over the top-line timestamp — there the
+   timestamp steps aside exactly when the kebab is revealed (the SAME selectors
+   as the kebab's reveal). In comfortable + cards the kebab is bottom-anchored
+   (above) and clears the timestamp on its own, so the timestamp stays fully
+   visible and is NOT faded. The kebab is a sibling that PRECEDES `.gr-top`, so
+   `~ .gr-top .tm` reaches the timestamp for the menu-open state. */
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA:hover .tm,
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA:focus-within .tm,
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA .gr-tile-kebab[data-state='open'] ~ .gr-top .tm {
+  opacity: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-grok] .grok-roster .gr-rowA .tm {
+    transition: none;
+  }
+}
+/* container-query: the timestamp is the FIRST thing to drop as the row narrows */
+@container (max-width: 168px) {
+  [data-grok] .grok-roster .gr-rowA .tm {
+    display: none;
+  }
+}
+[data-grok] .grok-roster .gr-rowA .l2 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 2px;
+}
+[data-grok] .grok-roster .gr-rowA .pv {
+  font-size: 13.5px;
+  color: var(--sm-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+[data-grok] .grok-roster .gr-rowA .st {
+  font-weight: 600;
+}
+[data-grok] .grok-roster .gr-rowA .cost {
+  margin-left: auto;
+  flex: none;
+  font-size: 11.5px;
+  color: var(--gr-meta);
+  font-family: var(--sm-font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+[data-grok] .grok-roster .gr-rowA .l3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 3px;
+}
+/* the state word's tone — the firewall's status half */
+[data-grok] .grok-roster .st-work { color: var(--gr-work); }
+[data-grok] .grok-roster .st-need { color: var(--gr-need); }
+[data-grok] .grok-roster .st-done { color: var(--gr-done); }
+[data-grok] .grok-roster .st-block { color: var(--gr-block); }
+[data-grok] .grok-roster .st-idle { color: var(--gr-idle); }
+
+/* provider dot + label */
+[data-grok] .grok-roster .prov {
+  font-size: 11px;
+  color: var(--gr-meta);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 500;
+  flex: none;
+}
+[data-grok] .grok-roster .prov .pd {
+  width: 5px;
+  height: 5px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.6;
+}
+/* the context ring — supermux's edge (Grok has none): a conic fill of the
+   context window, green<50 amber<80 red≥80 */
+[data-grok] .grok-roster .ring {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  flex: none;
+  position: relative;
+  background: conic-gradient(var(--rc) calc(var(--p) * 1%), var(--gr-track) 0);
+}
+[data-grok] .grok-roster .ring::after {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--gr-bg);
+}
+[data-grok] .grok-roster .gr-rowA:hover .ring::after {
+  background: color-mix(in srgb, var(--sm-bg-hover) 100%, var(--gr-bg));
+}
+[data-grok] .grok-roster .gr-rowA[data-active] .ring::after,
+[data-grok] .grok-roster .gr-rowA[data-highlighted] .ring::after {
+  background: color-mix(in srgb, var(--gr-sel) 100%, var(--gr-bg));
+}
+[data-grok] .grok-roster .rc-ok { --rc: var(--gr-done); }
+[data-grok] .grok-roster .rc-mid { --rc: var(--gr-work); }
+[data-grok] .grok-roster .rc-hot { --rc: var(--gr-block); }
+[data-grok] .grok-roster .ctx {
+  font-size: 11px;
+  color: var(--gr-meta);
+  font-family: var(--sm-font-mono);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+[data-grok] .grok-roster .tag {
+  font-size: 11px;
+  color: var(--sm-text-tertiary);
+  background: var(--gr-surf2);
+  border: 0.5px solid var(--gr-line);
+  padding: 1px 7px;
+  border-radius: 999px;
+  flex: none;
+  white-space: nowrap;
+}
+
+/* ── team facepile row — three member marks, 1-over-2, page-coloured ring ────── */
+[data-grok] .grok-roster .gr-pile {
+  width: 42px;
+  height: 42px;
+  flex: none;
+  position: relative;
+}
+[data-grok] .grok-roster .gr-pile .sm-mark {
+  position: absolute;
+}
+[data-grok] .grok-roster .gr-pile .p0 { left: 0; top: 1px; z-index: 1; }
+[data-grok] .grok-roster .gr-pile .p1 { right: 0; top: 0; z-index: 2; }
+[data-grok] .grok-roster .gr-pile .p2 { left: 9px; bottom: 0; z-index: 3; }
+/* The "+N" fourth pile slot (6b) — a crew bigger than the three-mark pile.
+   Sits in the bottom-right corner, on the same footprint a mark would, reading
+   as one more face in the stack rather than a separate badge. */
+[data-grok] .grok-roster .gr-pile .p3 {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--sm-bg-hover);
+  box-shadow: 0 0 0 2px var(--gr-bg);
+  color: var(--sm-text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+/* ── title-bar trailing actions (archive + account) ───────────────────────────
+   The overview's footer strip is GONE (owner feedback: it was a redundant second
+   bar stacked over the floating nav). What it carried and still has a job — the
+   ARCHIVE action and the user's identity — moved UP into the header's right edge:
+   archive as a clean ghost icon button, the SB avatar as the account affordance
+   (tap → Settings). The settings gear the footer also had was a duplicate of the
+   nav's Settings entry, so it was dropped, not moved. */
+[data-grok] .grok-roster .gr-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+/* Header-consistent ghost icon button (also the phone `+`'s sibling: the phone
+   block below grows every `.gr-icon-btn` to a 44×44 HIG tap target). Reused by
+   the Settings route's close-X (`.gk-settings .gr-icon-btn`) — Settings left the
+   grok nav, so its header grows this same ghost button as the exit affordance. */
+[data-grok] .grok-roster .gr-icon-btn,
+[data-grok] .gk-settings .gr-icon-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--sm-text-tertiary);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 9px;
+  transition: color 0.12s, background-color 0.12s;
+}
+[data-grok] .grok-roster .gr-icon-btn:hover,
+[data-grok] .gk-settings .gr-icon-btn:hover {
+  color: var(--sm-text-primary);
+  background: var(--sm-bg-hover);
+}
+[data-grok] .grok-roster .gr-icon-btn:focus-visible,
+[data-grok] .gk-settings .gr-icon-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sm-accent) 45%, transparent);
+}
+/* The account button — the SB avatar, top-right (the modern app-bar identity
+   slot). A tap opens Settings; the round chip carries the initials. */
+[data-grok] .grok-roster .gr-me {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 50%;
+  flex: none;
+  /* `relative` anchors the re-homed update-available dot (`NavBadgeDot`) to the
+     avatar's corner — it used to live on the now-hidden Settings nav item. */
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+[data-grok] .grok-roster .gr-me .av {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--gr-surf2);
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--sm-text-secondary);
+  transition: color 0.12s;
+}
+[data-grok] .grok-roster .gr-me:hover .av {
+  color: var(--sm-text-primary);
+}
+[data-grok] .grok-roster .gr-me:focus-visible {
+  outline: none;
+}
+[data-grok] .grok-roster .gr-me:focus-visible .av {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sm-accent) 45%, transparent);
+}
+
+/* ── DETAIL PANE — the power-user glance Grok structurally lacks ────────────── */
+[data-grok] .grok-roster .gr-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--gr-surf2);
+  min-height: 0;
+}
+[data-grok] .grok-roster .gr-pane-hd {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 24px;
+  flex: none;
+  position: relative;
+  background: var(--gr-bg);
+}
+[data-grok] .grok-roster .gr-pane-hd::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 0.5px;
+  background: var(--sm-sidebar-separator);
+}
+[data-grok] .grok-roster .gr-pane-hd .nm {
+  font-size: 19px;
+  font-weight: 660;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+[data-grok] .grok-roster .gr-pane-hd .sub {
+  font-size: 13px;
+  color: var(--sm-text-secondary);
+  margin-top: 2px;
+}
+[data-grok] .grok-roster .gr-pane-hd .acts {
+  margin-left: auto;
+  display: flex;
+  gap: 9px;
+  flex: none;
+}
+[data-grok] .grok-roster .gr-btn {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 0.5px solid var(--gr-line);
+  color: var(--sm-text-secondary);
+  background: var(--gr-surf);
+  white-space: nowrap;
+  cursor: pointer;
+}
+[data-grok] .grok-roster .gr-btn:hover {
+  color: var(--sm-text-primary);
+}
+[data-grok] .grok-roster .gr-btn.primary {
+  background: color-mix(in srgb, var(--sm-accent) 12%, transparent);
+  color: var(--sm-accent);
+  border-color: transparent;
+}
+[data-grok] .grok-roster .gr-pane-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  min-height: 0;
+}
+[data-grok] .grok-roster .glance {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 22px;
+}
+@container (max-width: 560px) {
+  [data-grok] .grok-roster .glance {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+[data-grok] .grok-roster .gcard {
+  background: var(--gr-surf);
+  border: 0.5px solid var(--gr-line);
+  border-radius: 14px;
+  padding: 15px 16px;
+}
+[data-grok] .grok-roster .gcard .glab {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--sm-text-tertiary);
+}
+[data-grok] .grok-roster .gcard .gval {
+  font-size: 23px;
+  font-weight: 660;
+  letter-spacing: -0.02em;
+  margin-top: 9px;
+  font-family: var(--sm-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+[data-grok] .grok-roster .gcard .gval.plain {
+  font-family: var(--sm-font-sans);
+  font-size: 16px;
+  font-weight: 600;
+}
+[data-grok] .grok-roster .gcard .gsub {
+  font-size: 11.5px;
+  color: var(--sm-text-tertiary);
+  margin-top: 3px;
+}
+[data-grok] .grok-roster .bigring {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  position: relative;
+  margin-top: 6px;
+  background: conic-gradient(var(--rc) calc(var(--p) * 1%), var(--gr-track) 0);
+}
+[data-grok] .grok-roster .bigring::after {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  border-radius: 50%;
+  background: var(--gr-surf);
+}
+[data-grok] .grok-roster .bigring b {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-weight: 700;
+  font-family: var(--sm-font-mono);
+}
+[data-grok] .grok-roster .dt-h3 {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--sm-text-tertiary);
+  margin: 6px 0 12px;
+}
+[data-grok] .grok-roster .msg {
+  background: var(--gr-surf);
+  border: 0.5px solid var(--gr-line);
+  border-radius: 16px 16px 16px 6px;
+  padding: 14px 17px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--sm-text-primary);
+  max-width: 64ch;
+}
+[data-grok] .grok-roster .msg .meta {
+  font-size: 12px;
+  color: var(--sm-text-tertiary);
+  margin-top: 9px;
+}
+[data-grok] .grok-roster .dt-tags {
+  display: flex;
+  gap: 8px;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+[data-grok] .grok-roster .spark-note {
+  font-size: 12px;
+  color: var(--sm-text-tertiary);
+  margin-top: 24px;
+}
+
+/* ── empty pane (nothing selected) ─────────────────────────────────────────── */
+[data-grok] .grok-roster .gr-pane-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  padding: 40px;
+  /* AA fix (overview minor): tertiary read 2.69:1 light / 3.89:1 dark on the pane
+     ground, both fail 4.5. Secondary ink clears it in both themes (4.63:1 on the
+     light pane / 6.74:1 on dark) while staying visibly quieter than the primary
+     copy around it. Grok-scoped — the default app's empty pane is untouched. */
+  color: var(--sm-text-secondary);
+  font-size: 13.5px;
+}
+
+/* ── empty LIST (jury d) — the left rail's own empty state ──────────────────────
+   Vertically centred to sit level with the right pane's hint, and led by a
+   PRIMARY-weight message (it is the one thing on the screen — never the muted
+   floor), paired with the inline create verb on the zero-bots path. */
+[data-grok] .grok-roster .gr-list-empty {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 40px 24px;
+  text-align: center;
+}
+[data-grok] .grok-roster .gr-empty-msg {
+  color: var(--sm-text-primary);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  max-width: 34ch;
+  line-height: 1.4;
+}
+
+/* ── BOT PANEL (ASK 3) — the per-bot settings page fills the pane slot. It owns
+      its own header/tabs/padding (Tailwind), so the pane is just the surface. ── */
+[data-grok] .grok-roster .gr-botpane {
+  padding: 0;
+}
+[data-grok] .grok-roster .gr-botpane > div {
+  flex: 1;
+  min-height: 0;
+}
+
+/* TEAM PANEL (Phase 2c) — the per-TEAM page in the same pane slot. Identical
+   contract to `.gr-botpane`: the panel owns its own header/tabs/padding
+   (Tailwind), so the `[data-grok]` surface is only the box it fills. Nothing new
+   is invented here — the tokens are `.gr-pane`'s. */
+[data-grok] .grok-roster .gr-teampane {
+  padding: 0;
+}
+[data-grok] .grok-roster .gr-teampane > div {
+  flex: 1;
+  min-height: 0;
+}
+
+/* THREAD-IN-PANE — the live conversation renderer mounted in the right pane
+   (desktop grok). Mirrors `.gr-botpane`: the `.gr-pane` box stays a flex column
+   and the reused `ChatSurface` (its single child) fills it, so the transcript
+   scrolls inside the pane and the composer pins to the bottom, exactly as it does
+   on the focus route. `ChatSurface` brings its own `bg-paper-raised`, so the pane
+   ground underneath is never seen. */
+[data-grok] .grok-roster .gr-threadpane {
+  padding: 0;
+}
+[data-grok] .grok-roster .gr-threadpane > div {
+  flex: 1;
+  min-height: 0;
+}
+
+/* ══ WS6 — density options wired into the header segmented control ════════════
+   Comfortable = Row A (default). Compact = Row C (dense one-line feed). Same
+   data, same rows, a `data-density` switch on the rail — supermux's density
+   affordance kept, in Grok's idiom. (The 'cards'/Row B option was retired —
+   it wasted space and earned nothing.) */
+
+/* COMPACT (Row C) — one line per bot, 26px mark, cost fades in on hover */
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA {
+  padding: 7px 18px;
+  gap: 11px;
+}
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA .l2,
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA .l3 {
+  display: none;
+}
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA .l1 {
+  gap: 8px;
+}
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA .l1 .cprev {
+  font-size: 13px;
+  color: var(--sm-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+  font-weight: 400;
+}
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA .nm {
+  flex: none;
+  font-size: 14px;
+}
+/* the compact preview only renders in compact mode */
+[data-grok] .grok-roster .gr-rowA .l1 .cprev {
+  display: none;
+}
+[data-grok] .grok-roster[data-density='compact'] .gr-rowA .l1 .cprev {
+  display: block;
+}
+
+[data-grok] .grok-roster .gr-rowA .gr-top {
+  display: contents;
+}
+
+/* ── phone: one column, no detail pane (row tap → thread) ───────────────────── */
+@media (max-width: 767px) {
+  [data-grok] .grok-roster .gr-rail {
+    width: auto;
+    flex: 1;
+  }
+  [data-grok] .grok-roster .gr-rail::after {
+    display: none;
+  }
+  [data-grok] .grok-roster .gr-pane {
+    display: none;
+  }
+  /* The header carries the whole state in a glance (brand · count · search · +).
+     The sort/density segmented controls are a desktop affordance — they overflow
+     a phone header, and the density lane is a power-user preference, so they fold
+     away here (the roster stays Comfortable = Row A, the default). */
+  [data-grok] .grok-roster .gr-head {
+    flex-wrap: wrap;
+    /* Row-gap between the three stacked bands (title+actions · count · search). */
+    row-gap: 10px;
+    /* Scroll-away (`useScrollAway` → `[data-head-hidden]`): overlay the list;
+       clearance rides on `.gr-list` padding-top, so only a transform moves. */
+    position: absolute;
+    inset: 0 0 auto 0;
+    z-index: 30;
+    background: var(--gr-bg);
+    transition: transform 0.26s ease-out;
+    will-change: transform;
+  }
+  [data-grok] .grok-roster .gr-seg {
+    display: none;
+  }
+  /* PHONE APP-BAR — a deterministic three-band header via `order`, so the wrap
+     never depends on how long the live count runs (the old free-wrap split the
+     `+` from the archive/account cluster onto different rows at different counts).
+       band 1 (order 0–2): brand · spacer · [ + · archive · SB ]  — title left,
+                            the whole action cluster grouped hard-right;
+       band 2 (order 4):   the count, on its own full-width line (the subtitle);
+       band 3 (order 5):   the search, full width.
+     The count leaving band 1 is what guarantees the action cluster always fits on
+     one row, so `+`/archive/SB read as ONE trailing group at every count. The
+     desktop header is untouched (all of this is phone-scoped). */
+  [data-grok] .grok-roster .gr-head-sp {
+    order: 1;
+  }
+  [data-grok] .grok-roster .gr-newbot {
+    order: 2;
+  }
+  [data-grok] .grok-roster .gr-head-actions {
+    order: 2;
+  }
+  [data-grok] .grok-roster .gr-count {
+    order: 4;
+    flex-basis: 100%;
+  }
+  [data-grok] .grok-roster .gr-search {
+    max-width: none;
+    order: 5;
+    flex-basis: 100%;
+  }
+  /* MEASURED-GAP FIX (touch target): the header `+` — the phone's primary action
+     — was a 34px plate, under the 44pt HIG minimum. Grow it (and any sibling
+     icon-btn) to a full 44×44 on the phone; the 10px plate + soft-accent wash are
+     unchanged, only the hit box grows. */
+  [data-grok] .grok-roster .gr-icon-btn,
+  [data-grok] .gk-settings .gr-icon-btn {
+    width: 44px;
+    height: 44px;
+  }
+  /* The account button matches the 44pt phone tap target; the 30px avatar chip
+     stays its size, centred in the larger hit box. */
+  [data-grok] .grok-roster .gr-me {
+    width: 44px;
+    height: 44px;
+  }
+
+  /* EDGE-TO-EDGE under the floating nav: the scroller is the roster's own
+     `.gr-list`, not `<main>`, so zero the shell's generic `<main>` bottom pad
+     (which would lift the roster off the nav to a hard edge) and move the
+     clearance onto `.gr-list` instead — content scrolls BEHIND the glass, the
+     last row rises clear. This (0,5,0) rule clears the generic (0,4,0). */
+  [data-grok] [data-shell-main]:has([data-shell-tabs]) [data-shell-content]:has(.grok-roster) {
+    padding-bottom: 0;
+  }
+  [data-grok] .grok-roster .gr-list {
+    padding-top: var(--gr-head-h, 132px); /* scroll-away clearance (see .gr-head) */
+    padding-bottom: calc(env(safe-area-inset-bottom) + 92px);
+  }
+  [data-grok] .grok-roster[data-head-hidden] .gr-head {
+    transform: translateY(-100%);
+  }
+}
+
+/* ══ GROK MODE — ONE PICKER (search · +new · @// mention · ⌘K) (WS7) ═══════════
+   The app already consolidated its four pickers to ONE <EntityPickerView> (fase
+   B3): two anchors — `token` (up from an @/-token in the composer, over the
+   transcript) and `field` (inside a box the parent drew: the ⌘K dialog, a sheet)
+   — nine row kinds, and ONE highlight atom (`[data-highlighted]`) that keyboard
+   and pointer both write so they can never disagree (mechanics §4.2). WS7 gives
+   that one component the Grok glass treatment, scoped under `[data-grok]` so the
+   default app stays byte-identical and the attribute's removal is a clean revert.
+
+   REACH — the two homes of the one picker, and why the ⌘K case is special. The
+   composer token popover and every field list live INSIDE the shell root, so
+   `[data-grok] …` reaches them by ancestry for free. The ⌘K palette, though, is a
+   Radix Dialog PORTALLED to <body> — a sibling of the shell root, NOT a
+   descendant — so `[data-grok]` on the shell root cannot reach it. So
+   command-palette.tsx stamps `data-grok` on the portalled Content ITSELF (read
+   once at mount, the same flag layout reads). The theme still resolves because
+   `.dark` lives on <html>, an ANCESTOR of the portal, so `.dark [data-grok]`
+   (the dark token half) matches the portalled dialog exactly as it matches the
+   shell. That is the whole trick: put the gate on the portalled node, keep the
+   theme swap on the ancestor.
+
+   NESTED RADII STEP DOWN (tokens.md §8 — never match): the token popover is a
+   10px container with 6px rows; the field popover / ⌘K dialog is a 12px container
+   with 8px rows. Raised glass (blur 20 / saturate 160 — a LIGHTER blur than the
+   80px substrate, never a second heavy blur), the popover shadow, one 0.5px
+   hairline — so the popover reads as one object with the shell, not a menu that
+   happened to land nearby. */
+
+/* The token popover container — raised glass, 10px, popover shadow. Overrides the
+   default `bg-surface backdrop-blur-[60px] rounded-[22px]` on the token anchor.
+   `mb-2` (8px) becomes 10px to match `bottom:calc(100%+10px)` (mechanics §4.2). */
+[data-grok] [data-anchor='token'] {
+  border-radius: var(--sm-r-md);
+  border-color: var(--sm-border);
+  background: var(--sm-raised-fill);
+  -webkit-backdrop-filter: var(--sm-glass-raised);
+  backdrop-filter: var(--sm-glass-raised);
+  box-shadow: var(--sm-shadow-popover);
+  margin-bottom: var(--sm-space-2_5);
+  animation: sm-popover-in 0.15s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* The ⌘K palette / field container — the Radix Dialog Content, which carries
+   `data-grok` on ITSELF (see command-palette.tsx), so this selector self-scopes
+   under grok without reaching the shell root (whose role is not `dialog`).
+   12px, raised glass, hairline, popover shadow — overrides the Dialog's default
+   `bg-card border border-border shadow-lg rounded-lg`. */
+[data-grok][role='dialog'] {
+  border-width: 0.5px;
+  border-color: var(--sm-border);
+  border-radius: var(--sm-r-lg);
+  /* MEASURED-GAP FIX (light picker AA). `--sm-raised-fill` (70% elevated) blended
+     over the blurred backdrop composited to a translucent GREY ~rgb(208); on that
+     ground the muted picker inks failed AA (snippet 2.36:1, group header 2.28:1,
+     placeholder 3.32:1). Lift the LIGHT dialog panel toward opaque near-white so
+     the muted ink has headroom — 95% elevated composites to ~rgb(246–250), still
+     letting a faint glass translucency through (Grok's subtle-glass feel kept).
+     The DARK panel measured fine, so it keeps the raised-glass fill (below). */
+  background: color-mix(in srgb, var(--sm-bg-elevated) 95%, transparent);
+  -webkit-backdrop-filter: var(--sm-glass-raised);
+  backdrop-filter: var(--sm-glass-raised);
+  box-shadow: var(--sm-shadow-popover);
+  /* Darken the muted picker inks for AA on the lifted panel. `--sm-ink-3`
+     (the row snippet + leading glyph, via `text-ink-3`) references
+     `--sm-text-tertiary`, and the group-heading rule reads `--sm-text-tertiary`
+     directly — so re-pointing tertiary in the dialog scope lifts BOTH to a solid
+     mid-grey that clears 4.5:1 on the near-white panel. Dark nudges up one step. */
+  --sm-text-tertiary: #5f6773;
+}
+/* DARK: keep the raised-glass panel (its measured panel + names passed); only the
+   muted ink was marginal (snippet 3.34:1 / header 3.22:1) — nudge it up one step
+   to clear Grok's 3.92 floor and approach AA on the dark panel. */
+.dark [data-grok][role='dialog'] {
+  background: var(--sm-raised-fill);
+  --sm-text-tertiary: #9a9a9a;
+}
+/* GRID-BLOWOUT FIX (measured, settled-DOM regression on ⌘K).
+   The Dialog Content is `display:grid`; a grid item defaults to `min-width:auto`,
+   so it refuses to shrink below its CONTENT's min-content width. The palette's
+   results carry long unbroken session names / command summaries, whose min-content
+   (~967px) blew the single-column item WIDER than the 576px (`max-w-xl`) dialog
+   track — the item overflowed BOTH sides and was chopped by the palette's
+   `overflow-hidden`, clipping the 'SESSIONS' group heading on the LEFT (it renders
+   as 'IONS'/'SIONS') and eating the row text on both edges. Constrain the grid
+   items to `min-width:0` so they honour the 576px track and the row spans'
+   `text-overflow:ellipsis` does the truncation instead. Scoped under grok only —
+   the base app (data-grok absent) shares this bug but is out of scope here and
+   must stay visually identical. */
+[data-grok][role='dialog'] > * {
+  min-width: 0;
+}
+/* The palette's search-input seam → a 0.5px hairline (it draws `border-b
+   border-border`). Hooked by the `data-grok-search` marker the palette adds only
+   when grok is on, so the default app's DOM is untouched. */
+[data-grok][role='dialog'] [data-grok-search] {
+  border-color: var(--sm-border);
+}
+/* MEASURED-GAP FIX (light picker AA): the palette's placeholder + search glyph
+   read too faint on the lifted panel (placeholder 3.32:1 before). Darken them to
+   the same solid mid-grey the muted body ink now uses, grok-scoped so the base
+   palette DOM is untouched. Dark uses the one-step-up grey. */
+[data-grok][role='dialog'] [data-grok-search] input::placeholder,
+[data-grok][role='dialog'] [data-grok-search] svg {
+  color: #5f6773;
+}
+.dark [data-grok][role='dialog'] [data-grok-search] input::placeholder,
+.dark [data-grok][role='dialog'] [data-grok-search] svg {
+  color: #9a9a9a;
+}
+
+/* Rows — ONE rule for both anchors (they share `[role=option]`). Field rows 8px;
+   token rows step down to 6px. The 0.12s transition animates background AND color
+   together (tokens.md §12.1 — hover/press is never fill-only). */
+[data-grok] [role='listbox'] [role='option'] {
+  border-radius: var(--sm-r-sm);
+  transition:
+    background-color 0.12s cubic-bezier(0.4, 0, 0.2, 1),
+    color 0.12s cubic-bezier(0.4, 0, 0.2, 1);
+}
+[data-grok] [data-anchor='token'] [role='option'] {
+  border-radius: var(--sm-r-xs);
+}
+/* The single highlight atom — keyboard AND pointer both set `[data-highlighted]`
+   on the same row (mechanics §4.2), so this is the one wash that renders whether
+   the cursor arrived by arrow key or by mouse. A warm-grey active fill, NEVER the
+   accent (accent is links/focus/info only — §3). Unlayered, so it out-specifies
+   the component's layered `.bg-fill-soft-2` utility on the active row. */
+[data-grok] [role='option'][data-highlighted] {
+  background: var(--sm-bg-active);
+}
+/* Group headings inside the listbox (`role=presentation`) → tertiary meta ink. */
+[data-grok] [role='listbox'] [role='presentation'] {
+  color: var(--sm-text-tertiary);
+}
+
+/* Popover-in: 0.15s scale-settle (mechanics §4 — popover in 0.15 / out 0.10; the
+   out is the unmount, i.e. instant, which honours "exits faster than entries").
+   A keyframe rather than a transition, so it fires on the popover's mount. */
+@keyframes sm-popover-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-grok] [data-anchor='token'] {
+    animation: none;
+  }
+}
+
+/* Reduced-transparency / no-backdrop fallback — opaque elevated fill, no blur:
+   the same accessibility gate the substrate pseudo uses above. */
+@media (prefers-reduced-transparency: reduce) {
+  [data-grok] [data-anchor='token'],
+  [data-grok][role='dialog'] {
+    background: var(--sm-bg-elevated);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  [data-grok] [data-anchor='token'],
+  [data-grok][role='dialog'] {
+    background: var(--sm-bg-elevated);
+  }
+}
+
+/* ══ WS8 — CHAT SURFACE TOKEN RE-POINT + PROVENANCE POLISH ════════════════════
+   The chat surface (fase A1, components/chat/*) is ALREADY Grok anatomy — user
+   bubble bright / agent wash quiet, the mascot IS the spinner (no working colour
+   chip), coloured-text provenance chips (no fill), the 2.4s receipt spinner,
+   system lines as a management log. Its job under Grok mode is a pure token
+   RE-POINT (GROK-MODE-SPEC §3.8 / WS8): it consumes supermux's B0 warm-paper
+   `--sm-*` ladder via Tailwind utilities (`text-ink`, `border-hairline`,
+   `bg-surface`, `bg-fill-soft`, `bg-code-bg`, `bg-paper-raised`, the shadow
+   vars). WS1 redefined only the bubbles + the accent, so those reskinned for
+   free but the surrounding ink / hairlines / fills / surfaces / shadows stayed
+   warm B0 — a half-reskinned surface. This block re-points the REST of the B0
+   ladder at Grok's greyscale glass tokens, entirely by cascade.
+
+   WHY THE CASCADE WINS (no per-component override — spec's WS8 accept). These B0
+   names are declared in globals.css on `:root` / `.dark` (the <html> element),
+   but `[data-grok]` sits on a shell <div> that is a DESCENDANT of <html>, so for
+   every chat element it is the CLOSER ancestor — its re-point overrides the
+   inherited :root value for the whole subtree (specificity/order never enter:
+   the two rules target different elements). This is the exact mechanism WS1's
+   bubble re-point already relies on. The Grok targets below are themselves
+   theme-swapped under `.dark [data-grok]` (the WS1 blocks), so `--sm-text-primary`
+   etc. resolve light↔dark per theme and the chat inherits the flip for free —
+   one bridge, both themes, zero `.dark`-specific rules needed here. */
+[data-grok] {
+  /* text ladder → Grok's alpha-on-ground ink (tokens.md §2) */
+  --sm-ink: var(--sm-text-primary);
+  --sm-ink-2: var(--sm-text-secondary);
+  --sm-ink-3: var(--sm-text-tertiary);
+
+  /* hairlines → the one 0.5px border token (tokens.md §4; a 1px line is a Grok
+     tell). `-soft` is the fainter half — used on the agent bubble's barely-there
+     edge and the inline code block. */
+  --sm-hairline: var(--sm-border);
+  --sm-hairline-soft: color-mix(in srgb, var(--sm-border) 55%, transparent);
+
+  /* pressed / hover washes + inline-code well → Grok's control washes (§1.1) */
+  --sm-fill-soft: var(--sm-bg-hover);
+  --sm-fill-soft-2: var(--sm-bg-active);
+  --sm-code-bg: var(--sm-bg-tertiary);
+
+  /* SURFACES. The doctrine: translucent tints over the ONE substrate blur, never
+     opaque panels (anti-pattern #1). The transcript ground (`bg-paper-raised` on
+     chat-surface.tsx) goes TRANSPARENT so the WS2 content-column `--sm-chat-fill`
+     (itself a tint over the substrate) reads through — one glass, not a second
+     panel stacked on it. `--sm-surface` (the composer, delegation pill, choice /
+     attention cards, header pill, login card) becomes the raised-glass title fill
+     (78% elevated). `--sm-paper` (the deepest page ground) → the opaque chrome. */
+  --sm-paper: var(--sm-bg-chrome);
+  --sm-paper-raised: transparent;
+  --sm-surface: var(--sm-title-fill);
+
+  /* SHADOWS. Grok floats only the window + true overlays; NO shadow on a bubble
+     or an inline card (anti-pattern #3) — they separate by tint + 0.5px hairline.
+     So the bubble + card shadows go to `none`; the one floating-list lift
+     (`--sm-popover-shadow`, worn by the composer and popovers) becomes Grok's
+     soft, large-offset popover shadow (§11). */
+  --sm-bubble-shadow: none;
+  --sm-card-shadow: none;
+  --sm-popover-shadow: var(--sm-shadow-popover);
+}
+
+/* The composer's own raised-glass blur is left to its component (`bg-surface` +
+   the `backdrop-blur` utility on `ui/composer.tsx`) — Grok explicitly sanctions
+   a raised blur on the composer / popovers (tokens.md §1.2). It is deliberately
+   NOT overridden here: `grok-shell-chrome.test.ts` guards a file-level invariant
+   that the ONLY backdrop-filter in grok-mode.css is the leaf substrate pseudo
+   (the containing-block guard for the shell's fixed overlay children), and a
+   composer blur declared in this file — even though the composer is no shell
+   column — would trip it. The composer's fill still reskins via `--sm-surface`
+   above; only its blur radius stays the component's. */
+
+/* ── The composer's one inverted control (mic / send disc) — Grok's emphasis
+   fill. `.sm-mic` defaults to a soft wash on light and a WARM near-white disc on
+   dark (globals.css). Grok's send is the inverted emphasis fill: near-black on
+   light, neutral near-white on dark — the same pairing as the user bubble
+   (`--sm-fill-emphasis` / `--sm-ink-on-emphasis`, tokens.md §7). Scoped through
+   `.sm-composer` (0,3,0) so it out-specifies the globals `.sm-mic` theme rules
+   (0,2,0), which are emitted after this file's @import; the emphasis tokens are
+   already theme-swapped, so one rule serves light + dark. */
+[data-grok] .sm-composer .sm-mic {
+  background: var(--sm-fill-emphasis);
+  color: var(--sm-ink-on-emphasis);
+}
+
+/* PHONE TOUCH TARGET (jury focus/shell call-out D): the composer's mic/send disc
+   is 36px (`size-9`) on the phone — below the 44pt HIG floor, and it is the
+   composer's ONE action. Lift the TARGET to 44×44 on a coarse pointer with a
+   centred `::after` expander (the same pattern the renderer switch uses), so the
+   visual disc and the composer's layout are unchanged — only the hit box grows,
+   spilling into the composer's own padding. Grok- and touch-scoped; the desktop
+   disc (40px) and the base app are untouched. */
+@media (pointer: coarse) {
+  [data-grok] .sm-composer .sm-mic {
+    position: relative;
+  }
+  [data-grok] .sm-composer .sm-mic::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* ── Composer leading control — multi-line anchoring + snug cluster (owner) ────
+   The composer row is `items-end`, so as the field GROWS the leading control
+   rode the bottom edge up with everything (measured lead.bottom == field.bottom
+   == send.bottom on a 4-line draft). Best practice — and the owner's ask — is
+   that ONLY the trailing send disc bottom-anchors; the leading control (the `+`,
+   or the desktop `@`·clock pair) stays at the FIRST line. On a GROWN composer
+   (multi-line / chips → `rounded-[26px]`) top-align the leading child; at rest
+   (single line, `rounded-full`) there is no rule, so the bar is a byte-exact
+   revert and the send disc still bottom-anchors from the row's `items-end`. */
+[data-grok] .sm-composer.rounded-\[26px\] > :first-child {
+  align-self: flex-start;
+}
+/* The leading cluster (attach · `@` · clock) reads as ONE set, so it must be
+   SNUG (owner: "de icons staan te ver van elkaar, mogen echt wel iets dichter op
+   elkaar"). A `gap` can only ADD space, and the discs are already a full 40px
+   each around a ~13px glyph, so even `gap:0` left ~27px of air between glyphs.
+   The discs must stay 40px — the 44pt touch target and the send-disc baseline
+   both depend on it (a shrunk disc height would drop the leading glyphs below the
+   send glyph under the row's `items-end`) — so the tightening is a NEGATIVE
+   overlap instead: `gap:0` + a −8px left margin on every disc after the first
+   pulls the ghost discs together, landing the icon centres ~32px apart (glyph
+   edges ~19px, down from ~29). The overlap is invisible at rest (the discs carry
+   no fill until hover) and the 40px box, its baseline and its touch target are
+   all untouched. `> button:not(:first-child)` skips the hidden desktop `<input>`
+   between the attach disc and `@`. Mobile's leading is a single `+` (a bare
+   button, not this `div`), so it is unaffected; the send side is untouched. */
+[data-grok] .sm-composer > div:first-child {
+  gap: 0;
+}
+[data-grok] .sm-composer > div:first-child > button:not(:first-child) {
+  margin-left: -8px;
+}
+
+/* ══ WS9 — EMPTY / LOADING / ERROR / ATTENTION SURFACES ═══════════════════════
+   The states of the app: nothing yet, loading, something went wrong, something
+   wants you. ENTIRELY scoped under `[data-grok]`; every surface below already
+   ships in the default app with its own (correct) look, so each rule here is
+   inert until the shell root carries `data-grok` and is a byte-exact revert when
+   it does not.
+
+   THREE LAWS this block enforces (mechanics.md §7, tokens.md §5):
+     1. ONE TONE, ONE COMPONENT. A failure and a success differ by ONE attribute
+        (`data-tone`), never a different component. A tone is consumed ONLY as a
+        `color-mix(<tone> 14%, transparent)` fill behind full-strength tone text —
+        NEVER a saturated filled bar (the #1 taste defect, tokens.md §15 #6).
+     2. THREE-LEVEL ATTENTION VOCABULARY. needs-you (a demand) is the one red
+        thing; unread is a calm dot; working is the mascot + live tail — no chip.
+     3. CALM, NOT DEAD. Skeletons are a flat tertiary wash; empty is a soft plate,
+        not a void; recovery is honest and graded, offered in the transcript.
+
+   INK BRIDGE. These surfaces are chat/roster components that paint with the app's
+   `--sm-ink*`/`bg-surface` ramp (repointed for the whole chat plane by WS8, not
+   here). So each container below re-points ITS OWN `.text-ink*` onto the Grok ink
+   ramp — scoped to the surface, never the shared token — so WS9 stands alone and
+   merges clean with WS8.
+
+   PORTAL NOTE. `[data-grok]` sits on the shell root, and the `--sm-*` tokens are
+   defined there; body-portalled overlays (vaul/Radix — e.g. the AttentionPicker
+   SHEET body) are outside it and can see neither the scope nor the tokens. That
+   is WS7's app-wide portal concern; WS9 restyles the in-shell surfaces (the
+   rollup trigger, the in-transcript attention card + pending band, the connection
+   chips, the banners), where the scope holds and the tokens resolve. */
+
+/* ── 1. THE ONE TONE SYSTEM ───────────────────────────────────────────────────
+   The canonical badge: one component, `data-tone` is the only thing that varies
+   a success into a failure. 14% tint fill + full-strength tone text + a pill.
+   Reusable primitive (mechanics.md §7.1) — available to every WS surface. */
+[data-grok] .grok-badge {
+  --gt: var(--sm-tone-accent);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: var(--sm-r-pill);
+  padding: 2px 8px 1px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: var(--sm-fw-medium);
+  /* The 14% fill + full-strength text — NEVER a saturated bar. */
+  background: color-mix(in srgb, var(--gt) 14%, transparent);
+  color: var(--gt);
+}
+[data-grok] .grok-badge[data-tone='accent'] {
+  --gt: var(--sm-tone-accent);
+}
+[data-grok] .grok-badge[data-tone='success'] {
+  --gt: var(--sm-tone-success);
+}
+[data-grok] .grok-badge[data-tone='warning'] {
+  --gt: var(--sm-tone-warning);
+}
+[data-grok] .grok-badge[data-tone='danger'] {
+  --gt: var(--sm-tone-danger);
+}
+/* muted is the one tone that is not a hue — a stopped/paused/archived thing. */
+[data-grok] .grok-badge[data-tone='muted'] {
+  background: var(--sm-fill-secondary);
+  color: var(--sm-text-tertiary);
+}
+[data-grok] .grok-badge__dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+/* The bridge to the app's existing tone hook. The chat surface already marks its
+   "needs a human" ink with `data-tone="warn"` (calm orange, `--status-error`);
+   under Grok that becomes the WARNING tone — amber, the reference's calm colour
+   (clean-stage1's Teach-a-task banner), never alarmist red. Text elements recolour
+   their ink; the dot variants (which carry `bg-status-error`) recolour their fill. */
+[data-grok] [data-tone='warn'] {
+  color: var(--sm-tone-warning);
+}
+[data-grok] [data-tone='warn'].bg-status-error {
+  background-color: var(--sm-tone-warning);
+}
+
+/* ── 2. LOADING SKELETONS ─────────────────────────────────────────────────────
+   A skeleton is decoration around an absence — a flat, calm tertiary wash, never
+   the app's opaque `--muted` grey (spec §3.7). `background-color` (not the
+   `background` shorthand) so the `shimmer` variant's own sweep is preserved. */
+[data-grok] [data-skeleton] {
+  background-color: var(--sm-bg-tertiary);
+}
+/* The tile placeholder's plate: drop the 1px card border (a Grok tell — tokens.md
+   §4/§15 #2) and sit on the translucent card wash so the substrate reads through,
+   matching the real Grok row it stands in for. */
+[data-grok] [data-skeleton-tile] {
+  border-color: transparent;
+  background: var(--sm-bg-card);
+  border-radius: var(--sm-r-lg);
+}
+
+/* ── 3. EMPTY STATES ──────────────────────────────────────────────────────────
+   Never a dead void: a soft tertiary plate + quiet secondary copy in the tight
+   type scale — Grok's calm, not the app's muted grey. The icon is identity, not
+   an alert, so it never takes a tone. */
+[data-grok] [data-empty-icon] {
+  background-color: var(--sm-bg-tertiary);
+  color: var(--sm-text-tertiary);
+}
+[data-grok] [data-empty-state] p {
+  color: var(--sm-text-secondary);
+  letter-spacing: -0.1px;
+}
+
+/* ── 4. ERROR / RECOVERY SURFACES ─────────────────────────────────────────────
+   Honest, graded, one-tone. Every one of these is the app being careful, not the
+   app being broken, so none is a saturated bar. */
+
+/* 4a. Composer blocked strip — this session cannot work (a quota bucket, an auth
+   death). Warning tint, no coloured border, pill radius: the tone IS the signal. */
+[data-grok] [data-testid='chat-composer-blocked'] {
+  border-color: transparent;
+  background-color: color-mix(in srgb, var(--sm-tone-warning) 14%, transparent);
+  color: var(--sm-tone-warning);
+  border-radius: var(--sm-r-lg);
+}
+
+/* 4b. The pending band — "this didn't reach the session · Retry · Open terminal ·
+   Dismiss". Graded recovery, least→most weight: Retry (the one control that writes
+   to the pty) reads at full ink, Dismiss recedes. The warn ink is bridged above. */
+[data-grok] [data-testid='chat-pending'] [data-testid='chat-pending-retry'],
+[data-grok] [data-testid='chat-pending'] [data-testid='chat-pending-open-terminal'] {
+  color: var(--sm-text-primary);
+}
+[data-grok] [data-testid='chat-pending'] [data-testid='chat-pending-dismiss'] {
+  color: var(--sm-text-secondary);
+}
+
+/* 4c. The Attention card — the surface that admits things (a send the watchdog
+   gave up on, a dialog with no verified mapping). INLINE ROW: raised-glass chip,
+   hairline seam, the warn dot bridged above. */
+/* Repaint only — the row already carries its own `backdrop-blur` from its
+   Tailwind classes; grok-mode.css adds NO second backdrop-filter (the one
+   substrate blur lives on `[data-grok]::before`, tokens.md §15 #4). */
+[data-grok] [data-testid='chat-attention-row'] {
+  background: var(--sm-raised-fill);
+  border-color: var(--sm-border);
+}
+[data-grok] [data-testid='chat-attention-row'] .text-ink {
+  color: var(--sm-text-primary);
+}
+[data-grok] [data-testid='chat-attention-show'] {
+  border-color: var(--sm-border);
+  color: var(--sm-text-primary);
+}
+[data-grok] [data-testid='chat-attention-show']:hover {
+  background-color: var(--sm-bg-hover);
+}
+/* EXPANDED CARD: an elevated surface with the popover shadow (the only place a
+   WS9 surface earns a shadow — it is a true overlay, tokens.md §11). */
+[data-grok] [data-testid='chat-attention-card'] {
+  background: var(--sm-bg-elevated);
+  border-color: var(--sm-border);
+  box-shadow: var(--sm-shadow-popover);
+}
+[data-grok] [data-testid='chat-attention-card'] .text-ink {
+  color: var(--sm-text-primary);
+}
+[data-grok] [data-testid='chat-attention-card'] .text-ink-2 {
+  color: var(--sm-text-secondary);
+}
+[data-grok] [data-testid='chat-attention-open-terminal'] {
+  background-color: var(--sm-fill-secondary);
+  border-color: var(--sm-border);
+  color: var(--sm-text-primary);
+}
+[data-grok] [data-testid='chat-attention-dismiss']:hover,
+[data-grok] [data-testid='chat-attention-close']:hover {
+  background-color: var(--sm-bg-hover);
+}
+
+/* 4c-bis. The modal-dialog family (AskUserQuestion / permission / form cards, all
+   via `DialogShell`, keyed by `data-dialog-shell`). WS8 re-pointed `--sm-surface`
+   to a ~78%-translucent title-fill (:2892) and `--sm-card-shadow: none` (:2900),
+   which left the card legible ONLY while its own `backdrop-filter` composites.
+   iOS WebKit mis-composites that nested blur inside the grok stacking contexts,
+   so the translucent fill can't cover the transcript and the prior text bleeds
+   through as unreadable overlap. Same fix WS9 gave the expanded attention card:
+   an OPAQUE elevated fill + the popover overlay shadow (a modal dialog is a true
+   overlay, tokens.md §11), so the card reads whether or not the blur lands. Scope
+   is the dialog family only — `--sm-surface`/`--sm-card-shadow` stay untouched
+   globally (correct for bubbles/composer). Base app is byte-identical off grok. */
+[data-grok] [data-dialog-shell] {
+  background: var(--sm-bg-elevated);
+  box-shadow: var(--sm-shadow-popover);
+}
+
+/* 4d. The connection chip — reconnecting / stale / no-chat-here / gone-for-good.
+   The healthy case renders nothing. The calm not-yet-current states are a neutral
+   tertiary chip (a dropped link may come back — not an error). The ONE state that
+   is final — a terminal close `CHAT_GONE` marks `alarming` (it carries the
+   `bg-status-error/10` strip) — takes the danger tint so "this session no longer
+   exists" cannot read as "reconnecting…". */
+[data-grok] [data-vr='chat-connection'] {
+  border-color: var(--sm-border);
+  background-color: var(--sm-bg-tertiary);
+  color: var(--sm-text-secondary);
+}
+[data-grok] [data-vr='chat-connection'].bg-status-error\/10 {
+  border-color: color-mix(in srgb, var(--sm-tone-danger) 30%, transparent);
+  background-color: color-mix(in srgb, var(--sm-tone-danger) 14%, transparent);
+  color: var(--sm-tone-danger);
+}
+
+/* 4e. The global reconnect banner — one morphing glass pill. Keep the raised
+   glass; swap the tint per state (one attribute, `data-conn-state`) and the
+   drop-shadow onto the popover shadow. reconnecting = warning, offline = danger,
+   the recovery flash = success. Never the app's alarmist `--destructive` red. */
+[data-grok] [data-conn-pill] {
+  border-color: var(--sm-border);
+  box-shadow: var(--sm-shadow-popover);
+  color: var(--sm-text-primary);
+}
+[data-grok] [data-conn-pill][data-conn-state='reconnecting'] {
+  background-color: color-mix(in srgb, var(--sm-tone-warning) 14%, transparent);
+}
+[data-grok] [data-conn-pill][data-conn-state='offline'] {
+  background-color: color-mix(in srgb, var(--sm-tone-danger) 14%, transparent);
+}
+[data-grok] [data-conn-pill][data-conn-state='connected'] {
+  background-color: color-mix(in srgb, var(--sm-tone-success) 14%, transparent);
+}
+
+/* ── 5. THE NEEDS-ATTENTION ROLLUP ────────────────────────────────────────────
+   The overview header's answer to "is anything waiting on me?" — the cross-agent
+   inbox Grok structurally lacks (mechanics.md §6.5). The count is the one red
+   thing (spec §3.2: `needs you: N`, danger tone, semibold); the +N overflow and
+   the hover stay in the neutral ramp. The facepile marks are identity and keep
+   their own hue — the count is the only tone. */
+[data-grok] [data-vr='attention-rollup']:hover {
+  background-color: var(--sm-bg-hover);
+}
+[data-grok] [data-vr='attention-rollup'] > span:first-of-type {
+  color: var(--sm-tone-danger);
+  font-weight: var(--sm-fw-semibold);
+}
+[data-grok] [data-vr='attention-rollup-overflow'] {
+  color: var(--sm-text-tertiary);
+}
+
+/* ══ WS10 — MEASURED-GAP CLOSURES: FOCUS / CHAT CHROME ════════════════════════
+   The chat/focus jury found two cold seams and one flat title. All scoped under
+   [data-grok]; each is a byte-exact revert when the attribute is absent. */
+
+/* SEAM 1 — the terminal / VT pane read as PURE #000 (dark) / pure #fff (light)
+   against the warm chrome, a cold edge where the pane meets the header/rail. Warm
+   the pane to the editor ground so pane + chrome read as ONE surface. This reaches
+   every DOM-rendered pane background (`bg-[var(--terminal-bg)]` — the native VT
+   grid, the stopped-session plate, tile previews) because [data-grok] is their
+   closer ancestor than :root. (A live xterm CANVAS reads the html-level var at
+   mount and is unaffected — its own theme is a JS concern; the seam the jury
+   measured is the DOM pane, which this fixes.) */
+[data-grok] {
+  --terminal-bg: var(--sm-bg-editor);
+}
+
+/* TITLE — the focus session-strip header ("Sessions") carried the SAME
+   `text-muted-foreground` as its body ("No other sessions."), separated by weight
+   alone, so it did not read as a titled group. Lift the header's tone to primary
+   ink; the body stays muted. Targets the strip header by its stable `data-vr`
+   hook, not a class, so the default app's muted title is untouched. */
+[data-grok] [data-vr='focus-strip'] > div:first-child {
+  color: var(--sm-text-primary);
+}
+
+/* ══ WS11 — CHAT HONESTY: FAILED STEPS, DELETIONS, ERROR PILL ═════════════════
+   The chat jury found three measured defects on the error / patch surfaces, all
+   fixed here under [data-grok] (byte-exact revert when the attribute is absent;
+   the components ship only inert data-attributes / classes off grok).
+
+   1) FAILED TOOL STEP READS AS A PASS (the headline honesty defect). The receipt
+      checklist draws ✓ for every DONE line — including a FAILED one ("✓ cargo
+      check → failed · error[E0432]"), so a failure reads as a pass at a glance.
+      `toReceiptRows` now flags a genuine failure (`ok===false`, not a decline)
+      and the line carries `data-failed`; here the check SVG is hidden, a cross
+      takes its slot, the outcome is tinted the calm warning tone (plan doctrine:
+      failure is amber, never alarmist red), and the card gains a faint warning
+      left-border so the failure is legible without reading each value. */
+[data-grok] [data-testid='chat-receipt'][data-failed] .chat-receipt-glyph {
+  color: var(--sm-tone-warning);
+}
+[data-grok] [data-testid='chat-receipt'][data-failed] .chat-receipt-glyph > svg {
+  display: none;
+}
+[data-grok] [data-testid='chat-receipt'][data-failed] .chat-receipt-glyph::before {
+  content: '✕';
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 13px;
+}
+/* The failing outcome ("failed · error[E0432]") tinted to the warning tone —
+   full-strength amber clears 4.5:1 on the agent bubble in both themes (light
+   #8a5200 ≈ 5.8:1, dark #e8a33d ≈ 8.5:1), well above Grok's 3.92 floor. */
+[data-grok] [data-testid='chat-receipt'][data-failed] .chat-receipt-outcome {
+  color: var(--sm-tone-warning);
+}
+/* A faint warning left-border on the card carrying any failed line — so the
+   failure is legible from the card's edge, not only from a glyph. `:has()` keeps
+   the hook on the receipt line (no extra wrapper state). */
+[data-grok] .chat-receipt-group:has([data-testid='chat-receipt'][data-failed]) {
+  border-left: 2px solid color-mix(in srgb, var(--sm-tone-warning) 55%, transparent);
+}
+
+/* 2) DIFF DELETION UNDER-LEGIBLE. `<CodeDel>` renders the removed line in
+      tertiary ink — measured 2.99:1 on the code well, below AA and below Grok's
+      floor, so add/del separated by brightness alone. Give the deletion a muted
+      error-accent tint (the danger tone — the conventional "removed" colour),
+      which clears 4.5:1 in both themes (light #c0362c ≈ 5.2:1, dark #ff6b5e ≈
+      4.5:1). Additions keep their full-strength ink, untouched. */
+[data-grok] [data-code-del] {
+  color: var(--sm-tone-danger);
+}
+
+/* 3) HEADER STATUS PILL CONTRAST. The "⚠ Error" / "Blocked" / hot-usage chips in
+      the session header carry the app's `--status-error` orange on a
+      `bg-status-error/15` tint — measured 2.67:1, below AA / large-text / Grok's
+      floor (it survived on hue alone). Re-point them to the calm AA warning tone
+      (the plan's "never alarmist red"), which clears 4.5:1 in both themes. Scoped
+      to the header pill so the base app's status-error usages are untouched. */
+[data-grok] [data-testid='chat-header-pill'] .text-status-error {
+  color: var(--sm-tone-warning);
+}
+[data-grok] [data-testid='chat-header-pill'] .bg-status-error\/15 {
+  background-color: color-mix(in srgb, var(--sm-tone-warning) 16%, transparent);
+}
+
+/* 4) OFFLINE PRESENCE-DOT HONESTY (the jury's worst break: a GREEN "ready" dot on
+      a "Couldn't load this conversation." screen). When the tail can't be read the
+      header wraps the dot in `data-tail-error-dot`; grey it to the neutral
+      "unknown" tone so it no longer vouches for a session it cannot see. Matches
+      the `<OfflineDot>` treatment the terminal-offline path already gets. */
+[data-grok] [data-tail-error-dot] > [role='img'] {
+  background-color: var(--sm-text-tertiary);
+  /* a spinner variant (border-t only) also loses its live amber arc */
+  border-top-color: var(--sm-text-tertiary);
+}
+
+/* 5) MODE (BYPASS) DOT — its OWN token, distinct from the connection dot.
+      The compact phone header packs a mode dot and the connection dot into one
+      right-aligned cluster. Both drew the app's `--status-error` token
+      (ModeGlyphChip's risky dot and `<ConnectionNote>`'s alarming compact dot),
+      so a bypass session next to an alarming connection showed two dots on one
+      token — the collision the sweep flagged, and still a live one in the base
+      app. Bypass is a MODE caution (approvals off), not a connection state, so
+      it gets its OWN token: the calm WARNING amber. That parts it cleanly from
+      the connection dot in BOTH renderings — from the neutral tertiary the
+      grok connection dot already carries (rule §4d re-points the compact chip to
+      `--sm-bg-tertiary`), and from the app's danger orange in the base. The amber
+      clears the 3:1 graphical-contrast floor on the header glass in both themes
+      (light #8a5200 ≈ 5.8:1 on the pane, dark #e8a33d ≈ 8.5:1). Base app is
+      untouched: off grok the dot keeps `bg-status-error` (header-pill.tsx). */
+[data-grok] [data-testid='chat-header-pill'] [data-mode-risk] {
+  background-color: var(--sm-tone-warning);
+}
+
+/* ── HEADER RENDERER SWITCH — MUST FIT AT 320px (sweep FIX 2) ──────────────────
+   The trailing renderer toggle (renderer-switch.tsx) floors each of its three
+   touch cells at 44px on a coarse pointer (`[@media(pointer:coarse)]:min-w-11`)
+   — a hard ~138px that does NOT shrink. On a 320px header card the busy header
+   (name + mode dot + connection dot + presence dot + this toggle) pushed the
+   `>_` (Terminal) cell's right edge to x≈350: ~30px OFF-SCREEN, clipped and
+   untappable (measured, rig). The header's own design intent is that the switch
+   "and its cells all shrink" at 320 (header-pill.tsx `NAME_MIN` doc); the 44px
+   coarse floor is what blocked it.
+
+   Below 360px only, condense the switch: 32px cells + tighter inline padding
+   bring it to ~98px, so the whole trailing cluster — `>_` included — lands back
+   inside the card and stays on-screen and tappable. The `::after` expander still
+   gives every cell the full 44px-TALL hit target (it grows vertically into the
+   card's padding); only the WIDTH tightens, and only on the narrowest screens
+   where an off-card control is the worse failure (rubric §1.3 blocker > §4.1).
+   Specificity `[data-grok] [data-renderer-switch] [role='tab']` (0,3,0) out-ranks
+   Tailwind's `.min-w-11` (0,1,0), so this wins the coarse floor at ≤359px while
+   360/390 keep 44px. Grok-scoped: the base app (no `data-grok`) is untouched. */
+/* 320-class (≤339px): the tightest condense — 28px cells + 1px rail bring the
+   switch to ~88px so its right edge lands INSIDE the card (measured: switch
+   right 301, card right 308). */
+@media (max-width: 339px) {
+  [data-grok] [data-renderer-switch] {
+    padding: 1px;
+  }
+  [data-grok] [data-renderer-switch] [role='tab'] {
+    min-width: 28px;
+    padding-left: 5px;
+    padding-right: 5px;
+  }
+}
+/* 360-class (340–374px): a MILDER condense. At 360 the full 44px floor pushed
+   the switch ~5px past the card's rounded right edge (on-screen but poking over
+   the ground); 38px cells pull it back inside the card while keeping a larger
+   touch cell than the 320 tier. 390 (>374px) keeps the full 44px cells — it
+   already fits the card with room to spare. */
+@media (min-width: 340px) and (max-width: 374px) {
+  [data-grok] [data-renderer-switch] [role='tab'] {
+    min-width: 38px;
+    padding-left: 7px;
+    padding-right: 7px;
+  }
+}
+
+/* ══ WS12 — PICKER ROW SECONDARY CONTRAST (non-dialog anchors) ════════════════
+   The shared EntityPicker draws its row descriptor (`row.meta` — file path, kind,
+   schedule) and its group headings in tertiary ink (`text-ink-3`). Inside the ⌘K
+   dialog WS7 already lifts tertiary for AA, but the TOKEN popover (composer @//)
+   and the FIELD lists do not carry `[role='dialog']`, so there the meta measured
+   2.43:1 light / 3.29:1 dark on the picker ground — below AA and Grok's 3.92
+   floor for text that is the row's primary descriptor. Lift tertiary within any
+   picker listbox to the same solid AA mid-grey the dialog uses (light #5f6773 ≈
+   5.2:1, dark #9a9a9a ≈ 6.5:1). The ⌘K dialog already re-points tertiary, so this
+   is additive there, not conflicting.
+
+   BOTH tokens are re-declared here. The group heading reads `--sm-text-tertiary`
+   directly (grok-mode.css §WS7), but the row META reads it through `text-ink-3` →
+   `--sm-ink-3`, whose value is COMPUTED at `[data-grok]` (var() in a custom prop
+   substitutes at its declaring element) and inherited down — so re-pointing only
+   `--sm-text-tertiary` here lifts the heading but NOT the meta. Re-aliasing
+   `--sm-ink-3` on the listbox recomputes it against the listbox's tertiary. */
+[data-grok] [role='listbox'] {
+  --sm-text-tertiary: #5f6773;
+  --sm-ink-3: var(--sm-text-tertiary);
+}
+.dark [data-grok] [role='listbox'] {
+  --sm-text-tertiary: #9a9a9a;
+  --sm-ink-3: var(--sm-text-tertiary);
+}
+
+/* ══ PER-MESSAGE ACTION BAR (WS — Copy · Share · More) ═════════════════════════
+   The bar under each assistant bubble carries `data-msg-actions`, each control
+   `data-msg-action`; the default app already styles them with semantic tokens so
+   both themes read. These rules are the GROK LIFT only — rest/hover tint and
+   radius in Grok's own token language, no TS branch. Scoped entirely to the
+   `data-msg-*` hooks, so nothing else moves. */
+[data-grok] [data-msg-action] {
+  color: var(--sm-text-tertiary);
+  border-radius: var(--sm-r-sm);
+}
+[data-grok] [data-msg-action]:hover {
+  color: var(--sm-text-secondary);
+  /* A faint accent wash instead of the neutral muted tint — Grok's emphasis. */
+  background-color: color-mix(in srgb, var(--sm-accent) 12%, transparent);
+}
+/* The desktop bar sits a touch quieter at rest; the phone bar stays persistent
+   but reads as chrome, not as a second row of content. */
+[data-grok] [data-msg-actions][data-surface='phone'] {
+  opacity: 0.6;
+}
+/* The overflow dropdown's items take the same accent-wash focus as the bar's
+   buttons, so the menu reads as one family with its trigger. */
+[data-grok] [data-msg-actions-menu] [role='menuitem'][data-highlighted] {
+  background-color: color-mix(in srgb, var(--sm-accent) 14%, transparent);
+  color: var(--sm-text-primary);
+}
+
+/* ══ WS13 — DESKTOP CHROME PORT: FILES + SETTINGS RE-SKIN ══════════════════════
+   Files (`routes/files.tsx` `.gk-files`) and Settings (`routes/settings.tsx`
+   `.gk-settings`) shipped as PURE base app — the iOS-list / shadcn material, zero
+   [data-grok] rules — so next to the grok roster they read legacy. Both are a
+   RE-SKIN, not a rebuild: their structure already matches the grok grammar (Files
+   = list-rail + viewer-pane; Settings = a sectioned scroll of labelled Rows). The
+   high-leverage move is to REPOINT the shared shadcn/paper tokens the routes' own
+   Tailwind utilities already read (`bg-card`, `bg-background`, `border-border`,
+   `text-muted-foreground`, `bg-accent`, `bg-secondary`, `bg-primary`,
+   `border-hairline`, `.glass`) onto the grok `--sm-*` ladder — so every surface,
+   row and control re-materializes at once with NO structural change and NO base
+   token edits (grok values win by being defined on a closer ancestor; the base
+   `:root`/`.dark` values are untouched, so the firewall holds).
+
+   DESKTOP-ONLY, on purpose. Both routes exist at every breakpoint, but the scope
+   contract is "base app (grok off) AND mobile stay byte-identical". So the whole
+   re-skin lives inside `@media (min-width: 768px)`: under grok on a phone Files /
+   Settings keep the exact base iOS look; only the desktop surfaces (where the
+   grok rail + roster set the visual bar) are re-materialized. The class hooks
+   themselves are inert everywhere — a bare class name paints nothing. */
+@media (min-width: 768px) {
+  /* The token repoint. Applied to each route's root hook so it cascades to every
+     in-flow descendant (portalled overlays — the delete Dialog, sort/model
+     DropdownMenus — escape the subtree and keep the base material; they are
+     transient and out of the captured surfaces). */
+  [data-grok] .gk-files,
+  [data-grok] .gk-settings {
+    /* grounds & elevation → the grok ladder */
+    --background: var(--sm-bg-editor);
+    --card: var(--sm-bg-elevated);
+    --popover: var(--sm-bg-elevated);
+    --secondary: var(--sm-bg-tertiary);
+    --muted: var(--sm-bg-tertiary);
+    /* ink → grok text ramp (theme-swapped by the --sm-* source) */
+    --foreground: var(--sm-text-primary);
+    --muted-foreground: var(--sm-text-secondary);
+    /* selection / hover → WARM GREY (grok never accent-fills a chrome-select),
+       and the on-grey ink stays primary */
+    --accent: var(--sm-bg-active);
+    --accent-foreground: var(--sm-text-primary);
+    /* the one hairline — 0.5px grok border everywhere `border-border` /
+       `border-hairline` are used */
+    --border: var(--sm-border);
+    --sm-hairline: var(--sm-border);
+    --sm-hairline-soft: var(--sm-border);
+    /* accent (links/focus/toggle-on) → the grok single accent */
+    --primary: var(--sm-accent);
+    --destructive: var(--sm-tone-danger);
+    color: var(--sm-text-primary);
+    font-family: var(--sm-font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Header glass → the grok TITLE recipe (a crisper, more saturated blur than the
+     shared `.glass` 72%/20px), so the toolbar reads as a grok surface rather than
+     a generic frosted bar. Targeted STRUCTURALLY off the `.gk-files` root (its
+     direct `<header>` toolbar + the viewer pane's own `<header>`) and the Settings
+     sticky nav bar, so only one class hook per route is needed. */
+  [data-grok] .gk-files > header,
+  [data-grok] .gk-files header,
+  [data-grok] .gk-settings > header {
+    background: var(--sm-title-fill);
+    -webkit-backdrop-filter: var(--sm-glass-title);
+    backdrop-filter: var(--sm-glass-title);
+  }
+
+  /* Files two-column split (the flex row after the toolbar): list rail on the warm
+     chrome ground, viewer pane on the editor ground, so they read as one grok
+     window rather than two flat base panes. */
+  [data-grok] .gk-files > div > div:first-child {
+    background: var(--sm-bg-chrome);
+  }
+  [data-grok] .gk-files > div > div:last-child {
+    background: var(--sm-bg-editor);
+  }
+  /* File rows — the roster row idiom: the selection plate (a `position:absolute`
+     span, the only `<span>` that is a direct child of a row `<li>`) becomes the
+     warm-grey selection with the grok list radius, never an accent fill. */
+  [data-grok] .gk-files li > span {
+    background: var(--sm-bg-active);
+    border-radius: var(--sm-r-sm);
+  }
+  /* Breadcrumb → grok mono meta, matching the roster pane-head crumb idiom. */
+  [data-grok] .gk-files > header nav {
+    font-family: var(--sm-font-mono);
+    font-size: 12px;
+  }
+
+  /* Settings — the sectioned scroll, re-materialized. The grouped `Section` card
+     (the only `rounded-2xl` box in this subtree) takes the grok large radius so
+     the cards read as grok panels; content, order and copy are unchanged. */
+  [data-grok] .gk-settings .rounded-2xl {
+    border-radius: var(--sm-r-lg);
+  }
+  /* The big scroll-crossfade title + the sticky bar label → grok display ink. */
+  [data-grok] .gk-settings h1,
+  [data-grok] .gk-settings header span {
+    color: var(--sm-text-primary);
+    letter-spacing: -0.02em;
+  }
+}
+
+/* ── Phase B — the thread pill's trailing actions ────────────────────────────
+   The verbs the retired `DesktopFocusHeader` used to carry (Detach ⌘D / Stop ⌘W /
+   Make it a team), re-homed as plain buttons in the chat pill's `trailing` slot
+   (`ThreadPillActions`, desktop-split.tsx). Styling lives here — not in Tailwind
+   class strings — to keep the tight main-app chunk lean. Rendered ONLY under
+   `chatActive`, which implies bot mode, so `[data-grok]` is always present.
+   NOT desktop-media-gated: this pane only exists on desktop, and the mobile focus
+   surface is a different file that never mounts these buttons. */
+[data-grok] [data-thread-actions] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+[data-grok] [data-thread-actions] button {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: var(--sm-r-pill);
+  border: 0.5px solid var(--sm-border);
+  color: var(--sm-text-tertiary);
+  background: transparent;
+  cursor: pointer;
+  transition: color 0.15s, background-color 0.15s;
+}
+[data-grok] [data-thread-actions] button:hover {
+  color: var(--sm-text-primary);
+  background: var(--sm-bg-hover);
+}
+[data-grok] [data-thread-actions] button[data-stop]:hover {
+  color: var(--sm-tone-danger);
+  background: color-mix(in srgb, var(--sm-tone-danger) 12%, transparent);
+}
+[data-grok] [data-thread-actions] button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sm-accent) 55%, transparent);
+}
+
+/* ══ PHONE — the transcript's top lip fades into the notch/status-bar zone ═════
+   The session header is a FLOATING glass card over the transcript (chat-surface
+   `headerOverlay`), sitting `--safe-top + 6px` down. Its own 80px backdrop-blur
+   softens whatever passes BEHIND it, but the strip ABOVE the card — the gap
+   between the iOS status bar and the card — showed sharp transcript text bleeding
+   up against the clock/battery, so the top of the screen read cluttered and the
+   card looked like it floated in a field of content ("header teveel naar beneden,
+   leeg/rommelig bovenin" — owner device feedback).
+
+   A mask fades the track's top lip to nothing across the safe area + the card's
+   own gap, so nothing renders hard against the status bar and the header reads as
+   anchored to the very top. A MASK, not a backdrop-filter, so grok-shell-chrome's
+   single-blur invariant holds; `[data-grok]` + phone-only, so the base app and
+   the desktop board are byte-for-byte untouched. Bottom stays owned by the
+   composer's own scrim (conversation.tsx `float`), so this is a top gradient. */
+@media (max-width: 767px) {
+  [data-grok] [data-surface='chat'] [data-chat-track] {
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent 0,
+      #000 calc(var(--safe-top, 0px) + 58px)
+    );
+    mask-image: linear-gradient(
+      to bottom,
+      transparent 0,
+      #000 calc(var(--safe-top, 0px) + 58px)
+    );
+  }
+}

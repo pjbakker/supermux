@@ -34,17 +34,61 @@ import { motionOff, springs, tweens } from '../../lib/springs'
 import { SessionMark } from '../../brand/marks'
 import { cn } from '../../lib/utils'
 
+import { useDictation } from '../focus-mode/use-dictation'
+
 import { ComposerFrame } from './composer-shell'
 import type { EntityPickerProps } from './entity-picker'
 import { pickerOptionId, PICKER_LISTBOX_ID, type EntityPickerData } from './slash'
 import type { ComposerHandle, ComposerNotice } from './use-composer'
 import { DRAFT_PREVIEW_CHARS } from './use-composer'
-import { Composer, MicIcon, PlusIcon } from './ui'
+import { AtIcon, ClockIcon, Composer, MicIcon, PlusIcon } from './ui'
+import ChatActionsSheet from './chat-actions-sheet'
+import ChatActionsPopover from './chat-actions-menu'
+import { AttachmentChips } from './attachment-chips'
+import { Popover, PopoverTrigger } from '../ui/popover'
+import { useMediaQuery } from '../../hooks/use-media-query'
+import type { UseStagedAttachmentsResult } from '../focus-mode/use-staged-attachments'
+
+/** The invisible 44pt touch target every disc on the bar grows on a coarse
+ *  pointer: an `::after` inset so pointer-events ride the pseudo-element and a
+ *  thumb landing a few px wide of the glyph still presses the button and nothing
+ *  else. One const, referenced by the leading `+`, the trailing send/stop, and
+ *  the rest-state mic — so the recipe is stated once, not copied three ways. */
+const COARSE_TARGET =
+  '[@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-1 [@media(pointer:coarse)]:after:content-[""]'
+
+/** A stable empty chip list, so an unwired composer never re-renders on a new
+ *  array identity (and reads byte-identically to today). */
+const EMPTY_ATTACHMENTS: readonly never[] = []
 
 /** The `@`/`/` popover (fase A4 T9), lazily — it is reached only when somebody
  *  types a trigger, so its list, its filter and its two queries stay out of the
  *  chunk the surface pays for on open (T12's budget rule). */
 const EntityPicker = React.lazy(() => import('./entity-picker'))
+
+/** The composer's folded-actions sheet rides in the `chat-panel` chunk (imported
+ *  at the top of this file). That chunk is itself lazy — loaded only when a chat
+ *  pane mounts, never on the hero path — so the sheet stays out of the ENTRY
+ *  chunk exactly as the budget rule requires, WITHOUT paying the app-total gzip
+ *  penalty a ~0.8 KB standalone `React.lazy` chunk costs (a tiny chunk has no
+ *  shared compression window). The `sheetMounted` gate below still defers the
+ *  RUNTIME cost — Vaul is not constructed until the first `+` tap. */
+
+/**
+ * The route-owned half of the leading `+` menu (mobile chat). The composer owns
+ * the sheet and the compose actions it can serve itself — mention, command,
+ * schedule — but these four reach OUT of the composer, so the surface that
+ * mounts it (`routes/focus/mobile.tsx`) passes them in. Present ⇒ the leading
+ * control is the single `+` add-menu; absent ⇒ the desktop minimal pair.
+ */
+export interface ChatComposerActions {
+  /** Open the session switcher; omitted (desktop's persistent list) → no row. */
+  onSwitchSession?: () => void
+  /** Open the global command palette (⌘K) — search / jump / new session. */
+  onCommandPalette: () => void
+  /** Open the snippets drawer; omitted → the row is not drawn. */
+  onSnippets?: () => void
+}
 
 /** The same 260ms opacity crossfade `live-layer.tsx`'s `SwapCell` uses for P13.
  *  Send→Stop is the same kind of event — one cell, two occupants — so it is the
@@ -94,6 +138,33 @@ export interface ChatComposerProps {
    */
   onSchedule?: (draft: string) => void
   /**
+   * The route-owned actions behind the leading `+` (mobile chat only). Present ⇒
+   * the leading control is ONE `+` that owns the whole add-menu: the composer's
+   * own mention/command/schedule PLUS these (switch session, command palette,
+   * snippets), all in a snug sheet anchored to the `+`. Dictation is NOT in that
+   * menu — the composer's trailing rest-state mic (a real `useDictation` toggle)
+   * is the single dictation control, so a menu row would only duplicate it. The
+   * old three leading buttons (`⋯` / `@`-as-plus / clock) collapse into the `+`,
+   * so the phone has a single, symmetric input bar.
+   *
+   * Omit (desktop split, bench, tests) ⇒ the leading control is the desktop
+   * minimal PAIR: a real `@` mention button and, when `onSchedule` is wired, the
+   * clock — each glyph matching its action, no sheet drawn behind them.
+   */
+  actions?: ChatComposerActions
+  /**
+   * The staged attachment plane (composer upgrade). Owned by the composition
+   * root next to `useComposer` (so the outgoing prefix / reset can be wired into
+   * the SAME gated submit), and handed down here to render: the chip row above
+   * the pill, the `+` add-menu's Attach group, the desktop attach disc, and
+   * paste / drag-drop — all feed `attachments.handleFiles`. `readyPaths()`
+   * becomes the `getOutgoingPrefix` the submit folds in.
+   *
+   * Optional: omitted (the bench, the read-only shell, any surface that does not
+   * wire uploads) ⇒ no chips, no attach affordances, byte-identical to today.
+   */
+  attachments?: UseStagedAttachmentsResult
+  /**
    * This session cannot work — a quota bucket, an auth death (`blocked.ts`).
    * The string is the REASON, already naming the limit and, where there is one,
    * when it lifts.
@@ -119,25 +190,227 @@ export function ChatComposer({
   renderPicker,
   pickerData,
   onSchedule,
+  actions,
+  attachments,
   blocked,
   className,
 }: ChatComposerProps) {
+  // Destructure the handle up front. `handle` carries `fieldRef` (a RefObject),
+  // so reading its members as `x` during render trips react-hooks/refs
+  // ("cannot access refs during render") for EVERY field — the rule taints the
+  // whole ref-bearing object. Pulling the fields into locals reads the ref only
+  // where it's meant to be read (the effect below) and keeps render clean.
+  const {
+    draft,
+    fieldRef,
+    picker,
+    insert,
+    handoff,
+    sending,
+    submit,
+    stop,
+    notice,
+    dismissNotice,
+    onChange,
+    onKeyDown,
+    onSelect,
+  } = handle
   const phone = surface === 'phone'
   const reduce = useReducedMotion() ?? false
+  // Fork the add-menu's OPEN SURFACE on input modality, not on the `phone`
+  // surface flag: a coarse pointer (any touch device — phone, tablet, a
+  // convertible on the desktop split) gets the thumb-reachable Vaul sheet; a
+  // fine pointer gets the anchored Radix popover in the composer's own glass.
+  // The single leading `+` is identical on both.
+  const coarse = useMediaQuery('(pointer: coarse)')
+  // THE LEADING `+` MENU. Owned HERE, not by the route, so the surface is
+  // literally anchored to the control that opens it — the fix for a menu that
+  // read as a floating, disconnected list. `menuOpen` drives BOTH shells and the
+  // `+ → ×` morph; `sheetMounted` gates the Vaul lazy chunk on the FIRST coarse
+  // open so the sheet's runtime never touches a fine-pointer surface.
+  const [menuOpen, setMenuOpen] = React.useState(false)
+  const [sheetMounted, setSheetMounted] = React.useState(false)
+  const toggleMenu = React.useCallback(() => {
+    setMenuOpen((open) => {
+      if (!open && coarse) setSheetMounted(true)
+      return !open
+    })
+  }, [coarse])
+  // Vaul returns focus to the trigger (`+`) on close; a compose action that
+  // stages a trigger needs the caret back in the FIELD instead, so the picker
+  // it just opened is what the next keystroke types into. The picker itself is
+  // draft-derived (`use-composer.ts`), so it shows regardless — this only keeps
+  // the field hot.
+  const refocusField = React.useCallback(() => {
+    window.requestAnimationFrame(() => fieldRef.current?.focus())
+  }, [fieldRef])
+  const onMention = React.useCallback(() => {
+    setMenuOpen(false)
+    insert('@')
+    refocusField()
+  }, [insert, refocusField])
+  const onSlash = React.useCallback(() => {
+    setMenuOpen(false)
+    insert('/')
+    refocusField()
+  }, [insert, refocusField])
+  // ── the rest-state mic IS dictation ─────────────────────────────────────────
+  // Not decoration: at rest the trailing cell is a real mic that toggles Web
+  // Speech through `useDictation` — the SAME hook the dock's mic uses, which
+  // DOES exist on iOS Safari / WKWebView (`webkitSpeechRecognition`). So the mic
+  // is shown on the iPhone, where dictation works, and hidden only where the
+  // browser exposes no recognition at all (`dictation.supported`).
+  //
+  // Transcribed text lands in the DRAFT through the composer's own insert seam
+  // (`handle.insert` → `insertIntoComposer`), so a dictated sentence reads
+  // exactly like a typed one and is one Enter from the gated send path.
+  //
+  // onFinal-FIRST FLUSH (iOS discipline, mirrored from the dock). Web Speech's
+  // `onend` fires unreliably on iOS / WKWebView, so FINAL segments are inserted
+  // the instant they commit (`onFinal`); the cumulative interim is buffered only
+  // as a safety tail, flushed on the stop tap. A `sentLen` cursor dedupes the
+  // two paths so a segment can never land twice.
+  const pendingTranscriptRef = React.useRef('')
+  const sentLenRef = React.useRef(0)
+  const dictation = useDictation({
+    // Cumulative interim — buffered for the safety-tail flush; never inserted here.
+    onTranscript: React.useCallback((text: string) => {
+      pendingTranscriptRef.current = text
+    }, []),
+    // Final segment — insert immediately (does not wait for the unreliable onend).
+    onFinal: React.useCallback(
+      (segment: string) => {
+        const seg = segment.trim()
+        if (!seg) return
+        insert(seg + ' ')
+        // Web Speech's cumulative transcript joins finals with spaces; advance the
+        // dedupe cursor past what we just inserted so the tail flush won't re-add it.
+        sentLenRef.current = pendingTranscriptRef.current.length
+      },
+      [insert],
+    ),
+  })
+  // Flush only the UNSENT tail — text the user spoke that never finalized before
+  // they stopped. Clears state BEFORE inserting so it can never double-insert.
+  const flushDictation = React.useCallback(() => {
+    const tail = pendingTranscriptRef.current.slice(sentLenRef.current).trim()
+    pendingTranscriptRef.current = ''
+    sentLenRef.current = 0
+    if (tail) insert(tail + ' ')
+  }, [insert])
+  // Mic tap: STOPPING flushes the unsent tail inside the user gesture (WS still
+  // open) THEN stops — independent of whether `onend` ever arrives. STARTING just
+  // starts; final segments stream in via `onFinal` while listening. Shared by the
+  // rest-state mic AND the add-menu's Dictate row (one instance, no dead second).
+  const onMicTap = React.useCallback(() => {
+    if (dictation.listening) {
+      flushDictation()
+      dictation.stop()
+    } else {
+      dictation.start()
+    }
+  }, [dictation, flushDictation])
+  // ── ATTACHMENTS (composer upgrade) ─────────────────────────────────────────
+  // Everything below no-ops when `attachments` is absent, so a composer that
+  // does not wire uploads renders exactly as before.
+  const stagedFiles = attachments?.attachments ?? EMPTY_ATTACHMENTS
+  const handleFiles = attachments?.handleFiles
+  const hasReady = (attachments?.readyPaths().length ?? 0) > 0
+  const uploading = attachments?.uploading ?? false
+
+  // The desktop attach disc's OS file dialog (one hidden `<input multiple>`).
+  const fileInputRef = React.useRef<HTMLInputElement | null>(null)
+  const onDesktopPick = React.useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const picked = Array.from(e.target.files ?? [])
+      e.target.value = '' // re-pick the same file still fires `change`
+      if (picked.length) handleFiles?.(picked)
+    },
+    [handleFiles],
+  )
+
+  // PASTE — Cmd/Ctrl+V an image blob becomes a chip (desktop-critical). Scans
+  // the clipboard for `kind: 'file'` images; only then `preventDefault` so text
+  // and rich-content paste are untouched. On the phone the contenteditable owns
+  // its own plain-text paste guard, so this never fires there.
+  const onPaste = React.useCallback(
+    (e: React.ClipboardEvent<Element>) => {
+      if (!handleFiles) return
+      const files: File[] = []
+      for (const item of Array.from(e.clipboardData?.items ?? [])) {
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const f = item.getAsFile()
+          if (f) files.push(f)
+        }
+      }
+      if (files.length) {
+        e.preventDefault()
+        handleFiles(files)
+      }
+    },
+    [handleFiles],
+  )
+
+  // DRAG-DROP — files dropped anywhere on the composer frame become chips, with
+  // an accent ring while a drag is over it. Desktop in practice; inert on touch.
+  const [dropActive, setDropActive] = React.useState(false)
+  const dropHandlers = React.useMemo(() => {
+    if (!handleFiles) return undefined
+    return {
+      onDragOver: (e: React.DragEvent) => {
+        if (!Array.from(e.dataTransfer.types).includes('Files')) return
+        e.preventDefault()
+        setDropActive(true)
+      },
+      onDragLeave: (e: React.DragEvent) => {
+        // Only the leave that exits the frame itself, not a child boundary.
+        if (e.currentTarget === e.target) setDropActive(false)
+      },
+      onDrop: (e: React.DragEvent) => {
+        e.preventDefault()
+        setDropActive(false)
+        const files = Array.from(e.dataTransfer.files)
+        if (files.length) handleFiles(files)
+      },
+    }
+  }, [handleFiles])
+
+  // MULTI-LINE / CHIPS → soften the pill's radius (the shell reads `grown`).
+  // Measured off the real field height so a SOFT-WRAPPED long line counts too,
+  // not just an explicit newline; the threshold is one line's worth of the
+  // field's own box (per surface). Re-read on every draft change — the same
+  // signal `growTextarea` runs on.
+  const [multiline, setMultiline] = React.useState(false)
+  React.useEffect(() => {
+    const el = fieldRef.current
+    setMultiline(!!el && el.scrollHeight > (phone ? 44 : 40))
+  }, [draft, fieldRef, phone])
+  const grown = multiline || stagedFiles.length > 0
+
   // A draft arms Send. While the POST is in flight the button STAYS (disabled)
   // rather than flipping back to the mic: a control that vanishes mid-tap reads
   // as a bug, and the disabled state is the honest "asked, not yet answered".
-  const canSend = handle.draft.trim().length > 0 && !blocked
+  //
+  // An IMAGE ALONE is a valid message (`hasReady`), and Send WAITS for uploads
+  // (`!uploading`): while bytes are in flight the disc shows disabled, the same
+  // honest "asked, not yet answered" `handle.sending` already uses.
+  const canSend = (draft.trim().length > 0 || hasReady) && !uploading && !blocked
+  // The Send disc is SHOWN (not swapped for the mic) whenever there is anything
+  // to send — including while an upload is still settling — so it can present as
+  // disabled rather than vanishing. `canSend` is the enabled gate; this is the
+  // visibility gate.
+  const showSend =
+    (draft.trim().length > 0 || stagedFiles.length > 0) && !blocked
   // WHICH ROW THE POPOVER IS ON (A4 review). The list lives in the picker, but
   // the only element that ever has focus is the textarea — so the textarea is
   // what has to carry `aria-activedescendant`, and the highlight travels up
   // here to be written onto it. −1 = the list has nothing to point at.
   const [activeOption, setActiveOption] = React.useState(-1)
-  const pickerOpen = handle.picker.open
+  const pickerOpen = picker.open
   const pickerProps: EntityPickerProps = {
     name,
-    kind: handle.picker.kind,
-    query: handle.picker.query,
+    kind: picker.kind,
+    query: picker.query,
     surface,
     ...pickerData,
     // The picker hands over the ROW; the composer's insert seam wants the text
@@ -150,13 +423,19 @@ export function ChatComposer({
     // is unreachable; making it a no-op rather than an assertion means a future
     // surface that hands chat a verb row inserts nothing instead of putting the
     // string "undefined" into somebody's message.
-    onPick: (row) => handle.picker.pick(row.value ?? ''),
-    bind: handle.picker.bind,
+    onPick: (row) => picker.pick(row.value ?? ''),
+    bind: picker.bind,
     onActive: setActiveOption,
   }
 
   return (
-    <ComposerFrame surface={surface} stat={stat} className={className}>
+    <ComposerFrame
+      surface={surface}
+      stat={stat}
+      className={className}
+      drop={dropHandlers}
+      dropActive={dropActive}
+    >
       {blocked && (
         <p
           role="status"
@@ -171,12 +450,12 @@ export function ChatComposer({
         </p>
       )}
       <ComposerBanner
-        notice={handle.notice}
+        notice={notice}
         onOpenTerminal={onOpenTerminal}
-        onDismiss={handle.dismissNotice}
+        onDismiss={dismissNotice}
         reduce={reduce}
       />
-      {handle.picker.open &&
+      {picker.open &&
         (renderPicker ? (
           renderPicker(pickerProps)
         ) : (
@@ -186,71 +465,167 @@ export function ChatComposer({
             <EntityPicker {...pickerProps} />
           </React.Suspense>
         ))}
+      {/* THE CHIP ROW — above the pill, in the same above-pill stack as the
+          banner and the `@`/`/` picker, so it reads as part of the one composer
+          unit and the rounded pill never clips a thumbnail. Renders nothing when
+          empty. */}
+      {attachments && (
+        <AttachmentChips attachments={attachments.attachments} onDismiss={attachments.dismiss} />
+      )}
+      {/* The one hidden OS file dialog for the fine-pointer attach affordances —
+          the desktop pair's paperclip disc AND the `+` popover's Attach row both
+          click it. Hoisted here so a single input serves either leading shape.
+          (The coarse sheet has its own native Camera/Photo/Files pickers.) */}
+      {attachments && (
+        <input ref={fileInputRef} type="file" multiple className="hidden" onChange={onDesktopPick} />
+      )}
       <Composer
         size={phone ? 'mobile' : 'desktop'}
         placeholder={`Message ${label}`}
+        grown={grown}
         leading={
-          <>
-          <button
-            type="button"
-            data-testid="chat-composer-at"
-            aria-label="Mention a file or a session"
-            // The boards' `+` was decoration; this is the same 26px cell doing
-            // what the boards' caption always said it did (attach / @files /
-            // /commands). It types the trigger rather than opening a menu of its
-            // own, so there is exactly ONE picker on this surface and the caret
-            // ends up where the user would have put it themselves.
-            onClick={() => handle.insert('@')}
-            // 26px of GLYPH inside a 44px of TARGET on touch. The cell is the
-            // boards' 26px on a pointer device and grows to the 44pt floor under
-            // `pointer: coarse` — measured at 26×26 on a phone, against a row of
-            // 44×44 controls one line below it. The pill's `gap-3` keeps the two
-            // accessories 12px apart, so the grown cells tile instead of
-            // overlapping (the mis-tap the renderer switch shipped).
-            className={cn(
-              'grid size-[26px] flex-none place-items-center rounded-full text-ink-2',
-              '[@media(pointer:coarse)]:size-11',
-            )}
-          >
-            <PlusIcon />
-          </button>
-          {onSchedule && (
-            <button
-              type="button"
-              data-testid="chat-composer-schedule"
-              aria-label="Schedule this instead of sending now"
-              title="Schedule this instead of sending now"
-              // The draft is COPIED, not moved (T9.2): the sheet gets a prompt
-              // to start from and the composer keeps every character, so
-              // cancelling leaves the box exactly as it was.
-              onClick={() => onSchedule(handle.draft)}
-              // Same 26 → 44 on touch as its neighbour above.
-              className={cn(
-                'grid size-[26px] flex-none place-items-center rounded-full text-ink-2',
-                '[@media(pointer:coarse)]:size-11',
+          // ONE CLEAN LEADING CONTROL, TWO SHAPES.
+          //
+          // ALIGNMENT (owner feedback #2). Every control on this bar is now the
+          // SAME disc — `size-9` on the phone / `size-10` on desktop, a `grid
+          // place-items-center` cell with its glyph optically centred and a 44pt
+          // touch target grown by a coarse-pointer `::after` (see
+          // `LeadingButton`, the exact recipe `TrailingButton` uses on the right).
+          // So the row is symmetric: an add disc on the left, the send disc on
+          // the right, both on one baseline — not the old cluster of a 26px `⋯`,
+          // an overlapped `@`/clock pair on negative margins, and a 40px mic.
+          //
+          // SEMANTICS (owner feedback #1). Under `actions` the leading control is
+          // a single `+` — on BOTH surfaces now — that OPENS THE MENU: `+`
+          // genuinely means "add something". It no longer silently types an `@`.
+          // Mentions, commands, attach and schedule live inside that menu (and
+          // `@`/`/` still work typed directly into the field). The menu's SHELL
+          // forks on the pointer: a Vaul sheet on coarse, an anchored Radix
+          // popover on fine — same rows, same `+`. Absent `actions` (benches /
+          // read-only) the desktop pair keeps DIRECT buttons, each with the glyph
+          // of the thing it does: an `@` for mention, a clock for schedule.
+          actions ? (
+            coarse ? (
+              // COARSE — the `+` toggles the Vaul bottom sheet (rendered below).
+              <LeadingButton
+                testId="chat-composer-add"
+                label={menuOpen ? 'Close actions' : 'Add to your message'}
+                phone={phone}
+                expanded={menuOpen}
+                aria-haspopup="menu"
+                onClick={toggleMenu}
+              >
+                <AddGlyph open={menuOpen} reduce={reduce} />
+              </LeadingButton>
+            ) : (
+              // FINE — the `+` is the Radix popover trigger; the menu rises from
+              // it in the composer's own glass (focus-trap / Esc / outside-click /
+              // return-focus come free from Radix).
+              <Popover open={menuOpen} onOpenChange={setMenuOpen}>
+                <PopoverTrigger asChild>
+                  <LeadingButton
+                    testId="chat-composer-add"
+                    label={menuOpen ? 'Close actions' : 'Add to your message'}
+                    phone={phone}
+                    expanded={menuOpen}
+                    aria-haspopup="menu"
+                  >
+                    <AddGlyph open={menuOpen} reduce={reduce} />
+                  </LeadingButton>
+                </PopoverTrigger>
+                <ChatActionsPopover
+                  // Attach is one OS dialog on a fine pointer (no camera) — the
+                  // hoisted hidden `<input>` below. Gated on wired uploads.
+                  onAttach={handleFiles ? () => fileInputRef.current?.click() : undefined}
+                  onMention={onMention}
+                  onSlash={onSlash}
+                  onSnippets={actions.onSnippets}
+                  // The draft is COPIED, not moved (T9.2): schedule opens a sheet
+                  // seeded from the prompt and the composer keeps every character.
+                  onSchedule={onSchedule ? () => onSchedule(draft) : undefined}
+                  // Omitted on desktop (the persistent session list makes it
+                  // redundant) ⇒ the Switch-session row simply won't render.
+                  onSwitchSession={actions.onSwitchSession}
+                  onCommandPalette={actions.onCommandPalette}
+                  onClose={() => setMenuOpen(false)}
+                />
+              </Popover>
+            )
+          ) : (
+            <div className="flex flex-none items-center gap-2">
+              {/* DESKTOP ATTACH — a direct disc, not a menu: there is one OS
+                  file dialog and no `+` sheet on desktop, so a button is fewer
+                  clicks than inventing one. Paste + drag-drop are the power
+                  paths; this is the discoverable fallback. Only when uploads are
+                  wired. */}
+              {attachments && (
+                <LeadingButton
+                  testId="chat-composer-attach"
+                  label="Attach a file"
+                  phone={phone}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <PaperclipIcon />
+                </LeadingButton>
               )}
-            >
-              <ClockIcon />
-            </button>
-          )}
-          </>
+              <LeadingButton
+                testId="chat-composer-at"
+                label="Mention a file or a session"
+                phone={phone}
+                // Types the trigger and opens the ONE picker this surface has —
+                // the caret ends up where the user would have put it. Now drawn
+                // as an `@`, the glyph of what it does.
+                onClick={() => insert('@')}
+              >
+                {/* `@` is the 18px reference the paperclip and clock are now sized
+                    to (they were a small 17 and a 16 beside it). */}
+                <AtIcon />
+              </LeadingButton>
+              {onSchedule && (
+                <LeadingButton
+                  testId="chat-composer-schedule"
+                  label="Schedule this instead of sending now"
+                  phone={phone}
+                  // The draft is COPIED, not moved (T9.2): the sheet starts from
+                  // a prompt and the composer keeps every character.
+                  onClick={() => onSchedule(draft)}
+                >
+                  {/* 18px, matching `@` and the paperclip — was `size-4` (16px),
+                      the third of three mismatched sizes. */}
+                  <ClockIcon className="size-[18px]" />
+                </LeadingButton>
+              )}
+            </div>
+          )
         }
         field={{
-          ref: handle.ref,
-          value: handle.draft,
+          ref: fieldRef,
+          value: draft,
           // READ-ONLY rather than `disabled`: the draft stays selectable and
           // copyable, so a message typed just before the limit landed can be
           // rescued into another session instead of being taken away.
           readOnly: blocked ? true : undefined,
           'aria-disabled': blocked ? true : undefined,
-          onChange: handle.onChange,
-          onKeyDown: handle.onKeyDown,
-          onSelect: handle.onSelect,
+          onChange: onChange,
+          onKeyDown: onKeyDown,
+          onSelect: onSelect,
+          // Paste an image → a chip. Only wired when uploads are (so an unwired
+          // composer carries no extra handler); the desktop textarea reads it
+          // off `rest`, and the phone contenteditable keeps its own plain-text
+          // paste guard, so this is a desktop path in practice.
+          onPaste: attachments ? onPaste : undefined,
           // The composer is a message box, not a code editor: the browser's own
           // spellcheck is the right default, and autocapitalise/autocorrect are
           // what a phone keyboard expects from one.
           spellCheck: true,
-          enterKeyHint: 'send',
+          // A soft keyboard shows a RETURN key, not "Send" — Enter breaks the line
+          // and the send DISC sends (BUG: the iOS keyboard showed "Send" and Enter
+          // submitted). `enterKeyHint` only reaches VIRTUAL keyboards, which are a
+          // touch (coarse-pointer) surface, and there the composer's Enter IS a
+          // newline (`use-composer.ts` gates that on the same coarse pointer) — so
+          // 'enter' is unconditional: a physical desktop keyboard ignores the hint
+          // and still submits on Enter, unchanged.
+          enterKeyHint: 'enter',
           // The `@`/`/` popover, as a relationship a screen reader can follow.
           // Without it the popover was invisible to assistive tech: nothing
           // announced that suggestions had appeared, ↑/↓ moved a highlight that
@@ -271,7 +646,7 @@ export function ChatComposer({
           <div className="grid size-10 place-items-center">
             <AnimatePresence initial={false}>
               <motion.div
-                key={canSend ? 'send' : active ? 'stop' : 'idle'}
+                key={showSend ? 'send' : active ? 'stop' : 'idle'}
                 style={{ gridArea: '1 / 1' }}
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
@@ -289,7 +664,7 @@ export function ChatComposer({
                     empty box during a turn → Stop; at rest → the boards' mic.
                     Stop with a draft up is still one Escape away (the key
                     contract) and the dock keeps its own Stop. */}
-                {canSend ? (
+                {showSend ? (
                   <TrailingButton
                     // THE CONTROL SAYS WHERE THE WORDS ARE GOING (fase B4
                     // T4.4). While the draft reads as a hand-off, Enter goes to
@@ -298,14 +673,20 @@ export function ChatComposer({
                     // element, same cell, no swap: only the sentence differs.
                     testId="chat-send"
                     label={
-                      handle.handoff
-                        ? `Hand to ${handle.handoff.label}`
-                        : `Send to ${label}`
+                      uploading
+                        ? 'Waiting for uploads…'
+                        : handoff
+                          ? `Hand to ${handoff.label}`
+                          : `Send to ${label}`
                     }
-                    data-handoff={handle.handoff ? handle.handoff.to : undefined}
+                    data-handoff={handoff ? handoff.to : undefined}
                     phone={phone}
-                    onClick={handle.submit}
-                    disabled={handle.sending}
+                    onClick={submit}
+                    // Disabled while a POST is in flight, while an upload is
+                    // still settling, or when there is nothing actually sendable
+                    // (only errored chips + an empty box) — `!canSend` folds all
+                    // three: the disc stays visible, present but not yet armed.
+                    disabled={sending || !canSend}
                   >
                     {/* THE GLYPH CHANGES TOO, not just the label (fase B4
                         T4.4). An `aria-label` alone is not "visible before the
@@ -313,9 +694,9 @@ export function ChatComposer({
                         holds the arrow becomes the RECIPIENT'S FACE, which is
                         this app's word for "this is going to them" everywhere
                         else. Same cell, same size, no reflow. */}
-                    {handle.handoff ? (
+                    {handoff ? (
                       <SessionMark
-                        seed={handle.handoff.to}
+                        seed={handoff.to}
                         size={phone ? 19 : 21}
                         animate={false}
                         label={null}
@@ -329,32 +710,147 @@ export function ChatComposer({
                     testId="chat-stop"
                     label="Stop"
                     phone={phone}
-                    onClick={handle.stop}
+                    onClick={stop}
                   >
                     <StopIcon />
                   </TrailingButton>
-                ) : (
-                  /* At rest the boards' mic keeps its cell. It is decoration
-                     until dictation lands — so it is `aria-hidden` and not a
-                     button, exactly as B0 draws it. */
-                  <span
-                    aria-hidden
+                ) : dictation.supported ? (
+                  /* AT REST THE MIC IS DICTATION — a real button, not decoration.
+                     Tapping it toggles Web Speech; transcribed text lands in the
+                     draft via `insert`. It exists on iOS too
+                     (`webkitSpeechRecognition`), so it is NOT hidden there.
+
+                     While listening it shows a recording state: `aria-pressed`
+                     and the brand-amber wash in place of the `.sm-mic` disc, so
+                     the user can see dictation is live before they speak. */
+                  <motion.button
+                    type="button"
+                    data-testid="chat-mic"
+                    aria-label={dictation.listening ? 'Stop dictation' : 'Dictate'}
+                    aria-pressed={dictation.listening}
+                    title={dictation.listening ? 'Stop dictation' : 'Dictate'}
+                    onClick={onMicTap}
+                    whileTap={{ scale: 0.94 }}
+                    transition={springs.buttonPress}
                     className={cn(
-                      'sm-mic grid place-items-center rounded-full',
+                      'relative grid place-items-center rounded-full',
                       phone ? 'size-9' : 'size-10',
+                      // Recording → brand wash; at rest → the boards' inverted disc.
+                      // Swapped (not layered) so there is no `.sm-mic`-vs-utility
+                      // specificity fight over the background.
+                      dictation.listening ? 'bg-brand/20 text-brand' : 'sm-mic',
+                      // The invisible 44pt target on a coarse pointer — same
+                      // `::after` inset the Send/Stop control uses, so the disc is
+                      // unchanged but a thumb landing 4px wide still presses it.
+                      COARSE_TARGET,
                     )}
                   >
                     <MicIcon />
-                  </span>
+                  </motion.button>
+                ) : (
+                  /* No Web Speech here — draw nothing rather than a dead mic. The
+                     cell keeps its footprint so the field width does not jump
+                     between the idle and the armed states. */
+                  <span aria-hidden className={phone ? 'size-9' : 'size-10'} />
                 )}
               </motion.div>
             </AnimatePresence>
           </div>
         }
       />
+      {/* THE ADD-MENU (COARSE), ANCHORED (owner feedback #3). The sheet is owned
+          by the composer and opened by the `+` above it, not floated in by the
+          route — so it reads as belonging to this bar. It carries the composer's
+          own materials (glass, radius, safe-area) and its rows use the SAME
+          authored list the fine-pointer popover draws from (`chat-actions.ts`).
+          `sheetMounted` holds it out of the tree until the first coarse tap, so
+          Vaul is never constructed on a surface that does not open it; the
+          `coarse` gate keeps it off fine-pointer surfaces (they get the popover). */}
+      {actions && coarse && sheetMounted && (
+        <ChatActionsSheet
+          open={menuOpen}
+          onOpenChange={setMenuOpen}
+          onMention={onMention}
+          onSlash={onSlash}
+          onSchedule={onSchedule ? () => onSchedule(draft) : undefined}
+          onSnippets={actions.onSnippets}
+          onSwitchSession={actions.onSwitchSession}
+          onCommandPalette={actions.onCommandPalette}
+          // The Attach group at the top of the `+` sheet — Camera / Photo
+          // library / Files — feeds the same staged plane the chips render.
+          onFiles={handleFiles}
+        />
+      )}
     </ComposerFrame>
   )
 }
+
+/** The `+ → ×` morph — a `PlusIcon` rotated 45° IS an `×`, so one glyph carries
+ *  its own open/close state with zero new bytes. Shared by the coarse `+` (opens
+ *  the sheet) and the fine `+` (the popover trigger). */
+function AddGlyph({ open, reduce }: { open: boolean; reduce: boolean }) {
+  return (
+    <motion.span
+      className="grid place-items-center"
+      animate={{ rotate: open ? 45 : 0 }}
+      transition={reduce ? motionOff : springs.buttonPress}
+    >
+      <PlusIcon />
+    </motion.span>
+  )
+}
+
+/**
+ * A leading disc — the ADD `+`, or a desktop mention/schedule button. The exact
+ * counterpart of `TrailingButton` on the right: same `size-9`/`size-10` cell,
+ * same `grid place-items-center`, same invisible 44pt target grown by a
+ * `::after` inset on a coarse pointer. Ghost, not inverted — the send disc is
+ * the one filled control on the bar, and a filled `+` would compete with it.
+ *
+ * `forwardRef` + a props spread so the fine-pointer `+` can be a Radix
+ * `PopoverTrigger asChild`: Radix clones this button and injects its own
+ * `onClick` / `aria-expanded` / `aria-controls` / `data-state` / `ref`, which the
+ * trailing `{...rest}` forwards onto the real `<button>` (rest wins over the
+ * defaults). The coarse `+` and the desktop pair pass an explicit `onClick`
+ * instead, with no `rest` to override it.
+ */
+const LeadingButton = React.forwardRef<
+  HTMLButtonElement,
+  {
+    testId: string
+    label: string
+    phone: boolean
+    onClick?: () => void
+    /** The add control announces its menu — `aria-expanded` for a screen reader,
+     *  and it is what tells the caller this button owns a disclosure. */
+    expanded?: boolean
+    children: React.ReactNode
+  } & Omit<React.ComponentPropsWithoutRef<'button'>, 'onClick' | 'children' | 'className'>
+>(function LeadingButton({ testId, label, phone, onClick, expanded, children, ...rest }, ref) {
+  return (
+    <button
+      ref={ref}
+      type="button"
+      data-testid={testId}
+      aria-label={label}
+      title={label}
+      aria-expanded={expanded}
+      onClick={onClick}
+      className={cn(
+        'relative grid flex-none place-items-center rounded-full text-ink-2 transition-colors',
+        phone ? 'size-9' : 'size-10',
+        'hover:text-ink active:bg-fill-soft',
+        // The invisible 44pt target — pointer-events ride the pseudo-element, so
+        // a thumb landing a few px wide of the glyph still hits this and nothing
+        // else. The pill's `gap-3` leaves clearance to the field.
+        COARSE_TARGET,
+      )}
+      {...rest}
+    >
+      {children}
+    </button>
+  )
+})
 
 /** The one inverted control, as a real button. Same disc as `.sm-mic` (the
  *  boards' trailing cell) — the DISC is B0's 36/40px and is not resized here,
@@ -403,8 +899,7 @@ function TrailingButton({
         // the pseudo-element, so a thumb landing 4px wide of the disc still
         // presses this button and nothing else — it is inside the pill, whose
         // `gap-3` leaves 8px of clearance to the field either way.
-        '[@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-1',
-        '[@media(pointer:coarse)]:after:content-[""]',
+        COARSE_TARGET,
         disabled && 'opacity-60',
       )}
     >
@@ -608,24 +1103,6 @@ const NOTICE_TITLE: Record<ComposerNotice['kind'], string> = {
   'handoff-failed': 'That hand-off didn’t go through — your message is still here.',
 }
 
-/** Schedule — a clock face, matching the `⏱` the transcript's schedule lines
- *  and the scheduler's own chips carry. Monochrome `currentColor` like every
- *  other glyph on this surface; the emoji taxonomy is terminal/tile-only. */
-function ClockIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 18 18" fill="none" aria-hidden>
-      <circle cx="9" cy="9" r="6.4" stroke="currentColor" strokeWidth="1.4" />
-      <path
-        d="M9 5.6V9l2.4 1.6"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  )
-}
-
 /** Send — an upward arrow, the one glyph every messenger agrees on. */
 function SendIcon() {
   return (
@@ -634,6 +1111,34 @@ function SendIcon() {
         d="M9 14.6V3.6M4.4 8.2L9 3.6l4.6 4.6"
         stroke="currentColor"
         strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+/** Attach — a paperclip. The one place a paperclip is the honest glyph: a
+ *  direct desktop file-picker button (the mobile add-menu rule is paperclip-
+ *  free, but there attach is a labelled ROW, not an icon).
+ *
+ *  OPTICALLY MATCHED TO ITS NEIGHBOURS (owner: first the paperclip read SMALLER,
+ *  then the over-correction made it read LARGER — "visueel te groot tov de
+ *  anderen"). The old glyph was a busy double-curl whose ink measured a size UP
+ *  against the compact `@`/clock circles (~14.6×15.5 vs their ~13×13). This is the
+ *  canonical single-loop paperclip — the inner wire runs straight and parallel to
+ *  the outer, no curl — drawn on a 24-viewBox at 18px: its ink WIDTH lands 13.2px,
+ *  level with `@` (13) and the clock (13.6) in the rig, stroke 2.0 (≈1.5px at 18px,
+ *  the weight `@`'s 1.4 carries). The diagonal reads heavier per unit than a
+ *  compact circle, so matching the WIDTH (not the taller diagonal bounding) is
+ *  what makes the three read as one size. */
+function PaperclipIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M21 11l-9 9a6 6 0 01-8-8l9-9a4 4 0 016 6l-9 9"
+        stroke="currentColor"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       />

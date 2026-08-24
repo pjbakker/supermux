@@ -366,7 +366,15 @@ export function MobileBottomPanel({
       // unchanged from when the dock owned this.
       className={cn(
         'glass relative shrink-0 overflow-hidden border-t border-border/60',
-        'pb-[max(env(safe-area-inset-bottom),0.5rem)]',
+        // Gate the home-indicator inset on the MIN of both keyboard-open signals:
+        // the JS keyboard detector (`--kb-safe-bottom=0` on visualViewport-shrink
+        // devices) OR the globals `:root:has(:focus)` rule (`--safe-bottom=0` on
+        // devices where the editable matches :has). Whichever fires drops this to
+        // the 0.5rem floor (no 34px band) while typing; neither alone is robust
+        // (the owner's real device shrinks vv but the contenteditable does NOT
+        // match :has, so --safe-bottom stayed 34px). At rest both are the full
+        // env(safe-area-inset-bottom) home-indicator clearance, so min = full.
+        'pb-[max(min(var(--kb-safe-bottom,env(safe-area-inset-bottom)),var(--safe-bottom,env(safe-area-inset-bottom))),0.5rem)]',
       )}
     >
       {/* The drag handle — the ONE drag region. 22pt tall hit area; visible

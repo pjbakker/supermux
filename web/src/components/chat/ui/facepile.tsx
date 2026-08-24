@@ -3,7 +3,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * Two forms, one component:
  *
- *   cluster  the approved boards' crew mark: three 18px members in a 1-over-2
+ *   cluster  the approved boards' crew mark: three 20px members in a 1-over-2
  *            arrangement inside a 40px box, each stroked with a page-coloured
  *            keyline. It stands in for a single mark in a roster row, so it must
  *            occupy exactly one mark's footprint — a team is a colleague too.
@@ -22,7 +22,7 @@
  */
 import type { ReactNode } from 'react'
 
-import { SessionMark, type MarkPin } from '../../../brand/marks'
+import { SessionMark, type MarkAttention, type MarkPin, type MarkState } from '../../../brand/marks'
 import { cn } from '../../../lib/utils'
 
 import { FACEPILE, MARK_SIZE } from './metrics'
@@ -31,13 +31,25 @@ export interface FacepileMember {
   seed: string
   pin?: MarkPin
   name?: string
+  /**
+   * The member's live expression, where the caller knows a session status
+   * (`markStateForSession`). Omit and the mark rests on `idle` — the right
+   * default for a face with no live session behind it (a bare @mention). Under
+   * the Grok skin this is what makes a pile of colleagues read their states.
+   */
+  state?: MarkState
+  /**
+   * The decoupled attention halo (`attentionFor`) — `needs`/`blocked`/`null`.
+   * Consumed only under the Grok skin, so it never touches the base pile.
+   */
+  attention?: MarkAttention
 }
 
 export interface FacepileProps {
   members: readonly FacepileMember[]
   /** `cluster` (a mark-sized crew badge) or `row` (an inline pile). */
   variant?: 'cluster' | 'row'
-  /** Member size. The cluster is fixed at 18px by its geometry. */
+  /** Member size. The cluster is fixed at 20px by its geometry. */
   size?: number
   /**
    * Keyline colour — the surface the pile sits on (`PAPER[theme].paper`).
@@ -80,6 +92,8 @@ export function Facepile({
               pin={m.pin}
               size={FACEPILE.cluster.size}
               ring={ring}
+              state={m.state}
+              attention={m.attention}
               animate={i === 0}
               label={null}
             />
@@ -105,7 +119,15 @@ export function Facepile({
               active && 'bg-fill-soft py-0.5 pl-0.5 pr-2.5',
             )}
           >
-            <SessionMark seed={m.seed} pin={m.pin} size={size} ring={ring} label={null} />
+            <SessionMark
+              seed={m.seed}
+              pin={m.pin}
+              size={size}
+              ring={ring}
+              state={m.state}
+              attention={m.attention}
+              label={null}
+            />
             {active && m.name && (
               <span className="whitespace-nowrap text-[12px] font-medium text-ink">{m.name}</span>
             )}

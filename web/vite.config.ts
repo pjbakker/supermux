@@ -1,8 +1,51 @@
+import { execSync } from 'node:child_process'
 import { defineConfig } from 'vite'
 import { fileURLToPath, URL } from 'node:url'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
+
+// Git sha this bundle is built from, baked in so the running page can tell when
+// the SERVER is live on a newer build than itself (the SW-lifecycle-independent
+// update guard in `src/lib/version-guard.ts`). Precedence mirrors
+// `server/build.rs` EXACTLY (`SUPERMUX_VERSION_SHA` env, else `git rev-parse
+// HEAD`) so the JS-baked sha and the server's `/api/version` `current.sha` are
+// identical for a given deploy and only differ once a new build ships.
+const BUILD_SHA: string =
+  process.env.SUPERMUX_VERSION_SHA?.trim() ||
+  (() => {
+    try {
+      return execSync('git rev-parse HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString()
+        .trim()
+    } catch {
+      return 'dev'
+    }
+  })()
+
+// Emit `dist/version.json` = {"sha": BUILD_SHA} — the SAME sha baked into
+// `__APP_BUILD_SHA__` above — so the server can serve the EMBEDDED FRONTEND's sha
+// as the client-reload freshness signal (see server/src/updates/preflight.rs +
+// src/lib/version-guard.ts). Because it reuses BUILD_SHA, dist/version.json.sha
+// and __APP_BUILD_SHA__ are ALWAYS equal for a given frontend build. It is a
+// build-only hook (generateBundle never runs on the dev server); the wholesale
+// `cp -r web/dist server/static` in scripts/build.sh embeds it via rust-embed,
+// and the embed is hash-gated on the dist tree so it re-embeds ONLY when the
+// frontend genuinely rebuilds. Not matched by the SW precache glob
+// (`**/*.{js,css,svg,png,woff2}`); read server-side only, never fetched by the
+// client — no service-worker interaction.
+const stampFrontendSha = {
+  name: 'supermux-frontend-sha-stamp',
+  generateBundle() {
+    // `this` is the rollup plugin context inside generateBundle.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(this as any).emitFile({
+      type: 'asset',
+      fileName: 'version.json',
+      source: JSON.stringify({ sha: BUILD_SHA }),
+    })
+  },
+}
 
 // https://vite.dev/config/
 // Tailwind v4 is wired via the first-party Vite plugin —
@@ -11,6 +54,7 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    stampFrontendSha,
     // Installable PWA for iOS Safari.
     //
     // The service worker caches ONLY the static app shell (fingerprinted JS/CSS
@@ -87,6 +131,29 @@ export default defineConfig({
         ],
       },
       workbox: {
+        // iOS-STANDALONE STUCK-SW FIX. Two SW-side settings so a freshly
+        // installed worker takes over IMMEDIATELY instead of parking as a
+        // WAITING worker forever:
+        //   - `skipWaiting` → the new SW calls self.skipWaiting() on install, so
+        //     it does not sit behind the old one until every tab closes (which,
+        //     for a home-screen PWA, is ~never);
+        //   - `clientsClaim` → on activate it clients.claim()s all open pages, so
+        //     it starts controlling THIS page without a reload.
+        // Together they guarantee ACTIVATION is never stuck: iOS standalone never
+        // reliably delivered the client-side "tap to update" (updateSW(true) /
+        // SKIP_WAITING) that `prompt` mode waits on, so the fresh precache never
+        // activated and the owner's PWA served the old bundle after every deploy.
+        // Activation now happens on its own; the page still lands on the fresh
+        // bundle via the draft-guarded `controllerchange` reload in `lib/pwa.ts`.
+        // registerType stays `prompt` (the VISIBLE reload keeps its draft veto).
+        skipWaiting: true,
+        clientsClaim: true,
+        // Bump this to RENAME the Cache Storage buckets so an already-installed,
+        // stuck SW cannot keep serving its OLD precache: iOS re-precaches into the
+        // new-named bucket on next launch, and `cleanupOutdatedCaches` (below)
+        // purges the superseded ones. Bump the suffix whenever a stale-cache
+        // deadlock must be force-broken again.
+        cacheId: 'supermux-v2',
         // Precache the fingerprinted shell assets (JS/CSS/icons). These are
         // content-hashed, so CacheFirst is safe and `cleanupOutdatedCaches`
         // sweeps superseded revisions on every SW activation.
@@ -166,6 +233,10 @@ export default defineConfig({
       },
     }),
   ],
+  // Bundle-build identity for the update guard (see BUILD_SHA above).
+  define: {
+    __APP_BUILD_SHA__: JSON.stringify(BUILD_SHA),
+  },
   resolve: {
     // @/* → src/* (shadcn copy-source convention; mirrors tsconfig paths).
     alias: {

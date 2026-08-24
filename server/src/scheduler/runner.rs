@@ -117,6 +117,7 @@ pub async fn run(state: AppState, sched: Schedule, trigger: Trigger) {
     // Surface the run to clients (anti-vision: push, never poll).
     let _ = state.sse_tx.send(SseEvent {
         event: "alerts".to_string(),
+        company_id: None,
         payload: json!({
             "level": if outcome.status == "error" { "error" } else { "info" },
             "source": "scheduler",
@@ -293,7 +294,7 @@ async fn execute_tmux(state: &AppState, sched: &Schedule) -> JobOutcome {
 
     for (sent, preview) in deliveries(sched, wrap) {
         if let Err(e) =
-            sessions::lifecycle::send_harness_text(state, &sched.session, &sent, Some(&preview))
+            sessions::lifecycle::send_harness_text(state, &sched.session, &sent, Some(&preview), None)
                 .await
         {
             return JobOutcome {
@@ -526,6 +527,8 @@ async fn execute_boot(state: &AppState, sched: &Schedule) -> JobOutcome {
         host_id: None,
         // Scheduler-booted sessions take the default (tmux) runtime.
         runtime: None,
+        model: None,
+        company_id: None,
     };
     if let Err(e) = sessions::create(state, input).await {
         return JobOutcome {

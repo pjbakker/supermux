@@ -70,6 +70,8 @@ async fn session_create_and_start_never_install_the_statusline() {
         // THE DEFAULT. Not a test convenience — `config.toml` with no
         // `statusline_tap` key resolves to exactly this.
         statusline_tap: false,
+        isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
+        human_auth: Default::default(),
     };
     let pool = db::init(&config).await.expect("db init");
     let state = AppState::new(pool, config);
@@ -97,6 +99,8 @@ async fn session_create_and_start_never_install_the_statusline() {
             bypass_permissions: None,
             // tmux, so the pin does not depend on a native holder binary.
             runtime: Some("tmux".into()),
+            model: None,
+            company_id: None,
         },
     )
     .await

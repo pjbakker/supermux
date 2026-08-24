@@ -21,12 +21,15 @@ import type { ChatEntry } from '../../src/components/chat/entries'
 import {
   applyReceipt,
   CONFIRM_SKEW_MS,
+  deliveryLine,
   isInlineOwned,
   latchUndelivered,
   markInlineOwned,
   normalizeSend,
   PROMPT_CLAMP_CHARS,
   reconcile,
+  settleReceipted,
+  settleUndelivered,
   watchdogState,
   WATCHDOG_MS,
   type PendingSend,
@@ -136,6 +139,189 @@ describe('reconcile', () => {
     // goes away instead of accusing a delivery that happened.
     const out = reconcile([mk('ship it', 1_000, 'undelivered')], [entry('ship it', 9_000)], 10_000)
     expect(out).toEqual([])
+  })
+
+  // #13 — a queued send Claude Code promotes to a NON-`prompt` user kind still
+  // reconciles, so the optimistic row leaves and does not stand beside the
+  // confirmed bubble as a duplicate.
+  test('a promoted `delegation` echo reconciles the optimistic row away', () => {
+    const out = reconcile([mk('ship it', 1_000)], [entry('ship it', 1_500, 'delegation')], 2_000)
+    expect(out).toEqual([])
+  })
+
+  test('a promoted `schedule` echo reconciles the optimistic row away', () => {
+    const out = reconcile([mk('nightly deploy', 1_000)], [entry('nightly deploy', 1_500, 'schedule')], 2_000)
+    expect(out).toEqual([])
+  })
+
+  test('a `teammate` entry with the same text never claims a pending', () => {
+    // Still excluded: that turn was authored by ANOTHER agent, so matching it
+    // would confirm a delivery of OUR send that never happened.
+    const out = reconcile([mk('status?', 1_000)], [entry('status?', 1_500, 'teammate')], 2_000)
+    expect(out).toHaveLength(1)
+  })
+})
+
+describe('settleReceipted — the window-eviction exit (#45)', () => {
+  /** A receipted, queued mid-turn row (delivered per the server, no transcript
+   *  echo in the window yet). */
+  function receiptedQueued(text: string, atMs: number): PendingSend {
+    return { ...mk(text, atMs), receipted: true, activeAtSend: true }
+  }
+
+  test('a receipted row clears once idle AND an agent turn answered after the send', () => {
+    // Delivered (receipted) and answered (an assistant entry after the send),
+    // session back to idle — the echo need not be in the window. This is the
+    // IMG_2441 stuck state clearing.
+    const p = receiptedQueued('revert the migration', 10_000)
+    const answered = [entry('done', 40_000, 'assistant')]
+    expect(settleReceipted([p], answered, { active: false })).toEqual([])
+  })
+
+  test('it does NOT clear while the session is still active — the message is genuinely queued', () => {
+    // The turn it is queued behind is still running and emitting agent entries
+    // stamped after the send. Clearing here would pull the correct "queued
+    // behind that turn" indicator out from under an unhandled message.
+    const p = receiptedQueued('revert the migration', 10_000)
+    const midTurn = [entry('still working', 20_000, 'tool_use')]
+    const out = settleReceipted([p], midTurn, { active: true })
+    expect(out).toHaveLength(1)
+    // …and the live indicator still shows the queued sentence.
+    expect(deliveryLine(out[0], { active: true })).toContain('queued behind that turn')
+  })
+
+  test('it does NOT clear when no agent turn has produced output after the send', () => {
+    // Idle, receipted, but the only agent entry predates the send: no answer to
+    // settle against.
+    const p = receiptedQueued('revert the migration', 10_000)
+    const before = [entry('old reply', 5_000, 'assistant')]
+    expect(settleReceipted([p], before, { active: false })).toHaveLength(1)
+  })
+
+  test('it never clears an UNRECEIPTED row, however quiet the session', () => {
+    // No server receipt = no proof of delivery, so an idle session with agent
+    // output is not evidence THIS send landed. The watchdog still owns it.
+    const p = mk('revert the migration', 10_000)
+    const answered = [entry('done', 40_000, 'assistant')]
+    expect(settleReceipted([p], answered, { active: false })).toEqual([p])
+  })
+
+  test('same reference back when nothing settled', () => {
+    const cur = [receiptedQueued('x', 10_000)]
+    expect(settleReceipted(cur, [], { active: false })).toBe(cur)
+  })
+
+  test('a live in-flight send in the same list is never dropped', () => {
+    // A `sending` row (POST not back) is not receipted, so settle leaves it —
+    // only the answered receipted row goes.
+    const inflight = mk('typing', 41_000, 'sending')
+    const done = receiptedQueued('revert', 10_000)
+    const out = settleReceipted([done, inflight], [entry('ok', 40_000, 'assistant')], { active: false })
+    expect(out).toEqual([inflight])
+  })
+})
+
+describe('settleUndelivered — the lost-response eviction exit (IMG_2451)', () => {
+  /** A LOST-RESPONSE row: the POST left but no reply came back (status-0
+   *  transport failure), sent into an IDLE session, escalated to undelivered
+   *  with the "Can't reach supermux-server" line. `seen` carries the pre-send
+   *  window; the echo that would clear it has been evicted from a long turn. */
+  function lostResponse(text: string, atMs: number, over: Partial<PendingSend> = {}): PendingSend {
+    return {
+      ...mk(text, atMs, 'undelivered'),
+      transportError: true,
+      activeAtSend: false,
+      seen: new Set(['old']),
+      note: 'Can’t reach supermux-server.',
+      ...over,
+    }
+  }
+  /** The aliveness ledger: the session was last observed active at `at`. */
+  const aliveAt = (at: number) => (ms: number) => at >= ms
+
+  test('clears once idle + answered + the session went active after the send, echo evicted', () => {
+    // Delivered and ANSWERED — the assistant reply is in the window — but this
+    // send's own prompt echo was evicted before reconcile could match it. The
+    // aliveness ledger witnessed the turn this send started. The false failure
+    // and its duplicating Retry go away with no transcript echo to match.
+    const p = lostResponse('deploy now', 10_000)
+    const answered = [entry('done', 40_000, 'assistant')]
+    const out = settleUndelivered([p], answered, { active: false, sawActiveSince: aliveAt(30_000) })
+    expect(out).toEqual([])
+  })
+
+  test('a GENUINELY-LOST send into an idle session STILL shows the error', () => {
+    // POST failed, nothing was typed, so the idle session produced no turn: no
+    // agent output after the send AND the ledger never saw it go active. The row
+    // keeps "Can't reach supermux-server. Retry".
+    const p = lostResponse('deploy now', 10_000)
+    // No agent entry after the send at all.
+    expect(settleUndelivered([p], [], { active: false, sawActiveSince: aliveAt(0) })).toEqual([p])
+    // An agent turn exists but the ledger never saw the session go active AFTER
+    // this send (the answer predates it / belongs to an older turn).
+    const stale = [entry('old reply', 5_000, 'assistant')]
+    expect(settleUndelivered([p], stale, { active: false, sawActiveSince: aliveAt(0) })).toEqual([p])
+  })
+
+  test('does NOT clear while a turn is still running', () => {
+    const p = lostResponse('deploy now', 10_000)
+    const midTurn = [entry('working', 20_000, 'tool_use')]
+    expect(
+      settleUndelivered([p], midTurn, { active: true, sawActiveSince: aliveAt(30_000) }),
+    ).toEqual([p])
+  })
+
+  test('never clears a send made MID-TURN — the running turn’s output proves nothing', () => {
+    // `activeAtSend` true: a previous turn was already running, so agent output
+    // after the send is that turn’s, not evidence THIS send landed. Only the
+    // receipt or the echo may clear such a row.
+    const p = lostResponse('deploy now', 10_000, { activeAtSend: true })
+    const answered = [entry('done', 40_000, 'assistant')]
+    expect(
+      settleUndelivered([p], answered, { active: false, sawActiveSince: aliveAt(30_000) }),
+    ).toEqual([p])
+  })
+
+  test('never clears a server REFUSAL (409) — the server said no', () => {
+    // A hard refusal is not a transport error, so later agent output cannot
+    // confirm a delivery the server itself declined.
+    const p = lostResponse('deploy now', 10_000, { transportError: false })
+    const answered = [entry('done', 40_000, 'assistant')]
+    expect(
+      settleUndelivered([p], answered, { active: false, sawActiveSince: aliveAt(30_000) }),
+    ).toEqual([p])
+  })
+
+  test('defers to reconcile whenever a user echo is visible after the send', () => {
+    // This send’s OWN echo is in the window — reconcile owns that case, so the
+    // eviction exit keeps its hands off (and reconcile then clears it).
+    const p = lostResponse('deploy now', 10_000)
+    const withEcho = [entry('deploy now', 12_000, 'prompt'), entry('done', 40_000, 'assistant')]
+    expect(
+      settleUndelivered([p], withEcho, { active: false, sawActiveSince: aliveAt(30_000) }),
+    ).toEqual([p])
+    // …and reconcile does clear it, leaving the transcript copy as sole survivor.
+    expect(reconcile([p], withEcho, 60_000)).toEqual([])
+  })
+
+  test('a LATER send’s turn is never mistaken for this one’s', () => {
+    // The lost send X (idle), then a SUCCESSFUL send Y whose echo is in the
+    // window. The visible answer may be Y’s, so X must NOT be cleared here — its
+    // own delivery is still unproven. `hasUserEntryAfter` sees Y’s echo and
+    // defers. (Y’s own row is cleared by reconcile elsewhere.)
+    const x = lostResponse('first', 10_000)
+    const entries = [entry('second', 30_000, 'prompt'), entry('answer', 40_000, 'assistant')]
+    expect(
+      settleUndelivered([x], entries, { active: false, sawActiveSince: aliveAt(35_000) }),
+    ).toEqual([x])
+  })
+
+  test('same reference back when nothing settled', () => {
+    const cur = [lostResponse('x', 10_000, { transportError: false })]
+    expect(settleUndelivered(cur, [entry('a', 40_000, 'assistant')], {
+      active: false,
+      sawActiveSince: () => true,
+    })).toBe(cur)
   })
 })
 
@@ -300,6 +486,40 @@ describe('the server’s delivery receipt', () => {
   test('a receipt for different text confirms nothing', () => {
     const p: PendingSend = { ...mk('deploy', 1_000), receiptAtS: 40 }
     expect(applyReceipt([p], receipt('revert', 41))).toEqual([p])
+  })
+
+  test('a burst back-fills: the last member is text-matched, the earlier ones ride its receipt', () => {
+    // The scalar receipt only ever holds the LAST send's text, so only msg3 is
+    // text-matched. msg1/msg2 were POSTed (unconfirmed) and serialized ahead of
+    // it, so they were delivered too — they must not later show the false
+    // "didn't reach the session".
+    const msg1: PendingSend = { ...mk('one', 1_000), receiptAtS: 40 }
+    const msg2: PendingSend = { ...mk('two', 1_500), receiptAtS: 40 }
+    const msg3: PendingSend = { ...mk('three', 2_000), receiptAtS: 40 }
+    const out = applyReceipt([msg1, msg2, msg3], receipt('three', 42))
+    expect(out.map((p) => p.receipted)).toEqual([true, true, true])
+    // …and being receipted, none of them escalates.
+    for (const p of out) {
+      expect(watchdogState(p, { nowMs: WATCHDOG_MS * 10, sawActiveSince: () => false })).toBe(
+        'unconfirmed',
+      )
+    }
+  })
+
+  test('back-fill never confirms a NEWER un-matched send, nor a refused earlier one', () => {
+    // Newer than the matched send → serialized AFTER it, so its own receipt is
+    // still owed; must stay unreceipted.
+    const matched: PendingSend = { ...mk('matched', 1_000), receiptAtS: 40 }
+    const newer: PendingSend = { ...mk('newer', 2_000), receiptAtS: 40 }
+    // An earlier UNDELIVERED send may be a genuinely refused one (409, no
+    // last_send written) — atS ordering alone must not confirm it.
+    const refused: PendingSend = { ...mk('refused', 500, 'undelivered'), receiptAtS: 40 }
+    const out = applyReceipt([refused, matched, newer], receipt('matched', 41))
+    const byId = Object.fromEntries(out.map((p) => [p.text, p]))
+    expect(byId.matched.receipted).toBe(true)
+    expect(byId.newer.receipted).toBeUndefined()
+    expect(byId.refused.receipted).toBeUndefined()
+    expect(byId.refused.state).toBe('undelivered')
   })
 
   test('a receipted send never escalates', () => {

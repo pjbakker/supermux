@@ -8,20 +8,35 @@ const AUTO_HEAL_KEY = 'recovery.auto_heal'
 import * as React from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
+  AnimatePresence,
   MotionConfig,
   motion,
   useScroll,
   useTransform,
+  type Variants,
 } from 'framer-motion'
 import {
+  ArrowUpCircle,
   Check,
+  CheckCircle2,
+  ChevronDown,
   ChevronsUpDown,
+  Loader2,
   PlayCircle,
   RefreshCw,
   SlidersHorizontal,
+  Store as StoreIcon,
+  X,
 } from 'lucide-react'
 
+import { cn } from '@/lib/utils'
 import { springs } from '@/lib/springs'
+import {
+  adoptNewBuild,
+  fetchServedSha,
+  isNewerServedSha,
+  isRealSha,
+} from '@/lib/version-guard'
 import { appVersion, authToken, baseUrl } from '@/env'
 import { MISC, ONBOARDING } from '@/brand/copy'
 import {
@@ -38,6 +53,9 @@ import {
   type OverviewPreview,
 } from '@/stores/ui-store'
 import { useAgentToolsSheet } from '@/stores/claude-tools-store'
+import { botModeOn, BOT_KILL_SWITCH_KEY } from '@/lib/bot-mode-flag'
+import { GROK_KILL_SWITCH_KEY } from '@/lib/grok-mode-flag'
+import { useConnectors } from '@/stores/connectors-store'
 import { getSoundsEnabled, playTone, primeAudio, setSoundsEnabled } from '@/lib/sound'
 import { pushApi, type NotifCategory, type PushAttempt, type PushPrefs } from '@/lib/api'
 import { usePush } from '@/hooks/use-push'
@@ -333,12 +351,12 @@ function ExperimentalSection() {
   const { data, isError } = useAgentTeams()
   const patch = usePatchAgentTeams()
   const enabled = !!data?.enabled
-  const chatRenderer = useUI((s) => s.chatRenderer)
-  const setChatRenderer = useUI((s) => s.setChatRenderer)
+  const botMode = useUI((s) => s.botMode)
+  const setBotMode = useUI((s) => s.setBotMode)
 
   const footnote = isError
     ? 'This server build doesn’t support Agent Teams yet.'
-    : 'Runs several Claude agents in parallel for one task — expect roughly a few times the tokens of a single session. Applies only when you start a team. Chat renderer: read-only preview of Claude sessions in focus mode (terminal one tap away) — early A1 dogfood, local Claude sessions only.'
+    : 'Runs several Claude agents in parallel for one task — expect roughly a few times the tokens of a single session. Applies only when you start a team.'
 
   return (
     <Section title="Experimental" footnote={footnote}>
@@ -354,12 +372,13 @@ function ExperimentalSection() {
         }
       />
       <Row
-        label="Chat renderer (preview)"
+        label="Bot mode"
+        hint="Your agents become bots: a roster inbox, chat threads instead of terminals, and Grok’s visual language across the app. Terminals stay one tap away. Takes effect on the next reload."
         control={
           <Switch
-            ariaLabel="Enable the chat renderer for local Claude sessions"
-            checked={chatRenderer}
-            onCheckedChange={setChatRenderer}
+            ariaLabel="Turn your agents into bots (roster inbox, chat threads, Grok skin)"
+            checked={botMode}
+            onCheckedChange={setBotMode}
           />
         }
       />
@@ -483,6 +502,44 @@ function ClaudeToolsSection() {
             <motion.button whileTap={{ scale: 0.96 }} transition={springs.buttonPress}>
               <SlidersHorizontal />
               Manage
+            </motion.button>
+          </Button>
+        }
+      />
+    </Section>
+  )
+}
+
+function ConnectorsSection() {
+  const navigate = useNavigate()
+  const { data: connectors } = useConnectors()
+  // Defensive: a non-array body from an offline / errored endpoint must not
+  // crash the row — coerce before `.filter`.
+  const installed = (Array.isArray(connectors) ? connectors : []).filter(
+    (c) => c.source === 'local',
+  ).length
+  return (
+    <Section
+      title="Connectors"
+      footnote="Secure, per-bot integrations. Keys are sealed in the vault and never shown to your bots — one bot, or all agents, your choice."
+    >
+      <Row
+        label="Connector store"
+        hint={
+          installed > 0
+            ? `${installed} installed · browse the catalog and connect more.`
+            : 'Browse the catalog and give your bots their first connector.'
+        }
+        control={
+          <Button
+            asChild
+            variant="outline"
+            onClick={() => navigate('/store')}
+            className="h-11 gap-1.5"
+          >
+            <motion.button whileTap={{ scale: 0.96 }} transition={springs.buttonPress}>
+              <StoreIcon />
+              Open store
             </motion.button>
           </Button>
         }
@@ -657,6 +714,19 @@ function NotificationsSection() {
     })
   }
 
+  // The lock-screen message-preview toggle. Same optimistic pattern as
+  // `togglePref`, but its key is the reserved (non-category) `message_preview`.
+  function togglePreview(next: boolean) {
+    if (!prefs) return
+    const prev = prefs
+    setPrefs({ ...prefs, message_preview: next })
+    setPrefError(null)
+    void pushApi.putPrefs({ message_preview: next }).catch((e) => {
+      setPrefs(prev)
+      setPrefError(e instanceof Error ? e.message : 'Could not save preference.')
+    })
+  }
+
   // Generic transport test (the existing "Send test" button — bypasses category
   // gates so it always fires when subscribed).
   const [testing, setTesting] = React.useState(false)
@@ -693,7 +763,10 @@ function NotificationsSection() {
   const refreshActivity = React.useCallback(async () => {
     try {
       const rows = await pushApi.getAttempts()
-      setActivity(rows)
+      // Defensive: an offline / errored endpoint can resolve with a non-array
+      // body. Coerce to [] so `activity.map` below never throws
+      // "list.map is not a function" — the panel renders its empty state instead.
+      setActivity(Array.isArray(rows) ? rows : [])
     } catch {
       /* best-effort; the panel renders an empty-state if this fails */
     }
@@ -790,6 +863,21 @@ function NotificationsSection() {
             />
           ))}
 
+          {/* Privacy: show the actual message on the lock screen, or keep
+              banners generic. Default ON — the owner asked for real previews. */}
+          <Row
+            label="Message preview"
+            hint="Show a preview of what happened on the lock screen. Off keeps banners generic for privacy."
+            control={
+              <Switch
+                ariaLabel="Message preview in notifications"
+                checked={prefs?.message_preview ?? true}
+                onCheckedChange={togglePreview}
+                disabled={!prefs}
+              />
+            }
+          />
+
           {prefError ? (
             <Row>
               <p className="text-[13px] text-destructive">{prefError}</p>
@@ -824,7 +912,9 @@ function NotificationsSection() {
                   Nothing yet. Send a test or wait for an agent to ping you.
                 </p>
               ) : (
-                activity.map((a, i) => <ActivityRow key={`${a.at}-${i}`} a={a} />)
+                (Array.isArray(activity) ? activity : []).map((a, i) => (
+                  <ActivityRow key={`${a.at}-${i}`} a={a} />
+                ))
               )}
             </div>
           </Row>
@@ -840,7 +930,228 @@ function NotificationsSection() {
   )
 }
 
+/** The running-bundle status line for the Diagnostics "Build" row. Four states,
+ *  driven by the version-guard served-sha compare so it can never contradict the
+ *  reload bar the background heartbeat surfaces. */
+type BuildStatus = 'checking' | 'latest' | 'stale' | 'unknown'
+
+function BuildStatusLine({
+  status,
+  onReload,
+  onRecheck,
+}: {
+  status: BuildStatus
+  onReload: () => void
+  onRecheck: () => void
+}) {
+  switch (status) {
+    case 'checking':
+      return (
+        <span className="flex items-center gap-2 text-[13px] text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" />
+          Checking for a newer version…
+        </span>
+      )
+    case 'latest':
+      return (
+        <span className="flex items-center gap-2 text-[13px] text-muted-foreground">
+          <CheckCircle2 className="size-4 text-emerald-500" />
+          You are on the latest version
+        </span>
+      )
+    case 'stale':
+      return (
+        <div className="flex items-center gap-2">
+          <span className="flex items-center gap-1.5 text-[13px] font-medium text-amber-600 dark:text-amber-400">
+            <ArrowUpCircle className="size-4" />
+            Update available
+          </span>
+          <Button asChild onClick={onReload} className="h-9 gap-1.5">
+            <motion.button whileTap={{ scale: 0.96 }} transition={springs.buttonPress}>
+              <RefreshCw className="size-4" />
+              Reload
+            </motion.button>
+          </Button>
+        </div>
+      )
+    case 'unknown':
+      return (
+        <button
+          type="button"
+          onClick={onRecheck}
+          className="flex items-center gap-1.5 text-[13px] text-muted-foreground underline-offset-2 hover:underline"
+        >
+          <RefreshCw className="size-3.5" />
+          Couldn’t compare — check again
+        </button>
+      )
+  }
+}
+
+/** Advanced → Diagnostics → Build. Which frontend bundle THIS install is
+ *  actually running (short `__APP_BUILD_SHA__`) and whether the live server has
+ *  already shipped a newer one. Reuses `fetchServedSha` + `isNewerServedSha`
+ *  from the version guard, and the guard's `adoptNewBuild` for the one-tap
+ *  reload — so this manual surface and the background heartbeat always agree. */
+function BuildVersionRow() {
+  const built = __APP_BUILD_SHA__
+  const real = isRealSha(built)
+  const shortSha = real ? built.slice(0, 7) : 'dev'
+  const [status, setStatus] = React.useState<BuildStatus>(real ? 'checking' : 'unknown')
+
+  const applyServed = React.useCallback(
+    (served: string | null) => {
+      if (served == null) setStatus('unknown')
+      else setStatus(isNewerServedSha(served, built) ? 'stale' : 'latest')
+    },
+    [built],
+  )
+
+  // Manual re-check (the "recheck" button): flips to the spinner, then fetches.
+  const check = React.useCallback(() => {
+    if (!real) return
+    setStatus('checking')
+    void fetchServedSha().then(applyServed)
+  }, [real, applyServed])
+
+  // Initial fetch. `status` already starts at 'checking' when `real`, so the
+  // effect does the async fetch WITHOUT a synchronous setState (which would trip
+  // react-hooks/set-state-in-effect) — the state settles in the async callback.
+  React.useEffect(() => {
+    if (!real) return
+    let alive = true
+    void fetchServedSha().then((served) => {
+      if (alive) applyServed(served)
+    })
+    return () => {
+      alive = false
+    }
+  }, [real, applyServed])
+
+  return (
+    <>
+      <Row
+        label="Build"
+        hint={
+          real
+            ? 'The frontend bundle this device is running, compared against the live server.'
+            : 'Local development build — there is no server version to compare against.'
+        }
+        control={
+          <span className="font-mono text-[13px] text-muted-foreground">{shortSha}</span>
+        }
+      />
+      {real ? (
+        <Row>
+          <div className="flex min-h-[2rem] items-center py-1">
+            <BuildStatusLine status={status} onReload={() => void adoptNewBuild()} onRecheck={check} />
+          </div>
+        </Row>
+      ) : null}
+    </>
+  )
+}
+
+/** Advanced → Diagnostics. Operator-only tools: which bundle is running (+ a
+ *  one-tap update when the server is newer). */
+function DiagnosticsSection() {
+  return (
+    <Section
+      title="Diagnostics"
+      footnote="Which frontend bundle this install is running."
+    >
+      <BuildVersionRow />
+    </Section>
+  )
+}
+
+/** Per-section spring-in for the Advanced disclosure header (mirrors the
+ *  `sectionItem` variant the grouped sections use, kept local so `primitives`
+ *  stays untouched). */
+const advItem: Variants = {
+  hidden: { opacity: 0, y: 10 },
+  visible: { opacity: 1, y: 0, transition: springs.cardExpand },
+}
+
+/** The disclosure body's reveal. Expressed as VARIANT LABELS (not inline style
+ *  objects) on purpose: the moved sections are themselves `motion.section`s with
+ *  a `hidden`/`visible` variant, and framer resolves a child's variant by the
+ *  LABEL its ancestor is animating to. An object-based `animate` here would break
+ *  that propagation and leave the children stuck at their `hidden` opacity, so
+ *  the group's `hidden`/`visible` labels must match theirs. */
+const advBody: Variants = {
+  hidden: { height: 0, opacity: 0 },
+  visible: { height: 'auto', opacity: 1, transition: springs.cardExpand },
+}
+
+/** The ADVANCED disclosure — a collapsible group at the foot of Settings that
+ *  holds the power-user / set-once / diagnostic sections so the everyday surface
+ *  (Appearance, Notifications, …) stays short. Collapsed by default; nothing is
+ *  removed, only regrouped. Deep-linked sections (`#hosts`, `#schedules`,
+ *  `#recovery`) are deliberately kept OUTSIDE so their fragment scroll still
+ *  resolves against the always-rendered tree. */
+function AdvancedGroup({ children }: { children: React.ReactNode }) {
+  const [open, setOpen] = React.useState(false)
+  return (
+    <motion.section variants={advItem} className="flex flex-col">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex items-center justify-between gap-3 rounded-2xl border border-border bg-card px-4 py-3.5 text-left transition-colors hover:bg-accent/40"
+      >
+        <span className="flex items-center gap-3">
+          <SlidersHorizontal className="size-[18px] text-muted-foreground" />
+          <span className="flex flex-col">
+            <span className="text-[15px] leading-tight text-foreground">Advanced</span>
+            <span className="text-[13px] leading-snug text-muted-foreground">
+              Power-user, diagnostic, and rarely-touched settings
+            </span>
+          </span>
+        </span>
+        <ChevronDown
+          className={cn(
+            'size-5 shrink-0 text-muted-foreground transition-transform duration-200',
+            open && 'rotate-180',
+          )}
+        />
+      </button>
+      <AnimatePresence initial={false}>
+        {open ? (
+          <motion.div
+            key="advanced-body"
+            variants={advBody}
+            initial="hidden"
+            animate="visible"
+            exit="hidden"
+            className="overflow-hidden"
+          >
+            <div className="flex flex-col gap-7 pt-7">{children}</div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+    </motion.section>
+  )
+}
+
 export function Settings() {
+  const navigate = useNavigate()
+  // Grok hides Settings from the nav (layout.tsx `grokHidden`), so under grok
+  // this route grows its own exit affordance — a top-right close X. Detected the
+  // same way the shell does (store botMode + the two kill-switches) so the
+  // button appears ONLY under grok; the base app (grok off) keeps Settings in
+  // the nav and this route stays byte-identical (no extra button in its header).
+  const [grok] = React.useState(() =>
+    botModeOn(
+      useUI.getState().botMode,
+      typeof localStorage === 'undefined'
+        ? null
+        : localStorage.getItem(BOT_KILL_SWITCH_KEY),
+      typeof localStorage === 'undefined'
+        ? null
+        : localStorage.getItem(GROK_KILL_SWITCH_KEY),
+    ),
+  )
   const { theme, setTheme } = useTheme()
   const viewMode = useUI((s) => s.viewMode)
   const setViewMode = useUI((s) => s.setViewMode)
@@ -885,7 +1196,13 @@ export function Settings() {
   }
 
   return (
-    <div ref={scrollRef} className="relative h-full overflow-y-auto">
+    // `gk-settings` — the Grok-skin hook (desktop-only re-materialization in
+    // grok-mode.css, scoped `[data-grok]` + `@media(min-width:768px)`). The
+    // class alone paints nothing, so base app (grok off) and every mobile
+    // breakpoint stay byte-identical; under grok on desktop it repoints the
+    // shared shadcn tokens the Section/Row/Switch/SegmentedControl primitives
+    // read, re-skinning every section at once.
+    <div ref={scrollRef} className="gk-settings relative h-full overflow-y-auto">
       {/* Floating glass nav bar — the only glass surface here; grouped cards
           below use the opaque iOS settings-list material. Fades in on scroll. */}
       {/* The shared mobile top bar was removed, so this sticky glass header
@@ -916,6 +1233,28 @@ export function Settings() {
         className="glass safe-header pointer-events-none sticky top-0 z-20 flex items-center justify-center border-b border-hairline sm:pt-0"
       >
         <span className="text-[17px] font-semibold tracking-tight">Settings</span>
+        {/* Close X — the exit affordance. Under grok, Settings is dropped from
+            the nav (layout.tsx `grokHidden`) and reached via the roster avatar,
+            so this route needs its own way out (the mirror of that top-right
+            entry point, and the iOS sheet-dismiss convention). The header is
+            `pointer-events-none` (a scroll-reveal glass bar) and `justify-center`
+            (centred title), so the button is `pointer-events-auto` and absolutely
+            pinned to the right edge, leaving the title centred. It reuses the
+            roster's `.gr-icon-btn` ghost style. `navigate('/')` returns to the
+            overview deterministically (vs. a fragile `navigate(-1)` on a
+            deep-link / cold load). Rendered ONLY under grok, so the base app's
+            header is byte-identical. */}
+        {grok && (
+          <button
+            type="button"
+            onClick={() => navigate('/')}
+            aria-label="Close settings"
+            title="Close"
+            className="gr-icon-btn pointer-events-auto absolute right-3 top-1/2 -translate-y-1/2 sm:right-4"
+          >
+            <X size={20} aria-hidden />
+          </button>
+        )}
       </motion.header>
 
       <MotionConfig reducedMotion="user">
@@ -1022,24 +1361,36 @@ export function Settings() {
 
           <ClaudeToolsSection />
 
-          <OnboardingSection />
-
-          <ApiKeysSection />
-
-          <ConnectionSection />
+          <ConnectorsSection />
 
           <RecoverySection />
 
-          <ExperimentalSection />
+          {/* B-advanced — declutter. The everyday surface above stays short;
+              the power-user / set-once / diagnostic sections fold into one
+              collapsed group. Nothing is removed and every toggle keeps its
+              exact same wiring — only the grouping changed. Deep-linked sections
+              (Hosts #hosts, Schedules #schedules, Recovery #recovery) stay above
+              so their fragment scroll still finds an always-rendered target. */}
+          <AdvancedGroup>
+            <DiagnosticsSection />
 
-          <SnippetsSection />
+            <OnboardingSection />
 
-          <Section
-            title="Audit log"
-            footnote="The last 200 recorded actions. Secrets are never logged."
-          >
-            <AuditLog />
-          </Section>
+            <ApiKeysSection />
+
+            <ConnectionSection />
+
+            <ExperimentalSection />
+
+            <SnippetsSection />
+
+            <Section
+              title="Audit log"
+              footnote="The last 200 recorded actions. Secrets are never logged."
+            >
+              <AuditLog />
+            </Section>
+          </AdvancedGroup>
         </motion.div>
       </MotionConfig>
     </div>

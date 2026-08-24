@@ -101,8 +101,23 @@ async fn list_teams(State(state): State<AppState>) -> Result<Json<serde_json::Va
 /// clamped/sanitized in [`start::start_team`].
 async fn start_team_handler(
     State(state): State<AppState>,
-    Json(input): Json<start::StartTeamInput>,
+    ctx: crate::scope::OptCtx,
+    Json(mut input): Json<start::StartTeamInput>,
 ) -> Result<impl IntoResponse, AppError> {
+    // P3d defense-in-depth: a scoped MEMBER may only spawn a team LEAD in their
+    // OWN company — mirror `sessions::create_handler` exactly. `company_id`
+    // defaults to theirs when omitted; an explicit FOREIGN id is a uniform 404
+    // (a member cannot even learn another company exists by probing). Owner/admin
+    // (`Scope::All`) are unrestricted — the lead is `company_id: None` (global)
+    // unless they set one. (The deny-by-default backstop already 404s
+    // `/api/teams/start` for a member; this keeps the handler safe on its own.)
+    if let crate::scope::Scope::Company(hc) = crate::scope::Scope::of(ctx.0.as_ref()) {
+        match input.company_id {
+            None => input.company_id = Some(hc),
+            Some(c) if c == hc => {}
+            Some(other) => return Err(AppError::NotFound(format!("company id={other}"))),
+        }
+    }
     let result = start::start_team(&state, input).await?;
     Ok((StatusCode::CREATED, Json(json!({ "ok": true, "data": result }))))
 }
@@ -123,8 +138,19 @@ async fn start_team_handler(
 ///   * 400 — bad name / empty task / non-Claude provider.
 async fn convert_to_team_handler(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
     Json(input): Json<start::ConvertToTeamInput>,
 ) -> Result<impl IntoResponse, AppError> {
+    // P3d defense-in-depth: converting an EXISTING session into a team lead
+    // restarts it with the team env + writes global team files, so a member must
+    // never do it to a foreign (or ANY non-own) session. Gate on the target's
+    // company BEFORE `convert_to_team` runs — a member converting a foreign /
+    // nonexistent session gets the uniform `session '{name}'` 404, closing both
+    // the cross-company hijack and the existence oracle. Owner/admin
+    // (`Scope::All`) are a no-op pass-through. (The backstop also 404s
+    // `/api/teams/start-from-existing` for a member; this makes the handler safe
+    // independently.)
+    crate::scope::authorize_session_for_human(&state, ctx.0.as_ref(), &input.name).await?;
     let result = start::convert_to_team(&state, input).await?;
     Ok((StatusCode::CREATED, Json(json!({ "ok": true, "data": result }))))
 }
@@ -134,9 +160,52 @@ async fn convert_to_team_handler(
 /// [`scan::archive_team_config`] move `sessions::lifecycle::archive` performs.
 /// The helper already no-ops on empty/dot-prefixed/missing names (never moves an
 /// arbitrary path), so the path segment needs no extra guarding here.
-async fn dismiss_team_handler(Path(name): Path<String>) -> Result<impl IntoResponse, AppError> {
+async fn dismiss_team_handler(
+    State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    authorize_team_for_human(&state, ctx.0.as_ref(), &name).await?;
     scan::archive_team_config(&name).map_err(|e| AppError::Internal(e.into()))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// P3b — gate a name-addressed, state-mutating team handler by the team's
+/// resolved LEAD session company (mirrors the pty/team WS gate in
+/// `sessions::chat::ws`, which scopes by lead company). Owner / admin-all
+/// ([`crate::scope::Scope::All`]) bypass entirely — behaviour-neutral, and (for
+/// the owner) it never even scans, exactly like [`crate::scope::
+/// authorize_session_for_human`]. A scoped human may act ONLY on a team whose
+/// resolved lead session belongs to their company; every OTHER outcome — the
+/// team is not on disk, it has no resolvable lead session, or that lead belongs
+/// to another company — collapses to the uniform `team '{team_name}'` 404
+/// (fail-closed), so a member can neither enumerate nor mutate another
+/// company's teams (and cannot kill/dismiss through them).
+async fn authorize_team_for_human(
+    state: &AppState,
+    ctx: Option<&crate::auth_human::AuthContext>,
+    team_name: &str,
+) -> Result<(), AppError> {
+    let hc = match crate::scope::Scope::of(ctx) {
+        crate::scope::Scope::All => return Ok(()),
+        crate::scope::Scope::Company(c) => c,
+    };
+    // Uniform 404 for every fail-closed branch — indistinguishable from a team
+    // that simply does not exist, so a scoped member gets no existence oracle.
+    let not_found = || AppError::NotFound(format!("team '{team_name}'"));
+    let teams = scan_and_enrich_raw(state).await;
+    let team = teams
+        .iter()
+        .find(|t| t.team_name == team_name)
+        .ok_or_else(not_found)?;
+    let lead = team.lead_supermux_session.as_deref().ok_or_else(not_found)?;
+    let sess = db::sessions::get(&state.pool, lead)
+        .await?
+        .ok_or_else(not_found)?;
+    if sess.company_id != Some(hc) {
+        return Err(not_found());
+    }
+    Ok(())
 }
 
 /// `DELETE /api/teams/{team_name}/members/{agent_id}`: remove ONE teammate
@@ -153,8 +222,13 @@ async fn dismiss_team_handler(Path(name): Path<String>) -> Result<impl IntoRespo
 ///     recorded, so a still-running agent is never silently hidden.
 async fn remove_member_handler(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
     Path((team_name, agent_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Gate BEFORE the destructive kill/dismiss: a scoped human targeting a team
+    // outside their company (or any unresolvable team) is refused here and
+    // never reaches the kill-then-dismiss path.
+    authorize_team_for_human(&state, ctx.0.as_ref(), &team_name).await?;
     remove_member(&state, &team_name, &agent_id).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -332,11 +406,18 @@ async fn get_agent_teams(
 /// SSE `settings` event so other tabs reconcile live (no poll).
 async fn put_agent_teams(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
     Json(input): Json<AgentTeamsToggle>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // P3d owner/admin-only: this is a GLOBAL prefs write that changes how EVERY
+    // next session spawns (the env var + `teammateMode` at launch). A scoped
+    // member gets the uniform NotFound; owner/admin (and the no-context unit-test
+    // caller) bypass. The GET reader stays open — a harmless global bool.
+    crate::scope::require_admin(ctx.0.as_ref(), "/api/settings/experimental/agent-teams")?;
     db::prefs::set_agent_teams_enabled(&state.pool, input.enabled).await?;
     let _ = state.sse_tx.send(SseEvent {
         event: "settings".to_string(),
+        company_id: None,
         payload: json!({ "key": db::prefs::AGENT_TEAMS_PREF_KEY, "enabled": input.enabled }),
     });
     Ok(Json(json!({ "ok": true, "data": { "enabled": input.enabled } })))
@@ -367,6 +448,8 @@ mod remove_member_tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = db::init(&config).await.expect("init pool");

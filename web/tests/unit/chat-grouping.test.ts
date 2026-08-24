@@ -30,6 +30,7 @@ import {
   mentionIndex,
   mentionSegments,
   receiptsFirst,
+  scopedMentionIndex,
   SESSION_GAP_S,
   toReceiptRows,
 } from '../../src/components/chat/grouping'
@@ -412,11 +413,22 @@ describe('toReceiptRows', () => {
 
   test('a failed call says so in the outcome — no red bubble, no lost line', () => {
     const rows = toReceiptRows([{ uuid: 'l1', label: 'cargo check', ok: false, result: 'E0432' }])
-    expect(rows[0]).toEqual({ tool: 'cargo check', outcome: 'failed · E0432' })
+    // `failed` is the honesty flag the grok receipt reads to swap ✓→✗ and tint
+    // the outcome; the outcome still carries the word, so the default renderer
+    // (which ignores the flag) is unchanged.
+    expect(rows[0]).toEqual({ tool: 'cargo check', outcome: 'failed · E0432', failed: true })
   })
 
   test('a failed call with nothing to say still says failed', () => {
     expect(toReceiptRows([{ uuid: 'l1', label: 'tests', ok: false }])[0].outcome).toBe('failed')
+  })
+
+  test('a DECLINE is not a FAILURE — it keeps the check (no `failed` flag)', () => {
+    // A denial is the user's own calm choice, reported with its own word
+    // ("declined · "), not a malfunction — so it must not read as a failed step.
+    const rows = toReceiptRows([{ uuid: 'l1', label: 'Bash', ok: false, denied: true, result: 'no' }])
+    expect(rows[0].failed).toBeUndefined()
+    expect(rows[0].outcome).toBe('declined · no')
   })
 
   test('a running line is never invented here — confirmed receipts are done', () => {
@@ -472,6 +484,93 @@ describe('mentionSegments', () => {
       { text: 'Patch and ' },
       { seed: 'quill', label: 'quill' },
     ])
+  })
+
+  test('a bare 1-2 char single-word name never linkifies (false-positive guard)', () => {
+    // A bot slugged `ok` would otherwise mint a chip on every "ok" in prose.
+    const shorty = mentionIndex([{ name: 'ok' }])
+    expect(mentionSegments('ok, will do', shorty)).toEqual([{ text: 'ok, will do' }])
+    // …but a multi-word name (carries a space) stays matchable at any length.
+    const twoWord = mentionIndex([{ name: 'qa', display_name: 'QA Bot' }])
+    expect(mentionSegments('ask QA Bot now', twoWord)).toEqual([
+      { text: 'ask ' },
+      { seed: 'qa', label: 'QA Bot' },
+      { text: ' now' },
+    ])
+  })
+
+  test('a Capitalized mention after another Capitalized word still linkifies (Ask Bolt)', () => {
+    // Company scoping — not a fragile Capitalized-adjacency guard — is what keeps
+    // an out-of-company "iCloud Mail" from minting a chip. So within a company a
+    // legitimate mention that trails a Capitalized word MUST still linkify.
+    const boltIdx = mentionIndex([{ name: 'acme-b', display_name: 'Bolt' }])
+    for (const lead of ['Ask', 'Then', 'Please', 'Hey']) {
+      expect(mentionSegments(`${lead} Bolt now`, boltIdx)).toEqual([
+        { text: `${lead} ` },
+        { seed: 'acme-b', label: 'Bolt' },
+        { text: ' now' },
+      ])
+    }
+  })
+
+  test('company scope — not adjacency — blocks the cross-company "iCloud Mail" leak', () => {
+    // Typing as `acme-a` (company 1): `mail` is a bot in ANOTHER company, so it is
+    // not in the scoped index and never linkifies — Capitalized lead-in or not.
+    const fleet = [
+      { name: 'acme-a', display_name: 'Aria', company_id: 1 },
+      { name: 'acme-b', display_name: 'Bolt', company_id: 1 },
+      { name: 'mail', display_name: 'Mail', company_id: 2 },
+    ]
+    const idx = scopedMentionIndex(fleet, 'acme-a')
+    // Out-of-company "Mail" stays plain text (no chip), even bare.
+    expect(mentionSegments('connect iCloud Mail today', idx)).toEqual([
+      { text: 'connect iCloud Mail today' },
+    ])
+    expect(mentionSegments('ping Mail today', idx)).toEqual([{ text: 'ping Mail today' }])
+    // …while a same-company "Bolt" DOES linkify, Capitalized lead-in and all.
+    expect(mentionSegments('Ask Bolt today', idx)).toEqual([
+      { text: 'Ask ' },
+      { seed: 'acme-b', label: 'Bolt' },
+      { text: ' today' },
+    ])
+  })
+})
+
+describe('scopedMentionIndex — a company chat only linkifies its own company', () => {
+  // Acme (1) has two bots, Globex (2) one, and there is one main/HQ bot.
+  const fleet = [
+    { name: 'acme-a', display_name: 'Aria', company_id: 1 },
+    { name: 'acme-b', display_name: 'Bolt', company_id: 1 },
+    { name: 'globex-a', display_name: 'Gizmo', company_id: 2 },
+    { name: 'pa', display_name: 'Assistant', company_id: null },
+  ]
+
+  test('a company session EXCLUDES an out-of-company bot (no cross-company link)', () => {
+    // Typing as `acme-a` (company 1): its index knows its own colleagues…
+    const idx = scopedMentionIndex(fleet, 'acme-a')
+    expect(idx.get('acme-a')).toBe('acme-a')
+    expect(idx.get('acme-b')).toBe('acme-b')
+    expect(idx.get('bolt')).toBe('acme-b')
+    // …but NOT the Globex bot, nor the HQ/main bot — no chip, no existence leak.
+    expect(idx.has('globex-a')).toBe(false)
+    expect(idx.has('gizmo')).toBe(false)
+    expect(idx.has('pa')).toBe(false)
+    expect(idx.has('assistant')).toBe(false)
+  })
+
+  test('a main/HQ session (company_id null) keeps the FULL fleet index', () => {
+    // The owner is omniscient — a PA bot may reference any bot in any company.
+    const idx = scopedMentionIndex(fleet, 'pa')
+    expect(idx.get('acme-a')).toBe('acme-a')
+    expect(idx.get('globex-a')).toBe('globex-a')
+    expect(idx.get('gizmo')).toBe('globex-a')
+    expect(idx.get('pa')).toBe('pa')
+  })
+
+  test('an unknown self name is treated as HQ (full index), never a silent empty', () => {
+    const idx = scopedMentionIndex(fleet, 'nobody')
+    expect(idx.get('acme-a')).toBe('acme-a')
+    expect(idx.get('globex-a')).toBe('globex-a')
   })
 })
 
@@ -559,6 +658,29 @@ describe('harness events in the stream', () => {
     expect(nodes[idx + 1]).toMatchObject({ kind: 'item', key: 'a1' })
   })
 
+  test('a mid-turn user message stays ABOVE the reply that answers it', () => {
+    // THE ORDERING BUG. With the management log merged in, the stream used to be
+    // TOTAL-sorted by ts (`stream.sort((a, b) => a.ts - b.ts)`). A message the
+    // owner sends MID-TURN carries a later wall-clock stamp (105) than the reply
+    // that follows it (101) — the reply belongs to a turn that STARTED at 100
+    // and is stamped with that earlier clock. Arrival order (the wire's own
+    // write order) is the truth: `u-mid` came in before `reply` was emitted. The
+    // by-ts sort reordered them and hoisted the reply ABOVE the very message it
+    // answers; the merge keeps the item backbone in arrival order.
+    const items = [
+      user('u-start', 100), // the turn starts
+      user('u-mid', 105), // the owner sends another message while it works
+      assistant('reply', 101), // the reply, stamped with the earlier turn's clock
+    ]
+    const withLog: HarnessEvent[] = [
+      { id: 1, ts: 100, actor: 'user', action: 'schedule.create', target: 's1', detail: { session: 'web-ui', title: 'Nightly' } },
+    ]
+    const nodes = buildTranscript(items, { nowMs: 3_000_000, events: withLog, self: 'web-ui' })
+    const order = nodes.flatMap((n) => (n.kind === 'item' ? [n.item.uuid] : []))
+    expect(order).toEqual(['u-start', 'u-mid', 'reply'])
+    expect(order.indexOf('u-mid')).toBeLessThan(order.indexOf('reply'))
+  })
+
   test('a session renaming ITSELF is news', () => {
     const self: HarnessEvent[] = [
       { id: 9, ts: 1500, actor: 'agent:web-ui', action: 'session.rename', target: 'web-ui', detail: { from: 'a', to: 'b' } },
@@ -589,6 +711,71 @@ describe('harness events in the stream', () => {
     expect(buildTranscript(items, { nowMs: 3000, events: [], self: 'web-ui' })).toEqual(
       buildTranscript(items, { nowMs: 3000 }),
     )
+  })
+
+  test('a run of consecutive delegations collapses to ONE grouped node', () => {
+    // THE WALL (owner's IMG_2353). A session that messaged other bots many
+    // times logs one `session.delegate` row per event; rendered as standalone
+    // lines they stack as identical narrator rows — one per event, and a
+    // session-block divider between any two that straddle the 30-min gap. The
+    // fold turns a maximal run of back-to-back delegations into a single
+    // `harness-run` node that carries every event (nothing is lost) and takes
+    // at most one divider.
+    const wall: HarnessEvent[] = Array.from({ length: 6 }, (_, i) => ({
+      id: 100 + i,
+      // Spread across days so, unfolded, each would earn its own divider.
+      ts: 1_000 + i * SESSION_GAP_S * 2,
+      actor: 'user',
+      action: 'session.delegate',
+      target: 'ipc',
+      detail: { from: 'web-ui' },
+    }))
+    const nodes = buildTranscript([user('u1', 500)], {
+      nowMs: 9_000_000,
+      self: 'web-ui',
+      events: wall,
+    })
+    const runs = nodes.filter((n) => n.kind === 'harness-run')
+    expect(runs).toHaveLength(1)
+    const run = runs[0]
+    if (run.kind !== 'harness-run') throw new Error('unreachable')
+    expect(run.evs.map((e) => e.id)).toEqual([100, 101, 102, 103, 104, 105])
+    // No bare per-event `harness` lines survive the fold, and the whole run
+    // takes exactly one session-block divider rather than one per delegation.
+    expect(nodes.filter((n) => n.kind === 'harness')).toHaveLength(0)
+    expect(nodes.filter((n) => n.kind === 'divider')).toHaveLength(1)
+  })
+
+  test('a lone delegation is left as a plain line, not a run', () => {
+    // The common one-off case must stay byte-identical: a single delegation is
+    // still a `harness` line, never a one-element run.
+    const nodes = buildTranscript([user('u1', 500)], {
+      nowMs: 9_000,
+      self: 'web-ui',
+      events: [
+        { id: 7, ts: 1_000, actor: 'user', action: 'session.delegate', target: 'ipc', detail: { from: 'web-ui' } },
+      ],
+    })
+    expect(nodes.filter((n) => n.kind === 'harness-run')).toHaveLength(0)
+    expect(nodes.filter((n) => n.kind === 'harness')).toHaveLength(1)
+  })
+
+  test('a non-delegation event between two delegations breaks the run', () => {
+    // A rename or schedule fire is different news; like a differing tool in the
+    // receipt coalescer it ends the run, so the two delegations do NOT fold
+    // across it.
+    const nodes = buildTranscript([user('u1', 500)], {
+      nowMs: 9_000,
+      self: 'web-ui',
+      events: [
+        { id: 1, ts: 1_000, actor: 'user', action: 'session.delegate', target: 'ipc', detail: { from: 'web-ui' } },
+        { id: 2, ts: 1_100, actor: 'agent:web-ui', action: 'session.rename', target: 'web-ui', detail: { from: 'a', to: 'b' } },
+        { id: 3, ts: 1_200, actor: 'user', action: 'session.delegate', target: 'ipc', detail: { from: 'web-ui' } },
+      ],
+    })
+    // Two lone delegations either side of the rename — three plain lines, no run.
+    expect(nodes.filter((n) => n.kind === 'harness-run')).toHaveLength(0)
+    expect(nodes.filter((n) => n.kind === 'harness')).toHaveLength(3)
   })
 
   test('an action nothing can render is not printed', () => {

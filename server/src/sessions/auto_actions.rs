@@ -803,8 +803,14 @@ pub async fn tick(
     // so the detector suppresses the raw heartbeat `Active` fallback for it —
     // typing at the prompt echoes bytes but must not flip the card to busy.
     let has_hooks = state.has_hooks(name);
+    // Is a BACKGROUND workflow provably running (a subagent transcript appended /
+    // an open subagent hook within SUBAGENT_LIVE_WINDOW)? Default-false for every
+    // session with no live subagent, so a plain idle session settles exactly as
+    // before; when true it holds an Active turn against the spinner-absence settle
+    // so a left-open workflow reads WORKING, not done/idle.
+    let subagents_live = state.subagents_live(name);
     let prev = detector.last_status();
-    let new_status = detector.detect(&capture, last_pty, turn, has_hooks);
+    let new_status = detector.detect_with_subagents(&capture, last_pty, turn, has_hooks, subagents_live);
 
     // THE FREEZE, reconciled with what is actually on the screen.
     //
@@ -840,11 +846,12 @@ pub async fn tick(
         // settle. A transient flap (e.g. a stale-by-now hook) that reverts is
         // suppressed; only a status that still holds is broadcast.
         tokio::time::sleep(FLAP_DEBOUNCE).await;
-        let confirmed = detector.detect(
+        let confirmed = detector.detect_with_subagents(
             &capture,
             state.last_pty(name),
             state.turn_state(name),
             state.has_hooks(name),
+            state.subagents_live(name),
         );
         // Commit when the confirmed status is a real change from the prior
         // broadcast baseline — either the in-memory `prev` (edge) or the persisted
@@ -2257,6 +2264,7 @@ fn parse_status(s: &str) -> Option<Status> {
 fn broadcast(state: &AppState, event: &str, payload: Value) {
     let _ = state.sse_tx.send(SseEvent {
         event: event.to_string(),
+        company_id: None,
         payload,
     });
 }
@@ -2316,6 +2324,8 @@ mod board_reaction_tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = crate::db::init(&config).await.expect("init pool");
@@ -2525,6 +2535,8 @@ mod boot_reconcile_tests {
             worktree: None,
             host_id: None,
             runtime: Some("native".into()),
+            model: None,
+            company_id: None,
         };
         crate::sessions::create(state, inp).await.expect("create");
         db::sessions::set_last_status(&state.pool, name, status).await.unwrap();
@@ -2724,6 +2736,8 @@ mod dead_holder_tests {
             worktree: None,
             host_id: None,
             runtime: Some("native".into()),
+            model: None,
+            company_id: None,
         };
         crate::sessions::create(state, inp).await.expect("create");
         db::sessions::set_last_status(&state.pool, name, status).await.unwrap();

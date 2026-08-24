@@ -51,19 +51,66 @@ export function ComposerFrame({
   stat,
   className,
   children,
+  drop,
+  dropActive,
 }: {
   surface?: 'desktop' | 'phone'
   stat?: React.ReactNode
   className?: string
   children: React.ReactNode
+  /**
+   * Drag-drop handlers for the composer's own wrapper (the `group relative`
+   * div) — the composer upgrade drops files onto the whole bar. Optional: absent
+   * ⇒ no listeners, byte-identical to today.
+   */
+  drop?: {
+    onDragOver: React.DragEventHandler
+    onDragLeave: React.DragEventHandler
+    onDrop: React.DragEventHandler
+  }
+  /** A drag is currently over the frame — draw the accent drop ring. */
+  dropActive?: boolean
 }) {
   const phone = surface === 'phone'
   return (
     <div
       data-testid="chat-composer"
-      className={cn(phone ? 'px-[14px] pb-[14px]' : 'px-8 pb-[18px]', className)}
+      className={cn(
+        // On the phone the composer is now the SINGLE bottom bar (the old dock
+        // below it is folded away under chat — mobile polish #4), so it owns the
+        // home-indicator inset: the `max(…, 36px)` (floor was 24px) keeps a 36px
+        // breathing room on a flat-bottom phone and lifts clear of the indicator
+        // on a notched one. The 36px floor lifts the input clear of the iOS
+        // keyboard on mode 9 (imperative root resize), where the composer rides
+        // flush at bottom:0 and 14px was clipped under the keyboard; at rest the
+        // env(safe-area-inset-bottom)=34px<36 so pb=36, a harmless 2px more
+        // resting gutter. The inner gate is `min(--kb-safe-bottom, --safe-bottom)`: BOTH are
+        // env(safe-area-inset-bottom) at rest, and keyboard-open zeros WHICHEVER
+        // signal fires — the JS keyboard detector sets `--kb-safe-bottom=0` on
+        // devices where visualViewport SHRINKS, and the globals `:root:has(:focus)`
+        // rule sets `--safe-bottom=0` on devices where the contenteditable
+        // registers as :focus for :has. Neither alone is robust (the owner's real
+        // device shrinks vv but does NOT match :has for the contenteditable, so
+        // --safe-bottom stayed 34px there); the MIN of both drops to 0 as long as
+        // EITHER path detects the open keyboard — so the ~34px home-indicator band
+        // cannot survive as a transparent gap between the composer and the keyboard.
+        phone
+          ? 'px-[14px] pb-[max(min(var(--kb-safe-bottom,env(safe-area-inset-bottom)),var(--safe-bottom,env(safe-area-inset-bottom))),36px)]'
+          : 'px-8 pb-[18px]',
+        className,
+      )}
     >
-      <div className={cn('group relative mx-auto w-full', !phone && 'max-w-[744px]')}>
+      <div
+        {...drop}
+        className={cn(
+          'group relative mx-auto w-full',
+          !phone && 'max-w-[744px]',
+          // The drop ring: an accent halo over the whole composer while a file
+          // drag hovers it. `rounded-[26px]` matches the grown pill's corner.
+          dropActive &&
+            'rounded-[26px] ring-2 ring-[color-mix(in_oklab,var(--sm-accent)_55%,transparent)]',
+        )}
+      >
         {stat && (
           <p className="pointer-events-none absolute inset-x-0 -top-[42px] text-center text-[11.5px] tabular-nums text-ink-3">
             {stat}

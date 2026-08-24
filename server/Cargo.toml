@@ -76,6 +76,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rand = "0.8"
 base64 = "0.22"
 constant_time_eq = "0.3"                                 # auth token compare
+# P3a human identity plane: SHA-256 for the cookie/token store (hash-only, never
+# raw) + HMAC for the signed cookie & CSRF double-submit. Both already resolved
+# transitively (jwt-simple/openssl pull them) — promoting to direct deps adds 0
+# crates to the lockfile.
+sha2 = "0.10"
+hmac = "0.12"
 
 # ── web push (VAPID + RFC8291 http-ece) ──
 # default-features = false drops the bundled isahc/curl HTTP client: we build the
@@ -102,6 +108,7 @@ async-trait = "0.1"                                       # async trait methods 
 futures-util = { version = "0.3", default-features = false, features = ["std"] }  # SSE preamble chain in updates::api (+ everything reqwest already pulls)
 thiserror = "2.0"
 once_cell = "1.20"
+arc-swap = "1.9"                                          # hot-swappable HumanAuthConfig for the companies onboarding wizard
 dashmap = "6.1"                                          # per-session lock/stream maps (AppState)
 regex = "1.11"
 # `term` (added for the NATIVE runtime) unlocks `nix::pty::{openpty, Winsize}`
@@ -125,6 +132,7 @@ url = "2.5"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 dirs = "5.0"                                             # home dir
 which = "7.0"                                            # locate claude/tmux
+landlock = "0.4"                                         # portable per-spawn agent isolation (Linux backend)
 
 [features]
 # Gates test-only helpers (e.g. `ReleaseCache::seed`) that would otherwise be

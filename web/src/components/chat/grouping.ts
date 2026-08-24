@@ -39,9 +39,11 @@
  * reverse.
  */
 import type { HarnessEvent } from '../../lib/api/harness'
+import { scopeMentionPeers } from '../../lib/mention-scope'
 
-import type { ChatEntry, ChatItem, ReceiptLine } from './entries'
+import type { ChatAuthor, ChatEntry, ChatItem, ReceiptLine } from './entries'
 import { harnessNotice, stripEmojiPrefix } from './entries'
+import { SYSTEM_ROW_BADGES } from './wire-entries'
 import type { Receipt } from './ui/receipt-group'
 
 /* ── speakers ────────────────────────────────────────────────────────────── */
@@ -66,31 +68,32 @@ import type { Receipt } from './ui/receipt-group'
  * 03:00). Its identity is the schedule's title, so two fires of one schedule
  * stack into one run and two different schedules never do.
  */
-export type Speaker = 'agent' | 'me' | 'system' | `teammate:${string}` | `schedule:${string}`
+export type Speaker =
+  | 'agent'
+  | 'me'
+  | 'system'
+  | `teammate:${string}`
+  | `schedule:${string}`
+  // A message an authenticated human colleague sent (P3c). The run key is the
+  // IMMUTABLE `user_id` (not the display name), so a rename never re-deals a
+  // colleague's run and the mark's hue is stable. The name + company ride on
+  // `GroupedItem.author`.
+  | `human:${string}`
 
 /** Wire kinds that are harness events rather than anybody speaking.
  *
- *  The last four are the states audit's allowlisted system rows
- *  (`wire-entries.ts::SYSTEM_ROW_BADGES`). A badge missing from this set is not
- *  merely unstyled — `speakerOf` falls through to `'me'` and the row is drawn
- *  as the USER's own bubble, which is how a retry storm would end up looking
- *  like something the human typed. */
-const SYSTEM_BADGES: ReadonlySet<string> = new Set([
+ *  A badge missing from this set is not merely unstyled — `speakerOf` falls
+ *  through to `'me'` and the row is drawn as the USER's own bubble, which is how
+ *  a retry storm would end up looking like something the human typed. The states
+ *  audit's allowlisted system rows are spread in from their ONE source
+ *  (`wire-entries.ts::SYSTEM_ROW_BADGES`) so a badge added there can never be
+ *  silently missed here; only the grouping-local extras are listed below. */
+const SYSTEM_BADGES: ReadonlySet<string> = new Set<string>([
   'notification',
   'system',
   'tool',
   'image',
-  'compaction',
-  'model-switch',
-  'api-retry',
-  'dialog',
-  // The grace-window notice: a fact about the account, in the system voice —
-  // never the user's bubble, which is exactly where it used to land.
-  'limit',
-  // A retry whose stream never started (still live), and the tombstone a
-  // retraction leaves behind — both `wire-entries.ts::SYSTEM_ROW_BADGES`.
-  'stalled',
-  'retracted',
+  ...SYSTEM_ROW_BADGES,
 ])
 
 function speakerOf(item: ChatItem, labels?: ReadonlyMap<string, string>): Speaker {
@@ -103,6 +106,10 @@ function speakerOf(item: ChatItem, labels?: ReadonlyMap<string, string>): Speake
   // in who is speaking, so they share one voice and one arrival divider.
   if (item.badge === 'teammate' || item.badge === 'delegation')
     return `teammate:${labels?.get(item.uuid) ?? ''}`
+  // A human colleague's message: keyed on the immutable author id so a rename
+  // never scrambles the run and the mark hue is stable. Fail-closed — an
+  // author-less human badge (never produced by the wire) falls through to 'me'.
+  if (item.badge === 'human' && item.author) return `human:${item.author.userId}`
   if (item.badge === 'schedule') return `schedule:${labels?.get(item.uuid) ?? ''}`
   if (item.badge && SYSTEM_BADGES.has(item.badge)) return 'system'
   // An interruption is user-role on the wire and nobody's words on the screen.
@@ -204,6 +211,9 @@ export interface GroupedItem {
   showGutter: boolean
   /** The colleague who sent it, when the speaker is a teammate. */
   sender?: string
+  /** The human author (P3c), when the speaker is `human:…` — the immutable id
+   *  (mark hue + self/remote key) and the display name (chip). */
+  author?: ChatAuthor
 }
 
 /**
@@ -226,12 +236,16 @@ export function groupItems(
     // nothing that could stack into it — it also breaks the run around it.
     const grouped = speaker !== 'system' && speaker === previous
     const teammate = speaker.startsWith('teammate:')
+    const human = speaker.startsWith('human:')
     out.push({
       item,
       speaker,
       grouped,
-      showGutter: !grouped && (speaker === 'agent' || teammate),
+      // A human row hangs its circle mark on the first row of the run, exactly
+      // like a colleague's — the two left-hand attributed voices.
+      showGutter: !grouped && (speaker === 'agent' || teammate || human),
       sender: teammate ? speaker.slice('teammate:'.length) || undefined : undefined,
+      author: human && item.type === 'user' ? item.author : undefined,
     })
     previous = speaker
   }
@@ -252,6 +266,14 @@ export type TranscriptNode =
   | ({ kind: 'item'; key: string } & GroupedItem)
   | { kind: 'divider'; key: string; ts: number; label: string }
   | { kind: 'harness'; key: string; ts: number; ev: HarnessEvent }
+  // A RUN of consecutive delegation rows, folded into one collapsible line
+  // (§13.2, daily-driver: a session that delegated many times used to wall the
+  // history with a stack of identical "Delegated to ●x" lines, one per event
+  // and one divider between each). The renderer shows a single "N delegations"
+  // affordance that expands to the individual rows — the information is kept,
+  // the resting transcript is not a stack. `ts` is the FIRST event's, so the
+  // run sits (and takes at most one divider) where its first delegation landed.
+  | { kind: 'harness-run'; key: string; ts: number; evs: HarnessEvent[] }
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -289,10 +311,12 @@ export function dayDividers(rows: readonly GroupedItem[], nowMs: number): Transc
   )
 }
 
-/** One position in the merged pre-divider stream: a message row, or an event. */
+/** One position in the merged pre-divider stream: a message row, an event, or
+ *  a folded run of consecutive delegation events. */
 type StreamRow =
   | { kind: 'item'; ts: number; row: GroupedItem }
   | { kind: 'harness'; ts: number; ev: HarnessEvent }
+  | { kind: 'harness-run'; ts: number; evs: HarnessEvent[] }
 
 /**
  * The divider pass, over the MERGED stream.
@@ -302,6 +326,54 @@ type StreamRow =
  * turns separated by "Delegated to ●deploy-fix" are not one run, and stacking
  * them at 8px with no second mark would draw them as one.
  */
+/** The uuid/id a session-block divider is keyed by, per stream-row kind. */
+function dividerAnchor(entry: StreamRow): string {
+  if (entry.kind === 'item') return entry.row.item.uuid
+  if (entry.kind === 'harness') return `hx-${entry.ev.id}`
+  return `hxr-${entry.evs[0].id}`
+}
+
+/**
+ * Fold consecutive delegation events into one run (§13.2 / daily-driver).
+ *
+ * The failure this fixes: a session that messaged other bots many times (the
+ * delegate/IPC mechanism logs one `session.delegate` row each) rendered a WALL
+ * of identical "Delegated to ●x" lines — one centred line per event, and a
+ * session-block divider between any two that straddled the 30-minute gap, so a
+ * week of delegations read as a stack of dozens of bare narrator lines with no
+ * content. That reads as a bug even though every row is a true event.
+ *
+ * The fix mirrors the receipt coalescer: a maximal run of ADJACENT delegation
+ * rows (nothing the user said or the agent replied sits between them, since the
+ * items are the backbone `buildTranscript` weaves events into) collapses to a
+ * single `harness-run` the renderer draws as one "N delegations" affordance,
+ * expandable to the individual rows. A lone delegation is left as a plain
+ * `harness` line — unchanged, so the common one-off case is byte-identical and
+ * the existing single-line tests still hold. Only `session.delegate` folds:
+ * a rename or a schedule fire between two delegations is real, different news
+ * and breaks the run, exactly as a differing tool breaks a receipt coalesce.
+ */
+function collapseDelegations(stream: readonly StreamRow[]): StreamRow[] {
+  const out: StreamRow[] = []
+  let run: HarnessEvent[] = []
+  const flush = () => {
+    if (run.length === 0) return
+    if (run.length === 1) out.push({ kind: 'harness', ts: run[0].ts, ev: run[0] })
+    else out.push({ kind: 'harness-run', ts: run[0].ts, evs: run })
+    run = []
+  }
+  for (const entry of stream) {
+    if (entry.kind === 'harness' && entry.ev.action === 'session.delegate') {
+      run.push(entry.ev)
+      continue
+    }
+    flush()
+    out.push(entry)
+  }
+  flush()
+  return out
+}
+
 function withDividers(stream: readonly StreamRow[], nowMs: number): TranscriptNode[] {
   const out: TranscriptNode[] = []
   let previousTs: number | null = null
@@ -313,13 +385,21 @@ function withDividers(stream: readonly StreamRow[], nowMs: number): TranscriptNo
     if (blockStart) {
       out.push({
         kind: 'divider',
-        key: `div-${entry.kind === 'item' ? entry.row.item.uuid : `hx-${entry.ev.id}`}`,
+        key: `div-${dividerAnchor(entry)}`,
         ts,
         label: dividerLabel(ts, nowMs),
       })
     }
     if (entry.kind === 'harness') {
       out.push({ kind: 'harness', key: `hx-${entry.ev.id}`, ts, ev: entry.ev })
+      previousTs = ts
+      cutByLine = true
+      continue
+    }
+    if (entry.kind === 'harness-run') {
+      // A folded run is one centred node keyed by its first event; like a lone
+      // harness line it is bubble-less, so it breaks the run around it.
+      out.push({ kind: 'harness-run', key: `hxr-${entry.evs[0].id}`, ts, evs: entry.evs })
       previousTs = ts
       cutByLine = true
       continue
@@ -403,18 +483,42 @@ export function buildTranscript(
   // the branch: it keeps the common path off the sort entirely.
   if (shown.length === 0) return dayDividers(rows, opts.nowMs)
 
-  const stream: StreamRow[] = rows.map((row) => ({
-    kind: 'item' as const,
-    ts: row.item.ts,
-    row,
-  }))
-  for (const ev of shown) stream.push({ kind: 'harness', ts: ev.ts, ev })
-  // Sort by ts ALONE, and lean on stability: the items were pushed first and in
-  // the order `receiptsFirst` decided, so an event sharing a second with a turn
-  // lands after it and the receipts-first ordering inside that second is
-  // untouched. A tie-break on kind would undo one of those two properties.
-  stream.sort((a, b) => a.ts - b.ts)
-  return withDividers(stream, opts.nowMs)
+  // MERGE the events into the item backbone — never a TOTAL sort of the two.
+  //
+  // The items are already in TRUE ARRIVAL ORDER: the wire delivers them in the
+  // transcript's own write order (`wire-entries.ts` reverses, it does not sort),
+  // and `receiptsFirst` only reorders WITHIN a second. That order is not the
+  // same as ascending `ts`. A message the owner sends MID-TURN carries a later
+  // wall-clock `ts` than the reply that follows it in arrival order, because the
+  // reply belongs to a turn that STARTED before the message arrived and CC
+  // stamps the reply with that earlier turn's clock. A `stream.sort((a, b) =>
+  // a.ts - b.ts)` re-sorts those two items against each other and hoists the
+  // reply ABOVE the later user message — the reply printed above the very
+  // message it answers. (Stability only ever protected EQUAL ts; the old
+  // comment reasoned about "an event sharing a second with a turn" and never
+  // about two items whose ts differ, which a total sort freely reorders.)
+  //
+  // So the items are the FIXED backbone and only the events are placed. Each
+  // event lands before the first item whose ts it does not reach; `<` (not
+  // `<=`) keeps the documented tie — an event sharing a second with a turn
+  // lands AFTER it, and the receipts-first order inside that second is
+  // untouched. Events are ordered among themselves by ts (few, sparse), which
+  // never touches an item's position.
+  const itemRows = rows.map((row) => ({ kind: 'item' as const, ts: row.item.ts, row }))
+  const evs = shown
+    .map((ev) => ({ kind: 'harness' as const, ts: ev.ts, ev }))
+    .sort((a, b) => a.ts - b.ts)
+  const stream: StreamRow[] = []
+  let ei = 0
+  for (const item of itemRows) {
+    while (ei < evs.length && evs[ei].ts < item.ts) stream.push(evs[ei++])
+    stream.push(item)
+  }
+  while (ei < evs.length) stream.push(evs[ei++])
+  // Fold runs of consecutive delegations into one collapsible line BEFORE the
+  // divider pass, so a week's worth of back-to-back delegations becomes a single
+  // node that takes at most one session-block divider instead of one per event.
+  return withDividers(collapseDelegations(stream), opts.nowMs)
 }
 
 /* ── receipt rows ────────────────────────────────────────────────────────── */
@@ -519,6 +623,15 @@ export function toReceiptRows(lines: readonly ReceiptLine[]): Receipt[] {
           : undefined
     const tool = clamp(stripEmojiPrefix(line.label), TOOL_MAX)
     const row: Receipt = { tool }
+    // HONESTY FLAG (grok skin). A genuine FAILURE — `ok === false` that is not a
+    // user DECLINE — carries a boolean the receipt line reads to swap its check
+    // glyph for a cross and tint the outcome, so a failed step cannot read as a
+    // pass at a glance (the jury's #1 honesty defect: "✓ cargo check → failed").
+    // A decline is the user's calm choice, not a malfunction, so it keeps the
+    // check (its "declined · " word already carries the distinction) — the same
+    // reasoning the outcome verb above encodes. Consumed ONLY under [data-grok];
+    // the default renderer ignores the flag and stays byte-identical.
+    if (line.ok === false && !line.denied) row.failed = true
     // Only when it says something DIFFERENT: a label with nothing to shorten
     // must not ship two copies of itself through every render (the transcript is
     // memoised on prop identity — see `transcript-item.tsx`).
@@ -565,6 +678,32 @@ export function mentionIndex(
 }
 
 /**
+ * Company-scoped `mentionIndex` — the prose→chip index a CHAT SESSION should
+ * linkify its transcript against (Bot Mode).
+ *
+ * A company bot's chat must NOT mint a clickable chip to a bot OUTSIDE its
+ * company: the chip would leak the mere existence of another company's fleet in
+ * the UI, even though the server delegation gate already refuses the message.
+ * So the index is built from ONLY the same-company peers (+ itself) — exactly
+ * the set the `@`-picker offers (`scopeMentionPeers`), keyed off the CHAT
+ * SESSION's OWN `company_id`, looked up from the live session list BY NAME (not
+ * the global `activeCompany` — the transcript follows whose chat this is, not
+ * where the switcher is parked). A main/HQ session (`self` `company_id` null) is
+ * left omniscient: it keeps the FULL index and may reference any bot.
+ */
+export function scopedMentionIndex(
+  sessions: readonly {
+    name: string
+    display_name?: string | null
+    company_id?: number | null
+  }[],
+  selfName: string,
+): Map<string, string> {
+  const selfCompanyId = sessions.find((s) => s.name === selfName)?.company_id ?? null
+  return mentionIndex(scopeMentionPeers(sessions, selfCompanyId))
+}
+
+/**
  * The other direction: slug → the name that session is CALLED.
  *
  * `mentionIndex` answers "is this word a colleague?"; this answers "what do we
@@ -603,7 +742,15 @@ export function mentionSegments(
   self?: string,
 ): ProseSegment[] {
   const tokens = [...index.keys()]
-    .filter((token) => token.length > 1 && index.get(token) !== self)
+    .filter(
+      (token) =>
+        index.get(token) !== self &&
+        // FALSE-POSITIVE GUARD (Bot Mode). A bare 1-2 char SINGLE word is almost
+        // always a coincidence, not a mention — a bot slugged `ci`/`ok` would
+        // otherwise linkify every "ok" in prose. Multi-word names (they carry a
+        // space) are specific enough to keep at any length.
+        (token.length > 2 || token.includes(' ')),
+    )
     .sort((a, b) => b.length - a.length)
   if (tokens.length === 0 || !text) return [{ text }]
 

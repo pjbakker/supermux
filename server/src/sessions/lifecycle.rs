@@ -213,6 +213,180 @@ fn quoted_flag_words(flags: &str) -> Vec<String> {
         .collect()
 }
 
+/// Resolve a per-bot MODEL selection to the real `--model` id the provider's CLI
+/// accepts, or reject it (migration 0030 / bot identity).
+///
+/// The model NEVER arrives as free text on the launch line: it is validated
+/// against a hardcoded per-provider ALLOWLIST here (SEC-01 — the resolved value
+/// is spliced into a shell command line), and only a mapped, known-safe literal
+/// is ever emitted. This is the single source of truth shared by the create /
+/// config write path (`sessions::mod`, which stores the mapped id) and the launch
+/// path ([`build_launch_command`], which trusts a stored id but re-resolves it so
+/// a legacy / hand-edited value is dropped rather than shell-injected).
+///
+/// Contract:
+///   * `Ok(None)`      — `model` is empty ⇒ use the provider default (unchanged
+///                        behaviour for the whole pre-0030 fleet).
+///   * `Ok(Some(id))`  — a validated, allowlisted real model id.
+///   * `Err(msg)`      — an unknown selection; the caller maps it to a 400.
+///
+/// The map is deliberately small and extend-later; the KEY is the user-facing
+/// selection and the VALUE is the id the CLI is invoked with. Keeping them
+/// separate lets a friendly label diverge from a versioned id without touching
+/// callers.
+pub(crate) fn resolve_model_flag(provider: &str, model: &str) -> Result<Option<&'static str>, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(None);
+    }
+    // (selection, real --model id). claude aliases already ARE the ids the CLI
+    // accepts; codex ids are its accepted model slugs.
+    let allow: &[(&str, &str)] = match provider {
+        p if launches_claude(p) => &[("opus", "opus"), ("sonnet", "sonnet"), ("haiku", "haiku")],
+        "codex" => &[
+            ("gpt-5-codex", "gpt-5-codex"),
+            ("gpt-5", "gpt-5"),
+            ("o3", "o3"),
+            ("o4-mini", "o4-mini"),
+        ],
+        _ => &[],
+    };
+    match allow.iter().find(|(sel, _)| *sel == model) {
+        Some((_, id)) => Ok(Some(id)),
+        None => {
+            let allowed = allow.iter().map(|(sel, _)| *sel).collect::<Vec<_>>().join(", ");
+            if allowed.is_empty() {
+                Err(format!("provider '{provider}' does not support a model selection"))
+            } else {
+                Err(format!(
+                    "unknown model '{model}' for provider '{provider}' (allowed: {allowed})"
+                ))
+            }
+        }
+    }
+}
+
+/// Compose the READ-ONLY role/notes system-prompt block injected at launch
+/// (migration 0030 / bot identity), or `None` when this session has neither a
+/// role (`desc`) nor notes (`memory`).
+///
+/// The owner's ask — "sluit rol nu echt aan": until now `desc` ("Standing
+/// instructions") was displayed but injected NOWHERE, so the role steered nothing.
+/// This turns it into the agent's system prompt at launch. `memory` (the bot's
+/// "Notes it keeps") is appended after the role under a clear delimiter. v1 is
+/// READ-ONLY — the agent can SEE its role + notes; a write-back path is a later
+/// phase and is deliberately not built here.
+fn role_system_prompt(s: &Session) -> Option<String> {
+    let role = s.desc.trim();
+    let notes = s.memory.trim();
+    if role.is_empty() && notes.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    if !role.is_empty() {
+        out.push_str(role);
+    }
+    if !notes.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        // A clearly delimited section so the agent can tell its standing role
+        // from the mutable notes it keeps.
+        out.push_str("Notes you keep:\n");
+        out.push_str(&cap_core_notes(notes));
+    }
+    Some(out)
+}
+
+/// Hard cap on the always-loaded CORE (the bot's `memory` index). Line and char
+/// budgets sized to the design's ~1500-token / ~40-line target (~4 chars/token).
+const CORE_MAX_LINES: usize = 40;
+const CORE_MAX_CHARS: usize = 6_000;
+
+/// Cap the CORE notes to the bounded index the design mandates. The CORE is the
+/// token tax paid on EVERY turn, so it must never grow unbounded (audit gap 4):
+/// the archival tier — recalled on demand by the bot-memory hook — is where the
+/// long tail lives. Truncates on whichever budget bites first (lines or chars)
+/// and appends a one-line pointer telling the agent the rest is recallable, so a
+/// clipped index reads as deliberate, not broken.
+///
+/// This is the SERVER-SIDE half of the cap; the bot-panel editor mirrors it so a
+/// human sees the same limit while editing (noted for the UI phase — the editor
+/// cap is additive and does not exist yet).
+fn cap_core_notes(notes: &str) -> String {
+    let notes = notes.trim_end();
+    let total_lines = notes.lines().count();
+    let within_lines = total_lines <= CORE_MAX_LINES;
+    let within_chars = notes.chars().count() <= CORE_MAX_CHARS;
+    if within_lines && within_chars {
+        return notes.to_string();
+    }
+
+    // Keep whole lines up to BOTH budgets. The char budget binds the FIRST kept
+    // line too: a single wall-of-text line with no newlines (sessions.memory is
+    // free text a human/bot edits) must not slip past the cap in full — it is
+    // char-truncated to the remaining budget so the always-loaded token tax is
+    // genuinely bounded, not just bounded when there happen to be many newlines.
+    let mut kept = String::new();
+    let mut kept_lines = 0usize;
+    let mut clipped = false;
+    for line in notes.lines() {
+        if kept_lines >= CORE_MAX_LINES {
+            break;
+        }
+        // Chars already spent, plus the newline this line needs (none for the
+        // first). Stop if there is no room left for even a separator.
+        let used = kept.chars().count();
+        let sep = usize::from(kept_lines > 0);
+        if used + sep >= CORE_MAX_CHARS {
+            break;
+        }
+        let budget = CORE_MAX_CHARS - used - sep;
+        if kept_lines > 0 {
+            kept.push('\n');
+        }
+        if line.chars().count() > budget {
+            // Truncate this line (the first line included) to the remaining char
+            // budget; the rest is recalled on demand, never front-loaded.
+            kept.extend(line.chars().take(budget));
+            kept_lines += 1;
+            clipped = true;
+            break;
+        }
+        kept.push_str(line);
+        kept_lines += 1;
+    }
+    let dropped = total_lines.saturating_sub(kept_lines);
+    if dropped > 0 {
+        kept.push_str(&format!("\n…({dropped} more in archival)"));
+    } else if clipped {
+        kept.push_str("\n…(truncated; more in archival)");
+    }
+    kept
+}
+
+/// Write the composed role/notes block to a per-session instructions file the
+/// codex arm points at, returning its path — or `None` when this session has no
+/// role/notes (then any stale file from a previous launch is removed, so a
+/// cleared role does not keep steering codex). Best-effort: any fs error yields
+/// `None` and the launch simply proceeds without role injection.
+fn write_codex_role_file(config: &crate::config::Config, s: &Session) -> Option<std::path::PathBuf> {
+    let dir = config.data_dir.join("bot-role");
+    let path = dir.join(format!("{}.md", s.name));
+    match role_system_prompt(s) {
+        Some(body) => {
+            if std::fs::create_dir_all(&dir).is_err() {
+                return None;
+            }
+            std::fs::write(&path, body).ok().map(|_| path)
+        }
+        None => {
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
 /// Per-session tmux env. Excludes the dashboard bearer by construction.
 ///
 /// `agent_teams` gates the experimental Claude Code Agent Teams feature:
@@ -403,7 +577,17 @@ fn build_env(
 /// a resume-picker escape (+ destructive `clear_cc`) is safe: it NEVER is on an
 /// intended resume (escaping abandons the exact conversation asked for and wiping
 /// the cc link breaks every later Start/Resume too). Always false for codex/shell.
-fn build_launch_command(config: &crate::config::Config, s: &Session) -> (String, bool) {
+/// `mcp_flags` are the per-session connector flag WORDS computed by the shared
+/// seam ([`crate::sessions::connector_config`]) — an empty slice for the whole
+/// pre-connector fleet, which yields a BYTE-IDENTICAL launch line. When present
+/// they are the `--mcp-config <inline json> --strict-mcp-config` pair; each word
+/// is shell-escaped here, and they sit BESIDE the role/notes
+/// `--append-system-prompt` pair (neither clobbers the other).
+fn build_launch_command(
+    config: &crate::config::Config,
+    s: &Session,
+    mcp_flags: &[String],
+) -> (String, bool) {
     let (agent, resume_intended) = match s.provider.as_str() {
         "codex" => {
             // Keep Codex in the normal terminal buffer so the browser terminal
@@ -415,6 +599,25 @@ fn build_launch_command(config: &crate::config::Config, s: &Session) -> (String,
             }
             // Per-session flags are caller-supplied → quoted word by word.
             parts.extend(quoted_flag_words(&s.flags));
+            // ── bot identity (migration 0030), codex arm ───────────────────
+            // Per-bot MODEL via codex's own `--model <id>` flag, allowlist-
+            // resolved exactly like the claude arm (never free text).
+            if let Ok(Some(id)) = resolve_model_flag(&s.provider, &s.model) {
+                parts.push("--model".to_string());
+                parts.push(shell_escape::unix::escape(std::borrow::Cow::Borrowed(id)).into_owned());
+            }
+            // ROLE + NOTES for codex. Codex has no per-launch `--append-system-
+            // prompt`, so v1 writes the composed role/notes to a per-session
+            // instructions FILE and points codex at it via its config override
+            // (`-c experimental_instructions_file="<path>"`). READ-ONLY, same as
+            // the claude arm. Best-effort: a write failure just skips injection
+            // (the session still launches). CONNECTOR-STORE seam applies here too
+            // (see the claude arm's note) — this consumes only its own `-c` pair.
+            if let Some(path) = write_codex_role_file(config, s) {
+                parts.push("-c".to_string());
+                let kv = format!("experimental_instructions_file={:?}", path.display().to_string());
+                parts.push(shell_escape::unix::escape(std::borrow::Cow::Owned(kv)).into_owned());
+            }
             let codex = parts.join(" ");
 
             // Codex is an optional provider, so make its first launch
@@ -493,6 +696,50 @@ fn build_launch_command(config: &crate::config::Config, s: &Session) -> (String,
                 parts.push(s.name.clone());
                 false
             };
+            // ── bot identity (migration 0030) ──────────────────────────────
+            // Per-bot MODEL: fold the stored selection into the launch line as
+            // `--model <id>`. Re-resolved through the allowlist (never trusted as
+            // free text) so a legacy / hand-edited column value is dropped rather
+            // than shell-injected; the id it yields is a known-safe literal, and
+            // we single-quote it anyway to keep the argv shape audit-obvious.
+            if let Ok(Some(id)) = resolve_model_flag(&s.provider, &s.model) {
+                parts.push("--model".to_string());
+                parts.push(shell_escape::unix::escape(std::borrow::Cow::Borrowed(id)).into_owned());
+            }
+            // ROLE + NOTES: inject the session's role (`desc`) and the bot's notes
+            // (`memory`) into Claude's SYSTEM PROMPT via `--append-system-prompt`
+            // (per-launch, clean, no file to clean up). READ-ONLY in v1. The value
+            // is shell-escaped as one word by the same quoting the flags path uses.
+            //
+            // CONNECTOR-STORE COEXISTENCE SEAM — see
+            // docs/superpowers/specs/2026-08-18-connector-store-design.md
+            // (branch feat/connector-store). That work injects at THIS SAME point
+            // via `--mcp-config <path>` and a `--settings <overlay>` file (with the
+            // secret `${VAR}` env in `build_env`; it does NOT repoint
+            // `CLAUDE_CONFIG_DIR`). This role/notes injection is designed to COMPOSE with
+            // it: it appends its OWN `--append-system-prompt` flag pair and does
+            // NOT consume the `--mcp-config` slot or any env slot the connector
+            // work needs — a later MCP-config flag simply sits beside this one in
+            // `parts`. Keep them as independent flag pairs; do not merge.
+            if let Some(sys) = role_system_prompt(s) {
+                parts.push("--append-system-prompt".to_string());
+                parts.push(shell_escape::unix::escape(std::borrow::Cow::Owned(sys)).into_owned());
+            }
+            // ── connector store (migration 0031) ───────────────────────────
+            // The per-session launch flags — the connector pair (`--mcp-config
+            // <inline json> --strict-mcp-config`) and the `--settings <overlay>`
+            // flag for the hooks/permissions/kill-switch overlay — computed by the
+            // shared seam `connector_config::assemble` from this session's enabled
+            // grants (its own + all-agents) and its bot memory. COMPOSES with the
+            // role/notes block above: separate, independent flag words appended
+            // after it, escaped word by word. Empty for a plain session (no grants,
+            // no memory) ⇒ the launch line is byte-identical to the pre-connector
+            // fleet. The matching `${VAR}` secret env is injected via `build_env`'s
+            // merge in `start_locked` — not here. Note: the overlay is layered via
+            // `--settings`, NOT by repointing `CLAUDE_CONFIG_DIR`.
+            for word in mcp_flags {
+                parts.push(shell_escape::unix::escape(std::borrow::Cow::Borrowed(word)).into_owned());
+            }
             (parts.join(" "), resume_intended)
         }
     };
@@ -506,9 +753,17 @@ fn build_launch_command(config: &crate::config::Config, s: &Session) -> (String,
     // ignore it). Single-quoted so a data-dir path with spaces never word-splits.
     let bridge = config.data_dir.join("bin/supermux-edit");
     let bridge = bridge.display();
+    // Put `<data_dir>/bin` on PATH (AFTER the profile sources so it wins) so the
+    // bot-memory write CLI resolves as a bare `supermux-memory` — the name the
+    // per-session `allowedTools` grant (`Bash(supermux-memory *)`) auto-approves.
+    // Harmless for non-bot panes (an extra dir on PATH); the CLI errors cleanly if
+    // BOT_MEMORY_* is unset.
+    let bin_dir = config.data_dir.join("bin");
+    let bin_dir = bin_dir.display();
     let command = format!(
         "source ~/.zprofile 2>/dev/null; source ~/.bash_profile 2>/dev/null; \
-         source ~/.profile 2>/dev/null; export EDITOR='{bridge}' VISUAL='{bridge}'; {agent}"
+         source ~/.profile 2>/dev/null; export EDITOR='{bridge}' VISUAL='{bridge}'; \
+         export PATH='{bin_dir}':\"$PATH\"; {agent}"
     );
     (command, resume_intended)
 }
@@ -580,7 +835,20 @@ fn pty_ready_for_send(capture: &str) -> bool {
         return false;
     }
     let screen = current_screen_tail(capture);
-    agent_ui_visible(&screen) || agent_busy(&screen)
+    agent_ui_visible(&screen) || agent_busy(&screen) || codex_ready(&screen)
+}
+
+/// True once a READY, EMPTY Codex composer is visible. Codex draws `›` (U+203A),
+/// not Claude's `❯`, so [`agent_ui_visible`] is blind to it and the send guard
+/// wrongly 409'd every send/delegate to an awake, idle Codex (FIX 2). ORed into
+/// [`pty_ready_for_send`] AFTER the picker/trust rejections, so a real Codex
+/// resume-picker or folder-trust dialog is still refused first. Keyed (via
+/// `status`) on the "Ask Codex to do anything" placeholder and/or the composer
+/// model footer — signals a picker/trust dialog never shows — and NEVER on a
+/// bare `›` (a `› N.` numbered selector stays non-ready). See
+/// [`status::is_codex_ready_composer`].
+fn codex_ready(screen: &str) -> bool {
+    status::is_codex_ready_composer(screen)
 }
 
 /// How many bottom rows of a capture count as the CURRENT interactive screen for
@@ -606,10 +874,23 @@ fn current_screen_tail(capture: &str) -> String {
     lines[start..].join("\n")
 }
 
-/// Heuristic: are we stuck in Claude's `--resume` session picker?
+/// Heuristic: are we stuck in a `--resume` session picker (Claude OR Codex)?
+///
+/// Claude's picker draws "Resume a conversation" / "Select a session" / "…
+/// conversation to resume". Codex's native `codex resume` picker (FIX 3) draws a
+/// distinct header — "Resume a session" / "Resume a previous session" — so a
+/// genuinely-stuck Codex picker is now visible to `should_escape_resume_picker`
+/// and can be escaped on a fresh, non-resume-intended start, exactly as Claude's
+/// is. All markers are disjoint from the ready-composer signals
+/// ("Ask Codex to do anything" + the model footer), so the composer never reads
+/// as a picker and a real picker still receives NO injected prompt.
 fn at_resume_picker(capture: &str) -> bool {
     let c = capture.to_lowercase();
-    c.contains("resume a conversation") || c.contains("select a session") || c.contains("conversation to resume")
+    c.contains("resume a conversation")
+        || c.contains("select a session")
+        || c.contains("conversation to resume")
+        || c.contains("resume a session")
+        || c.contains("resume a previous session")
 }
 
 /// Heuristic: is Claude blocking on its first-run "Do you trust the files in
@@ -775,6 +1056,7 @@ async fn hard_kill(pid: u32) {
 fn emit_alert(state: &AppState, name: &str, level: &str, detail: &str) {
     let _ = state.sse_tx.send(SseEvent {
         event: "alerts".to_string(),
+        company_id: None,
         payload: json!({ "level": level, "session": name, "detail": detail }),
     });
 }
@@ -797,10 +1079,12 @@ fn broadcast_status(state: &AppState, name: &str, status: &str) {
     };
     let _ = state.sse_tx.send(SseEvent {
         event: "status".to_string(),
+        company_id: None,
         payload: json!({ "name": name, "status": status, "version": version }),
     });
     let _ = state.sse_tx.send(SseEvent {
         event: "sessions".to_string(),
+        company_id: None,
         payload: json!({ "delta": [{ "name": name, "status": status }] }),
     });
 }
@@ -818,6 +1102,7 @@ fn broadcast_status(state: &AppState, name: &str, status: &str) {
 pub(crate) fn broadcast_send(state: &AppState, name: &str, text: &str, at: i64) {
     let _ = state.sse_tx.send(SseEvent {
         event: "sessions".to_string(),
+        company_id: None,
         payload: json!({
             "delta": [{
                 "name": name,
@@ -884,6 +1169,96 @@ async fn require_session(state: &AppState, name: &str) -> Result<Session, AppErr
     db::sessions::get(&state.pool, name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("session '{name}'")))
+}
+
+/// Build the per-spawn OS-sandbox confinement plan for a COMPANY session
+/// (companies §4.4), or `None` for a main/PA/tech-admin bot (`company_id` NULL)
+/// or when `isolation_mode = off`.
+///
+/// Resolves the company `root_dir` by a DB read (kept OUT of the pure
+/// `build_env`), builds the [`crate::isolation::SandboxSpec`], surfaces the
+/// MEASURED level per session (log + `isolation_applied` store for a later
+/// badge), and — under `StrictRequired` on a host that enforces nothing —
+/// REFUSES to start with a clear error rather than degrading. Under `BestEffort`
+/// a `None`/blocked measurement still returns a plan whose `apply_in_child`
+/// fails open, so the child execs.
+async fn company_confinement(
+    state: &AppState,
+    s: &Session,
+    name: &str,
+) -> Result<Option<crate::isolation::ConfinePlan>, AppError> {
+    use crate::isolation::IsolationMode;
+    // GATE: `company_id IS NULL` ⇒ a main/PA/tech-admin bot ⇒ never confined —
+    // `confine()` is simply never reached (no global sandbox to exempt from).
+    let Some(cid) = s.company_id else {
+        return Ok(None);
+    };
+    // Escape hatch: `isolation_mode = off` ⇒ no plan ⇒ `confine()` never called.
+    if state.isolation.mode() == IsolationMode::Off {
+        return Ok(None);
+    }
+    // StrictRequired fail-closed: refuse to start a company session on a host
+    // that enforces no OS sandbox — or one where the startup self-test showed a
+    // confined child cannot boot + exec — BEFORE any spawn.
+    if let Some(reason) = state.isolation.strict_refusal() {
+        return Err(AppError::Conflict(reason));
+    }
+    // SELF-TEST GATE (companies §4.4, the primary guarantee): if the startup
+    // self-test showed a confined child cannot BOOT + EXEC on this host (a broken
+    // Landlock allow-list, or a host without a working jail), DISABLE company
+    // confinement for this boot so the bot still starts UNCONFINED rather than
+    // dying at exec. Under StrictRequired this branch is unreachable (the refusal
+    // above already fired); it is the BestEffort fail-open path. The loud one-time
+    // warning was already logged by `confinement_self_test`.
+    if !state.isolation.confinement_usable() {
+        tracing::warn!(
+            session = name,
+            company = cid,
+            "isolation: company agent '{name}' spawning UNCONFINED — the startup self-test \
+             showed a confined child cannot boot + exec on this host (Landlock jail not \
+             functional / allow-list insufficient). secret-floor still applies; check the \
+             allow-list in server/src/isolation.",
+        );
+        state
+            .isolation_applied
+            .insert(name.to_string(), crate::isolation::IsolationLevel::None);
+        return Ok(None);
+    }
+    let company = db::companies::get(&state.pool, cid)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("load company {cid}: {e}")))?
+        .ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!(
+                "session '{name}' references company {cid} that no longer exists"
+            ))
+        })?;
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let plan = state
+        .isolation
+        .plan_for(std::path::Path::new(&company.root_dir), &home);
+
+    // Surface the MEASURED level per session (BestEffort surfaces the measured
+    // level, never the requested mode) — log it + stash it for a later UI badge.
+    let level = state.isolation.probe().best_level.clone();
+    if level.is_enforced() {
+        tracing::info!(
+            session = name,
+            company = cid,
+            backend = state.isolation.probe().backend,
+            "isolation: company agent confined at {level}",
+        );
+    } else {
+        tracing::warn!(
+            session = name,
+            company = cid,
+            backend = state.isolation.probe().backend,
+            "isolation: company agent '{name}' spawning UNCONFINED (measured {level}; \
+             fail-open under best-effort). secret-floor still applies; add \
+             SystemCallFilter=@sandbox on Linux to enable the kernel jail.",
+        );
+    }
+    state.isolation_applied.insert(name.to_string(), level);
+    Ok(plan)
 }
 
 /// R2 board↔session link liveness: when a session's lifecycle changes
@@ -1110,7 +1485,7 @@ async fn start_locked(
         }
     }
 
-    let env = build_env(
+    let mut env = build_env(
         &state.config,
         name,
         &hook_token,
@@ -1118,6 +1493,34 @@ async fn start_locked(
         agent_teams,
         s.host_id,
     );
+
+    // ── connector store (migration 0031): the shared per-session seam ──────────
+    // ONE component owns building this session's private settings OVERLAY:
+    // `connector_config::assemble`. It returns `None` (and touches nothing) unless
+    // the session has enabled connector grants OR bot memory — so the launch is
+    // byte-identical for the pre-connector fleet. When present it yields the env
+    // to MERGE over `build_env`'s map (the decrypted `${VAR}` secrets and the
+    // account-connector kill switch) and the launch flag words
+    // (`--mcp-config … --strict-mcp-config` plus `--settings <overlay>`) threaded
+    // into `build_launch_command` below. The overlay is layered via `--settings`,
+    // NOT by repointing `CLAUDE_CONFIG_DIR`, so the transcript tailer, statusline,
+    // teams, resume, and auth all stay on the real `~/.claude`. Claude-only (codex
+    // ignores these flags); best-effort — a failure logs and launches without
+    // connectors rather than blocking start.
+    let mut connector_flags: Vec<String> = Vec::new();
+    if launches_claude(&s.provider) {
+        match crate::sessions::connector_config::assemble(state, name).await {
+            Ok(Some(cfg)) => {
+                env.extend(cfg.env);
+                connector_flags = cfg.launch_flags;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(name = %name, error = %e, "connector launch injection failed; starting without connectors");
+            }
+        }
+    }
+
     let dir = PathBuf::from(&s.dir);
     let shell = user_shell();
 
@@ -1188,7 +1591,30 @@ async fn start_locked(
         // ("a fault reads as gone"), so a transient probe glitch on a session
         // that is actually running now lands here — and must not tear down that
         // live session's cached stream on the way to a spawn that fails.
-        rt.spawn(&dir, &env, &shell).await?;
+        // COMPANY ISOLATION (companies §4.4). Build the per-spawn confinement
+        // plan for a company session (`None` for a main/PA bot or under
+        // isolation_mode=off) and spawn through the confining seam. On THIS box
+        // the probe measures None (the @system-service filter blocks
+        // landlock_*), so under BestEffort the plan fails open and the child
+        // execs UNCONFINED — behaviour-identical to a NULL-company session.
+        let confine_plan = company_confinement(state, &s, name).await?;
+        let confinement_degraded = rt.spawn_confined(&dir, &env, &shell, confine_plan).await?;
+        if confinement_degraded {
+            // FAIL-SAFE landed: the confined holder could not boot under the
+            // Landlock jail, so the native runtime retried UNCONFINED to keep the
+            // company bot startable. Record the applied level as None so the (P2)
+            // badge / logs stay honest about the degraded isolation.
+            tracing::error!(
+                session = %name,
+                company = ?s.company_id,
+                "isolation: company agent started UNCONFINED after the confined holder \
+                 failed to boot (fail-safe); applied level recorded as None — check the \
+                 allow-list in server/src/isolation",
+            );
+            state
+                .isolation_applied
+                .insert(name.to_string(), crate::isolation::IsolationLevel::None);
+        }
         state.pty_invalidate(name);
     }
 
@@ -1210,6 +1636,7 @@ async fn start_locked(
     };
     let _ = state.sse_tx.send(SseEvent {
         event: "status".to_string(),
+        company_id: None,
         payload: json!({
             "name": name,
             "status": "starting",
@@ -1218,6 +1645,7 @@ async fn start_locked(
     });
     let _ = state.sse_tx.send(SseEvent {
         event: "sessions".to_string(),
+        company_id: None,
         payload: json!({ "delta": [{ "name": name, "status": "starting" }] }),
     });
 
@@ -1252,7 +1680,8 @@ async fn start_locked(
         _ => {
             // Give the new shell a beat, then launch the agent.
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let (cmd, resume_intended) = build_launch_command(&state.config, &s);
+            let (cmd, resume_intended) =
+                build_launch_command(&state.config, &s, &connector_flags);
             rt.send_text(&cmd).await?;
             submit_gap(rt.as_ref()).await;
             rt.send_key("Enter").await?;
@@ -1336,6 +1765,17 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     let _guard = lock.lock().await;
 
     let s = require_session(state, name).await?;
+
+    // Drop the session's shared-browser context (connectors::browser) — BEFORE
+    // the early-out below, because an already-dead runtime still leaves the
+    // context registered. The agent that owned the page is going away; leaving
+    // it keeps a logged-in cookie jar alive, holds a slot against
+    // `max_contexts` forever, and — since the idle reaper only fires on an
+    // EMPTY context map — keeps chrome running for the life of the process.
+    // Fire-and-forget so a wedged browser cannot slow a Stop down; silent for
+    // the overwhelmingly common session that never opened a browser at all.
+    crate::connectors::browser::dispose_on_teardown(&state.browser, name);
+
     // Runtime seam — the graceful-exit nudge, the liveness/dead poll, the PID
     // hard-kill and the definitive teardown are all backend-agnostic.
     let rt = state.runtime_for(name).await?;
@@ -1535,7 +1975,55 @@ fn reject_wrapper_markup(text: &str) -> Result<(), AppError> {
 /// their own transcript, not one session forging provenance in another's.
 pub async fn send_text(state: &AppState, name: &str, text: &str) -> Result<(), AppError> {
     reject_wrapper_markup(text)?;
-    send_harness_text(state, name, text, None).await
+    send_harness_text(state, name, text, None, None).await
+}
+
+/// [`send_text`] for the CHAT composer's `POST /send`, carrying the client's
+/// idempotency key. `send_id` (minted per message in
+/// `web/.../use-pending-sends.ts` and reused verbatim on every retry) lets the
+/// server recognise a re-POST of a message it already typed — a Retry over a
+/// false failure, or over a dropped response — and make it a NO-OP instead of a
+/// second prompt in the agent's queue. `None` keeps the un-deduped behaviour for
+/// callers with no client id.
+pub async fn send_chat_text(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    send_id: Option<&str>,
+) -> Result<(), AppError> {
+    reject_wrapper_markup(text)?;
+    send_harness_text(state, name, text, None, send_id).await
+}
+
+/// [`send_chat_text`] for a message sent by an authenticated HUMAN colleague
+/// (P3c). The author is server-resolved from `AuthContext` (P3a) and stamped into
+/// a `<supermux-human>` provenance wrapper — NEVER trusted from the request body.
+///
+/// The composer text is first refused if it already carries wrapper markup (a
+/// forged human/delegation/schedule claim), exactly as an owner send is; only
+/// THEN is the clean text wrapped and handed to the harness door
+/// ([`send_harness_text`], the one writer allowed to emit a wrapper). The stored
+/// preview is the UNWRAPPED text, so the roster's send-recall shows what the
+/// person typed, not the machinery. The owner's own sends never reach here (the
+/// owner is not a `Human` context), so they are byte-identically unaffected.
+pub async fn send_human_text(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    author_user_id: i64,
+    author_name: &str,
+    author_company_id: Option<i64>,
+    send_id: Option<&str>,
+) -> Result<(), AppError> {
+    reject_wrapper_markup(text)?;
+    let wrapped = crate::agents::delegate::wrap_human(
+        author_user_id,
+        author_name,
+        author_company_id,
+        text,
+    )
+    .map_err(|e| AppError::BadRequest(e.into()))?;
+    send_harness_text(state, name, &wrapped, Some(text), send_id).await
 }
 
 /// [`send_text`] for HARNESS-AUTHORED deliveries: no wrapper-markup guard, and
@@ -1574,6 +2062,7 @@ pub async fn send_harness_text(
     name: &str,
     text: &str,
     preview_text: Option<&str>,
+    send_id: Option<&str>,
 ) -> Result<(), AppError> {
     // ARCHIVE CONTRACT (B5/T5): `exists_active`, never the archive-blind
     // `exists`. This function AUTO-STARTS a session that is not alive (three
@@ -1612,6 +2101,18 @@ pub async fn send_harness_text(
 
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
+    // IDEMPOTENCY (chat Retry duplicate guard). Under the per-session lock, so a
+    // double-tap that races two POSTs cannot slip both past this check: the
+    // first types + records the id below, the second sees it here and returns
+    // Ok without typing. Only chat sends carry an id; harness callers pass None
+    // and are unaffected. The record happens ONLY after a successful delivery
+    // (below `set_last_send`), so a first attempt that 409s here or downstream
+    // records nothing and a retry with the same id proceeds normally.
+    if let Some(id) = send_id {
+        if state.send_dedup.seen(name, id) {
+            return Ok(());
+        }
+    }
     // RE-RESOLVE after a wake. `wake_for_send` → `start` can migrate a legacy
     // tmux session to native on its fresh start, which `runtime_invalidate`s the
     // cache — so `rt`, resolved BEFORE the wake, is now a handle to the dead tmux
@@ -1694,6 +2195,12 @@ pub async fn send_harness_text(
     let (preview, at) =
         db::sessions::set_last_send(&state.pool, name, preview_text.unwrap_or(text)).await?;
     broadcast_send(state, name, &preview, at);
+    // Record the idempotency key ONLY now that the text is genuinely typed +
+    // Entered + stamped: a re-POST with this id is a delivered message and must
+    // not be typed again. Still under the per-session lock taken above.
+    if let Some(id) = send_id {
+        state.send_dedup.record(name, id);
+    }
     Ok(())
 }
 
@@ -1929,6 +2436,7 @@ pub async fn archive(state: &AppState, name: &str) -> Result<String, AppError> {
     // frontend's `applyDelta` reads this flag and removes the row.
     let _ = state.sse_tx.send(SseEvent {
         event: "sessions".to_string(),
+        company_id: None,
         payload: json!({
             "delta": [{ "name": name, "archived": true }],
         }),
@@ -2070,6 +2578,7 @@ pub async fn unarchive(state: &AppState, name: &str) -> Result<(), AppError> {
         row["archived"] = json!(false);
         let _ = state.sse_tx.send(SseEvent {
             event: "sessions".to_string(),
+            company_id: None,
             payload: json!({ "delta": [row] }),
         });
     }
@@ -2411,6 +2920,7 @@ async fn relaunch_for_bypass(
 fn broadcast_mode(state: &AppState, name: &str, mode: Mode) {
     let _ = state.sse_tx.send(SseEvent {
         event: "sessions".to_string(),
+        company_id: None,
         payload: json!({ "delta": [{ "name": name, "mode": mode.as_str() }] }),
     });
 }
@@ -2647,6 +3157,86 @@ mod agent_ready_heuristics_tests {
             "a live composer at the bottom of the current screen still delivers",
         );
     }
+
+    /// FIX 2 (a). A ready, EMPTY Codex composer — `›` cursor + the placeholder
+    /// "Ask Codex to do anything" + the model footer — must be SENDABLE. Codex
+    /// draws `›` (U+203A) not Claude's `❯`, so before the fix the send guard was
+    /// blind to it and 409'd every send/delegate to an awake, idle Codex.
+    #[test]
+    fn codex_idle_composer_is_ready_for_send() {
+        let composer = "› Ask Codex to do anything\n  gpt-5.6-sol high · /opt/projects/Folderwijzer-codex";
+        assert!(
+            pty_ready_for_send(composer),
+            "an idle Codex composer (`›` + Ask-Codex placeholder + model footer) is a \
+             ready send target — the delegate/#2 regression",
+        );
+        // The model footer ALONE (placeholder scrolled out of a short tail) still
+        // reads ready — it is a signal a picker/trust dialog never shows.
+        assert!(
+            pty_ready_for_send("  gpt-5.6-sol high · /opt/projects/Folderwijzer-codex"),
+            "the Codex composer model footer alone is enough to read ready",
+        );
+    }
+
+    /// FIX 2 (b). A Codex `› N.` NUMBERED selector (CODEX_WAITING_BANK) must stay
+    /// GUARDED — the bare `›` is not admitted, so a selector/approval never reads
+    /// as a ready composer even though it shares Codex's cursor glyph.
+    #[test]
+    fn codex_numbered_selector_is_not_ready_for_send() {
+        let selector = "Do you want to run this command?\n› 1. Yes, run it\n  2. No, keep chatting";
+        assert!(
+            !pty_ready_for_send(selector),
+            "a Codex `› N.` numbered selector is a waiting prompt — MUST NOT be typed into",
+        );
+    }
+
+    /// FIX 3 (c). A Codex resume picker must be NOT ready (no injected prompt) AND
+    /// recognised by `at_resume_picker` so `should_escape_resume_picker` can
+    /// escape a genuinely-stuck one on a fresh, non-resume-intended start.
+    #[test]
+    fn codex_resume_picker_is_guarded_and_escapable() {
+        let picker = "Resume a previous session\n› 1. Fix the parser   2h ago\n  2. Older chat   1d ago";
+        assert!(
+            at_resume_picker(picker),
+            "a Codex resume picker header must be visible to the escape path (FIX 3)",
+        );
+        assert!(
+            !pty_ready_for_send(picker),
+            "a Codex resume picker still receives NO typed prompt",
+        );
+        // Escapable only on a fresh, non-resume-intended start; an INTENDED resume
+        // is never auto-escaped.
+        assert!(
+            should_escape_resume_picker(picker, false, false),
+            "a stuck Codex picker on a non-resume start is escapable",
+        );
+        assert!(
+            !should_escape_resume_picker(picker, true, false),
+            "an INTENDED Codex resume is never auto-escaped",
+        );
+    }
+
+    /// FIX 3 (d). A real folder-trust dialog is still NOT ready — the Codex-ready
+    /// predicate keys on composer markers a trust gate never shows, so it never
+    /// admits an injected prompt into the trust dialog.
+    #[test]
+    fn codex_trust_dialog_still_receives_no_injection() {
+        let trust = "Do you trust the files in this folder?\n› 1. Yes, I trust\n  2. No";
+        assert!(
+            !pty_ready_for_send(trust),
+            "a folder-trust dialog must still be refused a typed prompt",
+        );
+    }
+
+    /// FIX 2 (e). Claude's idle `❯` composer is UNCHANGED by the Codex additions —
+    /// still ready for send.
+    #[test]
+    fn claude_idle_composer_still_ready_after_codex_fix() {
+        assert!(
+            pty_ready_for_send("❯ Try \"fix tests\"\n  ? for shortcuts"),
+            "the Claude idle composer must remain a ready send target (unchanged)",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2671,6 +3261,8 @@ mod build_env_tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         }
     }
@@ -2829,15 +3421,20 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            company_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
             notif: "inherit".into(),
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
         };
 
-        let (command, resume_intended) = build_launch_command(&config, &session);
+        let (command, resume_intended) = build_launch_command(&config, &session, &[]);
         // Per-session flags go through the SEC-01 escaper, which leaves ordinary
         // flag words alone — the rendered line is byte-identical to before.
         let invocation = "codex --no-alt-screen --model gpt-5-codex --ask-for-approval never";
@@ -2890,23 +3487,28 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            company_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
             notif: "inherit".into(),
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
         };
 
         // Fresh: no cc handles → `--name`, not resume-intended.
-        let (cmd, resume) = build_launch_command(&config, &base);
+        let (cmd, resume) = build_launch_command(&config, &base, &[]);
         assert!(cmd.contains("--name worker"));
         assert!(!cmd.contains("--resume"));
         assert!(!resume);
 
         // A persisted conversation id → `--resume '<id>'`, resume-intended.
         let by_id = Session { cc_conversation_id: "abc-123".into(), ..base.clone() };
-        let (cmd, resume) = build_launch_command(&config, &by_id);
+        let (cmd, resume) = build_launch_command(&config, &by_id, &[]);
         assert!(cmd.contains("--resume 'abc-123'"));
         assert!(resume);
 
@@ -2916,7 +3518,7 @@ mod build_env_tests {
             cc_conversation_id: "abc-123".into(),
             ..base
         };
-        let (cmd, resume) = build_launch_command(&config, &by_name);
+        let (cmd, resume) = build_launch_command(&config, &by_name, &[]);
         assert!(cmd.contains("--resume 'my-chat'"));
         assert!(resume);
     }
@@ -2954,20 +3556,203 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            company_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
             notif: "inherit".into(),
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
         };
 
-        let (command, _resume) = build_launch_command(&config, &session);
+        let (command, _resume) = build_launch_command(&config, &session, &[]);
         let status = std::process::Command::new("bash")
             .args(["-n", "-c", &command])
             .status()
             .expect("bash must be available to validate the launch command");
         assert!(status.success(), "generated Codex bootstrap must parse as shell");
+    }
+
+    // ── bot identity (migration 0030): role/notes/model injection ────────────
+
+    /// The MODEL allowlist maps a selection to a real id per provider and rejects
+    /// anything else — the guard that keeps free text off the launch line.
+    #[test]
+    fn model_allowlist_maps_known_and_rejects_unknown() {
+        assert_eq!(resolve_model_flag("claude", "opus"), Ok(Some("opus")));
+        assert_eq!(resolve_model_flag("claude", "sonnet"), Ok(Some("sonnet")));
+        assert_eq!(resolve_model_flag("codex", "gpt-5-codex"), Ok(Some("gpt-5-codex")));
+        // Empty = provider default (no injection).
+        assert_eq!(resolve_model_flag("claude", ""), Ok(None));
+        assert_eq!(resolve_model_flag("claude", "   "), Ok(None));
+        // A claude model asked of codex (and vice-versa) is refused, not silently
+        // accepted — the allowlist is per-provider.
+        assert!(resolve_model_flag("claude", "gpt-5-codex").is_err());
+        assert!(resolve_model_flag("codex", "opus").is_err());
+        // Junk / shell-meta never maps.
+        assert!(resolve_model_flag("claude", "opus; rm -rf /").is_err());
+        assert!(resolve_model_flag("shell", "opus").is_err());
+    }
+
+    /// THE KEY NEW BEHAVIOUR: a non-empty role (`desc`) and the bot's notes
+    /// (`memory`) are injected into Claude's system prompt via
+    /// `--append-system-prompt`, and the model column lands as `--model <id>`.
+    #[test]
+    fn role_notes_and_model_inject_into_the_claude_launch_line() {
+        let config = cfg();
+        let mut s = claude_session("bot", "");
+        s.desc = "You are a meticulous code reviewer.".into();
+        s.memory = "The build is debug-only; never run cargo --release.".into();
+        s.model = "opus".into();
+
+        let (cmd, _resume) = build_launch_command(&config, &s, &[]);
+        // Role + notes ride ONE `--append-system-prompt` word.
+        assert!(cmd.contains("--append-system-prompt"), "cmd: {cmd}");
+        assert!(cmd.contains("meticulous code reviewer"), "role missing: {cmd}");
+        assert!(cmd.contains("Notes you keep:"), "notes delimiter missing: {cmd}");
+        assert!(cmd.contains("never run cargo --release"), "notes body missing: {cmd}");
+        // Model column → validated `--model opus`.
+        assert!(cmd.contains("--model opus"), "model missing: {cmd}");
+
+        // CONNECTOR-STORE COEXISTENCE: role injection consumes only its own
+        // `--append-system-prompt` slot and leaves `--mcp-config` free for the
+        // later connector-store work to sit beside it.
+        assert!(!cmd.contains("--mcp-config"), "must not pre-empt the connector slot");
+    }
+
+    /// A session with neither role nor notes injects NO system prompt — the launch
+    /// line is unchanged for the whole pre-0030 fleet.
+    #[test]
+    fn no_role_no_notes_means_no_system_prompt_injection() {
+        let config = cfg();
+        let s = claude_session("plain", "");
+        let (cmd, _resume) = build_launch_command(&config, &s, &[]);
+        assert!(!cmd.contains("--append-system-prompt"), "cmd: {cmd}");
+        assert!(!cmd.contains("--model"), "no model column → no --model: {cmd}");
+    }
+
+    /// A poisoned/legacy model column value is DROPPED at launch (re-resolved
+    /// through the allowlist), never shell-injected.
+    #[test]
+    fn a_junk_model_column_is_not_injected() {
+        let config = cfg();
+        let mut s = claude_session("legacy", "");
+        s.model = "totally-made-up".into();
+        let (cmd, _resume) = build_launch_command(&config, &s, &[]);
+        assert!(!cmd.contains("--model"), "an unmappable model must be dropped: {cmd}");
+    }
+
+    /// The composed launch line still parses as shell with role/notes/model on it
+    /// (the escaping holds for a system prompt full of spaces and shell-meta).
+    #[test]
+    fn role_injected_claude_launch_is_valid_shell() {
+        let config = cfg();
+        let mut s = claude_session("shellcheck", "");
+        s.desc = "Mind the $PATH; use \"quotes\" & `ticks` — carefully.".into();
+        s.memory = "Rule: don't `rm -rf`.".into();
+        s.model = "sonnet".into();
+        let (command, _resume) = build_launch_command(&config, &s, &[]);
+        let status = std::process::Command::new("bash")
+            .args(["-n", "-c", &command])
+            .status()
+            .expect("bash must be available to validate the launch command");
+        assert!(status.success(), "role-injected launch must parse as shell: {command}");
+    }
+
+    /// Connector scoping COMPOSES with role/notes (migration 0031): a session
+    /// with both a role AND connector flags emits BOTH the role's
+    /// `--append-system-prompt` pair and the connector's `--mcp-config …
+    /// --strict-mcp-config` pair — neither clobbers the other, and the whole line
+    /// still parses as shell.
+    #[test]
+    fn connector_flags_compose_with_role_notes() {
+        let config = cfg();
+        let mut s = claude_session("compose", "");
+        s.desc = "You are the mail bot.".into();
+        s.memory = "Never delete a thread.".into();
+        let mcp_flags = vec![
+            "--mcp-config".to_string(),
+            r#"{"mcpServers":{"icloud-mail":{"command":"python","args":["s.py"]}}}"#.to_string(),
+            "--strict-mcp-config".to_string(),
+        ];
+        let (command, _resume) = build_launch_command(&config, &s, &mcp_flags);
+        // BOTH flag pairs present.
+        assert!(command.contains("--append-system-prompt"), "role flag missing: {command}");
+        assert!(command.contains("--mcp-config"), "connector flag missing: {command}");
+        assert!(command.contains("--strict-mcp-config"), "strict flag missing: {command}");
+        assert!(command.contains("icloud-mail"), "inline mcp config missing: {command}");
+        // The role's system prompt survived intact.
+        assert!(command.contains("You are the mail bot."), "role text missing: {command}");
+        // And the composed line is still valid shell (the inline JSON is quoted).
+        let status = std::process::Command::new("bash")
+            .args(["-n", "-c", &command])
+            .status()
+            .expect("bash must be available to validate the launch command");
+        assert!(status.success(), "composed launch must parse as shell: {command}");
+    }
+
+    /// The CORE (always-loaded) notes index is HARD-CAPPED (audit gap 4): a bot
+    /// whose `memory` grows past the line budget gets a truncated index plus a
+    /// "…(N more in archival)" pointer, never the unbounded blob.
+    #[test]
+    fn core_notes_are_capped_with_archival_pointer() {
+        // 100 one-line notes — well over CORE_MAX_LINES (40).
+        let notes: String = (0..100).map(|i| format!("- note line {i}\n")).collect();
+        let capped = cap_core_notes(&notes);
+        let lines: Vec<&str> = capped.lines().collect();
+        // 40 kept lines + the pointer line.
+        assert_eq!(lines.len(), CORE_MAX_LINES + 1, "capped to the line budget + pointer");
+        assert!(lines[0].contains("note line 0"), "keeps the head");
+        assert!(!capped.contains("note line 99"), "drops the tail");
+        assert_eq!(lines.last().copied(), Some("…(60 more in archival)"), "pointer names the drop count");
+
+        // A short index passes through untouched.
+        let short = "- one\n- two\n- three";
+        assert_eq!(cap_core_notes(short), short, "under budget = verbatim");
+    }
+
+    /// The char budget is HARD even for a single wall-of-text line with no
+    /// newlines: the line budget alone would emit it whole (the always-loaded
+    /// token tax stays unbounded), so the first line is char-truncated too.
+    #[test]
+    fn core_notes_cap_a_single_overlong_line() {
+        let one_huge_line = "x".repeat(20_000); // >> CORE_MAX_CHARS, zero newlines
+        let capped = cap_core_notes(&one_huge_line);
+        assert!(
+            capped.chars().count() <= CORE_MAX_CHARS + 40,
+            "a single long line is clipped to the char budget (+pointer), got {}",
+            capped.chars().count()
+        );
+        assert!(capped.contains("more in archival"), "clipped index shows the pointer");
+    }
+
+    /// The cap also injects the pointer through the full `role_system_prompt`
+    /// composition (role + capped notes), not just the helper in isolation.
+    #[test]
+    fn role_system_prompt_caps_the_notes_section() {
+        let mut s = claude_session("bot", "");
+        s.desc = "Standing instructions: be terse.".into();
+        s.memory = (0..80).map(|i| format!("- fact {i}\n")).collect();
+        let sys = role_system_prompt(&s).expect("role+notes present");
+        assert!(sys.starts_with("Standing instructions: be terse."), "role first");
+        assert!(sys.contains("Notes you keep:"), "notes delimiter kept");
+        assert!(sys.contains("more in archival)"), "cap pointer injected");
+        assert!(!sys.contains("fact 79"), "tail dropped");
+    }
+
+    /// With NO connector flags (empty slice), the launch line is byte-identical to
+    /// the pre-connector fleet — the composition adds nothing.
+    #[test]
+    fn no_connector_flags_is_byte_identical() {
+        let config = cfg();
+        let s = claude_session("plain", "--yolo");
+        let (with_empty, _) = build_launch_command(&config, &s, &[]);
+        assert!(!with_empty.contains("--mcp-config"));
+        assert!(!with_empty.contains("--strict-mcp-config"));
     }
 
     // ── SEC-01: caller-supplied `flags` on a shell command line ──────────────
@@ -3004,12 +3789,17 @@ mod build_env_tests {
             start_error: String::new(),
             team_name: None,
             host_id: None,
+            company_id: None,
             mark_pin: None,
             runtime: "tmux".into(),
             notif: "inherit".into(),
             seen_ts: None,
             seen_count: None,
             seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
         }
     }
 
@@ -3100,7 +3890,7 @@ mod build_env_tests {
             "--version >/dev/null ; touch {} ; claude",
             sentinel.display()
         );
-        let (command, _) = build_launch_command(&cfg(), &claude_session("pwn", &payload));
+        let (command, _) = build_launch_command(&cfg(), &claude_session("pwn", &payload), &[]);
 
         // 1. It is still a VALID shell line (an unbalanced quote would 500 the
         //    pane instead of running the payload — also not acceptable).
@@ -3255,6 +4045,8 @@ mod link_liveness_tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = crate::db::init(&config).await.expect("init pool");
@@ -3476,6 +4268,8 @@ mod write_runtime_tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = crate::db::init(&config).await.expect("init pool");
@@ -3684,7 +4478,7 @@ mod write_runtime_tests {
             .session_runtimes
             .insert("parked".to_string(), rt.clone());
 
-        let res = send_harness_text(&state, "parked", "retry after the first refusal", None).await;
+        let res = send_harness_text(&state, "parked", "retry after the first refusal", None, None).await;
 
         assert!(
             matches!(res, Err(AppError::Conflict(_))),
@@ -3730,7 +4524,7 @@ mod write_runtime_tests {
             .session_runtimes
             .insert("ready".to_string(), rt.clone());
 
-        send_harness_text(&state, "ready", "a real message", None)
+        send_harness_text(&state, "ready", "a real message", None, None)
             .await
             .expect("a ready composer must accept the send");
 
@@ -3741,6 +4535,47 @@ mod write_runtime_tests {
             s.last_send_text, "a real message",
             "a genuine delivery records last_send",
         );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// IDEMPOTENT SEND — the chat Retry duplicate guard. A re-POST carrying the
+    /// SAME `send_id` (a Retry over a false failure, or a double-tap) is typed
+    /// exactly ONCE; the second call is a no-op. A DIFFERENT id is a genuinely
+    /// new message and is typed again. Proves "Retry can never duplicate a
+    /// delivered message" at the delivery seam every writer passes through.
+    #[tokio::test]
+    async fn the_same_send_id_is_typed_once_a_different_id_types_again() {
+        let (state, dir) = test_state().await;
+        db::sessions::insert_minimal(&state.pool, "idem", "/tmp", "claude")
+            .await
+            .unwrap();
+
+        let composer = "❯ Try \"fix tests\"\n  ? for shortcuts";
+        let rt = StubRuntime::parked_at(composer);
+        state.session_runtimes.insert("idem".to_string(), rt.clone());
+
+        // First delivery with key k1: typed + Entered + recorded.
+        send_harness_text(&state, "idem", "ship it", None, Some("k1"))
+            .await
+            .expect("first send delivers");
+        assert_eq!(rt.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1);
+
+        // Retry with the SAME key: Ok, but nothing typed (dedup no-op).
+        send_harness_text(&state, "idem", "ship it", None, Some("k1"))
+            .await
+            .expect("a same-id re-POST is an accepted no-op, not an error");
+        assert_eq!(rt.text_calls.load(Ordering::SeqCst), 1, "the duplicate is NOT typed again");
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1);
+
+        // A different key is a new message: typed again.
+        send_harness_text(&state, "idem", "ship it", None, Some("k2"))
+            .await
+            .expect("a new id delivers");
+        assert_eq!(rt.text_calls.load(Ordering::SeqCst), 2, "a genuinely new send is typed");
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 2);
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
@@ -3772,7 +4607,7 @@ mod write_runtime_tests {
         let rt = StubRuntime::parked_at(&screen);
         state.session_runtimes.insert("stale".to_string(), rt.clone());
 
-        let res = send_harness_text(&state, "stale", "retry into a bare shell", None).await;
+        let res = send_harness_text(&state, "stale", "retry into a bare shell", None, None).await;
         assert!(
             matches!(res, Err(AppError::Conflict(_))),
             "a retry whose CURRENT screen is a bare shell (stale agent glyphs only in \
@@ -3800,7 +4635,7 @@ mod write_runtime_tests {
         let rt = StubRuntime::capture_fails();
         state.session_runtimes.insert("blind".to_string(), rt.clone());
 
-        let res = send_harness_text(&state, "blind", "message into the unknown", None).await;
+        let res = send_harness_text(&state, "blind", "message into the unknown", None, None).await;
         assert!(
             matches!(res, Err(AppError::Conflict(_))),
             "a capture failure must refuse the send (fail closed), got {res:?}",
@@ -3830,7 +4665,7 @@ mod write_runtime_tests {
         let rt = StubRuntime::bare_shell_with_stale_capture("❯ Try \"fix tests\"\n  ? for shortcuts");
         state.session_runtimes.insert("nativebare".to_string(), rt.clone());
 
-        let res = send_harness_text(&state, "nativebare", "into the bare shell", None).await;
+        let res = send_harness_text(&state, "nativebare", "into the bare shell", None, None).await;
         assert!(
             matches!(res, Err(AppError::Conflict(_))),
             "shell_is_foreground()==Some(true) must refuse regardless of the capture, got {res:?}",
@@ -3858,7 +4693,7 @@ mod write_runtime_tests {
         Arc::get_mut(&mut rt).unwrap().shell_fg = Some(false);
         state.session_runtimes.insert("busy".to_string(), rt.clone());
 
-        send_harness_text(&state, "busy", "queue me", None)
+        send_harness_text(&state, "busy", "queue me", None, None)
             .await
             .expect("a send during a busy turn is a queue, not a refusal");
         assert_eq!(rt.text_calls.load(Ordering::SeqCst), 1, "the queued text is typed");

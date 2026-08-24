@@ -17,6 +17,8 @@
  * bubble's left edge (32px gutter + 12px gap). The same signal, one notch
  * quieter, for when the session is composing rather than working.
  */
+import type * as React from 'react'
+
 import { SessionMark, type MarkPin, type MarkState } from '../../../brand/marks'
 import { cn } from '../../../lib/utils'
 
@@ -29,10 +31,22 @@ export interface WorkingRowProps {
   pin?: MarkPin
   /** What it is doing right now — the hook label, or "Thinking…". */
   label: string
-  /** Right-hand elapsed clause, pre-formatted ("12s", "2m 04s"). */
-  elapsed?: string
-  /** `working` (default) or `waiting` — the face follows the status, not the row. */
-  state?: Extract<MarkState, 'working' | 'waiting'>
+  /**
+   * Right-hand elapsed clause.
+   *
+   * A NODE rather than a string: the DATA layer hands this slot a live clock
+   * (`chat/live-elapsed.tsx`) that advances by mutating its own text node,
+   * never by re-rendering anything here — which is what keeps a reader's
+   * selection alive while a turn runs. This primitive stays dumb and pure: it
+   * decides where the clause sits, not what it says or when it changes, and it
+   * imports no clock of its own. A plain string ("12s", "2m 04s") is still a
+   * valid occupant — the bench passes one.
+   */
+  elapsed?: React.ReactNode
+  /** `working` (default), `waiting`, or `streaming` — the face follows the status,
+   *  not the row. `streaming` gives the gutter mark the talking mouth while an
+   *  assistant delta lands, echoing the transcript's typing dots. */
+  state?: Extract<MarkState, 'working' | 'waiting' | 'streaming'>
   variant?: 'row' | 'presence'
   className?: string
 }

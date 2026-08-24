@@ -292,6 +292,7 @@ pub(crate) async fn emit_boards(state: &AppState) {
     if let Ok(boards) = db::boards::list(&state.pool).await {
         let _ = state.sse_tx.send(crate::state::SseEvent {
             event: "boards".to_string(),
+            company_id: None,
             payload: serde_json::to_value(&boards).unwrap_or(serde_json::Value::Null),
         });
     }
@@ -318,6 +319,8 @@ mod tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = db::init(&config).await.expect("init pool");

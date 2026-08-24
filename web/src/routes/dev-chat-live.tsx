@@ -43,6 +43,7 @@ import { EntityPickerView } from '@/components/chat/entity-picker'
 import { handoffLabel, readDelegateIntent } from '@/components/chat/delegate-intent'
 import { atRows, slashRows } from '@/components/chat/slash'
 import type { ComposerHandle } from '@/components/chat/use-composer'
+import type { UseStagedAttachmentsResult } from '@/components/focus-mode/use-staged-attachments'
 import { entryLabels } from '@/components/chat/grouping'
 import { ProvisionalTailView } from '@/components/chat/provisional-tail'
 import { RendererSwitch } from '@/components/chat/renderer-switch'
@@ -104,16 +105,35 @@ export default function DevChatLive() {
   const gone = goneParam === 'no-session' || goneParam === 'chat-unavailable' ? goneParam : null
   const chipState = gone ? 'offline' : connState
 
+  // `?grok=1` (DEV-only) stamps `data-grok` on this bench's wrapper so the
+  // grok-scoped chat CSS (`[data-grok] …` — header pill, surface, composer,
+  // status tokens) actually applies here. The app stamps `data-grok` in
+  // <Layout> (layout.tsx), which this out-of-Layout bench never mounts — so
+  // without this knob the bench renders the BASE (non-grok) chat surface and a
+  // reviewer/jury measures the wrong skin. Mirrors /dev/store · /dev/roster ·
+  // /dev/pickers: BARE `data-grok`, NOT `data-grok-root` — the shell-root
+  // substrate + 100dvh frame is not a bench's ground (its z:0 glass would paint
+  // over the non-lifted phone frame), and every chat-scoped rule keys off bare
+  // `[data-grok]`. Byte-inert when off: production + the base app are untouched.
+  const grok = import.meta.env.DEV && params.get('grok') === '1'
+
   const viewportPhone = useMediaQuery(PHONE_QUERY)
   const phone = params.get('surface') === 'phone' || viewportPhone
   const bare = params.has('bare')
+  // `&actions` turns on the per-message action bar (Bot-mode UI) so the offline
+  // rig can screenshot Copy · Share · More on a seeded transcript. Off by
+  // default → the existing shots are unchanged.
+  const showActions = params.has('actions')
 
   return (
-    <div className="h-dvh w-full overflow-hidden bg-paper text-ink">
+    <div
+      {...(grok ? { 'data-grok': '' } : {})}
+      className="h-dvh w-full overflow-hidden bg-paper text-ink"
+    >
       {phone ? (
-        <PhoneFrame state={state} nowMs={nowMs} conn={chipState} gone={gone} />
+        <PhoneFrame state={state} nowMs={nowMs} conn={chipState} gone={gone} showActions={showActions} />
       ) : (
-        <BoardFrame state={state} nowMs={nowMs} conn={chipState} gone={gone} />
+        <BoardFrame state={state} nowMs={nowMs} conn={chipState} gone={gone} showActions={showActions} />
       )}
       {!bare && (
         <Picker
@@ -162,6 +182,20 @@ export default function DevChatLive() {
  *  memo boundary (`transcript-item.tsx`'s doc). */
 const NOOP = () => {}
 
+/** A STATIC empty staged-attachment plane for the bench (see `BenchComposer`).
+ *  Every method is inert and the chip list is permanently empty — the bench has
+ *  no upload server — so its sole effect is to make the composer draw its leading
+ *  paperclip disc, i.e. render the real 📎·@·clock trio the desktop composition
+ *  ships. Module-level for referential stability. */
+const BENCH_ATTACHMENTS: UseStagedAttachmentsResult = {
+  attachments: [],
+  uploading: false,
+  handleFiles: NOOP,
+  dismiss: NOOP,
+  readyPaths: () => [],
+  reset: NOOP,
+}
+
 // Exported for `tests/unit/chat-gone-composer.test.tsx`: the gone→gated-composer
 // wiring is the honesty contract the `st-gone-*` shots exist to prove, so a test
 // drives THIS component (the composer expression + `BenchComposer`) rather than
@@ -172,12 +206,16 @@ export function Surface({
   surface,
   gone = null,
   offline = false,
+  showActions = false,
   headerLeading,
   headerTrailing,
+  headerStatus,
 }: {
   state: LiveState
   nowMs: number
   surface: 'desktop' | 'phone'
+  /** Show the per-message action bar (Bot-mode UI) — the `&actions` bench flag. */
+  showActions?: boolean
   /** The terminal 4404, threaded through EXACTLY as `chat-panel.tsx` threads
    *  `tail.gone` — into the conversation body AND the composer's gate. */
   gone?: ChatGone | null
@@ -186,6 +224,11 @@ export function Surface({
   offline?: boolean
   headerLeading?: React.ReactNode
   headerTrailing?: React.ReactNode
+  /** The data-plane chip ("Not up to date"), in the header's own STATUS slot —
+   *  the SAME seam `chat-panel.tsx` uses (`headerStatus`), so the bench groups
+   *  it with the mode chip and presence dot exactly as the app does, not bundled
+   *  onto the renderer toggle. */
+  headerStatus?: React.ReactNode
 }) {
   const items = React.useMemo(() => toDisplayList(state.entries), [state.entries])
   const labels = React.useMemo(() => entryLabels(state.entries), [state.entries])
@@ -217,6 +260,7 @@ export function Surface({
       mentions={MENTIONS}
       names={NAMES}
       events={state.events}
+      showActions={showActions}
       // The chips are LIVE on the bench (fase B4 T3.6): a screenshot of an
       // inert chip proves nothing about the interactive variant, and the two
       // render different elements. The handlers go nowhere — this page has no
@@ -238,11 +282,18 @@ export function Surface({
       dialog={state.dialog ?? null}
       dialogBusy={state.dialogBusy ?? null}
       onChooseDialog={() => {}}
+      // The bench has no pty behind it — the question card's answers are live
+      // (clickable), but the keys they would send go nowhere here (like
+      // `onChooseDialog`). The affordance under review is the card itself.
+      onAnswerQuestion={() => {}}
       dialogResolved={state.dialogResolved}
       // The stall's own sentence takes the working row's label (catalog
       // `err.stream_stalled`): `session.activity` still names the last tool
       // that RAN, which is the misreading this state exists to show fixed.
       stalled={state.stalled ?? null}
+      // The live compaction hint — its presence makes the working row read
+      // `Compacting context…` (same peek machinery as `stalled`).
+      compacting={state.compacting ?? null}
       attention={state.attention ?? null}
       attentionCapture={state.attentionCapture}
       attentionExpanded={state.attentionExpanded}
@@ -260,6 +311,7 @@ export function Surface({
       onReserveGrew={onReserveGrew}
       headerLeading={headerLeading}
       headerTrailing={headerTrailing}
+      headerStatus={headerStatus}
       offline={offline}
       // A GONE POINTER or an OFFLINE PLANE gates the composer even where the
       // fixture supplies no composer spec: the shipped panel always mounts a
@@ -329,7 +381,7 @@ function BenchComposer({
   const handle: ComposerHandle = {
     draft,
     setDraft: noop,
-    ref,
+    fieldRef: ref,
     sending: false,
     notice: spec?.notice ?? null,
     dismissNotice: noop,
@@ -369,6 +421,13 @@ function BenchComposer({
       // else an offline plane shows the "You're offline" refusal.
       blocked={gone ? CHAT_GONE[gone].detail : offline ? CHAT_OFFLINE_BLOCKED : undefined}
       onOpenTerminal={noop}
+      // The staged-attachment plane, as a STATIC empty fixture — no chips, no
+      // upload, just enough to draw the leading paperclip disc so the bench
+      // renders the REAL 📎·@·clock leading trio the desktop composition ships
+      // (the app's `chat-panel.tsx` always wires attachments; without this the
+      // bench showed only `@`·clock and the paperclip's optical size could not
+      // be reviewed).
+      attachments={BENCH_ATTACHMENTS}
       onSchedule={spec?.schedulable ? noop : undefined}
       pickerData={{
         files: TRACKED_FILES,
@@ -394,11 +453,12 @@ function BenchComposer({
 
 /* ── desktop: the surface, in the boards' window ─────────────────────────── */
 
-function BoardFrame({ state, nowMs, conn, gone }: {
+function BoardFrame({ state, nowMs, conn, gone, showActions = false }: {
   state: LiveState
   nowMs: number
   conn: 'reconnecting' | 'stale' | 'offline' | null
   gone: ChatGone | null
+  showActions?: boolean
 }) {
   const { resolvedTheme } = useTheme()
   const ring = PAPER[resolvedTheme].paper
@@ -441,6 +501,7 @@ function BoardFrame({ state, nowMs, conn, gone }: {
           surface="desktop"
           gone={gone}
           offline={conn === 'offline'}
+          showActions={showActions}
           headerTrailing={
             conn ? <ConnectionNote state={conn} onRetry={NOOP} gone={gone} /> : undefined
           }
@@ -452,18 +513,44 @@ function BoardFrame({ state, nowMs, conn, gone }: {
 
 /* ── phone: the surface, under the status bar ────────────────────────────── */
 
-function PhoneFrame({ state, nowMs, conn, gone }: {
+function PhoneFrame({ state, nowMs, conn, gone, showActions = false }: {
   state: LiveState
   nowMs: number
   conn: 'reconnecting' | 'stale' | 'offline' | null
   gone: ChatGone | null
+  showActions?: boolean
 }) {
+  const [params] = useSearchParams()
+  // `&device=1` reproduces the REAL iOS geometry the shipped app renders in,
+  // which the fake 54px topbar below deliberately does NOT: in the app the
+  // chat surface is a `position:fixed` full-bleed sheet from y=0 and the
+  // status-bar region is reserved by `env(safe-area-inset-top)` (—-safe-top),
+  // not by a chrome band that pushes the surface down. So `device` (a) forces
+  // `--safe-top` to a real notched value the headless `env()`=0 hides, and (b)
+  // makes the status bar an ABSOLUTE overlay so the surface — and its floating
+  // header card at `--safe-top + 12` — sit exactly where the phone puts them.
+  // `&safe=NN` overrides the inset (default 59, an iPhone Dynamic-Island top).
+  const device = params.has('device')
+  const safe = params.get('safe')
+  const safeTop = safe != null ? Number(safe) : 59
   return (
-    <div className="relative mx-auto flex h-full w-full max-w-[390px] flex-col bg-paper-raised">
+    <div
+      className="relative mx-auto flex h-full w-full max-w-[390px] flex-col bg-paper-raised"
+      style={device ? ({ ['--safe-top' as string]: `${safeTop}px` } as React.CSSProperties) : undefined}
+    >
       {/* Device chrome, not ours: the status bar and the notch `mobile-*.png`
           draws above the surface. Held at the phone's own 54px so the floating
-          header card lands exactly where the board puts it. */}
-      <div style={{ height: PHONE.topbar }} className="relative z-[5] flex-none bg-paper-raised">
+          header card lands exactly where the board puts it. In `device` mode it
+          is an ABSOLUTE overlay (it must not push the surface down — the real
+          app reserves the notch with `--safe-top`, not a flow band). */}
+      <div
+        style={device ? undefined : { height: PHONE.topbar }}
+        className={
+          device
+            ? 'pointer-events-none absolute inset-x-0 top-0 z-[6] h-[54px]'
+            : 'relative z-[5] flex-none bg-paper-raised'
+        }
+      >
         <div className="absolute left-1/2 top-3 h-[30px] w-[110px] -translate-x-1/2 rounded-full bg-[#0d0c0b] shadow-[0_0_0_0.5px_var(--sm-hairline)]" />
         <div className="absolute inset-x-[26px] top-5 flex h-4 items-center justify-between text-[13px] font-semibold tracking-[-0.1px] text-ink">
           <span className="tabular-nums">2:06</span>
@@ -482,6 +569,7 @@ function PhoneFrame({ state, nowMs, conn, gone }: {
           surface="phone"
           gone={gone}
           offline={conn === 'offline'}
+          showActions={showActions}
           // What A5's mobile shell ACTUALLY puts in these two slots
           // (`routes/focus/mobile.tsx`), so the card's geometry is reviewable
           // as shipped rather than as sketched: the back button, and the
@@ -498,11 +586,14 @@ function PhoneFrame({ state, nowMs, conn, gone }: {
               <BackIcon />
             </span>
           }
+          // The data-plane chip rides the header's STATUS slot (grouped with the
+          // mode chip + presence dot), and the renderer toggle rides TRAILING on
+          // its own — exactly how `chat-panel.tsx` splits them, so the bench
+          // reproduces the real 390px overflow instead of hiding it by bundling
+          // both onto the toggle.
+          headerStatus={conn ? <ConnectionNote state={conn} onRetry={NOOP} gone={gone} compact /> : undefined}
           headerTrailing={
-            <>
-              {conn ? <ConnectionNote state={conn} onRetry={NOOP} gone={gone} /> : null}
-              <RendererSwitch size="sm" labels="selected" value="auto" resolved="chat" onChange={() => {}} />
-            </>
+            <RendererSwitch size="sm" labels="selected" value="chat" onChange={() => {}} />
           }
         />
       </div>

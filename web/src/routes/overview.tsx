@@ -20,13 +20,16 @@ import {
 
 import { springs } from '@/lib/springs'
 import { useSessions, SESSIONS_KEY } from '@/hooks/use-sessions'
-import { useTeams } from '@/hooks/use-teams'
+import { useTeams, TEAMS_KEY } from '@/hooks/use-teams'
+import { COMPANIES_KEY } from '@/hooks/use-companies'
 import { splitTeamLeads } from '@/components/focus-mode/focus-strip-groups'
 import { TeamCard } from '@/components/team'
 import { useArchivedSessions } from '@/hooks/use-archived-sessions'
 import { useArchivedSheet } from '@/stores/archived-sheet-store'
 import { useOverviewLayout } from '@/hooks/use-overview-layout'
 import { useUI } from '@/stores/ui-store'
+import { botModeOn, BOT_KILL_SWITCH_KEY } from '@/lib/bot-mode-flag'
+import { GROK_KILL_SWITCH_KEY } from '@/lib/grok-mode-flag'
 import { type ApiSession } from '@/lib/api'
 import { SessionTile } from '@/components/session-tile'
 import { SessionRow } from '@/components/session-tile/session-row'
@@ -68,6 +71,12 @@ import {
   type OverviewLayout,
 } from '@/lib/overview-layout'
 import type { TileSession } from '@/components/session-tile'
+
+// GROK MODE (WS5+WS6) — the radical inbox overview. Lazy on PURPOSE: the overview
+// IS the entry chunk (scripts/size-budget.mjs), so a static import would land
+// GrokRoster's weight on the cold hero path every default user pays. React.lazy
+// puts it in its own chunk that is fetched only when the skin is on.
+const GrokRoster = React.lazy(() => import('@/components/roster/grok-roster'))
 
 /** Per-tier grid class — the tile grid keeps `sm:grid-cols-2` (small phones)
  *  and `md:grid-cols-N` (tablet) constant across tiers, then forks at `lg:`
@@ -113,6 +122,31 @@ function toTileSession(s: ApiSession): TileSession {
 }
 
 export function Overview() {
+  // GROK MODE — read the skin flag ONCE at mount (a skin flip is a reload-level
+  // change, like the substrate flag in layout.tsx), and when it is on render the
+  // radical inbox roster INSTEAD of today's team-card/terminal-tile board. Off
+  // grok this is `false` and the whole default overview below is untouched.
+  const [grok] = React.useState(() =>
+    botModeOn(
+      useUI.getState().botMode,
+      typeof localStorage !== 'undefined' ? localStorage.getItem(BOT_KILL_SWITCH_KEY) : null,
+      typeof localStorage !== 'undefined' ? localStorage.getItem(GROK_KILL_SWITCH_KEY) : null,
+    ),
+  )
+  // `?mock` seeding must run in BOTH skins — it lives here (not in DefaultOverview)
+  // so the Grok roster gets the same dev fixtures the default board does.
+  useDevMockSeed()
+  if (grok) {
+    return (
+      <React.Suspense fallback={<div className="h-full" />}>
+        <GrokRoster />
+      </React.Suspense>
+    )
+  }
+  return <DefaultOverview />
+}
+
+function DefaultOverview() {
   const { sessions: allSessions, isLoading, isError, refetch } = useSessions()
   // Agent Teams. The TEAM CARD owns its lead + teammates and renders
   // pinned above the session grid in EVERY sort mode. The lead IS a normal
@@ -172,8 +206,6 @@ export function Overview() {
   const [rawQuery, setRawQuery] = React.useState('')
   const [query, setQuery] = React.useState('')
   const [sheetOpen, setSheetOpen] = React.useState(false)
-
-  useDevMockSeed()
 
   // Debounce the search 200ms.
   React.useEffect(() => {
@@ -1050,9 +1082,45 @@ function useDevMockSeed() {
     if (!import.meta.env.DEV) return
     if (!new URLSearchParams(window.location.search).has('mock')) return
     let alive = true
-    void import('@/components/session-tile/mock').then(({ MOCK_TILES }) => {
-      if (alive) qc.setQueryData(SESSIONS_KEY, MOCK_TILES as ApiSession[])
-    })
+    // Both caches, from one dynamic import pair so neither mock module can end
+    // up in a production chunk. TEAMS is seeded alongside SESSIONS (Phase 0.2)
+    // because a roster with no teams cannot show the surface this wave is
+    // about: `/?mock` is the offline bench for the grok roster, and a team row
+    // only exists if `['teams']` has data AND the team's lead is in
+    // `['sessions']` (an unmapped lead renders as the honest "no live lead"
+    // case, which the fixture also carries deliberately).
+    void Promise.all([
+      import('@/components/session-tile/mock'),
+      import('@/routes/dev-teams.fixture'),
+      import('@/components/store/mock'),
+    ]).then(
+      ([
+        { MOCK_TILES, MOCK_COMPANIES },
+        { MOCK_TEAMS, MOCK_LEAD_SESSIONS },
+        { MOCK_STORE_CARDS, MOCK_CONNECTOR_CONSUMERS },
+      ]) => {
+        if (!alive) return
+        qc.setQueryData(SESSIONS_KEY, [
+          ...(MOCK_TILES as ApiSession[]),
+          ...MOCK_LEAD_SESSIONS,
+        ])
+        qc.setQueryData(TEAMS_KEY, MOCK_TEAMS)
+        // Companies (Bot Mode): seed the switcher's ['companies'] cache so the
+        // HQ/company switcher + scoping are exercisable at `/?mock` offline. The
+        // hook disables its live fetch under `?mock`, so this seed is the source.
+        qc.setQueryData(COMPANIES_KEY, MOCK_COMPANIES)
+        // Connector store: seed the merged grid (local rows carry their connected
+        // `accounts`) + each connector's consumers, so `/store → Installed` and its
+        // per-account detail render offline. Fresh seed → the live fetch stays put.
+        // Keys inlined (mirroring `connectors-store`'s `connectorsKey`/
+        // `connectorGrantsKey`) to keep the heavy store module OFF the entry chunk —
+        // this whole block is `import.meta.env.DEV`-gated and tree-shakes from prod.
+        qc.setQueryData(['connectors', {}], MOCK_STORE_CARDS)
+        for (const [id, consumers] of Object.entries(MOCK_CONNECTOR_CONSUMERS)) {
+          qc.setQueryData(['connector-grants', id], consumers)
+        }
+      },
+    )
     return () => {
       alive = false
     }

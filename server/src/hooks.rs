@@ -29,8 +29,10 @@ use crate::db;
 use crate::notify::{self, NotifEvent};
 use crate::error::AppError;
 use crate::sessions::activity::{self, HookPayload};
+use crate::sessions::connect_ask;
 use crate::sessions::elicitation;
 use crate::sessions::status::{HookEvent, Status};
+use crate::sessions::takeover_ask;
 use crate::state::{AppState, SseEvent};
 
 /// Header the hook command sets to its per-session `$SUPERMUX_HOOK_TOKEN`.
@@ -85,6 +87,23 @@ pub(crate) async fn verify_hook_token(
 struct HookBody {
     /// The supermux session name (`$SUPERMUX_SESSION`); scopes the token check.
     session: String,
+    /// The tmux pane the hook fired from (`$TMUX_PANE`, e.g. `"%17"`) — the
+    /// WITHIN-session discriminator (S2, §R2.2).
+    ///
+    /// A session name is NOT enough on a team host: Claude Agent Teams spawns
+    /// teammates as sibling panes and tmux applies the SESSION environment to
+    /// every pane, so a teammate's hook carries the LEAD's `$SUPERMUX_SESSION`
+    /// and `$SUPERMUX_HOOK_TOKEN` with the TEAMMATE's own conversation id
+    /// (measured live — `~/team-gap/PHASE0-PROBE.md`). `$TMUX_PANE` is the only
+    /// field that separates them, and tmux gives it to us for free.
+    ///
+    /// `#[serde(default)]` → empty string, for the two cases that legitimately
+    /// have no pane: a session whose `settings.json` still holds the previous
+    /// hook command (self-heals at the next session start, since `install_hooks`
+    /// runs per start and the MARKER replaces the entry in place), and a
+    /// non-tmux (native) session, which has no panes at all.
+    #[serde(default)]
+    pane: String,
     /// The Claude event kind, as installed by [`crate::claude_config`]:
     /// `user_prompt` | `pre_tool` | `post_tool` | `post_tool_failure` |
     /// `permission_request` | `notification` | `stop` | `subagent_start` |
@@ -183,7 +202,7 @@ async fn hook_handler(
             .get("session_id")
             .or_else(|| raw_payload.get("sessionId"))
             .and_then(Value::as_str);
-        track_conversation_pointer(&state, &body.session, id).await;
+        track_conversation_pointer(&state, &body.session, &body.pane, id).await;
     }
 
     // Re-tick the detector now so the status (e.g. Notification → waiting,
@@ -228,7 +247,61 @@ fn is_pointer_event(event: &str) -> bool {
 /// without this check anything holding `$SUPERMUX_HOOK_TOKEN` could point a
 /// session at `../../../somewhere/private` and have the dashboard stream it
 /// back. A refused id leaves the previous pointer in place.
-async fn track_conversation_pointer(state: &AppState, session: &str, id: Option<&str>) {
+///
+/// **Pane-attributed since S2 (§R2.2).** On a session that HOSTS A REAL TEAM the
+/// adoption is no longer unconditional: teammate panes inherit the lead's
+/// `$SUPERMUX_SESSION` + `$SUPERMUX_HOOK_TOKEN` from the tmux session
+/// environment, so a teammate's `SessionStart` authenticates as the lead and
+/// used to repoint it at the teammate's transcript (measured live —
+/// `~/team-gap/PHASE0-PROBE.md`; it corrupted `claude --resume` for leads too).
+/// The hook now carries `$TMUX_PANE` and only the LEAD's own pane may move the
+/// pointer; anything else is filed in the pane map ([`attribute_pointer`] holds
+/// the truth table). Sessions that do not host a team are untouched by this.
+async fn track_conversation_pointer(
+    state: &AppState,
+    session: &str,
+    pane: &str,
+    id: Option<&str>,
+) {
+    // ── S2: pane attribution, TEAM HOSTS ONLY (§R2.2) ───────────────────────
+    //
+    // The resolve is the ONLY I/O this adds, and a session that does not host a
+    // real team never pays it: `is_team_host` is one DB row plus (only if the
+    // polluted `team_name` column is set) one `config.json` read, and it runs on
+    // the two pointer events alone — never per hook. A non-team session
+    // therefore takes exactly the pre-wave path: base-app parity by
+    // construction.
+    let host = if crate::sessions::teams::is_team_host(state, session).await {
+        Some(TeamHost {
+            lead_pane: crate::sessions::teams::resolve_lead_pane(state, session).await,
+            tmux_runtime: state.is_tmux_runtime(session).await,
+        })
+    } else {
+        None
+    };
+    track_pointer_attributed(state, session, pane, id, host.as_ref()).await;
+}
+
+/// What the caller learned about a team host this tick. `None` at the call site
+/// means "not a team host" — the historical, unattributed path.
+#[derive(Debug, Clone)]
+struct TeamHost {
+    /// [`crate::sessions::teams::resolve_lead_pane`]'s answer.
+    lead_pane: Option<String>,
+    /// Is the HOST session itself a tmux session? (A native host owns no pane.)
+    tmux_runtime: bool,
+}
+
+/// The pointer decision + its effects, with the tmux/fs lookups already done and
+/// passed in — so every branch of the S2 truth table is exercisable in a unit
+/// test without a tmux server or a team on disk.
+async fn track_pointer_attributed(
+    state: &AppState,
+    session: &str,
+    pane: &str,
+    id: Option<&str>,
+    host: Option<&TeamHost>,
+) {
     let Some(id) = id.filter(|i| !i.is_empty()) else {
         return;
     };
@@ -238,6 +311,24 @@ async fn track_conversation_pointer(state: &AppState, session: &str, id: Option<
             "hook carried a conversation id outside the Claude id charset; pointer left alone"
         );
         return;
+    }
+    if let Some(host) = host {
+        // Learn `pane → conversation` either way (§R2.3): the map is pure
+        // write-side today and wants the LEAD's pane in it too, so a later
+        // merged feed can key every ring the same way.
+        state.record_pane_conversation(session, pane, id);
+        if attribute_pointer(pane, host.lead_pane.as_deref(), host.tmux_runtime)
+            == PointerAction::RecordOnly
+        {
+            tracing::debug!(
+                session = %session,
+                pane = %pane,
+                lead_pane = ?host.lead_pane,
+                "hook from a non-lead/unattributable pane on a team host; \
+                 the lead's conversation pointer is left alone"
+            );
+            return;
+        }
     }
     if db::sessions::track_cc_conversation_id(&state.pool, session, id)
         .await
@@ -249,6 +340,60 @@ async fn track_conversation_pointer(state: &AppState, session: &str, id: Option<
         // file it merely noticed, and this hook-carried id is the one
         // authoritative adoption signal.
         state.wake_chat_pointer(session);
+    }
+}
+
+/// What a pointer-carrying hook is allowed to do to a TEAM HOST's pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerAction {
+    /// Move `sessions.cc_conversation_id` — the historical behaviour.
+    Adopt,
+    /// Leave the lead's pointer alone; file the id under its pane instead
+    /// (§R2.3). NEVER an error: a teammate's conversation is real, it just is
+    /// not the lead's.
+    RecordOnly,
+}
+
+/// The S2 truth table, as a pure function (the tmux/fs I/O lives in the caller,
+/// so the DECISION is unit-testable without a tmux server or a team on disk).
+///
+/// Reached ONLY for a session that hosts a real team.
+///
+/// * `pane` — `$TMUX_PANE` from the hook body; `""` when the firing process is
+///   not inside tmux, or when an old hook command is still installed.
+/// * `lead_pane` — [`crate::sessions::teams::resolve_lead_pane`]: the one live
+///   pane of the lead's window that no team config claims as a teammate. `None`
+///   for a native session (no panes at all) and whenever the discrimination is
+///   ambiguous this tick.
+/// * `tmux_runtime` — is the HOST session a tmux session? A native host has no
+///   pane of its own, which is what makes an empty pane meaningful there.
+///
+/// The fail-safe direction is always "keep the lead's own conversation": a
+/// stale-but-own pointer is honest (the tailer surfaces it as
+/// `Reconnecting`/`NoHooks` via `classify_pointer`) and self-heals at the next
+/// start, whereas adopting a teammate's conversation silently shows the wrong
+/// transcript — and corrupts `claude --resume` for the lead besides.
+fn attribute_pointer(pane: &str, lead_pane: Option<&str>, tmux_runtime: bool) -> PointerAction {
+    if pane.is_empty() {
+        // No pane on a NATIVE host: the host itself has no tmux pane, while
+        // Claude spawns every teammate as a tmux pane (they carry a `%id`, and
+        // may even live on a different tmux server — measured). So an empty pane
+        // on a native team host can only be the lead's own process. Adopting
+        // keeps a native lead's pointer live; refusing would freeze the pointer
+        // of exactly the lead this wave makes chattable.
+        //
+        // On a TMUX host an empty pane is unattributable (a pre-upgrade hook
+        // command): do not move the pointer. It self-heals at the next session
+        // start, when `install_hooks` rewrites the marked entry.
+        return if tmux_runtime { PointerAction::RecordOnly } else { PointerAction::Adopt };
+    }
+    match lead_pane {
+        // The lead's own pane: adopt, exactly as before this wave.
+        Some(lead) if lead == pane => PointerAction::Adopt,
+        // A teammate pane — or a pane we cannot attribute this tick (churn,
+        // ambiguous layout, a host that resolves no lead pane). Either way it is
+        // NOT provably the lead, so the pointer does not move.
+        _ => PointerAction::RecordOnly,
     }
 }
 
@@ -318,14 +463,55 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             // inventing content — and it is the ONLY push for this tool call,
             // because the `PermissionRequest` Claude raises ~20 ms later
             // deliberately does not push (see that arm).
-            if payload.tool_name.as_deref() == Some("AskUserQuestion") {
+            //
+            // AND raise the ANSWERABLE question card via `session.question_request`
+            // (T1.5 follow-up): the STRUCTURED payload carries the question's
+            // options, so chat can draw the real choices as clickable buttons
+            // instead of the generic tool-permission prompt. Structured rather than
+            // pty-scraped so it is robust across Claude Code versions (the scrape
+            // does not reliably sight this dialog on the current CC). The generic
+            // `permission_request` for AskUserQuestion is deliberately suppressed in
+            // the `PermissionRequest` arm below so the two cards do not fight.
+            let question = if payload.tool_name.as_deref() == Some("AskUserQuestion") {
                 let q = activity::first_question(payload).unwrap_or_default();
                 notify::notify_event(state, session, NotifEvent::Question(q));
-            }
-            match activity::activity_label(payload) {
+                match activity::question_ask(payload) {
+                    Some(ask) => state.set_question_request(session, ask),
+                    None => false,
+                }
+            } else {
+                false
+            };
+            // The store's `connect(service)` affordance (spec §8): its descriptor
+            // carries `requiresUserInteraction`, so Claude routes it to the human
+            // prompt and the turn stops. Recognise it here and raise the inline
+            // Connect card via `session.connect_request` (the credential never
+            // touches this plane — the card POSTs it straight to the vault).
+            let connect = match connect_ask::parse(payload) {
+                Some(ask) => state.set_connect_request(session, ask),
+                None => false,
+            };
+            // The Shared Browser connector's `request_human_takeover(reason)`
+            // affordance — the same `requiresUserInteraction` shape, so the call
+            // stops for the human here too. Raise the in-chat "take the wheel"
+            // card via `session.browser_takeover`; the takeover panel it opens
+            // is what actually drives the page.
+            let takeover = match takeover_ask::parse(payload, session) {
+                Some(ask) => state.set_browser_takeover(session, ask),
+                None => false,
+            };
+            let label = match activity::activity_label(payload) {
                 Some((label, kind)) => state.set_activity(session, label, kind),
                 None => false,
-            }
+            };
+            // A subagent's own tool calls POST on the shared parent token
+            // (anthropics/claude-code#7881). While a subagent is outstanding this
+            // keeps its liveness fresh across a long tool call, so a background
+            // workflow does not lapse out of `subagents_live` mid-work. No-op (and
+            // no allocation) when no subagent is outstanding — a plain turn is
+            // unaffected.
+            state.touch_subagent_tool_hook(session);
+            connect || takeover || question || label
         }
         // A tool FAILED → transient `✗ {tool} failed`. Claude DOES have a
         // dedicated `PostToolUseFailure` event (live-verified on 2.1.227 +
@@ -337,7 +523,7 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
         // entry. Either way the tool call is over, so any pending permission
         // dialog for it is resolved.
         "post_tool_failure" | "PostToolUseFailure" => {
-            let cleared = state.clear_permission_request(session) | state.clear_elicitation(session);
+            let cleared = state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
             let set = state.set_activity(session, activity::failed_label(payload), "failed".into());
             cleared || set
         }
@@ -348,12 +534,14 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             // …and any pending ELICITATION: the form is raised mid-tool-call, so
             // the tool having finished proves the form is gone even if the
             // `ElicitationResult` leg never arrived.
-            let cleared = state.clear_permission_request(session) | state.clear_elicitation(session);
+            let cleared = state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
             let failed = if payload.error_type.is_some() || payload.error.is_some() {
                 state.set_activity(session, activity::failed_label(payload), "failed".into())
             } else {
                 false
             };
+            // Keep an outstanding subagent's liveness fresh (see the pre-tool arm).
+            state.touch_subagent_tool_hook(session);
             cleared || failed
         }
         // Claude is DISPLAYING a permission dialog for this tool call and is
@@ -363,6 +551,14 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
         // nothing to show → no-op.
         "permission_request" | "PermissionRequest" => {
             match activity::permission_ask(payload) {
+                // The AskUserQuestion permission dialog is SUPPRESSED as chat's
+                // permission card: the pre-tool arm already raised the answerable
+                // `question_request` (the question + its real options), and the
+                // generic ``Run `AskUserQuestion`?`` card would fight it for the one
+                // card slot. The push was already suppressed for this tool
+                // (`permission_raises_push`), so nothing else is lost by not
+                // recording the permission state at all.
+                Some(ask) if ask.tool.trim() == "AskUserQuestion" => false,
                 Some(ask) => {
                     // Whether this dialog is one the pre-tool arm already
                     // announced with the agent's own words. Decided BEFORE the
@@ -420,13 +616,19 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
         // display-only parallelism signal). Never touches the turn boundary.
         "subagent_start" | "SubagentStart" => state.inc_subagents(session),
         // The MAIN turn ended → clear the live activity (the error, if any,
-        // persists until the next prompt/start) AND force-0 the subagent count
-        // (the authoritative turn end; makes the finished-notification gate
-        // fail-safe — a lost SubagentStop can't permanently suppress a finish).
+        // persists until the next prompt/start). The subagent count is DELIBERATELY
+        // NOT force-0'd here any more: a session that dispatched a BACKGROUND
+        // workflow keeps its subagents running after the main agent returns to its
+        // prompt, and zeroing the count (and tearing down every "still busy"
+        // signal) is exactly what made such a session read done/idle while its
+        // subagents worked. The count now drains only on `SubagentStop`, and the
+        // finished-notification gate is kept fail-safe by
+        // `AppState::has_open_subagents` (an outstanding count corroborated by a
+        // hook fresh within `SUBAGENT_LIVE_WINDOW`) rather than by this force-0 —
+        // so a lost `SubagentStop` still cannot permanently suppress a finish.
         "stop" | "Stop" => {
             let act = state.clear_activity(session);
-            let sub = state.reset_subagents(session);
-            let perm = state.clear_permission_request(session) | state.clear_elicitation(session);
+            let perm = state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
             // TRIGGER 3 (B5/T1.5) — unread. The MAIN `Stop` only: `SubagentStop`
             // has its own arm and structurally cannot reach this one, so a Task
             // subagent finishing can never be announced as "the turn is done".
@@ -435,7 +637,7 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             // this push's replacement of a pending "needs you" banner causally
             // correct: by the time it lands, the dialog is provably resolved.
             notify::notify_event(state, session, NotifEvent::TurnFinished);
-            act || sub || perm
+            act || perm
         }
         // A Task sub-agent finished. It shares the parent session token and the
         // MAIN agent is still working, so do NOT wipe the main activity label or
@@ -448,7 +650,7 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
         "user_prompt" | "user_prompt_submit" | "UserPromptSubmit" => {
             let err = state.clear_error(session);
             let sub = state.reset_subagents(session);
-            let perm = state.clear_permission_request(session) | state.clear_elicitation(session);
+            let perm = state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
             err || sub || perm
         }
         // Session lifecycle ───────────────────────────────────────────────────
@@ -463,7 +665,7 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             state.reset_turn_state(session);
             state.clear_forced_status(session);
             let err = state.clear_error(session);
-            let perm = state.clear_permission_request(session) | state.clear_elicitation(session);
+            let perm = state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
             err || perm
         }
         // End: clear activity AND force Stopped now (the capture classifier can't
@@ -491,11 +693,18 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             let act_changed = state.clear_activity(session);
             let sub_changed = state.reset_subagents(session);
             let perm_changed =
-                state.clear_permission_request(session) | state.clear_elicitation(session);
+                state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
             // The turn is definitively over when the session ends — drop it so a
             // later restart can't inherit it (belt-and-suspenders with the
             // SessionStart reset above).
             state.reset_turn_state(session);
+            // The agent is gone, so its shared-browser context must go with it:
+            // otherwise the page outlives the agent, the max-contexts cap
+            // becomes a lifetime budget, and the idle reaper — which only fires
+            // on an EMPTY context map — never fires again, leaving chrome
+            // resident forever. Fire-and-forget; a session that never browsed is
+            // a no-op.
+            crate::connectors::browser::dispose_on_teardown(&state.browser, session);
             force_stopped(state, session);
             act_changed || sub_changed || perm_changed
         }
@@ -514,6 +723,21 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             let set = state.set_error(session, etype, msg);
             cleared || set
         }
+        // Claude raised a Notification. The needs-you family carries its message
+        // to the ephemeral Waiting line (the status side already flips Waiting
+        // via HookEvent::Notification). auth_success / agent_completed etc.
+        // surface nothing. Cleared by the same resolution events as `permission`.
+        "notification" | "Notification" => match payload.notification_type.as_deref() {
+            Some("permission_prompt" | "idle_prompt" | "agent_needs_input") => {
+                match payload.message.as_deref() {
+                    Some(m) if !m.trim().is_empty() => {
+                        state.set_waiting_message(session, m.trim().to_string())
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
         _ => false,
     };
 
@@ -564,6 +788,7 @@ fn force_stopped(state: &AppState, session: &str) {
         };
         let _ = state.sse_tx.send(SseEvent {
             event: "status".to_string(),
+            company_id: None,
             payload: json!({
                 "name": session,
                 "status": Status::Stopped.as_str(),
@@ -572,6 +797,7 @@ fn force_stopped(state: &AppState, session: &str) {
         });
         let _ = state.sse_tx.send(SseEvent {
             event: "sessions".to_string(),
+            company_id: None,
             payload: json!({ "delta": [{ "name": session, "status": Status::Stopped.as_str() }] }),
         });
     });
@@ -581,7 +807,7 @@ fn force_stopped(state: &AppState, session: &str) {
 /// open overviews update the live line / error badge without a refetch.
 /// Cheap; sent only when the snapshot changed (the caller gates
 /// on that). A cleared field is sent as JSON `null` so the client drops it.
-fn broadcast_activity_delta(state: &AppState, session: &str) {
+pub(crate) fn broadcast_activity_delta(state: &AppState, session: &str) {
     let act = state.session_activity(session).unwrap_or_default();
     let error = act.error.as_ref().map(|(t, m)| json!({ "type": t, "message": m }));
     let permission = act.permission.as_ref().map(|a| {
@@ -589,6 +815,7 @@ fn broadcast_activity_delta(state: &AppState, session: &str) {
     });
     let _ = state.sse_tx.send(SseEvent {
         event: "sessions".to_string(),
+        company_id: None,
         payload: json!({ "delta": [{
             "name": session,
             // `null` when absent so a client clears the prior value.
@@ -603,9 +830,28 @@ fn broadcast_activity_delta(state: &AppState, session: &str) {
             // form is gone. Carried WHOLE because the card IS the form — it is
             // already capped by `sessions::elicitation`.
             "elicitation": act.elicitation,
+            // The live connect ask (`null` once the connect tool call moved on —
+            // the client must drop the card, so this is always present). Names
+            // WHICH connector stalled; the credential never rides this plane.
+            "connect_request": act.connect_request,
+            // The live browser takeover ask (`null` once the human handed the
+            // wheel back or the call moved on — the client must drop the card,
+            // so this is always present).
+            "browser_takeover": act.browser_takeover,
+            // The live question ask (`null` once the AskUserQuestion call moved on
+            // — the client must drop the card, so this is always present). Carries
+            // the question + its real options; the chat card answers by clicking.
+            "question_request": act.question_request,
+            // The needs-you Notification waiting line (`null` clears — always
+            // present). Rendered read-only in the attention region on Waiting.
+            "waiting_message": act.waiting_message,
             // Live outstanding-subagent count (display-only parallelism signal).
             // Always present so a drop back to 0 clears the client's clause.
             "subagents": act.subagents,
+            // Is a BACKGROUND workflow provably running right now? Always present
+            // so the roster updates the "working" bucket/word/face live (and
+            // clears it) without a refetch when the signal flips.
+            "subagents_live": state.subagents_live(session),
             // Server-clock ms stamp: the fase-A1 hook→UI latency anchor AND
             // the chat client's clock-skew source — every chat supersede
             // comparison runs in this clock domain (a0-findings §1 item 3).
@@ -640,6 +886,8 @@ mod tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = crate::db::init(&config).await.expect("init pool");
@@ -680,6 +928,65 @@ mod tests {
             }
         }
         assert_eq!(last_count, Some(2), "the sessions delta must carry subagents: 2");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn main_stop_no_longer_force_zeroes_the_subagent_count() {
+        // The subagents_live fix: a session that dispatched a BACKGROUND workflow
+        // keeps its outstanding-subagent count past the MAIN `Stop` (the count now
+        // drains only on `SubagentStop`), so the roster + status can still read it
+        // as WORKING. Before, `Stop` force-0'd it and the session read done/idle.
+        let (state, dir) = test_state().await;
+        let s = "lead-stop";
+
+        apply_payload(&state, s, "subagent_start", &p("{}"));
+        apply_payload(&state, s, "subagent_start", &p("{}"));
+        assert_eq!(state.session_activity(s).map(|a| a.subagents), Some(2));
+        // The workflow is provably live (open subagent hooks).
+        assert!(state.subagents_live(s));
+
+        // The MAIN turn ends. The count MUST survive.
+        apply_payload(&state, s, "stop", &p("{}"));
+        assert_eq!(
+            state.session_activity(s).map(|a| a.subagents),
+            Some(2),
+            "main Stop must NOT force-0 a live background workflow's count"
+        );
+        assert!(state.subagents_live(s), "the workflow still reads live after main Stop");
+
+        // A SubagentStop drains it — the honest way the count now falls.
+        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        assert!(
+            !state.subagents_live(s),
+            "draining every subagent (SubagentStop) ends the live signal"
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_tool_hook_keeps_liveness_fresh_after_stop() {
+        // A subagent's own tool calls POST PreToolUse on the parent token after the
+        // main Stop; `touch_subagent_tool_hook` keeps the open-subagent liveness
+        // fresh through a long subagent tool call, but ONLY while a subagent is
+        // outstanding — a plain turn with no subagent is untouched.
+        let (state, dir) = test_state().await;
+
+        // No outstanding subagent → a tool hook allocates nothing / not live.
+        apply_payload(&state, "plain", "pre_tool", &p(r#"{"tool_name":"Read"}"#));
+        assert!(!state.subagents_live("plain"));
+
+        // With a subagent outstanding, a parent tool hook refreshes liveness.
+        let s = "lead-tool";
+        apply_payload(&state, s, "subagent_start", &p("{}"));
+        apply_payload(&state, s, "stop", &p("{}"));
+        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Bash","tool_input":{"command":"x"}}"#));
+        assert!(state.subagents_live(s), "a parent tool hook keeps the workflow live");
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
@@ -781,9 +1088,11 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_start_stop_track_the_outstanding_count() {
-        // Display-only parallelism signal: SubagentStart increments, SubagentStop
-        // decrements (saturating), a new prompt resets, and the main Stop force-0s
-        // (the authoritative turn end — bounds any drift to one turn).
+        // Parallelism signal: SubagentStart increments, SubagentStop decrements
+        // (saturating), a new prompt resets. The main Stop NO LONGER force-0s it
+        // (subagents_live fix) — a background workflow's count survives the main
+        // turn; a lost SubagentStop is instead reaped by SUBAGENT_LIVE_WINDOW
+        // freshness in `subagents_live`, not by zeroing the count here.
         let (state, dir) = test_state().await;
         let s = "lead-2";
 
@@ -808,13 +1117,19 @@ mod tests {
         apply_payload(&state, s, "user_prompt", &p("{}"));
         assert_eq!(subagents(&state, s), 0, "a new prompt resets the count");
 
-        // The main Stop force-0s any stragglers (makes the notification gate
-        // fail-safe: a lost SubagentStop can never permanently suppress a finish).
+        // The main Stop leaves the count INTACT now: a session that dispatched a
+        // background workflow keeps a truthful count after the main agent returns
+        // to its prompt (this is what lets the roster read it as WORKING). The
+        // count falls only when its SubagentStops arrive.
         apply_payload(&state, s, "subagent_start", &p("{}"));
         apply_payload(&state, s, "subagent_start", &p("{}"));
         assert_eq!(subagents(&state, s), 2);
         apply_payload(&state, s, "stop", &p("{}"));
-        assert_eq!(subagents(&state, s), 0, "main Stop force-0s the count");
+        assert_eq!(subagents(&state, s), 2, "main Stop must NOT force-0 the count");
+        // Its SubagentStops drain it the honest way.
+        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        assert_eq!(subagents(&state, s), 0, "SubagentStop drains the count to 0");
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
@@ -1118,6 +1433,260 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A live `connect(service)` tool call: the store's credential affordance
+    /// (spec §8), MCP-named `mcp__connect__connect`, carrying the connector id as
+    /// its `service` argument.
+    const LIVE_CONNECT: &str =
+        r#"{"session_id":"c0ffee","hook_event_name":"PreToolUse","tool_name":"mcp__connect__connect","tool_input":{"service":"pmcp-notion"}}"#;
+
+    #[tokio::test]
+    async fn a_connect_call_raises_the_connect_request_and_rides_the_sessions_delta() {
+        // THE round-1 finding (claim 5), executable: before this arm existed a
+        // bot could call connect() and NOTHING populated session.connect_request,
+        // so the inline Connect card could never raise in production. Now the
+        // PreToolUse hook recognises the affordance and sets it.
+        let (state, dir) = test_state().await;
+        let s = "worker-connect";
+        let mut rx = state.sse_tx.subscribe();
+
+        apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT));
+
+        let ask = state
+            .session_activity(s)
+            .and_then(|a| a.connect_request)
+            .expect("the connect tool raised the connect_request");
+        assert_eq!(ask.connector_id, "pmcp-notion");
+
+        let d = last_delta(&mut rx, s).expect("a connect ask broadcasts a delta");
+        assert_eq!(d["connect_request"]["connector_id"], json!("pmcp-notion"));
+
+        // Re-firing the identical call is not a change → silence.
+        apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT));
+        assert!(rx.try_recv().is_err(), "an unchanged connect ask must not re-broadcast");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A live `AskUserQuestion` PreToolUse, verbatim off Claude Code 2.1.2xx: the
+    /// structured `questions` array with object-options.
+    const LIVE_ASK_QUESTION: &str = r#"{"session_id":"c0ffee","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which fruit do you want?","header":"Fruit choice","multiSelect":false,"options":[{"label":"Apple","description":"A crisp and refreshing fruit"},{"label":"Banana","description":"A soft and sweet tropical fruit"},{"label":"Cherry","description":"A small and tart stone fruit"}]}]}}"#;
+
+    /// The `PermissionRequest` Claude raises ~20 ms after the pre-tool leg for the
+    /// SAME AskUserQuestion call — the one this app must NOT record as a permission
+    /// card (it would fight the answerable question card).
+    const LIVE_ASK_QUESTION_PERMISSION: &str = r#"{"session_id":"c0ffee","hook_event_name":"PermissionRequest","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which fruit do you want?"}]}}"#;
+
+    #[tokio::test]
+    async fn ask_user_question_raises_an_answerable_question_request_not_a_permission_card() {
+        // THE BUG: chat showed a generic ``Run `AskUserQuestion`?`` permission card
+        // with dead buttons instead of the real question + its options. The fix
+        // surfaces the STRUCTURED question as `question_request` (answerable) and
+        // SUPPRESSES the generic permission card for AskUserQuestion so the two do
+        // not fight over the one card slot.
+        let (state, dir) = test_state().await;
+        let s = "worker-question";
+        let mut rx = state.sse_tx.subscribe();
+
+        apply_payload(&state, s, "pre_tool", &p(LIVE_ASK_QUESTION));
+        let ask = state
+            .session_activity(s)
+            .and_then(|a| a.question_request)
+            .expect("the AskUserQuestion pre-tool raised the question_request");
+        assert_eq!(ask.question, "Which fruit do you want?");
+        assert_eq!(ask.header.as_deref(), Some("Fruit choice"));
+        assert_eq!(ask.options, vec!["Apple", "Banana", "Cherry"]);
+        assert!(!ask.multi_select);
+
+        let d = last_delta(&mut rx, s).expect("a question ask broadcasts a delta");
+        assert_eq!(d["question_request"]["question"], json!("Which fruit do you want?"));
+        assert_eq!(d["question_request"]["options"], json!(["Apple", "Banana", "Cherry"]));
+
+        // The permission dialog that follows must NOT record a permission card.
+        apply_payload(&state, s, "permission_request", &p(LIVE_ASK_QUESTION_PERMISSION));
+        assert!(
+            state.session_activity(s).and_then(|a| a.permission).is_none(),
+            "the AskUserQuestion permission card is suppressed in favour of the question card",
+        );
+        assert!(
+            state.session_activity(s).and_then(|a| a.question_request).is_some(),
+            "the answerable question card survives the permission leg",
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_question_request_clears_when_the_call_moves_on() {
+        for (event, payload) in [
+            ("post_tool", r#"{"tool_name":"AskUserQuestion"}"#),
+            ("post_tool_failure", LIVE_POST_TOOL_FAILURE),
+            ("stop", "{}"),
+            ("session_end", "{}"),
+            ("user_prompt", "{}"),
+            ("session_start", "{}"),
+        ] {
+            let (state, dir) = test_state().await;
+            let s = "worker-question";
+            apply_payload(&state, s, "pre_tool", &p(LIVE_ASK_QUESTION));
+            assert!(
+                state.session_activity(s).and_then(|a| a.question_request).is_some(),
+                "{event}: precondition — a question ask is live"
+            );
+
+            let mut rx = state.sse_tx.subscribe();
+            apply_payload(&state, s, event, &p(payload));
+            assert!(
+                state.session_activity(s).and_then(|a| a.question_request).is_none(),
+                "{event} must clear the live question request"
+            );
+            let d = last_delta(&mut rx, s).unwrap_or_else(|| panic!("{event}: clear broadcasts"));
+            assert_eq!(d["question_request"], Value::Null, "{event}: cleared as null");
+
+            state.pool.close().await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A live `request_human_takeover(reason)` call — the Shared Browser
+    /// connector's hand-the-wheel affordance, MCP-named
+    /// `mcp__browser__request_human_takeover`.
+    const LIVE_TAKEOVER: &str = r#"{"session_id":"c0ffee","hook_event_name":"PreToolUse","tool_name":"mcp__browser__request_human_takeover","tool_input":{"reason":"sign in to bank.example and approve the 2FA push"}}"#;
+
+    #[tokio::test]
+    async fn a_takeover_call_raises_the_browser_takeover_and_rides_the_sessions_delta() {
+        // Phase 3's chat surfacing, executable: the agent asks for a human, and
+        // the ask must reach `session.browser_takeover` so chat can draw the
+        // "take the wheel" card that opens the takeover panel.
+        let (state, dir) = test_state().await;
+        let s = "worker-browser";
+        let mut rx = state.sse_tx.subscribe();
+
+        apply_payload(&state, s, "pre_tool", &p(LIVE_TAKEOVER));
+
+        let ask = state
+            .session_activity(s)
+            .and_then(|a| a.browser_takeover)
+            .expect("the takeover tool raised the browser_takeover ask");
+        assert_eq!(ask.session, s, "the panel attaches to the ASKING session");
+        assert!(ask.reason.contains("2FA"), "the agent's own sentence: {}", ask.reason);
+
+        let d = last_delta(&mut rx, s).expect("a takeover ask broadcasts a delta");
+        assert_eq!(d["browser_takeover"]["session"], json!(s));
+        assert!(d["browser_takeover"]["reason"].as_str().unwrap().contains("2FA"));
+
+        // …and it clears when the tool call moves on (same rule as connect).
+        apply_payload(&state, s, "post_tool", &p(r#"{"tool_name":"mcp__browser__request_human_takeover"}"#));
+        assert!(
+            state.session_activity(s).and_then(|a| a.browser_takeover).is_none(),
+            "the card must not outlive the call"
+        );
+        let d = last_delta(&mut rx, s).expect("the clear broadcasts too");
+        assert_eq!(d["browser_takeover"], Value::Null, "cleared as null");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_notification_carries_its_message_to_the_waiting_line() {
+        // The needs-you Notification family (permission_prompt / idle_prompt /
+        // agent_needs_input) stashes its `message` on `waiting_message`, which
+        // rides the same `sessions` delta and clears on the next resolution
+        // event. auth_success / agent_completed surface nothing.
+        let (state, dir) = test_state().await;
+        let s = "worker-notif";
+        let mut rx = state.sse_tx.subscribe();
+
+        // agent_needs_input → the message is carried.
+        apply_payload(
+            &state,
+            s,
+            "notification",
+            &p(r#"{"notification_type":"agent_needs_input","message":"Claude needs your input"}"#),
+        );
+        assert_eq!(
+            state.session_activity(s).and_then(|a| a.waiting_message).as_deref(),
+            Some("Claude needs your input"),
+            "the needs-you message reaches the waiting line",
+        );
+        let d = last_delta(&mut rx, s).expect("the waiting message broadcasts a delta");
+        assert_eq!(d["waiting_message"], json!("Claude needs your input"));
+
+        // A resolution event (the user's next prompt) clears it as null.
+        apply_payload(&state, s, "user_prompt", &p("{}"));
+        assert!(
+            state.session_activity(s).and_then(|a| a.waiting_message).is_none(),
+            "the line must not outlive the Waiting state",
+        );
+        let d = last_delta(&mut rx, s).expect("the clear broadcasts too");
+        assert_eq!(d["waiting_message"], Value::Null, "cleared as null");
+
+        // auth_success carries no surface — waiting_message stays empty.
+        apply_payload(
+            &state,
+            s,
+            "notification",
+            &p(r#"{"notification_type":"auth_success","message":"Logged in"}"#),
+        );
+        assert!(
+            state.session_activity(s).and_then(|a| a.waiting_message).is_none(),
+            "auth_success is not a needs-you type — nothing is surfaced",
+        );
+
+        // The camel alias is accepted too, and an all-whitespace message is ignored.
+        apply_payload(
+            &state,
+            s,
+            "notification",
+            &p(r#"{"notificationType":"idle_prompt","message":"   "}"#),
+        );
+        assert!(
+            state.session_activity(s).and_then(|a| a.waiting_message).is_none(),
+            "a blank message surfaces nothing",
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_connect_request_clears_when_the_call_moves_on() {
+        // No hook reports the credential outcome (it never touches this plane —
+        // the card POSTs it straight to the vault), so "something after it
+        // happened" IS the resolution: the tool finishing, the turn ending, the
+        // user moving on.
+        for (event, payload) in [
+            ("post_tool", r#"{"tool_name":"mcp__connect__connect"}"#),
+            ("post_tool_failure", LIVE_POST_TOOL_FAILURE),
+            ("stop", "{}"),
+            ("session_end", "{}"),
+            ("user_prompt", "{}"),
+            ("session_start", "{}"),
+        ] {
+            let (state, dir) = test_state().await;
+            let s = "worker-connect";
+            apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT));
+            assert!(
+                state.session_activity(s).and_then(|a| a.connect_request).is_some(),
+                "{event}: precondition — a connect ask is live"
+            );
+
+            let mut rx = state.sse_tx.subscribe();
+            apply_payload(&state, s, event, &p(payload));
+            assert!(
+                state.session_activity(s).and_then(|a| a.connect_request).is_none(),
+                "{event} must clear the live connect request"
+            );
+            let d = last_delta(&mut rx, s).unwrap_or_else(|| panic!("{event}: clear broadcasts"));
+            assert_eq!(d["connect_request"], Value::Null, "{event}: cleared as null");
+
+            state.pool.close().await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     #[tokio::test]
     async fn permission_request_survives_a_pre_tool_and_a_subagent_stop() {
         // PreToolUse fires BEFORE the permission check, and a subagent finishing
@@ -1213,13 +1782,13 @@ mod tests {
         let s = "ptr-1";
         db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
 
-        track_conversation_pointer(&state, s, Some("conv-a")).await;
+        track_conversation_pointer(&state, s, "", Some("conv-a")).await;
         assert!(woke(&state, s).await, "the first id is a change — the tailer must re-resolve");
         let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
         assert_eq!(row.cc_conversation_id, "conv-a");
 
         // A terminal-side `--resume` / `/clear`: the id MOVED.
-        track_conversation_pointer(&state, s, Some("conv-b")).await;
+        track_conversation_pointer(&state, s, "", Some("conv-b")).await;
         assert!(woke(&state, s).await, "a moved pointer must wake the tailer");
         let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
         assert_eq!(row.cc_conversation_id, "conv-b");
@@ -1236,16 +1805,16 @@ mod tests {
         let s = "ptr-2";
         db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
 
-        track_conversation_pointer(&state, s, Some("conv-a")).await;
+        track_conversation_pointer(&state, s, "", Some("conv-a")).await;
         assert!(woke(&state, s).await);
         for _ in 0..3 {
-            track_conversation_pointer(&state, s, Some("conv-a")).await;
+            track_conversation_pointer(&state, s, "", Some("conv-a")).await;
         }
         assert!(!woke(&state, s).await, "an unchanged id must not wake the tailer");
 
         // A missing / empty id is a no-op, not a pointer reset.
-        track_conversation_pointer(&state, s, None).await;
-        track_conversation_pointer(&state, s, Some("")).await;
+        track_conversation_pointer(&state, s, "", None).await;
+        track_conversation_pointer(&state, s, "", Some("")).await;
         assert!(!woke(&state, s).await);
         let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
         assert_eq!(row.cc_conversation_id, "conv-a", "the pointer must survive");
@@ -1265,7 +1834,7 @@ mod tests {
         let (state, dir) = test_state().await;
         let s = "ptr-3";
         db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
-        track_conversation_pointer(&state, s, Some("conv-a")).await;
+        track_conversation_pointer(&state, s, "", Some("conv-a")).await;
         assert!(woke(&state, s).await);
 
         for bad in [
@@ -1277,7 +1846,7 @@ mod tests {
             "conv$(id)",
             &"x".repeat(129),
         ] {
-            track_conversation_pointer(&state, s, Some(bad)).await;
+            track_conversation_pointer(&state, s, "", Some(bad)).await;
             let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
             assert_eq!(
                 row.cc_conversation_id, "conv-a",
@@ -1287,9 +1856,151 @@ mod tests {
         }
 
         // …and the real shapes still land.
-        track_conversation_pointer(&state, s, Some("550e8400-e29b-41d4-a716-446655440000")).await;
+        track_conversation_pointer(&state, s, "", Some("550e8400-e29b-41d4-a716-446655440000")).await;
         let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
         assert_eq!(row.cc_conversation_id, "550e8400-e29b-41d4-a716-446655440000");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── S2: pane-attributed pointer adoption (§R2.2) ────────────────────────
+
+    /// The truth table, pure. Every branch's fail-safe direction is "keep the
+    /// lead's OWN conversation" — never adopt a foreign one.
+    #[test]
+    fn pane_attribution_only_lets_the_lead_pane_move_a_team_hosts_pointer() {
+        use PointerAction::*;
+        // A tmux lead firing from its own pane: adopt, exactly as pre-wave.
+        assert_eq!(attribute_pointer("%3", Some("%3"), true), Adopt);
+        // A teammate pane on the same host: NEVER moves the lead's pointer.
+        assert_eq!(attribute_pointer("%7", Some("%3"), true), RecordOnly);
+        // Lead pane unresolvable this tick (pane churn / ambiguous layout):
+        // a pane we cannot prove is the lead does not get to move the pointer.
+        assert_eq!(attribute_pointer("%7", None, true), RecordOnly);
+        // Empty pane on a TMUX host = a pre-upgrade hook command, unattributable.
+        // Freeze rather than guess; the next session start rewrites the hook.
+        assert_eq!(attribute_pointer("", Some("%3"), true), RecordOnly);
+        assert_eq!(attribute_pointer("", None, true), RecordOnly);
+        // Empty pane on a NATIVE host = the lead itself: a native session has no
+        // pane at all, while every teammate is a tmux pane carrying a `%id`.
+        // Adopting here is what keeps a native lead's thread live (the live box's
+        // shape — see ~/team-gap/PHASE0-PROBE.md).
+        assert_eq!(attribute_pointer("", None, false), Adopt);
+        // …and a teammate `%id` reaching a native host is still not the lead.
+        assert_eq!(attribute_pointer("%7", None, false), RecordOnly);
+    }
+
+    #[tokio::test]
+    async fn a_teammate_pane_never_repoints_the_lead_but_is_recorded() {
+        let (state, dir) = test_state().await;
+        let s = "team-lead-1";
+        db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
+        let host = TeamHost { lead_pane: Some("%3".into()), tmux_runtime: true };
+
+        // The lead's own pane adopts, as always.
+        track_pointer_attributed(&state, s, "%3", Some("lead-conv"), Some(&host)).await;
+        assert!(woke(&state, s).await);
+        let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
+        assert_eq!(row.cc_conversation_id, "lead-conv");
+
+        // A teammate's SessionStart: same session name, same hook token, its OWN
+        // conversation id. This is the measured live bug (H1). The pointer must
+        // not move…
+        track_pointer_attributed(&state, s, "%7", Some("mate-conv"), Some(&host)).await;
+        let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
+        assert_eq!(
+            row.cc_conversation_id, "lead-conv",
+            "a teammate pane must never repoint the lead"
+        );
+        assert!(!woke(&state, s).await, "…and must not wake the lead's tailer either");
+
+        // …and must instead be LEARNED as `pane → conversation` (§R2.3), which is
+        // what makes a real teammate thread buildable later.
+        assert_eq!(state.pane_conversation(s, "%7").as_deref(), Some("mate-conv"));
+        assert_eq!(
+            state.pane_conversation(s, "%3").as_deref(),
+            Some("lead-conv"),
+            "the lead's own pane is in the map too, so the map is total"
+        );
+
+        // An unattributable (empty) pane on a TMUX team host: also frozen —
+        // strictly better than adopting whichever pane happened to fire.
+        track_pointer_attributed(&state, s, "", Some("legacy-conv"), Some(&host)).await;
+        let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
+        assert_eq!(row.cc_conversation_id, "lead-conv");
+        assert!(
+            state.pane_conversation(s, "").is_none(),
+            "an empty pane identifies nothing and must not become a map key"
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_native_team_host_still_adopts_its_own_paneless_hook() {
+        // The live box's shape: the lead runs native (no tmux pane of its own)
+        // while Claude spawns its teammates as tmux panes — on a separate tmux
+        // server, even. Refusing an empty pane here would freeze the pointer of
+        // exactly the lead S1 just made chattable.
+        let (state, dir) = test_state().await;
+        let s = "team-lead-native";
+        db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
+        let host = TeamHost { lead_pane: None, tmux_runtime: false };
+
+        track_pointer_attributed(&state, s, "", Some("lead-conv"), Some(&host)).await;
+        let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
+        assert_eq!(row.cc_conversation_id, "lead-conv", "a native lead must keep adopting");
+
+        // A teammate pane reaching that native host is still refused + recorded.
+        track_pointer_attributed(&state, s, "%12", Some("mate-conv"), Some(&host)).await;
+        let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
+        assert_eq!(row.cc_conversation_id, "lead-conv");
+        assert_eq!(state.pane_conversation(s, "%12").as_deref(), Some("mate-conv"));
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_non_team_session_adopts_from_any_pane_exactly_as_before() {
+        // BASE-APP PARITY. `host = None` is what `track_conversation_pointer`
+        // passes for every session that does not host a real team — i.e. all of
+        // them, in the base app. No pane is consulted, nothing is recorded, the
+        // pointer follows the hook as it always has.
+        let (state, dir) = test_state().await;
+        let s = "plain-1";
+        db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
+
+        // Empty pane (native session, or a pre-upgrade hook command): adopts.
+        track_pointer_attributed(&state, s, "", Some("conv-a"), None).await;
+        assert!(woke(&state, s).await);
+        assert_eq!(
+            db::sessions::get(&state.pool, s).await.unwrap().unwrap().cc_conversation_id,
+            "conv-a"
+        );
+        // A pane id (an ordinary tmux session): also adopts — the guard is
+        // team-host-scoped, so a plain session is never pane-discriminated.
+        track_pointer_attributed(&state, s, "%4", Some("conv-b"), None).await;
+        assert!(woke(&state, s).await);
+        assert_eq!(
+            db::sessions::get(&state.pool, s).await.unwrap().unwrap().cc_conversation_id,
+            "conv-b"
+        );
+        assert!(
+            state.pane_conversation(s, "%4").is_none(),
+            "a non-team session must not even populate the pane map"
+        );
+
+        // And end-to-end through the real entry point (which resolves
+        // `is_team_host` itself — false here, since `team_name` is NULL).
+        track_conversation_pointer(&state, s, "%9", Some("conv-c")).await;
+        assert_eq!(
+            db::sessions::get(&state.pool, s).await.unwrap().unwrap().cc_conversation_id,
+            "conv-c",
+            "the un-teamed path must be byte-identical to pre-wave behaviour"
+        );
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);

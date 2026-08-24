@@ -52,9 +52,12 @@ import {
   shouldLoadOlder,
   type ScrollMark,
 } from './backlog'
-import { ChatComposer } from './composer'
+import { ChatComposer, type ChatComposerActions } from './composer'
+import { attachmentSentence } from './composer-insert'
+import { useStagedAttachments } from '../focus-mode/use-staged-attachments'
 import { focusComposer } from './composer-draft'
 import { ChatConversation, PHONE_QUERY } from './conversation'
+import type { KbLayoutComponent } from '@/components/focus-mode/kb-modes/contract'
 import { useComposer } from './use-composer'
 import { useHarnessEvents } from './use-harness-events'
 import { useDialogAnswer } from './use-dialog-answer'
@@ -62,8 +65,11 @@ import { LoginCard, ProviderAuthCard } from './login-card'
 import { loginOwnsScreen as loginOwns } from './login-lens'
 import { useLogin } from './use-login'
 import { usePeekLens } from './use-peek-lens'
+import { useDeferredFollow } from './follow-bottom'
+import { createKeyboardOpenDetector } from '@/hooks/use-keyboard-viewport'
+import { useTapToDismissKeyboard } from './use-tap-to-dismiss'
 import { usePendingSends } from './use-pending-sends'
-import { displayNames, entryLabels, mentionIndex } from './grouping'
+import { displayNames, entryLabels, scopedMentionIndex } from './grouping'
 import { useChatTurn } from './use-chat-turn'
 import { ProvisionalTail } from './provisional-tail'
 import type { ScheduleRef } from './transcript-item'
@@ -90,6 +96,8 @@ export default function ChatPanel({
   surface,
   headerLeading,
   headerTrailing,
+  actions,
+  layout,
 }: {
   name: string
   session: TileSession | null
@@ -123,13 +131,37 @@ export default function ChatPanel({
    */
   headerLeading?: React.ReactNode
   headerTrailing?: React.ReactNode
+  /**
+   * The route-owned actions behind the composer's leading `+` (mobile chat only).
+   * The phone's old global dock — session switcher, command palette, snippets —
+   * is gone under chat; those actions now live inside the composer's own
+   * add-menu, so the surface is a single input bar. The route provides them (it
+   * holds the picker and the snippet drawer); the composer owns the sheet and
+   * adds its own mention/command/schedule/dictate — dictation being the
+   * composer's own rest-state mic, not a route plane. Omit → the desktop leading
+   * pair, no sheet (desktop split, bench).
+   */
+  actions?: ChatComposerActions
+  /**
+   * The active keyboard-layout MODE (`KbLayout`), forwarded straight to
+   * `ChatConversation` → `ChatSurface`. Set only by the MOBILE focus route (the
+   * `kbMode` setting resolves to the registry's lazy loader); omitted by the
+   * desktop seam and benches, where the surface DOM stays unchanged.
+   */
+  layout?: KbLayoutComponent
 }) {
-  // The turn state machine (anchor, supersede gate, teardown, 1s ticker)
-  // lives in `use-chat-turn.ts` — this component is wiring only.
-  const { entries, items, turnStart, showProvisional, overlay, tail, backlog } = useChatTurn(
-    name,
-    session,
-  )
+  // The turn state machine (anchor, supersede gate, teardown, the turn's
+  // edge-scheduled thresholds) lives in `use-chat-turn.ts` — this component is
+  // wiring only.
+  const { entries, items, turnStart, endTurn, showProvisional, overlay, tail, backlog } =
+    useChatTurn(name, session)
+  // THE RECONCILED LIVE TURN. Everything that presents "a turn is running" — the
+  // working row, the provisional tail, the Stop control — reads this, not raw
+  // `status === 'active'`: the anchor is dropped the moment the turn ends (or the
+  // user Stops), so a status stuck at `active` after a cancel stops leaving the
+  // surface thinking with a dead Stop button. It is the same expression
+  // `live-layer.tsx` gates the working row on, hoisted so the composer shares it.
+  const turnLive = session?.status === 'active' && turnStart != null
 
   React.useEffect(() => exposeLatency(), [])
   // WHO OWNS THE OUTAGE STORY. While this panel is on screen the chat plane's
@@ -139,7 +171,11 @@ export default function ChatPanel({
   // full-screen curtain down, because a curtain over the transcript makes that
   // documented promise false in exactly the scenario the reconnect specs test.
   React.useEffect(() => claimChatSurface(), [])
-  // One pass over the ring per render (the ticker re-renders us every second).
+  // One pass over the ring per render — and this panel no longer renders on a
+  // clock (the 1s live-layer ticker is gone, `use-chat-turn.ts`), so the footer's
+  // hook→UI p50 refreshes on real hook samples and the renders they already
+  // cause. The p50 barely moves between samples; the pass no longer runs 60× a
+  // minute over a turn that produced nothing to measure.
   const latency = latencySummary()
 
   // A name in prose becomes a mention chip only when it names a session that
@@ -147,10 +183,30 @@ export default function ChatPanel({
   // from the shared sessions query: one cache, already populated by the shell,
   // so this adds a subscriber rather than a fetch.
   const { sessions } = useSessions()
-  const mentions = React.useMemo(() => mentionIndex(sessions), [sessions])
+  // A subagent-count / activity SSE delta hands the shared sessions query a NEW
+  // array reference every ~3s while subagents run (use-sessions.ts:286/298),
+  // even though it changes NEITHER a name NOR a display_name — the only fields
+  // mentionIndex/displayNames read (grouping.ts:651-689). Keying these memos on
+  // the raw `sessions` reference would therefore mint new Map identities every
+  // tick, breaking TranscriptItem's React.memo (transcript-item.tsx:199) →
+  // re-running the un-memoised ChatMarkdown → WebKit collapsing any live text
+  // selection anchored in that prose. So key them on a CONTENT SIGNATURE of just
+  // name + display_name: an activity tick leaves the signature (and thus the Map
+  // identity) untouched, while a real rename / add / remove still changes it and
+  // still updates.
+  const nameSig = React.useMemo(
+    () =>
+      sessions
+        .map((s) => `${s.name} ${s.display_name ?? ''} ${s.company_id ?? ''}`)
+        .join(''),
+    [sessions],
+  )
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- key on nameSig, not the sessions ref (see above)
+  const mentions = React.useMemo(() => scopedMentionIndex(sessions, name), [nameSig, name])
   // slug → what that session is CALLED. The arrival divider names a colleague,
   // and the wire's teammate envelope carries only the slug.
-  const names = React.useMemo(() => displayNames(sessions), [sessions])
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- key on nameSig, not the sessions ref (see above)
+  const names = React.useMemo(() => displayNames(sessions), [nameSig])
   // The other half of the transcript: what the HARNESS did — this session's
   // delegations, renames and schedule fires, read from the durable audit ledger
   // (SSE is only its invalidation tick). Rendered as centred system lines in
@@ -196,10 +252,12 @@ export default function ChatPanel({
   // The wire labels `ChatItem` deliberately does not carry: the slash name of a
   // command, the teammate id of an arrival, the subject of a system event.
   const labels = React.useMemo(() => entryLabels(entries), [entries])
-  // Relative divider labels recompute on the existing 1s live-layer ticker
-  // (`use-chat-turn`), never on an interval of their own. The clock is bucketed
-  // to 30s so a ticking turn does not re-shape the whole transcript once a
-  // second for labels that change once a minute — and it is the SERVER's clock,
+  // Relative divider labels recompute on `use-chat-turn`'s 30s bucket wake-up,
+  // never on an interval of their own. The clock is bucketed to 30s so a running
+  // turn does not re-shape the whole transcript for labels that change once a
+  // minute — and that bucket is now also the wake-up's period, so the panel
+  // renders when the labels can actually change and not before. It is the
+  // SERVER's clock,
   // like every other time comparison on this surface, because the timestamps it
   // is subtracted from are server-stamped (`latency.ts`).
   const nowBucketMs = Math.floor(serverNowMs() / 30_000) * 30_000
@@ -232,10 +290,8 @@ export default function ChatPanel({
   // and the app-wide link aggregate, so the two cannot disagree.
   // …and a TERMINAL close always speaks, fresh or not: "this session no longer
   // exists" is not the calm empty state, it is the end of one.
-  const connectionNote =
-    tail.fresh && tail.gone === null ? null : (
-      <ConnectionNote state={connection} onRetry={tail.redial} gone={tail.gone} />
-    )
+  // (The node itself is built below, once `phone` is known — it condenses on the
+  // phone so the header's toggle can never be shoved off the right edge.)
 
   // ── one identity per session, across both surfaces (fase A6 T4.3) ──────────
   //
@@ -253,9 +309,38 @@ export default function ChatPanel({
   const viewportPhone = useMediaQuery(PHONE_QUERY)
   const phone = surface ? surface === 'phone' : viewportPhone
 
+  // The data-plane chip ("Not up to date" / "Offline"), for the header's STATUS
+  // slot. COMPACT on the phone: at 390px the header must keep the essentials —
+  // back, the name, and the Chat/⌨ toggle — on-screen and reachable, so the chip
+  // condenses to an icon-only dot there rather than pushing the toggle off the
+  // right edge (owner's IMG_2348). Desktop keeps the words. Built here, once
+  // `phone` is known.
+  const connectionNote =
+    tail.fresh && tail.gone === null ? null : (
+      <ConnectionNote
+        state={connection}
+        onRetry={tail.redial}
+        gone={tail.gone}
+        compact={phone}
+      />
+    )
+
   // Follow-bottom pin: stick to the newest content unless the user scrolled up.
   const scrollRef = React.useRef<HTMLDivElement | null>(null)
   const pinnedRef = React.useRef(true)
+  // Keyboard-open scroll anchor (see the effect below): `wasAtBottomRef` is the
+  // atomic capture of "was the transcript at the bottom when the field focused",
+  // read straight off the scroller BEFORE the viewport shrinks; `anchoringRef`
+  // marks the open animation window, during which onScroll must NOT downgrade the
+  // pin (the shrink transiently reads distance>48).
+  const wasAtBottomRef = React.useRef(false)
+  const anchoringRef = React.useRef(false)
+  // STICKY user-scrolled-away: the durable memory the per-render `pinnedRef`
+  // cannot be, because the keyboard-open anchor keeps overwriting the pin the
+  // whole time the keyboard is up. A real finger/wheel gesture sets it; it holds
+  // auto-follow stood down across every stream tick until the reader returns to
+  // the bottom (onScroll) or taps the jump pill (jumpToBottom).
+  const userScrolledAwayRef = React.useRef(false)
   // The pill's visibility is STATE, not the pin's ref: it has to re-render.
   // Its threshold is its own (`JUMP_AWAY_PX`) — see `backlog.ts`.
   const [showJump, setShowJump] = React.useState(false)
@@ -296,7 +381,25 @@ export default function ChatPanel({
     const el = scrollRef.current
     if (!el) return
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight
-    pinnedRef.current = distance < FOLLOW_THRESHOLD_PX
+    // STICKY OVERRIDE: once a real user gesture parked the view away from the
+    // bottom, follow stays false regardless of the anchoring lock — until the
+    // reader scrolls back within threshold, which clears the flag and re-pins.
+    // This is what stops a keyboard-open stream from re-snapping a scrolled-up
+    // reader (the anchoring lock never releases while the keyboard is up).
+    if (userScrolledAwayRef.current) {
+      if (distance < FOLLOW_THRESHOLD_PX) {
+        userScrolledAwayRef.current = false
+        pinnedRef.current = true
+      } else {
+        pinnedRef.current = false
+      }
+    } else if (!anchoringRef.current) {
+      // DETERMINISM LOCK: while the keyboard-open anchor is armed, do not let the
+      // transient mid-shrink distance>48 frames flip the pin to false (that race is
+      // exactly what made the first open inconsistent). showJump/loadOlder stay
+      // unguarded — they are position read-outs, not the follow decision.
+      pinnedRef.current = distance < FOLLOW_THRESHOLD_PX
+    }
     setShowJump(jumpVisible(distance))
     if (shouldLoadOlder({ scrollTop: el.scrollTop, hasOlder, loading: loadingOlder })) {
       requestOlder()
@@ -307,6 +410,9 @@ export default function ChatPanel({
     const el = scrollRef.current
     if (!el) return
     pinnedRef.current = true
+    // The explicit "get me back to live" gesture re-engages auto-follow: drop
+    // the sticky scrolled-away flag so the stream is followed again.
+    userScrolledAwayRef.current = false
     setShowJump(false)
     if (typeof el.scrollTo === 'function') {
       el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
@@ -315,9 +421,54 @@ export default function ChatPanel({
     }
   }, [])
 
+  // FOLLOW-BOTTOM, and the two things it must not do (iOS selection bug).
+  //
+  // No dependency array on purpose: "the track grew" is not expressible as a
+  // dep — new confirmed rows, the live layer, a receipt opening are all just
+  // renders of this component — so the pin re-asserts itself on every one.
+  // That generosity is what made it a SELECTION EATER on the phone:
+  //
+  //   · it fired on every render, and the peek poller re-renders this panel
+  //     once every SLOW_PEEK_MS while the agent is idle (`use-peek-lens.ts`
+  //     now holds the frame when the capture is byte-identical, which removes
+  //     the idle renders at the source — this guard is the second lock);
+  //   · `el.scrollTop = …` on the scroller a selection lives in ends the
+  //     selection gesture in WebKit: the native Copy callout is dismissed and
+  //     the highlight goes with it. A reader long-pressing a message therefore
+  //     lost the selection a second or two later, "as if some JS keeps
+  //     deselecting" — which is exactly what it was.
+  //
+  // So: never write while the reader holds a selection in the track, and never
+  // write a value the scroller is already at (a redundant write is still a
+  // scroll gesture as far as WebKit is concerned, and it is free to skip).
+  // TAP THE CONVERSATION TO PUT THE KEYBOARD AWAY (the WhatsApp gesture).
+  //
+  // The phone composer is a contenteditable so iOS stops drawing its
+  // prev/next/Done accessory bar (`plain-editable.tsx`); Done was the only
+  // NATIVE dismiss, so the gesture has to come back app-side. Coarse pointers
+  // only — a click that stole the caret out of the desktop composer would fight
+  // `arm-composer-focus.ts`, which exists to put it back.
+  const coarse = useMediaQuery('(pointer: coarse)')
+  useTapToDismissKeyboard(scrollRef, coarse)
+
+  // The follow-bottom gate. `selectionInside(el)` already stood this write DOWN
+  // while a selection was held (keeping the highlight), but nothing RESUMED the
+  // follow when the selection cleared — so after a copy a reader who had drifted
+  // below the live bottom stayed stuck scrolled up until some later render moved
+  // the view. `useDeferredFollow` keeps the same stand-down AND flushes the
+  // deferred scroll the instant the selection clears (see `follow-bottom.ts`).
+  const follow = useDeferredFollow()
+
   React.useEffect(() => {
     const el = scrollRef.current
-    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight
+    if (!el || !pinnedRef.current) return
+    const bottom = el.scrollHeight - el.clientHeight
+    if (Math.abs(el.scrollTop - bottom) < 1) return
+    follow(() => {
+      const e = scrollRef.current
+      if (!e || !pinnedRef.current) return
+      e.scrollTop = e.scrollHeight - e.clientHeight
+    })
   })
 
   // …and the same pin, for the one thing that grows WITHOUT re-rendering this
@@ -331,8 +482,117 @@ export default function ChatPanel({
     const el = scrollRef.current
     if (!el || !followsFooterGrowth(el, grewBy)) return
     pinnedRef.current = true
-    el.scrollTop = el.scrollHeight
-  }, [])
+    // Same rule as the effect above: a reader holding a selection in the track
+    // keeps it (the write is deferred), even at the cost of the newest band being
+    // briefly covered — and the follow resumes the instant the selection clears.
+    follow(() => {
+      const e = scrollRef.current
+      if (e) e.scrollTop = e.scrollHeight
+    })
+  }, [follow])
+
+  // ── Keyboard-open scroll anchor (mode-agnostic; benefits all KbLayout modes) ─
+  // When the soft keyboard opens the visual viewport shrinks (and mode 9 shrinks
+  // #root to match), cutting the scroller's clientHeight by ~keyboardInset — a
+  // transcript that sat exactly at the bottom is suddenly ~keyboardInset px from
+  // it, so the newest message hides behind the composer/keyboard. Worse, onScroll
+  // resamples pinnedRef DURING the shrink + the iOS native focus-scroll, sees
+  // distance>48, and clobbers pinnedRef to false, so the render-gated follow
+  // effect (above) declines to re-pin. The outcome depended on rAF/event ordering
+  // — the inconsistent "sometimes the first open works".
+  //
+  // The fix is an atomic capture-before / re-assert-after bracket:
+  //   1. `focusin` (the earliest deterministic pre-shrink signal, and where
+  //      WebKit collapses any track selection) reads the scroller DIRECTLY to
+  //      record wasAtBottom and arms `anchoringRef`.
+  //   2. every rAF-coalesced visualViewport frame while the detector reads `open`
+  //      && wasAtBottom re-pins to the true bottom through `follow()` (never a raw
+  //      scrollTop= — the selection-preservation deferral is honoured). Re-pinning
+  //      EVERY settling frame makes the final fully-shrunk frame land pinned
+  //      regardless of ordering vs mode 9's shrink.
+  //   3. while armed, onScroll's pinnedRef downgrade is suppressed (see onScroll)
+  //      so no transient frame can flip the pin. On open→false the bracket disarms.
+  // Scrolled up (wasAtBottom false) → the loop writes nothing and scrollTop is
+  // left where the reader parked it. Gated on `coarse`: desktop never attaches
+  // (open never becomes true anyway).
+  React.useEffect(() => {
+    if (!coarse) return
+    const visual =
+      typeof window !== 'undefined' ? window.visualViewport : undefined
+    if (!visual) return
+
+    const detect = createKeyboardOpenDetector()
+
+    // STEP 1 — capture "was at bottom" the instant an editable in this surface
+    // focuses, BEFORE the native focus-scroll settles and BEFORE mode 9's next
+    // rAF shrinks clientHeight. Read the scroller directly, not pinnedRef.
+    const onFocusIn = (e: FocusEvent) => {
+      const t = e.target as HTMLElement | null
+      if (!t) return
+      const editable =
+        t.tagName === 'TEXTAREA' ||
+        t.tagName === 'INPUT' ||
+        t.isContentEditable === true
+      if (!editable) return
+      const el = scrollRef.current
+      if (!el) return
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+      wasAtBottomRef.current = distance < FOLLOW_THRESHOLD_PX
+      anchoringRef.current = true
+    }
+
+    // STEP 2 — re-assert bottom on every settling frame while the keyboard is
+    // open; disarm on close.
+    let raf = 0
+    const measure = () => {
+      raf = 0
+      const { open } = detect(visual)
+      if (open) {
+        if (
+          anchoringRef.current &&
+          wasAtBottomRef.current &&
+          !userScrolledAwayRef.current
+        ) {
+          follow(() => {
+            const el = scrollRef.current
+            if (el) el.scrollTop = el.scrollHeight - el.clientHeight
+          })
+        }
+      } else if (anchoringRef.current) {
+        anchoringRef.current = false
+        wasAtBottomRef.current = false
+      }
+    }
+    const schedule = () => {
+      if (raf) return
+      raf = window.requestAnimationFrame(measure)
+    }
+
+    // A real user drag/wheel on the scroller is an unambiguous "I took over":
+    // disarm the anchoring lock (so onScroll's pin downgrade stops being
+    // suppressed) and set the sticky flag, so a scrolled-away reader is no
+    // longer yanked to the bottom on every stream tick while the keyboard is
+    // still open. Passive — this never blocks the scroll, only observes it.
+    const onUserDrag = () => {
+      anchoringRef.current = false
+      userScrolledAwayRef.current = true
+    }
+    const scroller = scrollRef.current
+
+    document.addEventListener('focusin', onFocusIn)
+    visual.addEventListener('resize', schedule)
+    visual.addEventListener('scroll', schedule)
+    scroller?.addEventListener('touchmove', onUserDrag, { passive: true })
+    scroller?.addEventListener('wheel', onUserDrag, { passive: true })
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf)
+      document.removeEventListener('focusin', onFocusIn)
+      visual.removeEventListener('resize', schedule)
+      visual.removeEventListener('scroll', schedule)
+      scroller?.removeEventListener('touchmove', onUserDrag)
+      scroller?.removeEventListener('wheel', onUserDrag)
+    }
+  }, [coarse, follow])
 
   // ── The input plane (fase A4 T3) ───────────────────────────────────────────
   // ONE peek poller for the whole surface (T2): the composer's pre-send draft
@@ -444,14 +704,34 @@ export default function ChatPanel({
     }),
     [mentions, name, names],
   )
+  // The staged attachment plane — owned HERE, next to `useComposer`, so its
+  // outgoing prefix and reset fold into the SAME gated submit the peek/slash/
+  // hand-off gates guard (never around them). Handed to `<ChatComposer>` for the
+  // chip row, the `+` Attach group, the desktop disc, and paste / drag-drop.
+  const staged = useStagedAttachments()
   const composer = useComposer({
     name,
     input: pending.input,
     peek,
-    active: session?.status === 'active',
+    // Fold the quoted upload paths in at submit time (image-alone is valid), and
+    // clear the chips only once the POST resolves.
+    getOutgoingPrefix: React.useCallback(
+      () => attachmentSentence(staged.readyPaths()),
+      [staged],
+    ),
+    onSent: staged.reset,
+    // The RECONCILED live turn (not raw status): the trailing control is Stop and
+    // a bare Escape interrupts only while a turn is genuinely running. When the
+    // turn ends — or the user's Stop reconciles a stuck-`active` one — this drops
+    // to false, so the control returns to the mic and Escape stops meaning stop.
+    active: turnLive,
     dialogCard,
     formCard,
     handoff,
+    // The honest half of Stop: after a delivered interrupt, drop the client's
+    // live-turn anchor so a stuck-`active` "thinking" state clears instead of
+    // firing an Escape into a pty with nothing to interrupt (a silent no-op).
+    onInterrupt: endTurn,
   })
 
   // ── What the `@`/`/` popover offers (fase A4 T9) ───────────────────────────
@@ -621,6 +901,11 @@ export default function ChatPanel({
       mentions={mentions}
       names={names}
       events={events}
+      // The per-message action bar (Copy · Share · More) is Bot-mode UI, and
+      // this panel is the Bot-mode renderer (it mounts only when the chat
+      // renderer is on). Passing it unconditionally here keeps every OTHER
+      // caller of the transcript (benches, unit tests) byte-identical.
+      showActions
       onOpenSession={openSession}
       onOpenSchedule={openSchedule}
       // The handoff pill's ONLY source (fase B4 T5): a POST this client made
@@ -631,15 +916,16 @@ export default function ChatPanel({
       turnStart={turnStart}
       overlay={overlay}
       surface={phone ? 'phone' : 'desktop'}
+      // The active keyboard-layout MODE — forwarded from the mobile route; the
+      // surface arranges its regions through it when present.
+      layout={layout}
       headerLeading={headerLeading}
-      // The honesty chip rides in the header's own trailing slot rather than
-      // over the transcript: nothing is broken, so nothing should move.
-      headerTrailing={
-        <>
-          {connectionNote}
-          {headerTrailing}
-        </>
-      }
+      // The honesty chip rides in the header's own STATUS slot (grouped with the
+      // mode chip and presence dot), not bundled onto the renderer toggle — so the
+      // phone header keeps the toggle in its own clear place (mobile polish #1).
+      // Nothing is broken, so nothing moves over the transcript.
+      headerStatus={connectionNote}
+      headerTrailing={headerTrailing}
       pinFor={pinFor}
       // The header's honesty half: an `offline` plane greys the presence dot so
       // it stops reading as a live green "ready" beside the "Offline" chip. Only
@@ -675,6 +961,10 @@ export default function ChatPanel({
       // during a stall — `session.activity` still names the last tool that ran
       // (`live-layer.tsx` `stalled`).
       stalled={peek.lens.notice?.kind === 'stream-stalled' ? peek.lens.notice.text : null}
+      // CC is compacting the context window — a live, benign pause. Labels the
+      // working row `Compacting context…` (same peek.lens.notice machinery as
+      // `stalled`; the two are mutually exclusive on the one PTY line).
+      compacting={peek.lens.notice?.kind === 'compacting' ? peek.lens.notice.text : null}
       onRetryPending={pending.retry}
       onDismissPending={pending.dismiss}
       attention={attention}
@@ -718,7 +1008,11 @@ export default function ChatPanel({
           label={session?.display_name?.trim() ? session.display_name : name}
           handle={composer}
           surface={phone ? 'phone' : 'desktop'}
-          active={session?.status === 'active'}
+          // The reconciled live turn (see `turnLive`): the Stop control shows
+          // while a turn is genuinely running, not merely while `status` reads
+          // `active` — so a stuck-`active` status after a cancel no longer strands
+          // a Stop button that fires into nothing.
+          active={turnLive}
           // NOTHING SENT INTO A BLOCKED SESSION ARRIVES. The composer says
           // which limit and when it lifts, rather than accepting a message
           // that Claude Code will never pick up (verify matrix:
@@ -751,6 +1045,8 @@ export default function ChatPanel({
           // same rule as `mentions`/`names`.
           pickerData={pickerData}
           onSchedule={scheduleDraft}
+          actions={actions}
+          attachments={staged}
           // The dogfood number — DEV BUILDS ONLY (daily-driver QA #9).
           //
           // It shipped unconditionally and printed `hook→UI p50 9 ms (n=3)`

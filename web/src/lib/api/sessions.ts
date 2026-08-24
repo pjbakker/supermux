@@ -54,6 +54,10 @@ export interface SessionSummary {
   /** Remote host the session runs on. `null` / undefined = LOCAL. Carried
    *  on the tile so <HostBadge> can render without an extra fetch. */
   host_id?: number | null
+  /** The company this session belongs to (migration 0032); null / absent = a
+   *  main/PA bot (the entire existing fleet). Additive read/write field; the
+   *  company switcher (P1) reads it to scope the roster client-side. */
+  company_id?: number | null
   /** The user's last sent prompt (≤200 chars), captured by `set_last_send` on
    *  both REST `send`/`paste` and WebSocket Input frames terminated by Enter.
    *  Absent when the session has never received a submission. */
@@ -76,6 +80,59 @@ export interface PermissionRequestInfo {
   summary: string
   kind: string
   mode?: string
+}
+
+/** A bot's pending `connect(service)` ask (spec §8). The card it drives is
+ *  supermux-native and posts the credential straight to the vault — the request
+ *  itself carries NO secret, only WHICH connector wants a human and enough of its
+ *  card to render (name, tool-count, whether it needs a sign-in / a key). */
+export interface ConnectRequestInfo {
+  /** Correlates the ask across SSE deltas (keys the card, like the form's id). */
+  id?: string
+  /** The connector id the bot asked to connect (`service` arg). */
+  connector_id: string
+  /** Display name for the card header (falls back to the id). */
+  display_name?: string
+  /** For the "N tools" line. */
+  tool_count?: number | null
+  /** True when the connector offers an OAuth sign-in (primary button). */
+  has_oauth?: boolean
+}
+
+/** **The live question ask** — an `AskUserQuestion` tool call is blocked on a
+ *  human, surfaced as an ANSWERABLE card in chat (the real question + its options
+ *  as clickable buttons) rather than the generic tool-permission prompt. Built
+ *  server-side from the STRUCTURED `tool_input` payload, so it is robust across
+ *  Claude Code versions (it does not depend on scraping the pty). While it is set
+ *  the generic `permission_request` for AskUserQuestion is suppressed server-side,
+ *  so the two cards never fight. */
+export interface QuestionRequestInfo {
+  /** The model's own two-word name for the decision (`Fruit choice`) — the card's
+   *  eyebrow. Absent when the model sent none. */
+  header?: string
+  /** The agent's own sentence — the whole content of the ask. */
+  question: string
+  /** The option labels, in dialog order: the row index IS the TUI caret index the
+   *  answer sequence navigates to. */
+  options: string[]
+  /** Whether more than one option may be chosen. `false` is the common case (a
+   *  single click answers it); a multi-select question is drawn but answered in
+   *  the terminal for now — see `components/chat/question-answer.ts`. */
+  multi_select: boolean
+}
+
+/** **The live browser takeover ask** — a granted bot called the Shared Browser
+ *  connector's `request_human_takeover(reason)` and is parked until a human
+ *  finishes a login / 2FA / CAPTCHA on its page. Carries the agent's own
+ *  sentence and the session whose browser context the takeover panel attaches
+ *  to. Rides the `sessions` SSE delta; `null` the moment the wheel comes back. */
+export interface BrowserTakeoverInfo {
+  /** Correlates the ask across deltas (keys the card). */
+  id?: string
+  /** The session whose browser context to attach the takeover panel to. */
+  session: string
+  /** What the agent needs you to do, in its own words. */
+  reason: string
 }
 
 /** One-line-per-side summary of a session's chat, for the tile (fase A2).
@@ -192,6 +249,22 @@ export interface ApiSession {
    *  (the built-in pty holder) or `"tmux"`. Read by the recovery ladder, which
    *  can only heal a holder it owns — a tmux pane has no holder to recover. */
   runtime?: string
+  /** Per-bot launch-line MODEL (migration 0030), e.g. `"opus"`. Empty/absent =
+   *  provider default. Injected as `--model <id>` at launch; changing it via the
+   *  config PATCH is a launch-line change (see `restart_required`). */
+  model?: string
+  /** The bot's "Notes it keeps" (migration 0030) — free text injected READ-ONLY
+   *  into the agent's system prompt at launch, after the role (`desc`). v1 is
+   *  read-only server-side; the editor round-trips it. */
+  memory?: string
+  /** Reserved per-bot skills selection (migration 0030). Nothing consumes it
+   *  yet; surfaced so the editor can round-trip it. */
+  skills?: string[]
+  /** TRUE only on a config-PATCH RESPONSE whose change touched a launch-line
+   *  property (model / role / notes): the UI shows "Applies on next start"
+   *  instead of relaunching the agent. Omitted from the wire when false, so
+   *  `get`/`list`/SSE rows never carry it — it is purely the PATCH advisory. */
+  restart_required?: boolean
   /** Cross-device seen cursor (migration 0029) — server-clock **ms** at which
    *  this session was last read on ANY device, or null/absent for never seen.
    *  Merged newest-wins with the localStorage cursor in `use-attention.ts`;
@@ -247,6 +320,14 @@ export interface ApiSession {
    *  agent is working and this is ≥ 2. Never a status signal. Omitted (absent)
    *  when 0, which the SSE delta sends as `0` to clear the clause. */
   subagents?: number
+  /** TRUE when a BACKGROUND workflow is provably running RIGHT NOW — a
+   *  `subagents/agent-*.jsonl` append (the tailer ground truth) OR an open
+   *  subagent hook within ~10s. Unlike `subagents` (the raw count, historically
+   *  torn down on the main `Stop`) this SURVIVES the main agent returning to its
+   *  prompt, so the roster + notifications read a left-open workflow as WORKING
+   *  rather than done/idle. Omitted (absent → falsy) when there is no live
+   *  workflow, which is the common case. */
+  subagents_live?: boolean
   /** The latest unrecovered agent error from a `StopFailure` hook (hooks-10x):
    *  `{type, message}` (e.g. `rate_limit` / `billing_error`). In-memory only;
    *  cleared on the next `UserPromptSubmit`/`SessionStart`. Drives the amber
@@ -289,6 +370,28 @@ export interface ApiSession {
    *  same `sessions` SSE delta (`null` clears). Every string in it is authored
    *  by the MCP server — see `components/chat/elicitation.ts`. */
   elicitation?: ElicitationAsk | null
+  /** **A bot's `connect(service)` tool is asking for a human** (the `_meta`
+   *  `requiresUserInteraction` marker reached the prompt). supermux renders the
+   *  inline Connect card from this — a secure sign-in / API-key paste that POSTs
+   *  straight to the vault, NEVER an MCP elicitation (spec forbids elicitation
+   *  for secrets). Rides the same `sessions` SSE delta (`null` clears). The
+   *  credential never travels the chat/MCP stream. Populated by the server's
+   *  connect-ask plumbing (a later Build-phase addition); the card is buildable
+   *  and testable against this typed shape via the `/dev/chat-live` fixture. */
+  connect_request?: ConnectRequestInfo | null
+  /** **An `AskUserQuestion` tool call is blocked on a human** — the agent asked a
+   *  multiple-choice question. supermux renders an ANSWERABLE question card from
+   *  this (the real question + its options as clickable buttons), NOT the generic
+   *  tool-permission prompt. Rides the same `sessions` SSE delta (`null` clears).
+   *  See `components/chat/live-layer.tsx` `QuestionCard`. */
+  question_request?: QuestionRequestInfo | null
+  /** The live shared-browser takeover ask (see `BrowserTakeoverInfo`). */
+  browser_takeover?: BrowserTakeoverInfo | null
+  /** The Notification `message` for the needs-you family (permission_prompt /
+   *  idle_prompt / agent_needs_input) while the session sits Waiting. Rides the
+   *  `sessions` SSE delta (`null` clears — mergeRow passes null through).
+   *  Rendered read-only in the attention region, gated on `status === 'waiting'`. */
+  waiting_message?: string | null
   /** Server-clock ms stamp on the latest activity delta — the fase-A1
    *  hook→UI latency anchor and the client's clock-skew sample. */
   activity_at?: number
@@ -297,6 +400,10 @@ export interface ApiSession {
    *  row). The session tile renders a small globe badge when this is set; the
    *  new-session sheet picks it via <HostPicker>. */
   host_id?: number | null
+  /** The company this session belongs to (migration 0032); null / absent = a
+   *  main/PA bot (the entire existing fleet). Additive read/write field; the
+   *  company switcher (P1) reads it to scope the roster client-side. */
+  company_id?: number | null
   /** The user's last sent prompt (≤200 chars, control chars stripped), captured
    *  on both REST `send`/`paste` and WebSocket Input frames terminated by Enter.
    *  Absent when the session has never received a submission. Pairs with
@@ -464,6 +571,18 @@ export interface SessionConfigPatch {
    *  the mute decision. ANDed with the global per-category toggles in Settings:
    *  a push goes out only when both allow it. See [`NotifPolicy`]. */
   notif?: NotifPolicy
+  /** Per-bot MODEL (migration 0030), e.g. `"opus"`. Resolved against the
+   *  provider allowlist server-side (unknown → 400). `''` clears it back to the
+   *  provider default. A launch-line change: the PATCH response carries
+   *  `restart_required: true` and the live agent is NOT relaunched. */
+  model?: string
+  /** The bot's "Notes it keeps" (migration 0030) — injected READ-ONLY into the
+   *  system prompt at launch. Like `model`/`desc`, a launch-line change →
+   *  `restart_required: true`. */
+  memory?: string
+  /** Reserved per-bot skills selection (migration 0030). Stored as a JSON array;
+   *  nothing injects it yet, so it does NOT set `restart_required`. */
+  skills?: string[]
 }
 
 /** Per-session notification policy — notifications live on the BOT, not only in
@@ -503,16 +622,30 @@ export interface NewSession {
    *  `name` server-side when omitted. The create sheet derives `name` (slug)
    *  from this typed text. */
   display_name?: string
-  dir: string
+  /** Working directory. Optional: omit it for a COMPANY session (`company_id`
+   *  set) — the server OWNS that dir and forces it to `<company root>/<name>/`,
+   *  ignoring anything sent here, so we send nothing. For a main/HQ bot it is
+   *  the folder to run in (server defaults to `$HOME` when absent). */
+  dir?: string
   provider?: 'claude' | 'codex' | 'shell'
   desc?: string
   worktree?: boolean
   command?: string
   host_id?: number | null
+  /** The company this session belongs to (migration 0032); null / absent = a
+   *  main/PA bot (the entire existing fleet). Additive read/write field; the
+   *  company switcher (P1) reads it to scope the roster client-side. */
+  company_id?: number | null
   /** Boot Claude in bypass-permissions mode (`--permission-mode
    *  bypassPermissions`) — it runs tools without asking. A typed boolean: the
    *  server builds the trusted flag, the web never sends raw launch flags. */
   bypass_permissions?: boolean
+  /** Per-bot MODEL selection (migration 0030), e.g. `"opus"` / `"sonnet"` /
+   *  `"gpt-5-codex"`. NOT free text — resolved server-side against the provider's
+   *  allowlist (`lifecycle::resolve_model_flag`) and stored on the row, so it
+   *  rides the launch line as `--model <id>`. Absent = provider default. The
+   *  create sheet's Advanced → Model picker is the one place the web sends it. */
+  model?: string
 }
 
 /** A failed sessions request; carries the HTTP status so callers can branch on
@@ -739,6 +872,19 @@ export const sessionsApi = {
   }> =>
     sessReq(`/api/sessions/${encodeURIComponent(name)}/restart`, { method: 'POST' }),
 
+  /** `POST .../connect_request {connector_id}` — the store→chat CONNECT handoff.
+   *  Pushes the SAME per-session live-state a bot's own `connect(service)` tool
+   *  sets, so the bot's Focus chat raises the existing `ConnectCard` for this
+   *  connector. No secret rides this call — the credential still flows only
+   *  through the vault write the card performs later. Scoped server-side: a
+   *  member reaching a foreign-company bot (or an unknown connector/session)
+   *  gets a uniform 404. */
+  connectInBot: (name: string, connectorId: string): Promise<{ connector_id: string }> =>
+    sessReq(`/api/sessions/${encodeURIComponent(name)}/connect_request`, {
+      method: 'POST',
+      body: JSON.stringify({ connector_id: connectorId }),
+    }),
+
   /** `POST .../recover` — rung 1: the manual holder heal, bypassing the
    *  automatic layer's cooldown (B5/T8).
    *
@@ -876,6 +1022,58 @@ export const sessionsApi = {
       return []
     }
   },
+}
+
+// ── Companies (Bot Mode, migration 0032) ─────────────────────────────────────
+// Additive CRUD client over `server/src/companies/mod.rs`. Routed through the
+// same `sessReq` (auth + `{ok,data}` envelope unwrap + `SessionError`) as every
+// other call here. P0 exposes the api + types only; the switcher UI is P1.
+
+export type { Company } from '../companies'
+import type { Company } from '../companies'
+
+/** Create body for `POST /api/companies`. `root_dir` is only a HINT: the server
+ *  is authoritative and DERIVES the jail root as `<projects_root>/companies/<slug>`,
+ *  ignoring any supplied value. Read the returned `Company.root_dir` for the
+ *  truth. */
+export interface NewCompany {
+  slug: string
+  display_name: string
+  root_dir: string
+}
+
+export const companiesApi = {
+  /** `GET /api/companies` — live (non-archived) companies, ordered by
+   *  `display_name`. `sessReq` already unwrapped the `{data}` envelope. */
+  list: async (): Promise<Company[]> => {
+    const body = await sessReq<unknown>('/api/companies')
+    return Array.isArray(body) ? (body as Company[]) : []
+  },
+
+  /** `POST /api/companies` — create ({slug, display_name}); the server DERIVES +
+   *  mkdir's `root_dir` = `<projects_root>/companies/<slug>` (any supplied
+   *  `root_dir` is ignored) and returns the row (201). 409 on a slug that
+   *  collides with an existing company OR session slug. */
+  create: (input: NewCompany): Promise<Company> =>
+    sessReq('/api/companies', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  /** `PATCH /api/companies/{id}` — archive (soft-hide from the switcher). The row
+   *  and its `root_dir` survive. */
+  archive: (id: number): Promise<Company> =>
+    sessReq(`/api/companies/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ archived: true }),
+    }),
+
+  /** `PATCH /api/companies/{id}` — set the display name. */
+  rename: (id: number, display_name: string): Promise<Company> =>
+    sessReq(`/api/companies/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ display_name }),
+    }),
 }
 
 // ── Project repos endpoint ───────────────────────────────────────────────────

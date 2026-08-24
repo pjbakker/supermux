@@ -545,6 +545,10 @@ export interface LiveState {
   /** The pty's stall line (catalog `err.stream_stalled`) — what the working
    *  row says while a request is out and nothing is coming back. */
   stalled?: string
+  /** The pty's live compaction hint (`peek-lens` `compacting`) — its presence
+   *  makes the working row read `Compacting context…`. Driven through the real
+   *  `readLens` so the bench exercises COMPACTING_RE, not a hand-typed label. */
+  compacting?: string
 }
 
 /**
@@ -676,6 +680,26 @@ export function liveStates(nowMs: number): LiveState[] {
         status: 'idle',
       }),
       entries: release,
+    },
+    {
+      // The daily-driver WORST CASE for the phone header (owner's real device,
+      // IMG_2348): a short name flanked by a Bypass mode chip, a "Not up to
+      // date" connection chip, the presence dot AND the A/Chat/⌘ segmented
+      // toggle — the widest realistic trailing cluster, at 390px. The simple
+      // one-name header the older bench drew never reproduced the overflow.
+      id: 'busy-header',
+      title: 'Busy header — bypass + not-up-to-date + toggle, at 390px',
+      board: 'mobile-*.png (widest realistic header)',
+      session: session({
+        name: 'ipc',
+        display_name: 'ipc',
+        status: 'idle',
+        mode: 'bypass',
+      }),
+      entries: release,
+      // The rest composer (empty draft, idle → the mic), so the same capture
+      // proves the placeholder is vertically centred with the + and the mic.
+      composer: { draft: '' },
     },
     {
       id: 'working',
@@ -1297,6 +1321,32 @@ export function liveStates(nowMs: number): LiveState[] {
       },
     },
     {
+      // THE PRODUCTION FIX (this branch): an AskUserQuestion surfaced from the
+      // STRUCTURED `question_request`, not the pty scrape. The old `question`
+      // state above depends on a `dialog` sighting the current Claude Code does
+      // not reliably produce, so in production the question fell through to the
+      // generic ``Run `AskUserQuestion`?`` card with dead buttons. This state has
+      // NO `dialog` — only `question_request` — and must draw the real question
+      // with its options as live, clickable answers. `data-vr="qq-card"`.
+      id: 'question-ask',
+      title: 'AskUserQuestion — the answerable card from the structured payload',
+      board: 'verify matrix finding 4 (structured question_request)',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        status: 'active',
+        activity: '⚡ AskUserQuestion',
+        question_request: {
+          header: 'Fruit choice',
+          question: 'Which fruit do you want?',
+          options: ['Apple', 'Banana', 'Cherry'],
+          multi_select: false,
+        },
+      }),
+      entries: release,
+      turnAgo: 8,
+    },
+    {
       id: 'trust-gate',
       title: 'The startup wedge — answerable, with no boot banner to pin against',
       board: 'the states audit, catalog perm.trust_folder',
@@ -1427,6 +1477,47 @@ export function liveStates(nowMs: number): LiveState[] {
       stalled: 'Waiting for API response · will retry in 3s · check your network',
     },
     {
+      id: 'compacting',
+      title: 'Compacting the context — the live, benign in-progress pause',
+      board: 'the states audit, the live compaction hint',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        // ACTIVE: the turn is still live while CC compacts; the working row
+        // takes the compaction label instead of the last tool that ran.
+        status: 'active',
+        activity: '⚡ Read server/src/export/money.rs',
+      }),
+      entries: release,
+      turnAgo: 12,
+      // Driven through the REAL peek machinery: inject the pty hint line and let
+      // `readLens`/COMPACTING_RE derive the notice, exactly as ChatPanel does.
+      // Its presence (any non-null) makes the working row read `Compacting
+      // context…` (the fixed label lives in `live-layer.tsx`).
+      compacting:
+        readLens(
+          ['✻ Simmering… (esc to interrupt)', '  ⎿  Compacting conversation… (23.4k tokens)'].join(
+            '\n',
+          ),
+        ).notice?.text ?? undefined,
+    },
+    {
+      id: 'waiting-message',
+      title: 'The Notification waiting line — idle_prompt / agent_needs_input',
+      board: 'the states audit, the needs-you Notification message',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        // WAITING (from the Notification hook → HookEvent::Notification): the
+        // read-only line renders in the attention region, gated on this status.
+        // No permission_request / dialog, so the SystemLine — not a card — shows.
+        status: 'waiting',
+        waiting_message: 'Claude needs your input to continue',
+      }),
+      entries: release,
+      turnAgo: undefined,
+    },
+    {
       id: 'stop-armed',
       title: 'Stop refused — the terminal has Escape armed for something else',
       board: 'the states audit, catalog generic.armed_keys',
@@ -1463,6 +1554,7 @@ export const MENTIONABLE: readonly MentionableSession[] = [
 /** Every state id, for the picker and for the coverage test. */
 export const STATE_IDS = [
   'idle',
+  'busy-header',
   'working',
   'provisional',
   'permission',
@@ -1494,6 +1586,7 @@ export const STATE_IDS = [
   'dialog-aborted',
   'question',
   'question-refused',
+  'question-ask',
   'trust-gate',
   'limit-blocked',
   // PTY-07 — the dialog/pty families.
@@ -1501,6 +1594,8 @@ export const STATE_IDS = [
   'refusal-fallback',
   'turn-refused',
   'stalled',
+  'compacting',
+  'waiting-message',
   'stop-armed',
 ] as const
 

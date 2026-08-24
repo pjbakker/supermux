@@ -14,7 +14,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, Notify};
 
 use crate::config::Config;
-use crate::sessions::activity::PermissionAsk;
+use crate::sessions::activity::{PermissionAsk, QuestionAsk};
+use crate::sessions::connect_ask::ConnectAsk;
 use crate::sessions::elicitation::ElicitationAsk;
 use crate::sessions::host_pool::HostPool;
 use crate::sessions::pty::PtyStream;
@@ -27,6 +28,19 @@ use crate::ws::streamer::PtyStreamer;
 /// session, [`AppState::last_pty`] reports the last byte as 5 minutes ago, so a
 /// freshly-booted server never reads `Active` off a stale heartbeat.
 const COLD_START_PTY_IDLE: Duration = Duration::from_secs(300);
+
+/// How recently a background subagent must have shown activity — a
+/// `subagents/agent-*.jsonl` APPEND (the tailer's ground truth) OR an OPEN
+/// subagent hook (`SubagentStart`/a parent tool hook while the count is >0) — for
+/// the session to still read as WORKING. Ten seconds, matching
+/// [`crate::sessions::status`]'s `SPINNER_SETTLE` and the tailer's
+/// `HOOK_ACTIVITY_WINDOW_MS`: it is also the STALENESS REAPER for the subagent
+/// count. Because a lost `SubagentStop` pins the count but stops producing any
+/// fresh subagent signal, the count alone can never keep a session `subagents_live`
+/// past this window — so it can no longer permanently pin the status `Active`
+/// (nor suppress a finish notification), the property the old force-0-on-`Stop`
+/// used to guarantee.
+const SUBAGENT_LIVE_WINDOW: Duration = Duration::from_secs(10);
 
 /// A per-session status snapshot pushed through [`AppState::status_watch`]:
 /// `(status, version)`. The channel + version counter form the
@@ -61,8 +75,20 @@ pub struct SessionActivity {
     /// status classifier's turn boundary ([`super::sessions::status::TurnState`]
     /// `turn_end` = main `Stop` only), so it cannot regress the false-finished
     /// fix. Best-effort (subagents share the parent token, no per-subagent id):
-    /// saturating, reset on a new prompt, force-0 on the main `Stop`.
+    /// saturating, reset on a new prompt. NO LONGER force-0'd on the main `Stop`
+    /// (so a session left with a live background workflow keeps a truthful count);
+    /// a lost `SubagentStop` can no longer pin it forever because
+    /// [`AppState::subagents_live`] gates it on [`SUBAGENT_LIVE_WINDOW`] freshness
+    /// (the staleness reaper).
     pub subagents: u32,
+    /// The instant of the last OPEN-subagent hook signal — a `SubagentStart`, a
+    /// `SubagentStop`, or a parent tool hook (`PreToolUse`/`PostToolUse`) that
+    /// arrived while [`subagents`](Self::subagents) was > 0. Paired with the count
+    /// in [`AppState::has_open_subagents`] / [`AppState::subagents_live`]: an
+    /// outstanding count is only "live" while this stays fresh, so a lost
+    /// `SubagentStop` decays out of live within [`SUBAGENT_LIVE_WINDOW`]. `None`
+    /// until the first subagent hook. In-memory only.
+    pub subagent_hook_at: Option<Instant>,
     /// The LIVE permission request: Claude is displaying a permission dialog for
     /// this tool call and is blocked on a human. Set by the `PermissionRequest`
     /// hook (which fires when the dialog DISPLAYS, before any decision) and
@@ -80,6 +106,38 @@ pub struct SessionActivity {
     /// as the backstop. In-memory only, and every string in it is third-party
     /// text (see `sessions::elicitation`).
     pub elicitation: Option<ElicitationAsk>,
+    /// **The live connect ask** (`connectors.connect`): a bot's `connect(service)`
+    /// tool carried the `requiresUserInteraction` marker and stopped for a human.
+    /// Set by the `PreToolUse` hook when it recognises the connect affordance
+    /// ([`crate::sessions::connect_ask::parse`]) and cleared by the same
+    /// "something after it happened" events as [`permission`](Self::permission) —
+    /// no hook reports the credential outcome (it never touches this plane; the
+    /// card POSTs it straight to the vault). In-memory only.
+    pub connect_request: Option<ConnectAsk>,
+    /// **The live browser takeover ask** (`connectors.browser`): a granted bot
+    /// called the Shared Browser's `request_human_takeover(reason)` — a login,
+    /// a 2FA prompt, a CAPTCHA — and needs a human to finish it on the page.
+    /// Set by the `PreToolUse` hook when it recognises the affordance
+    /// ([`crate::sessions::takeover_ask::parse`]) AND by the tool endpoint when
+    /// the call actually runs (that path also parks the agent on the drive
+    /// lock), and cleared by the same "something after it happened" events as
+    /// [`connect_request`](Self::connect_request), plus explicitly by the
+    /// endpoint the moment the human hands the wheel back. In-memory only.
+    pub browser_takeover: Option<crate::sessions::takeover_ask::TakeoverAsk>,
+    /// **The live question ask** (`AskUserQuestion`): the agent called
+    /// `AskUserQuestion` and is blocked on a human. Set by the `PreToolUse` hook
+    /// from the STRUCTURED payload ([`crate::sessions::activity::question_ask`]) so
+    /// chat can draw the real question + its options as clickable buttons rather
+    /// than the generic tool-permission prompt — version-robust, since it does not
+    /// depend on scraping the pty. Cleared by the same "something after it
+    /// happened" events as [`permission`](Self::permission). While it is set the
+    /// generic `permission` dialog for AskUserQuestion is deliberately NOT raised
+    /// (the two would fight over the chat card). In-memory only.
+    pub question_request: Option<QuestionAsk>,
+    /// The Notification `message` for the needs-you family (permission_prompt /
+    /// idle_prompt / agent_needs_input) while the session sits Waiting. In-memory,
+    /// display-only; SAME clear-set as `permission` (the needs-you resolution set).
+    pub waiting_message: Option<String>,
 }
 
 impl SessionActivity {
@@ -93,6 +151,10 @@ impl SessionActivity {
             && self.subagents == 0
             && self.permission.is_none()
             && self.elicitation.is_none()
+            && self.connect_request.is_none()
+            && self.browser_takeover.is_none()
+            && self.question_request.is_none()
+            && self.waiting_message.is_none()
     }
 }
 
@@ -105,6 +167,40 @@ pub struct SseEvent {
     #[serde(rename = "type")]
     pub event: String,
     pub payload: serde_json::Value,
+    /// P3b — the company this frame belongs to, for per-subscriber routing.
+    /// `None` = global/owner-only. NEVER serialized onto the wire (it is a
+    /// routing attribute, not payload; the client already gets what it needs
+    /// from `payload`); the SSE handler drops any frame a scoped viewer must not
+    /// see BEFORE serialization. Producers that know the session's company stamp
+    /// it via [`SseEvent::for_company`]; the rest stay `None` and, being
+    /// unstamped, reach ONLY the owner/admin (fail-closed).
+    #[serde(skip)]
+    pub company_id: Option<i64>,
+}
+
+impl SseEvent {
+    /// A global (unstamped) frame — reaches the owner/admin only once a scoped
+    /// human exists; today (no humans) it reaches everyone unchanged.
+    pub fn global(event: impl Into<String>, payload: serde_json::Value) -> Self {
+        SseEvent {
+            event: event.into(),
+            payload,
+            company_id: None,
+        }
+    }
+
+    /// A company-stamped frame — reaches the owner/admin and members of `company`.
+    pub fn for_company(
+        event: impl Into<String>,
+        payload: serde_json::Value,
+        company: Option<i64>,
+    ) -> Self {
+        SseEvent {
+            event: event.into(),
+            payload,
+            company_id: company,
+        }
+    }
 }
 
 /// Default fan-out capacity for the SSE broadcast channel.
@@ -229,6 +325,12 @@ pub struct AppState {
     /// Per-session serialization locks. Added on first use; removed in
     /// `sessions::delete`/`archive`.
     pub session_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    /// Idempotency ledger for chat `POST /send`: the client-generated `send_id`s
+    /// recently typed into each session, so a Retry (or a double-tapped resend)
+    /// of an already-delivered message is a no-op instead of a duplicate prompt.
+    /// Memory-only, self-pruned by TTL + cap; a restart simply forgets. See
+    /// [`crate::sessions::send_dedup`].
+    pub send_dedup: Arc<crate::sessions::send_dedup::SendDedup>,
     /// Per-session status watch channels (the wait-primitive seam).
     /// Empty until the detector drives updates; the map + cleanup ensures
     /// churn never leaks entries.
@@ -237,6 +339,19 @@ pub struct AppState {
     /// removed on delete. NEVER holds the dashboard bearer — only the narrow
     /// per-session `SUPERMUX_HOOK_TOKEN`. The `/api/_internal/hook` route reads it.
     pub hook_tokens: Arc<DashMap<String, String>>,
+    /// `(session, pane) → Claude conversation id` — the PANE MAP (§R2.3).
+    ///
+    /// Memory-only and purely WRITE-side for now: every pointer-carrying hook
+    /// that arrives from a team host's pane records the pane it came from and
+    /// the conversation id it carried
+    /// ([`AppState::record_pane_conversation`], called from
+    /// [`crate::hooks::track_conversation_pointer`]). Its reason to exist is
+    /// that a teammate is NOT an `/api/sessions` row and therefore has no other
+    /// handle on its transcript: with this map a teammate pane becomes
+    /// addressable as a real conversation (a teammate chat thread, a merged team
+    /// feed) using the tailer/store/WS that already exist. Rebuilt from hooks, so
+    /// a restart simply relearns it — never persisted, never authoritative.
+    pub pane_conversations: Arc<DashMap<(String, String), String>>,
     /// Per-session TURN STATE (the "busy while thinking" fix). Written by
     /// `/api/_internal/hook` (folding each Claude `SettingsHook` event into the
     /// matching per-type timestamp via [`TurnState::apply`]); read by the status
@@ -245,6 +360,17 @@ pub struct AppState {
     /// window of the last hook. Each timestamp is the server-side receive
     /// `Instant`, so freshness is judged locally (clock-skew safe).
     pub last_hook: Arc<DashMap<String, TurnState>>,
+    /// Per-session "a background subagent last did something" instant — the
+    /// ground-truth clock behind [`AppState::subagents_live`]. Bumped by the chat
+    /// TAILER on every `subagents/agent-*.jsonl` APPEND (survives the main `Stop`,
+    /// independent of hooks, un-fakeable by an idle roster repaint) and, as the
+    /// no-chat backstop, by every `SubagentStart`/`SubagentStop` and by a parent
+    /// tool hook that arrives while the outstanding-subagent count is > 0. A
+    /// separate map (not on `SessionActivity`) so it survives the count draining
+    /// to 0 — a hook-less Workflow subagent writing its transcript is live even
+    /// though it never bumped the count. Memory-only; cleared on delete/rename;
+    /// naturally decays via [`SUBAGENT_LIVE_WINDOW`] (no reaper task needed).
+    pub subagent_active_at: Arc<DashMap<String, Instant>>,
     /// Per-session "hooks are LIVE" flag. Set the moment ANY authenticated hook
     /// POST arrives from the session (`/api/_internal/hook`), so it goes true
     /// within the boot window — the `SessionStart` hook fires when Claude
@@ -435,6 +561,64 @@ pub struct AppState {
     /// SAME cache + registry (a `/start` writer + `/progress` subscriber must
     /// rendezvous on one channel — see `crate::updates`).
     pub updates: crate::updates::UpdatesState,
+    /// **Shared-Browser connector** service (phase 1). One long-lived
+    /// `chrome-headless-shell` with an isolated CDP browser context per agent
+    /// session and an AGENT/HUMAN drive lock per context.
+    ///
+    /// **Lazily started — constructing it spawns nothing.** Chrome is launched
+    /// on the FIRST [`crate::connectors::browser::BrowserService::context_for`]
+    /// call, so an install with no browser grants never runs a browser and its
+    /// launch stays byte-identical to a build without the module. Teardown is
+    /// owned by the service itself (process-group kill + temp-profile removal +
+    /// a SIGTERM/SIGINT hook installed only once chrome is really running), so
+    /// nothing here or in `main.rs` has to remember to stop it.
+    pub browser: Arc<crate::connectors::browser::BrowserService>,
+    /// Portable agent-isolation runtime (companies §4.4): the requested
+    /// [`IsolationMode`](crate::isolation::IsolationMode), the once-at-startup
+    /// probe result, and the active backend. The spawn path (`lifecycle::
+    /// start_locked`) consults it to build a per-spawn confinement plan for
+    /// COMPANY sessions only. Cheap `Arc`; the probe (which forks once) is
+    /// memoised process-wide, so building this per test `AppState` is free after
+    /// the first.
+    pub isolation: Arc<crate::isolation::IsolationRuntime>,
+    /// The last per-spawn isolation level actually applied, keyed by session
+    /// name (companies §4.4 surface). In-memory only; written when a company
+    /// session is (re)started so a later surface can render a badge without
+    /// re-probing. A stale entry is harmless and overwritten on the next start.
+    pub isolation_applied: Arc<DashMap<String, crate::isolation::IsolationLevel>>,
+    /// P3a — human identity plane runtime: the ephemeral OIDC flow store + the
+    /// (swappable-for-tests) Google verifier. Config/keys live on
+    /// `config.human_auth`.
+    pub human_auth: Arc<crate::auth_human::HumanAuth>,
+    /// The LIVE human-auth config, hot-swappable by the onboarding wizard.
+    ///
+    /// Seeded at boot from `config.human_auth` merged with any
+    /// `<data_dir>/companies_config.toml` companion
+    /// ([`crate::external_access::store::boot_overlay`]); the wizard's
+    /// `POST /api/external-access/google` + `POST /api/companies/{id}/host`
+    /// rewrite the companion and call [`reload_human_auth`](Self::reload_human_auth)
+    /// to swap this WITHOUT a restart. Every human-auth reader consults
+    /// [`human_auth_cfg`](Self::human_auth_cfg) instead of `config.human_auth`, so
+    /// external access goes live in-process.
+    pub human_auth_config: Arc<arc_swap::ArcSwap<crate::config::HumanAuthConfig>>,
+    /// The onboarding wizard's Cloudflare + connector-runtime seams (swappable for
+    /// tests, like [`human_auth`](Self::human_auth)'s verifier).
+    pub external_access: Arc<crate::external_access::ExternalAccess>,
+    /// P2a — the LIVE, hot-swappable set of registered connector-OAuth **apps**
+    /// (non-secret `client_id` + `scopes` per `(provider, company)`). Seeded at
+    /// boot from the companion `companies_config.toml`
+    /// ([`crate::external_access::store::read_or_default`]) and swapped by
+    /// [`reload_oauth_apps`](Self::reload_oauth_apps) after each registration write
+    /// — no restart. Read (cheaply, per-card) by
+    /// [`crate::connectors::api::derive_auth`] to decide the auth lane. Client
+    /// SECRETS are NOT here — they are read from their 0600 file only at
+    /// device-poll time.
+    pub oauth_apps: Arc<arc_swap::ArcSwap<Vec<crate::external_access::store::OauthApp>>>,
+    /// P2a — ephemeral RFC-8628 device-flow state, keyed by an opaque v4-UUID
+    /// handle. Holds the `device_code` + `client_secret` server-side ONLY (never
+    /// returned, never logged); the client holds only the handle. Entries drop on
+    /// terminal status and self-prune on a poll past expiry. In-memory only.
+    pub oauth_device_handles: Arc<DashMap<String, crate::connectors::oauth::DeviceHandle>>,
 }
 
 impl AppState {
@@ -454,6 +638,23 @@ impl AppState {
         // mkdir of `<data_dir>/ssh-control`); the actual ssh work happens
         // lazily when `transport_for` is first called for a host.
         let host_pool = HostPool::new(pool.clone(), &config.data_dir);
+        // Capture the isolation policy before `config` is moved into the Arc.
+        let isolation_mode = config.isolation_mode;
+        // Build the P3a human-auth runtime (flow store + Google verifier) before
+        // `config` is moved into the Arc. The LIVE config is the file baseline
+        // MERGED with any `companies_config.toml` companion the wizard wrote, so a
+        // wizard-configured box comes back configured after a restart. Absent the
+        // companion this is byte-identical to `config.human_auth` (every existing
+        // install + unit test).
+        let live_human_auth =
+            crate::external_access::store::boot_overlay(&config.data_dir, config.human_auth.clone());
+        let human_auth = Arc::new(crate::auth_human::HumanAuth::new(&live_human_auth));
+        let human_auth_config = Arc::new(arc_swap::ArcSwap::from_pointee(live_human_auth));
+        // P2a — seed the registered connector-OAuth apps from the companion store
+        // (absent file ⇒ empty Vec ⇒ byte-identical to every current install/test).
+        let oauth_apps_seed = crate::external_access::store::read_or_default(&config.data_dir)
+            .map(|c| c.oauth_apps)
+            .unwrap_or_default();
         Self {
             pool,
             config: Arc::new(config),
@@ -462,9 +663,12 @@ impl AppState {
             push_attempts: Arc::new(crate::push::AttemptLog::default()),
             pending_pushes: Arc::new(DashMap::new()),
             session_locks: Arc::new(DashMap::new()),
+            send_dedup: Arc::new(crate::sessions::send_dedup::SendDedup::default()),
             status_watch: Arc::new(DashMap::new()),
             hook_tokens: Arc::new(DashMap::new()),
+            pane_conversations: Arc::new(DashMap::new()),
             last_hook: Arc::new(DashMap::new()),
+            subagent_active_at: Arc::new(DashMap::new()),
             hooks_live: Arc::new(DashMap::new()),
             detector_wake: Arc::new(DashMap::new()),
             chat_pointer_wake: Arc::new(DashMap::new()),
@@ -484,7 +688,63 @@ impl AppState {
             statuslines: Arc::new(DashMap::new()),
             host_pool,
             updates: crate::updates::UpdatesState::new(),
+            // Cheap: a config struct. No process, no I/O — see the field docs.
+            browser: crate::connectors::browser::BrowserService::new(
+                crate::connectors::browser::BrowserConfig::from_env(),
+            ),
+            // Runs (or reuses) the once-per-process isolation probe and logs the
+            // honest measured level. On THIS box the systemd @system-service
+            // filter blocks landlock_*, so the probe measures None and company
+            // agents run UNCONFINED under BestEffort (fail-open).
+            isolation: Arc::new(crate::isolation::IsolationRuntime::from_mode(
+                isolation_mode,
+            )),
+            isolation_applied: Arc::new(DashMap::new()),
+            human_auth,
+            human_auth_config,
+            external_access: Arc::new(crate::external_access::ExternalAccess::new()),
+            oauth_apps: Arc::new(arc_swap::ArcSwap::from_pointee(oauth_apps_seed)),
+            oauth_device_handles: Arc::new(DashMap::new()),
         }
+    }
+
+    /// The LIVE human-auth config snapshot (hot-swappable by the onboarding
+    /// wizard). Every human-auth reader uses this instead of `config.human_auth`
+    /// so a wizard save takes effect in-process. Cheap `Arc` load.
+    pub fn human_auth_cfg(&self) -> Arc<crate::config::HumanAuthConfig> {
+        self.human_auth_config.load_full()
+    }
+
+    /// Rebuild the live [`crate::config::HumanAuthConfig`] from the companion store
+    /// (`companies_config.toml` + the 0600 secret files) and hot-swap it, then
+    /// point the OIDC verifier at the (possibly new) Google client. Called by the
+    /// wizard after it writes the store, so external access + login go live WITHOUT
+    /// a restart. Idempotent; safe to call repeatedly.
+    pub fn reload_human_auth(&self) -> anyhow::Result<()> {
+        let store = crate::external_access::store::read_or_default(&self.config.data_dir)?;
+        let merged = crate::external_access::store::assemble(
+            &self.config.data_dir,
+            &self.config.human_auth,
+            &store,
+        )?;
+        self.human_auth
+            .set_verifier(Arc::new(crate::auth_human::oidc::GoogleOidcVerifier::new(
+                merged.google_client_id.clone(),
+                merged.google_client_secret.clone(),
+            )));
+        self.human_auth_config.store(Arc::new(merged));
+        Ok(())
+    }
+
+    /// P2a — re-read the registered connector-OAuth apps from the companion store
+    /// and hot-swap the in-memory snapshot. Called by `POST`/`DELETE
+    /// /api/oauth/apps` after the atomic companion write, so `derive_auth` sees a
+    /// freshly-registered app WITHOUT a restart. Client secrets are never cached —
+    /// only the non-secret `client_id`/`scopes` ride this snapshot.
+    pub fn reload_oauth_apps(&self) -> anyhow::Result<()> {
+        let store = crate::external_access::store::read_or_default(&self.config.data_dir)?;
+        self.oauth_apps.store(Arc::new(store.oauth_apps));
+        Ok(())
     }
 
     // ── external edit: in-flight native-editor handoff registry ───────────────
@@ -884,6 +1144,10 @@ impl AppState {
     /// the detector classifies the new session from scratch (content + heartbeat).
     pub fn reset_turn_state(&self, name: &str) {
         self.last_hook.remove(name);
+        // A brand-new process inherits no background-workflow liveness either, so
+        // a restart cannot leave a stale `subagents_live` pinning the fresh,
+        // idle session `Active` (the restart-stuck-loading class of bug).
+        self.subagent_active_at.remove(name);
     }
 
     /// Mark `name`'s Claude hooks as LIVE — called by `/api/_internal/hook` on
@@ -893,6 +1157,29 @@ impl AppState {
     /// typing at the prompt can't flip the card to busy).
     pub fn mark_hooks_live(&self, name: &str) {
         self.hooks_live.entry(name.to_string()).or_insert(());
+    }
+
+    /// Record `pane` of `session` as carrying Claude conversation `conv_id`
+    /// (§R2.3, the pane map). Idempotent, last-write-wins: a pane that restarts
+    /// its Claude process gets a new conversation id and the map follows it.
+    ///
+    /// An EMPTY pane is not recorded: it identifies nothing (a non-tmux session,
+    /// or a pane whose hook command predates the `pane` field), and a `("s","")`
+    /// key would collide across every such hook. Same for an empty id.
+    pub fn record_pane_conversation(&self, session: &str, pane: &str, conv_id: &str) {
+        if pane.is_empty() || conv_id.is_empty() {
+            return;
+        }
+        self.pane_conversations
+            .insert((session.to_string(), pane.to_string()), conv_id.to_string());
+    }
+
+    /// The conversation id last seen from `session`'s `pane`, if any (§R2.3).
+    /// `None` means "not learned this process lifetime" — never "no such pane".
+    pub fn pane_conversation(&self, session: &str, pane: &str) -> Option<String> {
+        self.pane_conversations
+            .get(&(session.to_string(), pane.to_string()))
+            .map(|v| v.clone())
     }
 
     /// Does `name` have LIVE Claude hooks (we have seen ≥1 hook POST from it)?
@@ -929,7 +1216,11 @@ impl AppState {
             || entry.error != before.error
             || entry.subagents != before.subagents
             || entry.permission != before.permission
-            || entry.elicitation != before.elicitation;
+            || entry.elicitation != before.elicitation
+            || entry.connect_request != before.connect_request
+            || entry.browser_takeover != before.browser_takeover
+            || entry.question_request != before.question_request
+            || entry.waiting_message != before.waiting_message;
         let empty = entry.is_empty();
         drop(entry);
         if empty {
@@ -977,6 +1268,8 @@ impl AppState {
     pub fn inc_subagents(&self, name: &str) -> bool {
         self.mutate_activity(name, |a| {
             a.subagents = a.subagents.saturating_add(1);
+            // A `SubagentStart` is itself fresh open-subagent evidence.
+            a.subagent_hook_at = Some(Instant::now());
         })
     }
 
@@ -986,16 +1279,92 @@ impl AppState {
     pub fn dec_subagents(&self, name: &str) -> bool {
         self.mutate_activity(name, |a| {
             a.subagents = a.subagents.saturating_sub(1);
+            a.subagent_hook_at = Some(Instant::now());
         })
     }
 
+    /// Stamp a parent-session HOOK (`PreToolUse`/`PostToolUse`) as open-subagent
+    /// evidence, but ONLY while a subagent is outstanding (`subagents > 0`). After
+    /// the main `Stop`, a subagent's own tool calls still POST on the shared
+    /// parent token (anthropics/claude-code#7881); this keeps
+    /// [`subagent_hook_at`](SessionActivity::subagent_hook_at) fresh through a
+    /// long subagent tool call, so `subagents_live` does not lapse mid-work. A
+    /// no-op (never allocates an entry) when no subagent is outstanding, so a
+    /// plain single-agent turn is byte-identical. Returns whether it changed a
+    /// broadcastable field (always `false` — the timestamp is not one).
+    pub fn touch_subagent_tool_hook(&self, name: &str) {
+        // Read-only guard first: never create an activity entry for a session
+        // that has no outstanding subagent (the common case).
+        let outstanding = self
+            .session_activity
+            .get(name)
+            .map(|a| a.subagents > 0)
+            .unwrap_or(false);
+        if outstanding {
+            self.mutate_activity(name, |a| {
+                a.subagent_hook_at = Some(Instant::now());
+            });
+        }
+    }
+
+    /// Mark `name` as having live BACKGROUND-subagent activity RIGHT NOW — a
+    /// `subagents/agent-*.jsonl` append the chat tailer observed. This is the
+    /// GROUND TRUTH for [`subagents_live`](Self::subagents_live): it survives the
+    /// main `Stop`, needs no hook, and a per-second idle roster repaint cannot
+    /// fake it. Stored off `SessionActivity` (its own map) so it is not pruned
+    /// when the outstanding count is 0.
+    pub fn mark_subagent_active(&self, name: &str) {
+        self.subagent_active_at
+            .insert(name.to_string(), Instant::now());
+    }
+
+    /// Is there an OPEN subagent — an outstanding count paired with a FRESH
+    /// subagent hook (within [`SUBAGENT_LIVE_WINDOW`])? The count alone is not
+    /// enough: a lost `SubagentStop` pins it, so it must be corroborated by recent
+    /// hook activity. This is the "finished" notification gate's fail-safe (a
+    /// stale pinned count no longer suppresses a finish) — the property the old
+    /// force-0-on-`Stop` provided.
+    pub fn has_open_subagents(&self, name: &str) -> bool {
+        self.session_activity
+            .get(name)
+            .map(|a| {
+                a.subagents > 0
+                    && a.subagent_hook_at
+                        .is_some_and(|t| t.elapsed() < SUBAGENT_LIVE_WINDOW)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Does `name` have a live BACKGROUND WORKFLOW — a subagent that did something
+    /// within [`SUBAGENT_LIVE_WINDOW`]? True when EITHER a
+    /// `subagents/agent-*.jsonl` APPEND is that fresh (the tailer ground truth,
+    /// [`mark_subagent_active`](Self::mark_subagent_active)) OR there is an OPEN
+    /// subagent hook ([`has_open_subagents`](Self::has_open_subagents)). Default
+    /// FALSE for every session with no recent subagent signal — so a plain idle
+    /// Claude session is unaffected (the stuck-`active` fix stays intact) and the
+    /// status classifier's golden fixtures are byte-identical. Threaded into
+    /// [`crate::sessions::status::StatusDetector::detect`] and surfaced on
+    /// `SessionView` so the roster + notifications read a running workflow as
+    /// WORKING, not done/idle.
+    pub fn subagents_live(&self, name: &str) -> bool {
+        let append_fresh = self
+            .subagent_active_at
+            .get(name)
+            .is_some_and(|t| t.elapsed() < SUBAGENT_LIVE_WINDOW);
+        append_fresh || self.has_open_subagents(name)
+    }
+
     /// Reset the outstanding-subagent count to 0 — on a new prompt (a fresh turn)
-    /// and force-applied on the main `Stop`/`SessionEnd` (the authoritative turn
-    /// end, which bounds any drift to a single turn and makes the "finished"
-    /// notification gate fail-safe). Returns whether it changed.
+    /// and on `SessionStart`/`SessionEnd`. NO LONGER called on the main `Stop`: a
+    /// session that left a background workflow running keeps a truthful count past
+    /// its main turn, and [`SUBAGENT_LIVE_WINDOW`] freshness (not a force-0) is now
+    /// what keeps a lost `SubagentStop` from pinning it. Returns whether it
+    /// changed.
     pub fn reset_subagents(&self, name: &str) -> bool {
+        self.subagent_active_at.remove(name);
         self.mutate_activity(name, |a| {
             a.subagents = 0;
+            a.subagent_hook_at = None;
         })
     }
 
@@ -1018,6 +1387,24 @@ impl AppState {
         })
     }
 
+    /// Set `name`'s Notification waiting message (the needs-you family's text,
+    /// shown read-only on the Waiting line). Same posture and same clear-set as
+    /// the permission ask. Returns whether it changed.
+    pub fn set_waiting_message(&self, name: &str, msg: String) -> bool {
+        self.mutate_activity(name, |a| {
+            a.waiting_message = Some(msg);
+        })
+    }
+
+    /// Clear `name`'s Notification waiting message — cleared by the same
+    /// resolution events as the permission ask (next Active/Stop). Returns
+    /// whether it changed.
+    pub fn clear_waiting_message(&self, name: &str) -> bool {
+        self.mutate_activity(name, |a| {
+            a.waiting_message = None;
+        })
+    }
+
     /// Set `name`'s live MCP elicitation ask (from an `Elicitation` payload: a
     /// third-party server is demanding a typed form and the session cannot
     /// continue until a human answers). Returns whether it changed — Claude Code
@@ -1034,6 +1421,66 @@ impl AppState {
     pub fn clear_elicitation(&self, name: &str) -> bool {
         self.mutate_activity(name, |a| {
             a.elicitation = None;
+        })
+    }
+
+    /// Set `name`'s live connect ask (from a `PreToolUse` payload whose tool is
+    /// the store's `connect(service)` affordance). Returns whether it changed —
+    /// a re-fired identical call broadcasts nothing.
+    pub fn set_connect_request(&self, name: &str, ask: ConnectAsk) -> bool {
+        self.mutate_activity(name, |a| {
+            a.connect_request = Some(ask);
+        })
+    }
+
+    /// Clear `name`'s live connect ask — on any event that proves the connect
+    /// tool call moved on (the credential outcome itself is never reported by a
+    /// hook, so "something after it happened" IS the resolution signal, exactly
+    /// like the permission dialog). Returns whether it changed.
+    pub fn clear_connect_request(&self, name: &str) -> bool {
+        self.mutate_activity(name, |a| {
+            a.connect_request = None;
+        })
+    }
+
+    /// Set `name`'s live question ask (from an `AskUserQuestion` `PreToolUse`
+    /// payload). Returns whether it changed — a re-fired identical ask broadcasts
+    /// nothing.
+    pub fn set_question_request(&self, name: &str, ask: QuestionAsk) -> bool {
+        self.mutate_activity(name, |a| {
+            a.question_request = Some(ask);
+        })
+    }
+
+    /// Clear `name`'s live question ask — on any event that proves the
+    /// `AskUserQuestion` call moved on (the answer itself is never reported by a
+    /// hook, so "something after it happened" IS the resolution signal, exactly
+    /// like the permission dialog and the connect ask). Returns whether it changed.
+    pub fn clear_question_request(&self, name: &str) -> bool {
+        self.mutate_activity(name, |a| {
+            a.question_request = None;
+        })
+    }
+
+    /// Set `name`'s live browser takeover ask — a granted bot asked a human to
+    /// take the wheel of its page. Returns whether it changed (a re-fired
+    /// identical ask broadcasts nothing).
+    pub fn set_browser_takeover(
+        &self,
+        name: &str,
+        ask: crate::sessions::takeover_ask::TakeoverAsk,
+    ) -> bool {
+        self.mutate_activity(name, |a| {
+            a.browser_takeover = Some(ask);
+        })
+    }
+
+    /// Clear `name`'s live browser takeover ask — the human handed the wheel
+    /// back, the park timed out, or the tool call otherwise moved on. Returns
+    /// whether it changed.
+    pub fn clear_browser_takeover(&self, name: &str) -> bool {
+        self.mutate_activity(name, |a| {
+            a.browser_takeover = None;
         })
     }
 
@@ -1184,9 +1631,14 @@ impl AppState {
     /// `DashMap` entries.
     pub fn forget_session(&self, name: &str) {
         self.session_locks.remove(name);
+        self.send_dedup.forget(name);
         self.status_watch.remove(name);
         self.hook_tokens.remove(name);
+        // The pane map is keyed by (session, pane): retain-scan it so a deleted
+        // session leaves no pane rows behind for a later session reusing the name.
+        self.pane_conversations.retain(|(s, _), _| s != name);
         self.last_hook.remove(name);
+        self.subagent_active_at.remove(name);
         self.hooks_live.remove(name);
         self.detector_wake.remove(name);
         self.chat_pointer_wake.remove(name);
@@ -1232,6 +1684,14 @@ impl AppState {
             }
         }
         self.pty.forget(name);
+        // The shared-browser context is per-session state too — and the most
+        // dangerous kind to leave behind, because it holds whatever the agent
+        // logged into. A deleted/archived name can be created again minutes
+        // later; the next occupant must never find this one's cookie jar. (The
+        // launch-id keying in `BrowserService::context_for` is the second lock
+        // on that same door.) Fire-and-forget: a session that never browsed is
+        // a silent no-op.
+        crate::connectors::browser::dispose_on_teardown(&self.browser, name);
     }
 
     /// Evict a teammate PANE stream keyed by its stream key
@@ -1255,14 +1715,33 @@ impl AppState {
         if let Some((_, v)) = self.session_locks.remove(old) {
             self.session_locks.insert(new.to_string(), v);
         }
+        // The dedup ledger is a small TTL'd set of recently-typed ids; a rename
+        // is rare and the worst case of dropping it is one retry re-delivering
+        // once, so forget the old name rather than carry internals across.
+        self.send_dedup.forget(old);
         if let Some((_, v)) = self.status_watch.remove(old) {
             self.status_watch.insert(new.to_string(), v);
         }
         if let Some((_, v)) = self.hook_tokens.remove(old) {
             self.hook_tokens.insert(new.to_string(), v);
         }
+        // Re-key the pane map's (session, pane) pairs onto the new name so a
+        // rename doesn't orphan a team host's learned teammate conversations.
+        let moved: Vec<(String, String)> = self
+            .pane_conversations
+            .iter()
+            .filter(|e| e.key().0 == old)
+            .map(|e| (e.key().1.clone(), e.value().clone()))
+            .collect();
+        for (pane, conv) in moved {
+            self.pane_conversations.remove(&(old.to_string(), pane.clone()));
+            self.pane_conversations.insert((new.to_string(), pane), conv);
+        }
         if let Some((_, v)) = self.last_hook.remove(old) {
             self.last_hook.insert(new.to_string(), v);
+        }
+        if let Some((_, v)) = self.subagent_active_at.remove(old) {
+            self.subagent_active_at.insert(new.to_string(), v);
         }
         if let Some((_, v)) = self.hooks_live.remove(old) {
             self.hooks_live.insert(new.to_string(), v);
@@ -1307,6 +1786,13 @@ impl AppState {
         self.session_runtimes.remove(old);
         self.session_runtimes.remove(new);
         crate::sessions::native::forget(old);
+        // The browser registry is keyed by session NAME, so a rename would
+        // strand the live context under the old key: invisible to the renamed
+        // session (which would open a second one), never reaped (the map never
+        // empties), and — worst — waiting under a name someone else can create.
+        // Disposing it is the honest move: the agent loses a page it can
+        // trivially reopen, and no authenticated context outlives its name.
+        crate::connectors::browser::dispose_on_teardown(&self.browser, old);
         // Carry the debounce handle across the rename: a rename mid-debounce
         // would otherwise leak the handle under `old` and never fire (the
         // task's own re-read uses the captured task_name, which is the old
@@ -1487,6 +1973,8 @@ mod pending_edit_tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = crate::db::init(&config).await.expect("init pool");
@@ -1571,6 +2059,76 @@ mod pending_edit_tests {
         state.clear_edit_if("w1", "req-2");
         assert!(!state.resolve_edit("w1", "req-2", EditResult::Cancelled));
 
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn subagents_live_from_a_tailer_append() {
+        let (state, dir) = test_state().await;
+        // No signal → not live (the default for every plain session).
+        assert!(!state.subagents_live("s"));
+        // A tailer-observed subagent transcript append marks it live, with NO hook
+        // count involved — a hook-less Workflow subagent writing its transcript.
+        state.mark_subagent_active("s");
+        assert!(state.subagents_live("s"), "a fresh subagent append reads live");
+        assert!(!state.has_open_subagents("s"), "append alone is not an open-hook count");
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn subagents_live_from_an_open_subagent_hook_survives_stop() {
+        let (state, dir) = test_state().await;
+        // SubagentStart → an OPEN subagent (count>0 + fresh hook) reads live.
+        state.inc_subagents("s");
+        assert!(state.has_open_subagents("s"));
+        assert!(state.subagents_live("s"));
+        // The main `Stop` no longer force-0s the count (hooks.rs) — the count and
+        // its liveness survive, so a left-open workflow keeps reading working.
+        // (Simulate the Stop side effects that DO run: clear_activity only.)
+        state.clear_activity("s");
+        assert!(state.has_open_subagents("s"), "the count survives the main Stop");
+        assert!(state.subagents_live("s"));
+        // Draining it (SubagentStop) drops both — a clean multi-agent finish.
+        state.dec_subagents("s");
+        assert!(!state.has_open_subagents("s"), "count 0 → no open subagent");
+        assert!(!state.subagents_live("s"));
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn staleness_reaper_a_pinned_count_alone_is_not_live() {
+        let (state, dir) = test_state().await;
+        // A lost `SubagentStop` pins the count > 0…
+        state.inc_subagents("s");
+        // …but if the hook signal is stale (older than SUBAGENT_LIVE_WINDOW) the
+        // count alone can no longer keep it live — the reaper that replaces the old
+        // force-0-on-Stop fail-safe. Age the stamp past the window.
+        if let Some(mut a) = state.session_activity.get_mut("s") {
+            a.subagent_hook_at = Some(Instant::now() - Duration::from_secs(30));
+        }
+        assert!(
+            !state.has_open_subagents("s"),
+            "a pinned count with a stale hook is NOT an open subagent"
+        );
+        assert!(!state.subagents_live("s"), "so the session is not subagents_live");
+        // The raw count is still there (display), but it can no longer pin status.
+        assert_eq!(state.session_activity("s").map(|a| a.subagents), Some(1));
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reset_subagents_clears_liveness() {
+        let (state, dir) = test_state().await;
+        state.inc_subagents("s");
+        state.mark_subagent_active("s");
+        assert!(state.subagents_live("s"));
+        // A new prompt / SessionStart resets both the count and the append clock.
+        state.reset_subagents("s");
+        assert!(!state.subagents_live("s"), "a fresh turn inherits no stale liveness");
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
     }

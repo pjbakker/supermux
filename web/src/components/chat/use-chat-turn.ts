@@ -1,8 +1,16 @@
 // The turn state machine, lifted verbatim out of `chat-panel.tsx` (fase A3 T1)
 // and re-pointed at the A2 socket. This is BEHAVIOUR, not presentation: the
 // turn anchor and its priority rule, the supersede gate, the bounded teardown
-// and the 1s live-layer ticker. Nothing here decides what anything looks
+// and the turn's time thresholds. Nothing here decides what anything looks
 // like — `chat-panel.tsx` / `chat-surface.tsx` own that.
+//
+// NO TICKER. This hook is called at the TOP of `ChatPanel`, so anything that
+// re-renders it re-renders the whole panel — and it used to do exactly that once
+// a second, forever, for as long as a turn was live. Every clock on this surface
+// is now a `LiveElapsed` leaf that advances by mutating its own text node, so
+// nothing DISPLAYED needs the cadence; what is left are four time thresholds,
+// each of which flips exactly once, and each of which is now woken by its own
+// `setTimeout` at the moment it is crossed (`useWakeAt`).
 //
 // Data plane: `use-chat-ws` (the A2 chat WebSocket). The A1 `/recall?chat=true`
 // poll it replaced also had a zero-debounce refetch on the turn-end edge; a
@@ -39,6 +47,55 @@ const SEND_ANCHOR_WINDOW_MS = 30_000
  *  layer polling `/peek` once a second forever. Well past the a0 confirm
  *  latency (text-only p50 31s) so it never fires on a healthy turn. */
 const TURN_CONFIRM_TIMEOUT_MS = 120_000
+/**
+ * The honest ceiling on the confirm bridge, measured from the moment the session
+ * LEFT `active` (the turn's real end), NOT from its start.
+ *
+ * Once the session is idle the turn is over — the pty is at its prompt, the
+ * terminal renderer already shows it. The live layer is kept only long enough for
+ * a genuine answer's confirming batch to REPLACE the provisional tail instead of
+ * blanking it; a healthy turn clears the instant that batch lands
+ * (`confirmedCaughtUp`), so this only governs the case where NO batch ever comes
+ * — a cancel with no output. There the 120s `TURN_CONFIRM_TIMEOUT_MS` ceiling
+ * (anchored to the turn START) left the chat plane "thinking" for up to two
+ * minutes after the pty had gone quiet: the exact desync the owner hit. Anchored
+ * to the idle edge and cut short, the chat plane settles to idle promptly instead.
+ */
+const IDLE_SETTLE_MS = 6_000
+
+/**
+ * Should the live-turn anchor be torn down?
+ *
+ * A turn is over once the session has LEFT `active`. The live layer is kept a
+ * moment longer than the bare status flip so a genuine answer's confirming batch
+ * can REPLACE the provisional pty tail instead of blanking it — that is
+ * `confirmedCaughtUp`. It is torn down when any of these hold:
+ *   · the confirming batch for THIS turn has landed (`confirmedCaughtUp`), or
+ *   · the session reached a TERMINAL rest (`stopped`/`error`) — no batch is ever
+ *     coming, so waiting for one strands the live layer on `/peek`; a cancelled
+ *     turn that ends `stopped` used to sit "thinking" for a full 120s, or
+ *   · the session has been idle past the confirm bridge (`idleSettled`) — the
+ *     honest ceiling that reconciles the chat plane with a pty that is already at
+ *     its prompt, so a cancel with no confirming batch does not keep "thinking",
+ *     or
+ *   · the absolute fallback ceiling elapsed (`turnStranded`).
+ *
+ * While the session is still `active` this NEVER fires: a live turn is not over
+ * just because time passed. The one thing that can end a still-`active` turn is
+ * the user's Stop, which reconciles imperatively (`endTurn`) rather than here.
+ */
+export function shouldEndTurn(a: {
+  active: boolean
+  turnStart: number | null
+  confirmedCaughtUp: boolean
+  turnStranded: boolean
+  terminalRest: boolean
+  idleSettled: boolean
+}): boolean {
+  if (a.turnStart == null) return false
+  if (a.active) return false
+  return a.confirmedCaughtUp || a.terminalRest || a.idleSettled || a.turnStranded
+}
 
 export interface ChatTurn {
   /** Newest-first wire entries (memoised identity). */
@@ -49,6 +106,11 @@ export interface ChatTurn {
   turnStart: number | null
   /** The live layer is mounted (turn running OR awaiting its confirmation). */
   liveLayerUp: boolean
+  /** Reconcile the live turn to idle NOW — the honest half of Stop. Drops the
+   *  client's turn anchor so the working row, the provisional tail and the Stop
+   *  control all clear even when the server's `status` is lagging at `active`
+   *  (a stuck last-capture, a cancel not yet re-read). */
+  endTurn: () => void
   /** The transcript is far enough behind to show the provisional pty tail. */
   showProvisional: boolean
   /** Hook-driven receipt overlay lines for this turn. */
@@ -58,6 +120,27 @@ export interface ChatTurn {
   /** Pages BELOW the socket's window, and the affordance state for them
    *  (daily-driver QA #3). */
   backlog: ChatBacklog
+}
+
+/** How far past a threshold to wake, so a `>` comparison is already true when
+ *  the re-render reads it (rather than costing a second wake 50ms later). */
+const EDGE_SLACK_MS = 50
+
+/**
+ * Re-render ONCE when the server clock reaches `atMs`; `null` disarms.
+ *
+ * The edge-scheduled replacement for a polling tick: the caller passes the
+ * instant its threshold flips and stops passing it once it has flipped, so the
+ * timeout arms exactly once per crossing and cleans itself up. A floor keeps a
+ * deadline that is already in the past (a clock-skew sample landing between
+ * render and effect) from spinning.
+ */
+function useWakeAt(atMs: number | null, wake: () => void): void {
+  React.useEffect(() => {
+    if (atMs == null) return
+    const id = window.setTimeout(wake, Math.max(50, atMs + EDGE_SLACK_MS - serverNowMs()))
+    return () => window.clearTimeout(id)
+  }, [atMs, wake])
 }
 
 export function useChatTurn(name: string, session: TileSession | null): ChatTurn {
@@ -114,23 +197,57 @@ export function useChatTurn(name: string, session: TileSession | null): ChatTurn
   const confirmedCaughtUp = turnStart != null && lastAgentMs >= turnStart
   const turnStranded =
     turnStart != null && serverNowMs() - turnStart > TURN_CONFIRM_TIMEOUT_MS
-  React.useEffect(() => {
-    // Turn teardown on the (status flip + confirmed batch) edge — both are
-    // external events; the guard makes it fire at most once per turn.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (!active && (confirmedCaughtUp || turnStranded)) setTurnStart(null)
-  }, [active, confirmedCaughtUp, turnStranded])
+  // A TERMINAL rest can never produce a confirming batch, so the caught-up gate
+  // would never satisfy and the live layer would strand until the 120s ceiling.
+  const terminalRest = session?.status === 'stopped' || session?.status === 'error'
 
-  // 1s live-layer ticker: a prose-only turn produces NO deltas and NO
-  // refetches, so every time-gated piece below (showProvisional, elapsed,
-  // footer stats) must re-render on its own clock or it never appears.
-  const liveLayerUp = active || turnStart != null
-  const [, tick] = React.useReducer((n: number) => n + 1, 0)
+  // WHEN THE SESSION LEFT `active` — the turn's real end, stamped on the SSE
+  // status edge (external event), server clock. The confirm bridge is measured
+  // from here, not from the turn start: an idle session's turn is over, and the
+  // chat plane must not keep "thinking" past a short settle just because the
+  // start was recent (or, worse, until the 120s start-anchored ceiling). Cleared
+  // to null while active, so a live turn has no idle edge.
+  const [leftActiveAt, setLeftActiveAt] = React.useState<number | null>(null)
   React.useEffect(() => {
-    if (!liveLayerUp) return
-    const id = window.setInterval(tick, 1000)
-    return () => window.clearInterval(id)
-  }, [liveLayerUp])
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLeftActiveAt(active ? null : serverNowMs())
+  }, [active])
+  const idleSettled =
+    turnStart != null &&
+    !active &&
+    leftActiveAt != null &&
+    serverNowMs() - leftActiveAt > IDLE_SETTLE_MS
+
+  const endsTurn = shouldEndTurn({
+    active,
+    turnStart,
+    confirmedCaughtUp,
+    turnStranded,
+    terminalRest,
+    idleSettled,
+  })
+  React.useEffect(() => {
+    // Turn teardown on the (confirmed batch / terminal rest / idle settle /
+    // ceiling) edge — all external events; the guard fires it at most once per
+    // turn (the anchor is null after, and only an idle→active edge re-arms it).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (endsTurn) setTurnStart(null)
+  }, [endsTurn])
+
+  // THE STOP RECONCILE — the honest half of the interrupt. When the user presses
+  // Stop the turn is over from their side, but the server's `status` can lag at
+  // `active` (a stuck last-capture, a cancel the supervisor has not re-read), and
+  // while it does every live-turn signal reads `active` and the surface stays
+  // "thinking" over a Stop that fires an Escape into a pty with nothing to
+  // interrupt — a silent no-op. `endTurn` drops the anchor at once so the working
+  // row, the provisional tail and the Stop control all clear. It cannot re-arm
+  // from the same stale `active`: the anchor SET effect above is gated on an
+  // `active` EDGE (idle→active), so a genuinely new turn re-anchors while a
+  // stuck-`active` one stays cleared.
+  const endTurn = React.useCallback(() => setTurnStart(null), [])
+
+  const liveLayerUp = active || turnStart != null
+  const [, wake] = React.useReducer((n: number) => n + 1, 0)
 
   const overlay = useReceiptOverlay(session, turnStart, lastConfirmedTs)
 
@@ -142,5 +259,44 @@ export function useChatTurn(name: string, session: TileSession | null): ChatTurn
     turnStart != null &&
     serverNowMs() - lastConfirmedMs > PROVISIONAL_LAG_MS
 
-  return { entries, items, turnStart, liveLayerUp, showProvisional, overlay, tail, backlog }
+  // ── the four edges that used to be a per-second poll ──────────────────────
+  //
+  // Each of these is a one-way flip at a known instant, so it is scheduled for
+  // that instant instead of re-checked 1× per second until it happens. A turn
+  // that runs two minutes cost ~120 whole-panel renders and now costs at most
+  // four (plus one per 30s label bucket). All of them are ALSO re-evaluated on
+  // every real event — an SSE frame, a socket entry, a status flip — exactly as
+  // they were before; the timeout is only what covers a prose-only turn that
+  // produces no events at all.
+  useWakeAt(
+    // The provisional tail appears once the transcript is PROVISIONAL_LAG_MS
+    // behind the live turn.
+    liveLayerUp && turnStart != null && !showProvisional ? lastConfirmedMs + PROVISIONAL_LAG_MS : null,
+    wake,
+  )
+  useWakeAt(
+    // The confirm bridge closes IDLE_SETTLE_MS after the session left `active`.
+    turnStart != null && !active && leftActiveAt != null && !idleSettled
+      ? leftActiveAt + IDLE_SETTLE_MS
+      : null,
+    wake,
+  )
+  useWakeAt(
+    // The absolute stranded-turn ceiling.
+    turnStart != null && !turnStranded ? turnStart + TURN_CONFIRM_TIMEOUT_MS : null,
+    wake,
+  )
+  useWakeAt(
+    // THE 30s LABEL BUCKET. `chat-panel.tsx` derives `nowBucketMs` (relative
+    // divider labels, and the connection chip's staleness ceiling) from the
+    // server clock rounded to 30s — deliberately coarse, so a running turn does
+    // not re-shape the transcript for labels that change once a minute. It was
+    // the 1s ticker that carried it over each boundary; this is the same
+    // boundary, woken directly. One render per 30s while a turn is live, which
+    // is the granularity those readings already had.
+    liveLayerUp ? (Math.floor(serverNowMs() / 30_000) + 1) * 30_000 : null,
+    wake,
+  )
+
+  return { entries, items, turnStart, liveLayerUp, endTurn, showProvisional, overlay, tail, backlog }
 }

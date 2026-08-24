@@ -70,7 +70,7 @@
 // surface shrinks to sit above the soft keyboard exactly as the terminal did.
 
 import * as React from 'react'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 
 import { useNavigateMorph } from '@/components/view-transitions/morph'
@@ -96,6 +96,7 @@ import {
 import { useRenderer } from '@/components/chat/use-renderer-pref'
 import { BackIcon } from '@/components/chat/ui'
 import { useUI } from '@/stores/ui-store'
+import Mode9RootResize from '@/components/focus-mode/kb-modes/mode-9-root-resize'
 import { useSessions } from '@/hooks/use-sessions'
 import { useAttentionContext } from '@/hooks/use-attention'
 import { useTeams } from '@/hooks/use-teams'
@@ -114,14 +115,25 @@ import {
 } from '@/components/focus-mode/last-send-recall'
 import { MobileDock } from '@/components/focus-mode/dock'
 import { MobileBottomPanel } from '@/components/focus-mode/mobile-bottom-panel'
-import { useKeyboardViewport } from '@/hooks/use-keyboard-viewport'
+import { useKeyboardOpen } from '@/hooks/use-keyboard-viewport'
 import { SessionPickerSheet } from '@/components/focus-mode/session-picker-sheet'
 import { KeyBar, useKeyBar } from '@/components/focus-mode/key-bar'
 import { SnippetPanel } from '@/components/snippets/snippet-panel'
+import { triggerCommandPalette } from '@/components/command-palette/trigger'
 import { MobileComposeSheet } from '@/components/focus-mode/mobile-compose-sheet'
 import { useExternalEdit } from '@/components/focus-mode/use-external-edit'
 import { SessionInfoPanel } from '@/components/focus-mode/session-info-panel'
+import { botModeOn, BOT_KILL_SWITCH_KEY } from '@/lib/bot-mode-flag'
+import { GROK_KILL_SWITCH_KEY } from '@/lib/grok-mode-flag'
 import { useEdgeGestures } from '@/components/focus-mode/use-edge-gestures'
+
+// The per-bot settings page — the SAME component the desktop roster's detail
+// pane renders. Under Grok mode the mobile focus-view title opens it as a bottom
+// sheet instead of the flat info panel, so there is ONE bot surface, not two.
+// Lazy so the default (non-grok) focus route never pulls it.
+const BotPanel = React.lazy(() =>
+  import('@/components/roster/bot-panel').then((m) => ({ default: m.BotPanel })),
+)
 import { neighborSession } from '@/components/focus-mode/session-order'
 import type { TileSession } from '@/components/session-tile/types'
 
@@ -176,6 +188,18 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
   // and a View Transition would fight the live drag transform.
   const navigateMorph = useNavigateMorph()
   const reduceMotion = useReducedMotion()
+  // Grok skin, read ONCE at mount (a skin flip is a reload-level change). Read
+  // up here (rather than only at the title-info fork below) because the teammate
+  // affordances branch on it: under grok a teammate opens the phone `/team/<team>/
+  // <agent>` route (Phase 6a); off grok it opens the shared <TeammateFocus>
+  // overlay, exactly as the base app always has — so the base app is untouched.
+  const [grok] = React.useState(() =>
+    botModeOn(
+      useUI.getState().botMode,
+      typeof localStorage === 'undefined' ? null : localStorage.getItem(BOT_KILL_SWITCH_KEY),
+      typeof localStorage === 'undefined' ? null : localStorage.getItem(GROK_KILL_SWITCH_KEY),
+    ),
+  )
   const { sessions: liveSessions } = useSessions()
   // DEV-only override (the /dev/focus-mobile harness) — TileSession is a
   // superset-compatible shape (see session-tile/types.ts), so it slots in
@@ -232,12 +256,8 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
   // Same three gates as the desktop seam, same pure decision
   // (`components/chat/seam.ts`), same kill-switch. Declared HERE, above the
   // input plane and the tap gate, because both of them fork on `chatActive`.
-  const isTeamLead = React.useMemo(
-    () => teams.some((t) => t.lead_supermux_session === name),
-    [teams, name],
-  )
-  const chatSetting = useUI((s) => s.chatRenderer)
-  const chatOn = useChatRenderer(row, isTeamLead)
+  const chatSetting = useUI((s) => s.botMode)
+  const chatOn = useChatRenderer(row)
   // The ONLY state is the user's manual tap, keyed by session name so it resets
   // on navigation and cannot be stomped by a late flag/eligibility resolve.
   // Fase A5 T1/T2: a PERSISTED pin, not `React.useState`. `row != null` (not
@@ -246,7 +266,6 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
   // difference.
   const {
     resolved: renderer,
-    pref: rendererPref,
     setPref: setRendererPref,
   } = useRenderer(name, chatOn, row != null)
   const setRenderer = React.useCallback(
@@ -350,16 +369,14 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
     }
   }, [])
 
-  // ── Keyboard-viewport layout (the "page slides weirdly" fix) ────────────────
-  // visualViewport drives the sheet's exact height so the terminal shrinks to
-  // sit DIRECTLY above the soft keyboard (no page scroll), and the accessory
-  // dock rides the keyboard top. No-op on desktop / closed keyboard (height is
-  // null → the sheet falls back to its 100dvh CSS height).
-  const {
-    height: vvHeight,
-    keyboardInset,
-    keyboardOpen,
-  } = useKeyboardViewport()
+  // ── Keyboard-open signal (native-column layout) ─────────────────────────────
+  // MobileSheet is now a plain `100dvh` flex column that the browser shrinks via
+  // `interactive-widget=resizes-content` when the keyboard opens — no JS sheet
+  // sizing. The only signal the route still needs is a single boolean: the dock's
+  // accessory key strip + the ⌨ toggle label render only while the keyboard is
+  // up. `useKeyboardOpen` runs the same dual-signal detector as the old hook but
+  // publishes ONLY `open`, dropping the visualViewport height/offset machinery.
+  const keyboardOpen = useKeyboardOpen()
 
   // Imperative summon/dismiss of the keyboard. Tapping the terminal must focus
   // xterm INSIDE the user gesture (iOS only opens the keyboard on a real touch),
@@ -465,9 +482,22 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
   const focusMember: TeamMember | null = teammateFocus
     ? focusTeam?.members.find((m) => m.agent_id === teammateFocus.agentId) ?? null
     : null
-  const openTeammate = React.useCallback((team: Team, member: TeamMember) => {
-    setTeammateFocus({ teamName: team.team_name, agentId: member.agent_id })
-  }, [])
+  const openTeammate = React.useCallback(
+    (team: Team, member: TeamMember) => {
+      // Phase 6a — under grok a teammate is a first-class route, not an overlay:
+      // route to the phone `/team/<team>/<agent>` detail (MemberPane) instead of
+      // the retiring in-route <TeammateFocus>. Off grok the base app keeps the
+      // shared overlay exactly as before.
+      if (grok) {
+        navigate(
+          `/team/${encodeURIComponent(team.team_name)}/${encodeURIComponent(member.agent_id)}`,
+        )
+        return
+      }
+      setTeammateFocus({ teamName: team.team_name, agentId: member.agent_id })
+    },
+    [grok, navigate],
+  )
   // Seed teammateFocus from `/focus/<lead>?teammate=<agent_id>` — the overview
   // TEAM CARD navigates here for a teammate tap (single teammate-view surface,
   // no in-overview overlay). Strip the param after consuming so a later
@@ -479,12 +509,22 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
     const t = teams.find((x) => x.lead_supermux_session === name)
     const m = t?.members.find((x) => x.agent_id === teammateParam)
     if (!t || !m) return
+    // Phase 6a — the `?teammate=<agent>` deep link keeps working, but under grok
+    // it now REDIRECTS to the dedicated `/team/<team>/<agent>` route (the overlay
+    // path is retired for grok). Off grok it opens the shared overlay, unchanged.
+    if (grok) {
+      navigate(
+        `/team/${encodeURIComponent(t.team_name)}/${encodeURIComponent(m.agent_id)}`,
+        { replace: true },
+      )
+      return
+    }
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setTeammateFocus({ teamName: t.team_name, agentId: m.agent_id })
     const next = new URLSearchParams(searchParams)
     next.delete('teammate')
     setSearchParams(next, { replace: true })
-  }, [teammateParam, teams, name, searchParams, setSearchParams])
+  }, [teammateParam, teams, name, searchParams, setSearchParams, grok, navigate])
   // Floating KeyBar (mobile-focus-keybar spec) — persisted open/keys state
   // (localStorage, `focus_key_bar` — independent of the legacy `quick_keys`
   // server pref). The dock's `···` icon now toggles `keyBar.open` instead of
@@ -495,6 +535,15 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
   // disable edge-swipe nav while it's open, matching `pickerOpen`.
   const [keyBarPickerOpen, setKeyBarPickerOpen] = React.useState(false)
   const [snippetsOpen, setSnippetsOpen] = React.useState(false)
+  // ── the composer's leading `+` add-menu (mobile chat) ───────────────────────
+  // Under chat the old global dock below the composer is gone; its session
+  // switcher, command palette and snippets live inside the composer's own leading
+  // `+` menu, which the COMPOSER owns and anchors (it renders the sheet lazily).
+  // The route only provides the actions that reach OUT of the composer — it holds
+  // the picker and the snippet drawer. Dictation is NOT owned here either: the
+  // composer's own rest-state mic is the single dictation control (it drives
+  // `useDictation` and inserts into the draft directly), so nothing wires a second
+  // recognition session.
   // The on-demand native EDITOR sheet (feat-edit-in-native-editor). The dock's
   // bottom-left Edit field is its trigger: tapping it sends Ctrl+G to the pty,
   // Claude lifts its current `❯` input into the supermux bridge, and the sheet
@@ -543,7 +592,31 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
     termRef.current?.sendKey('Enter')
   }, [])
   // feat-session-info — the title-click info panel (a bottom Sheet on mobile).
+  // `grok` (read once at mount, above) also decides this: on ⇒ the tabbed
+  // BotPanel sheet; off ⇒ the flat SessionInfoPanel.
   const [infoOpen, setInfoOpen] = React.useState(false)
+  // Which tab the info panel opens on — mobile parity for the roster's
+  // name-as-click deep-link (§2.1): a "manage tools" entry navigates here with
+  // `{ openPanel, panelTab }` in history state, and the panel lands on that tab.
+  const [infoTab, setInfoTab] = React.useState<
+    'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
+  >('overview')
+  const location = useLocation()
+  const panelHint = (location.state ?? null) as { openPanel?: boolean; panelTab?: typeof infoTab } | null
+  React.useEffect(() => {
+    if (panelHint?.openPanel) {
+      // Legitimately an effect: consuming this one-shot router hint pairs the two
+      // setStates with a real side effect — `navigate(..., { state: {} })` clears
+      // the hint so back/forward or a resize can't re-open the panel. It cannot
+      // move to render (navigation during render is illegal), so the
+      // set-state-in-effect here is by design, not the anti-pattern the rule hunts.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setInfoTab(panelHint.panelTab ?? 'overview')
+      setInfoOpen(true)
+      navigate(location.pathname + location.search, { replace: true, state: {} })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelHint?.openPanel, panelHint?.panelTab])
   // feat-last-prompt — recall sheet for the user's last prompt. No auto-show
   // on mobile (the icon in the header is the only entry).
   const [lastSendOpen, setLastSendOpen] = React.useState(false)
@@ -610,14 +683,21 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
       <motion.div
         // The whole focus surface tracks the left-edge drag so the peek-of-next
         // reads as "the next session sliding in behind."
-        style={{ x: edge.peekX }}
+        //
+        // TRANSFORM-ANCESTOR GUARD (real-root fix). This wrapper is the ONLY
+        // transform ancestor above <MobileSheet> (data-testid=focus-sheet). A
+        // `transform` — even `translateX(0)` while idle — makes this element the
+        // containing block for the sheet's `position: fixed`, which changes
+        // whether iOS applies the visual-viewport keyboard shift to it. So the
+        // transform is applied ONLY while a left-edge drag is actually in flight;
+        // at rest (and therefore whenever the keyboard is up — you cannot be
+        // edge-swiping and typing at once) the wrapper carries NO transform and
+        // the sheet is a true viewport-fixed box again.
+        style={edge.dragging ? { x: edge.peekX } : undefined}
         transition={reduceMotion ? motionOff : springs.sheetDetent}
         className="h-full w-full"
       >
-        <MobileSheet
-          contentHeight={vvHeight}
-          keyboardInset={keyboardInset}
-        >
+        <MobileSheet>
           {/* The title-bar "···" overflow was removed: it opened the SAME
               SessionPickerSheet the bottom-left session pill already opens (the
               pill is the richer, more discoverable affordance — name + status +
@@ -642,7 +722,10 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
               // `stopped` (not `current.status`) so a pty the SOCKET found dead
               // hides it too — see `useTerminalGone`.
               onRefresh={stopped ? undefined : () => termRef.current?.resync()}
-              onTitleClick={() => setInfoOpen(true)}
+              onTitleClick={() => {
+                setInfoTab('overview')
+                setInfoOpen(true)
+              }}
               hasLastSend={!!current}
               lastSendOpen={lastSendOpen}
               onToggleLastSend={() => setLastSendOpen((o) => !o)}
@@ -660,10 +743,9 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
             >
               <RendererSwitch
                 size="sm"
-                // The rail has the full row's width, so all three words fit —
-                // this is the one place the switch does NOT have to shrink.
-                value={rendererPref}
-                resolved={renderer ?? 'terminal'}
+                // The rail has the full row's width, so both words fit — this is
+                // the one place the switch does NOT have to shrink.
+                value={renderer ?? 'terminal'}
                 onChange={setRendererPref}
               />
             </div>
@@ -746,6 +828,12 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
                     name={name}
                     session={row}
                     surface="phone"
+                    // The definitive iOS keyboard-layout handler: mode-9 root
+                    // resize (shrinks the app root to visualViewport.height while
+                    // the keyboard is open). The surface arranges its header/body/
+                    // composer through it. Chat-only: the terminal path keeps
+                    // MobileSheet.
+                    layout={Mode9RootResize}
                     // The RAW plane. The panel is the one place that may write to
                     // the session under chat, and it does it through its own gates
                     // (peek-verify, the slash gate, the pending echo + watchdog).
@@ -754,6 +842,16 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
                     // way out of it.
                     input={restInput}
                     onOpenTerminal={() => setRenderer('terminal')}
+                    // The single-bar fold: the composer's leading `+` owns an
+                    // add-menu with these route-level actions folded in, in place
+                    // of the old global dock. The composer adds its own
+                    // mention/command/schedule/dictate and anchors the sheet to
+                    // the `+`.
+                    actions={{
+                      onSwitchSession: () => setPickerOpen(true),
+                      onCommandPalette: triggerCommandPalette,
+                      onSnippets: () => setSnippetsOpen(true),
+                    }}
                     // The card's two shell slots (`mobile-light.png`): navigation
                     // on the left, the renderer choice on the right. The surface
                     // owns neither, which is why they arrive as nodes.
@@ -776,8 +874,7 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
                           // that goes is the one naming the surface you are not
                           // looking at, and the session's name gets it back.
                           labels="selected"
-                          value={rendererPref}
-                          resolved={renderer ?? 'chat'}
+                          value={renderer ?? 'chat'}
                           onChange={setRendererPref}
                         />
                       ) : undefined
@@ -834,6 +931,12 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
               content is passed as children so MobileBottomPanel stays a pure
               presentational shell that doesn't have to know the dock's many
               props. */}
+          {/* ONE INPUT BAR UNDER CHAT. The global dock — a second bottom bar
+              below the composer — is folded into the composer's own leading `+`
+              add-menu (owned and anchored by the composer). Terminal and stopped
+              panes keep it: they have raw keys, the session-pill switcher and the
+              ⌨ toggle to host, and no chat composer to fold them into. */}
+          {!chatActive && (
           <MobileBottomPanel
             sessions={sessions}
             currentName={name}
@@ -881,6 +984,7 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
               rawKeys={chrome.dockRawKeys}
             />
           </MobileBottomPanel>
+          )}
         </MobileSheet>
       </motion.div>
 
@@ -905,9 +1009,20 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
       <SnippetPanel
         open={snippetsOpen}
         onOpenChange={setSnippetsOpen}
-        onInsert={(body) => composerInsert.current?.(body)}
+        // Under chat the dock is unmounted, so `composerInsert` (the dock's
+        // registered target) is null — stage straight into the composer draft via
+        // the chat input plane instead. Terminal keeps the dock's live-type path.
+        onInsert={(body) => {
+          if (chatActive) void input.insert(body)
+          else composerInsert.current?.(body)
+        }}
         onRun={(body) => void input.submit(body)}
       />
+
+      {/* The composer's add-menu (session switcher, command palette, snippets +
+          the composer's own mention/command/schedule/dictate) is owned and
+          rendered by the composer itself now — anchored to the leading `+` —
+          rather than floated in here as a route-level sibling. */}
 
       {/* The on-demand native EDITOR sheet (feat-edit-in-native-editor) — morphs
           from the dock Edit field via a shared `layoutId`. It opens PRE-FILLED with
@@ -929,12 +1044,26 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
       {/* feat-session-info — the title-click info panel (bottom Sheet on mobile).
           Cloning an agent navigates to its focus route via `goSession`. The
           panel's content only mounts while open (Vaul unmounts when closed). */}
-      <SessionInfoPanel
-        name={name}
-        open={infoOpen}
-        onOpenChange={setInfoOpen}
-        onNavigate={goSession}
-      />
+      {grok ? (
+        <React.Suspense fallback={null}>
+          <BotPanel
+            name={name}
+            variant="sheet"
+            initialTab={infoTab}
+            open={infoOpen}
+            onOpenChange={setInfoOpen}
+            onOpenThread={() => setInfoOpen(false)}
+            onNavigate={goSession}
+          />
+        </React.Suspense>
+      ) : (
+        <SessionInfoPanel
+          name={name}
+          open={infoOpen}
+          onOpenChange={setInfoOpen}
+          onNavigate={goSession}
+        />
+      )}
 
       {/* feat-last-prompt — the recall bottom sheet. Heavy content only mounts
           while open (Vaul unmounts when closed). Gated on the SESSION, not on

@@ -34,6 +34,9 @@ import * as React from 'react'
 import type { MarkPin } from '../../brand/marks'
 import type { SessionStatus } from '../../lib/api'
 import type { TileSession } from '../session-tile/types'
+// Type-only (erased before resolution) — keeps this module free of the `@/` alias
+// the unit runner's root tsconfig cannot resolve (see this file's header rule 2).
+import type { KbLayoutComponent } from '../focus-mode/kb-modes/contract'
 
 import { sessionAccentVarsFor } from './session-accent'
 
@@ -59,6 +62,17 @@ export interface ChatSurfaceProps {
    * ask for the overlay (`conversation.tsx` sets both).
    */
   headerOverlay?: boolean
+  /**
+   * The phone composition offsets the floating header card DOWN by the iOS
+   * safe-area so the card floats clear of the notch (`mobile-light.png`: a 60px
+   * card inset 12px under the status bar). The single reservation of that inset
+   * lives here as the overlay wrapper's `top` — `calc(var(--safe-top) + 12px)`
+   * — NOT as padding inside the card (that painted an empty band above the
+   * name, doubling the card's height on a notched device). Off-phone the header
+   * pins to the pane top (`top:0`), so this stays unset. See `--safe-top`
+   * (globals.css) for why the inset is a named var and not a raw `env()`.
+   */
+  headerOverlayInsetTop?: string
   /**
    * Bottom slot — the composer. It FLOATS: the approved boards inset the pill
    * from the pane's bottom edge and let the transcript pass behind its blur, so
@@ -99,6 +113,19 @@ export interface ChatSurfaceProps {
    * renderer-switch e2e asserts on it.
    */
   testId?: string
+  /**
+   * The keyboard-layout handler (`KbLayout`), threaded from the mobile focus
+   * route (the mode-9 root-resize layout). It owns how the composer stays flush
+   * above the soft keyboard on the owner's device by shrinking the app root to
+   * `visualViewport.height` while the keyboard is open.
+   *
+   * WHEN ABSENT (desktop, unit tests, `/dev/chat-live`) this surface renders its
+   * CURRENT DOM byte-for-byte — no regression to any existing test. WHEN PRESENT
+   * (mobile focus route) the surface computes its header / body / composer nodes
+   * and hands them to the layout INSTEAD of arranging them itself; the layout
+   * places them. See `focus-mode/kb-modes/`.
+   */
+  layout?: KbLayoutComponent
 }
 
 /**
@@ -173,6 +200,7 @@ export function ChatSurface({
   pin,
   header,
   headerOverlay,
+  headerOverlayInsetTop,
   footer,
   children,
   float,
@@ -180,6 +208,7 @@ export function ChatSurface({
   scrollRef,
   onScroll,
   testId = 'chat-surface',
+  layout: Layout,
 }: ChatSurfaceProps) {
   const top = header ?? (
     <div className="flex items-center gap-2 px-5 py-2">
@@ -197,6 +226,81 @@ export function ChatSurface({
   // a template literal instead of a hook.
   const hid = `chat-title-${name}`
   const title = session?.display_name?.trim() ? session.display_name : name
+
+  // The three semantic regions, computed ONCE so both the default arrangement
+  // and a delegated `KbLayout` render the identical subtrees. When no `layout`
+  // is passed they are dropped straight into the accent root in this order —
+  // byte-identical to the pre-KbLayout DOM (a React fragment creates no box, so
+  // `bodyNode`'s children stay direct flex children of the root and the track's
+  // `flex-1` still sizes against it).
+  //
+  // The top slot owns its own box: the A3 T6 header pill has a safe-area inset
+  // and a height floor of its own, and a padded wrapper here would inset it
+  // twice. The DEFAULT occupant keeps the padding it always had, so a surface
+  // rendered without a header looks exactly as it did.
+  const headerNode = headerOverlay ? (
+    <div
+      className="absolute inset-x-0 z-[3]"
+      // The notch reserved ONCE: on the phone the wrapper drops the card below
+      // the safe area (`calc(var(--safe-top) + 12px)`); off-phone it sits flush
+      // at the pane top. `top` (not padding) so the card keeps its own 60px
+      // height instead of growing to swallow the inset.
+      style={{ top: headerOverlayInsetTop ?? 0 }}
+    >
+      {top}
+    </div>
+  ) : (
+    <div className="shrink-0">{top}</div>
+  )
+
+  // The scroll region + its float layer — the `body` the mode is handed. Kept as
+  // a fragment so, in the default arrangement, track and float remain the same
+  // two siblings of the root they always were.
+  const bodyNode = (
+    <>
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        // A named region, NOT a live one: the transcript's arrivals are spoken
+        // by the live layer's single coalesced status (see `live-layer.tsx`'s
+        // `LiveAnnouncer`). Making this a `log`/`aria-live` container is the
+        // naive repair the A6 plan warns about — the WS seed inserts the whole
+        // backlog into it after mount, and every one of those entries would be
+        // read out loud before the user reached the message they asked for.
+        role="region"
+        aria-labelledby={hid}
+        // The TRACK, addressable. Two behaviours need to name this exact
+        // element rather than guess at it from a ref they were handed:
+        //   · `chat-track` (globals.css) states out loud that everything the
+        //     agent said is selectable text with the native iOS callout — the
+        //     one thing a reader on a phone can do with a message is copy it;
+        //   · the phone's tap-to-dismiss (`use-tap-to-dismiss.ts`) listens here,
+        //     so "tapped above the keyboard" means "tapped the transcript" and
+        //     nothing wider.
+        data-chat-track=""
+        // `overscroll-contain` (bug C): the transcript is an INNER scroller inside
+        // the shared `<main data-shell-content overflow-auto>` (layout.tsx). Without
+        // this, a wheel delta past the transcript's top/bottom CHAINS up to `<main>`
+        // (and the root), dragging the whole focus shell — rail + roster + header —
+        // out of view and exposing the app's dark ground below. `contain` stops the
+        // chain at this boundary while keeping the local bounce; it is the
+        // standardized fix (Safari 16+, macOS+iOS) and a no-op where unsupported.
+        // `body { overscroll-behavior: none }` (globals.css) is NOT sufficient — it
+        // stops the body rubber-banding the browser, not an inner list chaining into it.
+        className="chat-track min-h-0 flex-1 overflow-y-auto overscroll-contain"
+      >
+        {children}
+      </div>
+
+      {float != null && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[3]">{float}</div>
+      )}
+    </>
+  )
+
+  const composerNode =
+    footer != null ? <div className="absolute inset-x-0 bottom-0 z-[4]">{footer}</div> : null
+
   return (
     <div
       data-testid={testId}
@@ -215,37 +319,19 @@ export function ChatSurface({
       <h2 id={hid} className="sr-only">
         Conversation with {title}
       </h2>
-      {/* The top slot owns its own box: the A3 T6 header pill has a safe-area
-          inset and a height floor of its own, and a padded wrapper here would
-          inset it twice. The DEFAULT occupant keeps the padding it always had,
-          so a surface rendered without a header looks exactly as it did. */}
-      {headerOverlay ? (
-        <div className="absolute inset-x-0 top-0 z-[3]">{top}</div>
+      {Layout ? (
+        // Delegated: the active keyboard-layout MODE arranges the three regions
+        // and owns keyboard-avoidance. `chatActive` is always true here — the
+        // terminal path does not mount a KbLayout (only the chat surface does).
+        <Layout header={headerNode} body={bodyNode} composer={composerNode} chatActive />
       ) : (
-        <div className="shrink-0">{top}</div>
+        // Default arrangement — the pre-KbLayout DOM, byte-for-byte.
+        <>
+          {headerNode}
+          {bodyNode}
+          {composerNode}
+        </>
       )}
-
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        // A named region, NOT a live one: the transcript's arrivals are spoken
-        // by the live layer's single coalesced status (see `live-layer.tsx`'s
-        // `LiveAnnouncer`). Making this a `log`/`aria-live` container is the
-        // naive repair the A6 plan warns about — the WS seed inserts the whole
-        // backlog into it after mount, and every one of those entries would be
-        // read out loud before the user reached the message they asked for.
-        role="region"
-        aria-labelledby={hid}
-        className="min-h-0 flex-1 overflow-y-auto"
-      >
-        {children}
-      </div>
-
-      {float != null && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[3]">{float}</div>
-      )}
-
-      {footer != null && <div className="absolute inset-x-0 bottom-0 z-[4]">{footer}</div>}
 
       {/* Above both floating layers (header z-3, composer z-4): the card is
           telling the user that one of them just refused to do something. */}

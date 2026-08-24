@@ -71,6 +71,12 @@ pub struct StartTeamInput {
     /// `team-<suffix>` name is generated. Validated like any session name.
     #[serde(default)]
     pub name: Option<String>,
+    /// The company the LEAD belongs to. `None` = a main/global lead (owner path,
+    /// unchanged). For a scoped MEMBER the handler forces this to their own
+    /// company (defaulting an omitted value, refusing a foreign id) exactly like
+    /// `sessions::create` — so a member's team lead is always company-fenced.
+    #[serde(default)]
+    pub company_id: Option<i64>,
 }
 
 /// `POST /api/teams/start` success payload: the created LEAD [`SessionView`] (so
@@ -277,6 +283,10 @@ pub async fn start_team(
             // tmux split-window panes, which the native runtime has no analogue
             // for. EXPLICIT since the create default became native.
             runtime: Some(crate::sessions::runtime::RUNTIME_TMUX.to_string()),
+            model: None,
+            // P3d — the LEAD inherits the caller's company (the handler already
+            // forced a member's to their own; `None` for the owner path).
+            company_id: input.company_id,
         },
     )
     .await?;
@@ -643,6 +653,8 @@ mod tests {
             push_sub: None,
             github_token: None,
             statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
             extra_origins: Vec::new(),
         };
         let pool = crate::db::init(&config).await.expect("init pool");
@@ -694,6 +706,8 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: Some("native".into()),
+                model: None,
+                company_id: None,
             },
         )
         .await
@@ -743,6 +757,8 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                model: None,
+                company_id: None,
             },
         )
         .await
@@ -781,6 +797,8 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                model: None,
+                company_id: None,
             },
         )
         .await
@@ -826,6 +844,8 @@ mod tests {
                 worktree: None,
                 host_id: None,
                 runtime: None,
+                model: None,
+                company_id: None,
             },
         )
         .await

@@ -37,12 +37,14 @@
  */
 import * as React from 'react'
 
-import { SessionMark, type MarkPin } from '../../brand/marks'
+import { accentInk, characterFromSeed, SessionMark, type MarkPin } from '../../brand/marks'
 import { cn } from '../../lib/utils'
+import { useTheme } from '../theme-provider'
+import { HumanMark } from '../roster/human-mark'
 
 import type { HarnessEvent } from '../../lib/api/harness'
 
-import type { ChatItem } from './entries'
+import type { ChatAuthor, ChatItem } from './entries'
 import { harnessNotice } from './entries'
 import { framesIn } from './frames'
 import { mentionSegments, toReceiptRows, type TranscriptNode } from './grouping'
@@ -136,6 +138,21 @@ export interface TranscriptItemProps {
    * Omit and the schedule entity is plain emphasis, never a dead affordance.
    */
   onOpenSchedule?: (ref: ScheduleRef) => void
+  /**
+   * Show the per-message action bar (Copy · Share · More) under assistant
+   * bubbles. Bot/Grok-mode only — the panel passes it `true`; every other caller
+   * (the base app never renders this surface, plus the benches and unit tests)
+   * leaves it `false`, so `AgentRow`'s output is BYTE-IDENTICAL to before. See
+   * `ui/message-actions.tsx`.
+   */
+  showActions?: boolean
+  /**
+   * The VIEWER's own human user id (P3c), when a human colleague is signed in.
+   * A human-authored message whose `author.userId` matches renders as "You";
+   * every other colleague renders their name chip. Absent for the owner (who is
+   * not a Human context) → every human author is a named remote colleague.
+   */
+  selfHumanId?: string
 }
 
 /** What a schedule chip knows about the schedule it names. Both fields optional —
@@ -187,6 +204,16 @@ const SYSTEM_WORD: Record<string, string> = {
  * `nowMs` is bucketed to 30s (`chat-panel.tsx`) so the transcript reshapes twice
  * a minute rather than once a second. A prop that starts changing per render is
  * what would silently undo this — hence the test in `chat-interactive`.
+ *
+ * BELT-AND-SUSPENDERS (see `areTranscriptPropsEqual` below): even with the panel
+ * indexes stabilised, `buildTranscript` mints a brand-new `node` OBJECT for every
+ * row on each rebuild — and it rebuilds on every harness `/events` tick
+ * (`conversation.tsx:370-373`), a debounced feed that fires while subagents
+ * delegate. A new `node` identity for an UNCHANGED row would fail the default
+ * shallow comparator and re-render/re-run this bubble's markdown, collapsing any
+ * live WebKit selection anchored in it. The custom comparator holds the boundary
+ * by content: a `kind:'item'` row is equal when its underlying `item` object and
+ * run-grammar are unchanged, regardless of the fresh `node` wrapper.
  */
 export const TranscriptItem = React.memo(function TranscriptItem(
   props: TranscriptItemProps,
@@ -204,8 +231,19 @@ export const TranscriptItem = React.memo(function TranscriptItem(
       />
     )
   }
+  if (node.kind === 'harness-run') {
+    return (
+      <HarnessRunLine
+        evs={node.evs}
+        names={props.names}
+        pinFor={props.pinFor}
+        onOpenSession={props.onOpenSession}
+      />
+    )
+  }
 
-  const { item, speaker, grouped, showGutter, sender } = node
+  const { item, speaker, grouped, showGutter, author } = node
+  const { sender } = node
   // Before the system arm: a blocked banner is a CARD, not a centred line, and
   // it is the one row on this surface that must be impossible to mistake for
   // Claude talking.
@@ -213,6 +251,11 @@ export const TranscriptItem = React.memo(function TranscriptItem(
     return <BlockedRow item={item} onOpenTerminal={props.onOpenTerminal} />
   if (speaker === 'system') return <SystemRow item={item} labels={props.labels} />
   if (speaker === 'me') return <UserRow {...props} item={item} grouped={grouped} />
+  // A human colleague's message (P3c) — a circle mark + name chip + hue keyline,
+  // reusing the delegation ARRIVAL vocabulary. Checked before the teammate arm.
+  if (speaker.startsWith('human:') && author) {
+    return <HumanRow {...props} item={item} grouped={grouped} author={author} />
+  }
   if (sender !== undefined || speaker.startsWith('teammate:')) {
     return <TeammateRow {...props} item={item} grouped={grouped} sender={sender ?? ''} />
   }
@@ -234,7 +277,92 @@ export const TranscriptItem = React.memo(function TranscriptItem(
       gutter={showGutter ? props.name : undefined}
     />
   )
-})
+}, areTranscriptPropsEqual)
+
+/**
+ * Skip a re-render only when NOTHING this row draws has changed.
+ *
+ * Conservative by construction: it returns `true` (skip) exclusively when every
+ * scalar/callback prop reference-compares equal AND the `node` renders the same
+ * thing. The `node` object itself is a fresh wrapper on every `buildTranscript`
+ * rebuild, so it is compared by CONTENT, not identity:
+ *
+ *  - `kind:'item'` — the selection-bearing bubbles. Equal when the underlying
+ *    `item` object is the SAME reference (buildTranscript preserves it from the
+ *    transcript query, so a harness-only tick keeps it) OR carries identical
+ *    content (`uuid`/`type`/`text`/`truncated`/`retracted`), AND the run-grammar
+ *    that decides layout is unchanged (`speaker`/`grouped`/`showGutter`/
+ *    `sender`). Any difference → re-render. This is the lock that keeps
+ *    `ChatMarkdown` mounted through an unrelated subagent-activity rebuild.
+ *  - `divider` — equal when the label text is unchanged.
+ *  - `harness` / `harness-run` — equal when the event payload reference is the
+ *    same; a refetched `/events` payload is a new object → re-render (cheap,
+ *    and these centred lines hold no selection).
+ *
+ * If in any doubt it returns `false`: new messages, edits, renames, retractions
+ * and regroupings all change one of the compared fields and still render.
+ */
+function areTranscriptPropsEqual(a: TranscriptItemProps, b: TranscriptItemProps): boolean {
+  if (
+    a.name !== b.name ||
+    a.surface !== b.surface ||
+    a.labels !== b.labels ||
+    a.mentions !== b.mentions ||
+    a.names !== b.names ||
+    a.selfHumanId !== b.selfHumanId ||
+    a.rawUrl !== b.rawUrl ||
+    a.pinFor !== b.pinFor ||
+    a.showActions !== b.showActions ||
+    a.onOpenSession !== b.onOpenSession ||
+    a.onOpenSchedule !== b.onOpenSchedule ||
+    a.onOpenTerminal !== b.onOpenTerminal
+  ) {
+    return false
+  }
+  const x = a.node
+  const y = b.node
+  if (x === y) return true
+  if (x.kind !== y.kind || x.key !== y.key) return false
+  if (x.kind === 'item' && y.kind === 'item') {
+    if (
+      x.grouped !== y.grouped ||
+      x.showGutter !== y.showGutter ||
+      x.speaker !== y.speaker ||
+      x.sender !== y.sender ||
+      // A human author's display name (chip label) can change on a rename while
+      // the id-keyed speaker stays put — compare it by value so the chip is not
+      // frozen. `userId` is already in `speaker`; `name` is the render input.
+      x.author?.name !== y.author?.name
+    ) {
+      return false
+    }
+    const ai = x.item
+    const bi = y.item
+    if (ai === bi) return true
+    if (ai.type !== bi.type || ai.uuid !== bi.uuid) return false
+    // A receipts block carries no `text`; its content lives in `lines`/`overflow`,
+    // which a rebuild replaces on the fresh item object. Only the reference check
+    // above can vouch for it, so a receipts row whose object changed re-renders.
+    if (ai.type === 'receipts' || bi.type === 'receipts') return false
+    // Every prose/scalar field any variant draws — miss one and an edit to it
+    // would be silently frozen, so the set is deliberately broad.
+    const A = ai as Record<string, unknown>
+    const B = bi as Record<string, unknown>
+    return (
+      A.text === B.text &&
+      A.truncated === B.truncated &&
+      A.retracted === B.retracted &&
+      A.secs === B.secs &&
+      A.badge === B.badge &&
+      A.detail === B.detail &&
+      A.label === B.label
+    )
+  }
+  if (x.kind === 'divider' && y.kind === 'divider') return x.label === y.label
+  if (x.kind === 'harness' && y.kind === 'harness') return x.ev === y.ev
+  if (x.kind === 'harness-run' && y.kind === 'harness-run') return x.evs === y.evs
+  return false
+}
 
 /* ── the human ───────────────────────────────────────────────────────────── */
 
@@ -259,7 +387,7 @@ function UserRow({
   const text =
     command && item.text.startsWith(command) ? item.text.slice(command.length).trimStart() : item.text
   return (
-    <MessageRow me grouped={grouped}>
+    <MessageRow me grouped={grouped} surface={surface}>
       <Bubble variant="user" surface={surface} author={grouped ? undefined : 'You'}>
         {chip && (
           <span className={cn('font-medium tracking-[-0.1px] opacity-70', text && 'mr-1.5')}>
@@ -283,6 +411,18 @@ function commandChip(badge: string | undefined, label: string | undefined): stri
 
 /* ── this session ────────────────────────────────────────────────────────── */
 
+/**
+ * The per-message action bar, behind its OWN lazy boundary.
+ *
+ * It pulls the dropdown-menu primitive and (on touch) the Vaul sheet, plus the
+ * export helpers — none of which the calm transcript needs until an assistant
+ * bubble with actions actually renders (Bot mode only). Splitting it here keeps
+ * that weight off the main app chunk, the same discipline `ChatMarkdown` uses
+ * for the markdown stack. The fallback is `null`: the bar is chrome, so a
+ * bubble that mounts a frame ahead of the chunk simply shows no bar for a beat.
+ */
+const MessageActions = React.lazy(() => import('./ui/message-actions'))
+
 function AgentRow({
   item,
   grouped,
@@ -292,50 +432,69 @@ function AgentRow({
   const mark = gutter ? <Mark seed={gutter} pinFor={rest.pinFor} /> : undefined
   if (item.type === 'thinking') {
     return (
-      <MessageRow grouped={grouped} gutter={mark}>
+      <MessageRow grouped={grouped} gutter={mark} surface={rest.surface}>
         <ThinkingDisclosure item={item} surface={rest.surface} />
       </MessageRow>
     )
   }
   if (item.type === 'receipts') {
     return (
-      <MessageRow grouped={grouped} gutter={mark}>
+      <MessageRow grouped={grouped} gutter={mark} surface={rest.surface}>
         <Receipts item={item} surface={rest.surface} rawUrl={rest.rawUrl} />
       </MessageRow>
     )
   }
   if (item.type !== 'assistant') return null
+  const bubble = (
+    <Bubble surface={rest.surface} author={grouped ? undefined : AGENT_VOICE}>
+      {/* WITHDRAWN, NOT DELETED (catalog `err.refusal_fallback_dialog`).
+          Claude Code retracted this reply — the prompt it came from was
+          flagged, and the model will not act on it any more. The words stay on
+          screen because the user READ them and a transcript that quietly
+          removes what somebody read is lying about what happened; what changes
+          is that they stop reading as live. Dimmed, captioned, and marked in
+          the DOM so the e2e can prove it. */}
+      {item.retracted && (
+        <p
+          data-testid="chat-retracted"
+          className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-3"
+        >
+          Withdrawn by Claude Code
+        </p>
+      )}
+      <div className={item.retracted ? 'opacity-55' : undefined}>
+        <Prose
+          text={item.text}
+          self={rest.name}
+          mentions={rest.mentions}
+          pinFor={rest.pinFor}
+          surface={rest.surface}
+          rawUrl={rest.rawUrl}
+          onOpenSession={rest.onOpenSession}
+        />
+        {item.truncated && <ClippedMarker uuid={item.uuid} />}
+      </div>
+    </Bubble>
+  )
+  // Base app / benches / tests: byte-identical to before — just the bubble.
+  if (!rest.showActions) {
+    return (
+      <MessageRow grouped={grouped} gutter={mark} surface={rest.surface}>
+        {bubble}
+      </MessageRow>
+    )
+  }
+  // Bot/Grok mode: the bubble and its action bar share one hover-group column,
+  // the bar a STABLE SIBLING of the bubble (never inside <Prose>), so the
+  // memoised markdown subtree never re-mounts and text selection is untouched.
   return (
-    <MessageRow grouped={grouped} gutter={mark}>
-      <Bubble surface={rest.surface} author={grouped ? undefined : AGENT_VOICE}>
-        {/* WITHDRAWN, NOT DELETED (catalog `err.refusal_fallback_dialog`).
-            Claude Code retracted this reply — the prompt it came from was
-            flagged, and the model will not act on it any more. The words stay on
-            screen because the user READ them and a transcript that quietly
-            removes what somebody read is lying about what happened; what changes
-            is that they stop reading as live. Dimmed, captioned, and marked in
-            the DOM so the e2e can prove it. */}
-        {item.retracted && (
-          <p
-            data-testid="chat-retracted"
-            className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-3"
-          >
-            Withdrawn by Claude Code
-          </p>
-        )}
-        <div className={item.retracted ? 'opacity-55' : undefined}>
-          <Prose
-            text={item.text}
-            self={rest.name}
-            mentions={rest.mentions}
-            pinFor={rest.pinFor}
-            surface={rest.surface}
-            rawUrl={rest.rawUrl}
-            onOpenSession={rest.onOpenSession}
-          />
-          {item.truncated && <ClippedMarker uuid={item.uuid} />}
-        </div>
-      </Bubble>
+    <MessageRow grouped={grouped} gutter={mark} surface={rest.surface}>
+      <div className="group/msg flex min-w-0 flex-col items-start">
+        {bubble}
+        <React.Suspense fallback={null}>
+          <MessageActions text={item.text} surface={rest.surface} />
+        </React.Suspense>
+      </div>
     </MessageRow>
   )
 }
@@ -482,6 +641,7 @@ function TeammateRow({
       )}
       <MessageRow
         grouped={grouped}
+        surface={rest.surface}
         gutter={!grouped && sender ? <Mark seed={seed} pinFor={rest.pinFor} /> : undefined}
       >
         <Bubble surface={rest.surface} author={grouped ? undefined : rest.names?.get(sender ?? '') ?? AGENT_VOICE}>
@@ -496,6 +656,83 @@ function TeammateRow({
           />
           {item.truncated && <ClippedMarker uuid={item.uuid} />}
         </Bubble>
+      </MessageRow>
+    </>
+  )
+}
+
+/* ── a human colleague ───────────────────────────────────────────────────── */
+
+/**
+ * A message an authenticated human colleague sent (P3c / UI-DIRECTION §5).
+ *
+ * Reuses the delegation ARRIVAL vocabulary — `<ArrivalDivider>` naming the
+ * author once above their run — but swaps the mascot for the CIRCLE `<HumanMark>`
+ * (people ≠ agents' faces ≠ companies' rounded-squares) and adds a name chip +
+ * a 2px left keyline, both in the author's own `accentInk(hue)`. The hue is a
+ * pure function of the IMMUTABLE `author.userId`, so it is stable across a
+ * rename and the same colour rides the mark, the chip and the keyline. SELF (the
+ * signed-in viewer's own id) reads "You"; every other colleague reads their name.
+ *
+ * Mobile-first: the chip `min-w-0 truncate`s and the divider `flex-wrap`s, so a
+ * long name folds instead of overflowing the 390px column; the keyline is a 2px
+ * border, never a fixed-width element.
+ */
+function HumanRow({
+  item,
+  grouped,
+  author,
+  selfHumanId,
+  ...rest
+}: TranscriptItemProps & {
+  item: ChatItem
+  grouped: boolean
+  author: ChatAuthor
+}) {
+  const { resolvedTheme } = useTheme()
+  if (item.type !== 'user') return null
+  const isDark = resolvedTheme === 'dark'
+  const ink = accentInk(characterFromSeed(author.userId).hue, isDark)
+  const isSelf = selfHumanId !== undefined && author.userId === selfHumanId
+  const shown = isSelf ? 'You' : author.name
+  return (
+    <>
+      {!grouped && (
+        <ArrivalDivider>
+          <span>Message from</span>
+          <span className="inline-flex min-w-0 items-center gap-1.5 font-medium">
+            <HumanMark seed={author.userId} name={author.name} size={MARK_SIZE.divider} dark={isDark} />
+            <span className="truncate" style={{ color: ink }}>
+              {shown}
+            </span>
+          </span>
+        </ArrivalDivider>
+      )}
+      <MessageRow
+        grouped={grouped}
+        surface={rest.surface}
+        gutter={
+          !grouped ? (
+            <HumanMark seed={author.userId} name={author.name} size={MARK_SIZE.gutter} dark={isDark} />
+          ) : undefined
+        }
+      >
+        {/* The 2px left keyline — the "left accent bar" mapped onto attribution,
+            in the author's pigment. A non-semantic identity surface, so it never
+            collides with the status left-edge bar. */}
+        <div style={{ borderLeft: `2px solid ${ink}`, borderRadius: 1, paddingLeft: rest.surface === 'phone' ? 8 : 10 }}>
+          <Bubble surface={rest.surface} author={grouped ? undefined : shown}>
+            <Prose
+              text={item.text}
+              mentions={rest.mentions}
+              pinFor={rest.pinFor}
+              surface={rest.surface}
+              rawUrl={rest.rawUrl}
+              onOpenSession={rest.onOpenSession}
+            />
+            {item.truncated && <ClippedMarker uuid={item.uuid} />}
+          </Bubble>
+        </div>
       </MessageRow>
     </>
   )
@@ -542,7 +779,7 @@ function ScheduleRow({
           )}
         </ArrivalDivider>
       )}
-      <MessageRow grouped={grouped}>
+      <MessageRow grouped={grouped} surface={rest.surface}>
         <Bubble surface={rest.surface} author={grouped ? undefined : AGENT_VOICE}>
           <Prose
             text={item.text}
@@ -764,6 +1001,110 @@ export function HarnessLine({ ev, names, pinFor, onOpenSession, onOpenSchedule }
   )
 }
 
+export interface HarnessRunLineProps {
+  /** The folded run — two or more consecutive `session.delegate` events. */
+  evs: readonly HarnessEvent[]
+  names?: ReadonlyMap<string, string>
+  pinFor?: (seed: string) => MarkPin | undefined
+  onOpenSession?: (slug: string) => void
+}
+
+/**
+ * A folded run of delegations, as ONE calm line (§13.2 / daily-driver).
+ *
+ * `grouping.ts::collapseDelegations` hands us a maximal run of back-to-back
+ * `session.delegate` rows so the transcript is not walled by a stack of
+ * identical "Delegated to ●x" narrator lines. Collapsed, it is a single centred
+ * affordance that names how many; expanded, it is exactly the rows it stands
+ * for — the information is preserved, a curious reader is one tap away, and the
+ * resting history stays quiet.
+ *
+ * Two collapsed shapes, chosen by whether the run is one colleague or several:
+ *   · all to ONE session → `Delegated to ●ipc ×12`, so the run still reads as
+ *     the thing it is (a busy back-and-forth with one bot). The chip navigates;
+ *     the `×N` toggle expands — two affordances, never a chip nested in a
+ *     button.
+ *   · MIXED targets → a plain `12 delegations` toggle; naming twelve chips on
+ *     one line would be its own wall.
+ */
+export function HarnessRunLine({ evs, names, pinFor, onOpenSession }: HarnessRunLineProps) {
+  const [expanded, setExpanded] = React.useState(false)
+  const count = evs.length
+  const targets = React.useMemo(() => [...new Set(evs.map((e) => e.target))], [evs])
+
+  if (expanded) {
+    return (
+      <div data-testid="chat-delegation-run" data-expanded="true">
+        {evs.map((ev) => (
+          <HarnessLine
+            key={ev.id}
+            ev={ev}
+            names={names}
+            pinFor={pinFor}
+            onOpenSession={onOpenSession}
+          />
+        ))}
+        <SystemLine>
+          <RunToggle expanded onClick={() => setExpanded(false)}>
+            Show less
+          </RunToggle>
+        </SystemLine>
+      </div>
+    )
+  }
+
+  // Collapsed. `data-count` is what the render test reads to assert the fold.
+  const single = targets.length === 1 ? targets[0] : null
+  return (
+    <SystemLine testId="chat-delegation-run">
+      <span data-count={count} className="inline-flex items-center">
+        {single ? (
+          <>
+            Delegated to{' '}
+            <MentionChip
+              seed={single}
+              pin={pinFor?.(single)}
+              name={names?.get(single)}
+              onClick={onOpenSession ? () => onOpenSession(single) : undefined}
+            />{' '}
+            <RunToggle onClick={() => setExpanded(true)}>×{count}</RunToggle>
+          </>
+        ) : (
+          <RunToggle onClick={() => setExpanded(true)}>{count} delegations</RunToggle>
+        )}
+      </span>
+    </SystemLine>
+  )
+}
+
+/** The expand/collapse control on a folded delegation run — the same
+ *  zero-layout-cost hover pill `SystemEntity` uses, so the sentence never
+ *  shifts when the affordance lights up. */
+function RunToggle({
+  children,
+  expanded,
+  onClick,
+}: {
+  children: React.ReactNode
+  expanded?: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-expanded={expanded ?? false}
+      className={cn(
+        'font-medium text-ink-2',
+        'my-[-1px] ml-[-3px] mr-[-5px] inline-flex items-center rounded-md py-px pl-[3px] pr-[5px] tabular-nums',
+        'sm-t-hover hover:bg-fill-soft hover:text-ink',
+      )}
+    >
+      {children}
+    </button>
+  )
+}
+
 /* ── pieces ──────────────────────────────────────────────────────────────── */
 
 function Mark({
@@ -881,7 +1222,10 @@ function Receipts({
   if (item.type !== 'receipts') return null
   const rows = toReceiptRows(item.lines)
   const frames = framesIn(item.lines)
-  const width = surface === 'phone' ? BUBBLE_MAX.phoneAssistant : CAPTURED_FRAME.width
+  // One width for both compositions. The card is `max-w-full`, so on the phone
+  // it fills whatever the (now column-wide) bubble gives it instead of being
+  // pinned to a second, narrower artboard number.
+  const width = CAPTURED_FRAME.width
   return (
     <div className="flex min-w-0 flex-col items-start gap-2">
       <ReceiptGroup
