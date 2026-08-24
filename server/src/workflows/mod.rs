@@ -239,17 +239,21 @@ pub async fn tick_once(state: &AppState) -> anyhow::Result<()> {
 /// `scope::member_may_reach` allowlist entry — not a blanket owner-only route
 /// layer that would 404 the whole surface for members.
 pub fn router_for(state: AppState) -> Router {
-    use axum::routing::{get, put};
+    use axum::routing::{get, post, put};
     Router::new()
         .route("/api/workflows", get(list_handler).post(create_handler))
         // Static segments are registered alongside the `{id}` capture; axum's
         // router prioritizes static segments, so the order is unambiguous —
         // exactly the shape `scheduler::router_for` had.
+        .route("/api/workflows/runs", get(all_runs_handler))
         .route(
             "/api/workflows/{id}",
             get(get_handler).patch(patch_handler).delete(delete_handler),
         )
         .route("/api/workflows/{id}/steps", put(put_steps_handler))
+        .route("/api/workflows/{id}/runs", get(runs_handler))
+        .route("/api/workflows/{id}/run", post(run_now_handler))
+        .route("/api/workflows/{id}/cancel", post(cancel_handler))
         .with_state(state)
 }
 
@@ -864,6 +868,99 @@ async fn delete_handler(
     let _ = db::audit::log(&state.pool, "user", "workflow.delete", &id, json!({})).await;
     emit_workflows(&state, &wf, "deleted");
     Ok(Json(json!({ "ok": true, "data": { "deleted": true } })))
+}
+
+// ── run now, cancel, and the run ledger ───────────────────────────────────────
+
+/// `POST /api/workflows/{id}/run` — start the chain now.
+///
+/// 202, not 200: a chain can outlive the request by hours, so the honest answer
+/// is "accepted, here is the run to watch". [`engine::Trigger::Manual`] never
+/// claims a fire-key and never touches `next_run` — the tick still owns cadence.
+async fn run_now_handler(
+    State(state): State<AppState>,
+    OptCtx(ctx): OptCtx,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let wf = scoped_workflow(&state, ctx.as_ref(), &id).await?;
+    let run_id = engine::start(&state, wf.clone(), engine::Trigger::Manual).await?;
+    let _ = crate::sessions::audit_harness(
+        &state,
+        "user",
+        "workflow.run",
+        &wf.id,
+        json!({ "session": wf.session, "title": wf.title, "run_id": run_id }),
+        &[wf.session.as_str()],
+    )
+    .await;
+    emit_workflows(&state, &wf, "run");
+    Ok((StatusCode::ACCEPTED, ok(json!({ "run_id": run_id }))))
+}
+
+/// `POST /api/workflows/{id}/cancel` — stop the in-flight run.
+///
+/// A chain needs a stop button: without one, a workflow whose first step parks
+/// for its full 1800s deadline holds §3.2 rule 2's "one run at a time" lock and
+/// blocks every later window. Cancelling closes the run row FIRST (so the
+/// advance claim below is what actually stops step k+1 from being delivered) and
+/// then closes the step run that was still open, so the ledger does not carry a
+/// step that runs forever.
+async fn cancel_handler(
+    State(state): State<AppState>,
+    OptCtx(ctx): OptCtx,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let wf = scoped_workflow(&state, ctx.as_ref(), &id).await?;
+    let Some(run) = db::workflows::running_for(&state.pool, &id).await? else {
+        // Not an error: "stop" on something already stopped is the outcome the
+        // caller wanted, and a 404 here would make a double-click look broken.
+        return Ok((StatusCode::ACCEPTED, ok(json!({ "cancelled": false }))));
+    };
+    engine::cancel(&state, run.id).await?;
+    emit_workflows(&state, &wf, "cancelled");
+    Ok((StatusCode::ACCEPTED, ok(json!({ "cancelled": true, "run_id": run.id }))))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RunsQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// `GET /api/workflows/{id}/runs` — this workflow's history, newest first, each
+/// run carrying its own step rows (the timeline the detail view draws).
+async fn runs_handler(
+    State(state): State<AppState>,
+    OptCtx(ctx): OptCtx,
+    Path(id): Path<String>,
+    Query(q): Query<RunsQuery>,
+) -> Result<Json<Envelope<Vec<serde_json::Value>>>, AppError> {
+    scoped_workflow(&state, ctx.as_ref(), &id).await?;
+    // Clamped to the retention cap: asking for more than the table keeps is a
+    // question with no answer, and an unbounded limit is a table scan a client
+    // should not be able to ask for.
+    let limit = q.limit.unwrap_or(20).clamp(1, db::workflows::RUN_HISTORY_KEEP);
+    let runs = db::workflows::runs_for(&state.pool, &id, limit).await?;
+    let mut out = Vec::with_capacity(runs.len());
+    for run in runs {
+        let steps = db::workflows::step_runs_for(&state.pool, run.id).await?;
+        out.push(json!({ "run": run, "steps": steps }));
+    }
+    Ok(ok(out))
+}
+
+/// `GET /api/workflows/runs` — the cross-workflow activity feed.
+///
+/// SCOPE-FILTERED on the run's own workflow `company_id`, which `recent_runs`
+/// joins in for exactly this reason: the feed is the one place a member could
+/// otherwise read another company's titles.
+async fn all_runs_handler(
+    State(state): State<AppState>,
+    OptCtx(ctx): OptCtx,
+) -> Result<Json<Envelope<Vec<db::workflows::RunSummary>>>, AppError> {
+    let scope = Scope::of(ctx.as_ref());
+    let rows = db::workflows::recent_runs(&state.pool, 50).await?;
+    Ok(ok(rows.into_iter().filter(|r| scope.sees(r.company_id)).collect()))
 }
 
 /// The `workflows` SSE frame — COMPANY-STAMPED, always (spec §5.5).

@@ -641,3 +641,255 @@ async fn a_created_workflow_narrates_itself_into_its_bots_feed() {
         .is_empty());
     h.cleanup();
 }
+
+// ── run now, cancel, the ledger, the feed (T3.2) ─────────────────────────────
+
+/// The status→idle EDGE the detector would publish when a turn ends.
+fn idle_edge(state: &AppState, session: &str) {
+    let tx = state.status_watch_for(session);
+    let next = tx.borrow().1 + 1;
+    tx.send_replace(("idle".to_string(), next));
+}
+
+/// Poll until `f` holds or ~10s elapse — the chain is genuinely asynchronous.
+async fn until<F, Fut>(what: &str, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if f().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+async fn delivered(state: &AppState, session: &str, preview: &str) -> bool {
+    db::sessions::get(&state.pool, session)
+        .await
+        .unwrap()
+        .map(|s| s.last_send_text == preview)
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn run_now_is_a_202_that_does_not_touch_next_run() {
+    let h = spawn_harness().await;
+    make_session(&h, "alpha", None).await;
+    let (status, created) = send(
+        &h.app,
+        Method::POST,
+        "/api/workflows",
+        Some(json!({
+            "title": "nightly", "session": "alpha",
+            "schedule_expr": "every 1h", "steps": one_step("do the thing"),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["data"]["id"].as_str().unwrap().to_string();
+    let before = db::workflows::get(&h.state.pool, &id).await.unwrap().unwrap();
+
+    let (status, body) = send(&h.app, Method::POST, &format!("/api/workflows/{id}/run"), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let run_id = body["data"]["run_id"].as_i64().expect("a run id to watch");
+
+    until("the step is delivered", || async {
+        delivered(&h.state, "alpha", "do the thing").await
+    })
+    .await;
+    idle_edge(&h.state, "alpha");
+    until("the run finishes", || async {
+        db::workflows::get_run(&h.state.pool, run_id)
+            .await
+            .unwrap()
+            .map(|r| r.status == "ok")
+            .unwrap_or(false)
+    })
+    .await;
+
+    let after = db::workflows::get(&h.state.pool, &id).await.unwrap().unwrap();
+    assert_eq!(after.next_run, before.next_run, "a manual run must not move the cadence");
+    assert_eq!(after.run_count, 1, "it did run");
+    // No fire-key: the idempotency gate belongs to the TICK, and claiming one
+    // here would make the next real window look like a duplicate and be skipped.
+    let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_run_keys")
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(keys, 0, "run-now must not claim a fire-key");
+
+    h.cleanup();
+}
+
+#[tokio::test]
+async fn cancel_stops_the_in_flight_run_and_the_next_step_is_never_delivered() {
+    let h = spawn_harness().await;
+    make_session(&h, "alpha", None).await;
+    let (status, created) = send(
+        &h.app,
+        Method::POST,
+        "/api/workflows",
+        Some(json!({
+            "title": "chain", "session": "alpha",
+            "steps": [{ "prompt": "step one" }, { "prompt": "step two" }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["data"]["id"].as_str().unwrap().to_string();
+
+    let (_, body) = send(&h.app, Method::POST, &format!("/api/workflows/{id}/run"), None).await;
+    let run_id = body["data"]["run_id"].as_i64().unwrap();
+    until("step 1 delivered", || async { delivered(&h.state, "alpha", "step one").await }).await;
+
+    let (status, body) =
+        send(&h.app, Method::POST, &format!("/api/workflows/{id}/cancel"), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["data"]["cancelled"], true);
+
+    let run = db::workflows::get_run(&h.state.pool, run_id).await.unwrap().unwrap();
+    assert_eq!(run.status, "cancelled");
+    assert!(run.finished_at.is_some());
+
+    // The open step run is CLOSED — a step that never ends reads, in the
+    // timeline, as a chain still running.
+    let steps = db::workflows::step_runs_for(&h.state.pool, run_id).await.unwrap();
+    assert_eq!(steps.len(), 1, "step two must never have been delivered: {steps:?}");
+    assert!(steps[0].finished_at.is_some(), "{steps:?}");
+    assert_eq!(steps[0].status, "interrupted");
+
+    // …and it STAYS at one, even after the signal the chain was waiting for.
+    idle_edge(&h.state, "alpha");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !delivered(&h.state, "alpha", "step two").await,
+        "a cancelled chain must not deliver its next step",
+    );
+    assert_eq!(db::workflows::step_runs_for(&h.state.pool, run_id).await.unwrap().len(), 1);
+
+    // Cancelling again is the outcome the caller wanted, not an error.
+    let (status, body) =
+        send(&h.app, Method::POST, &format!("/api/workflows/{id}/cancel"), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["data"]["cancelled"], false);
+
+    h.cleanup();
+}
+
+/// The run ledger, per workflow and across them. The retention cap is the row
+/// layer's (`RUN_HISTORY_KEEP`); what is asserted here is that the endpoints
+/// read it, that a workflow's history is its own, and that the static `/runs`
+/// feed is not swallowed by the `{id}` capture.
+#[tokio::test]
+async fn the_run_endpoints_read_the_ledger_and_the_static_feed_wins_the_route() {
+    let h = spawn_harness().await;
+    make_session(&h, "alpha", None).await;
+    let mk = |title: &str| {
+        json!({ "title": title, "session": "alpha", "steps": one_step("hi") })
+    };
+    let (_, busy) = send(&h.app, Method::POST, "/api/workflows", Some(mk("busy"))).await;
+    let busy_id = busy["data"]["id"].as_str().unwrap().to_string();
+    let (_, quiet) = send(&h.app, Method::POST, "/api/workflows", Some(mk("quiet"))).await;
+    let quiet_id = quiet["data"]["id"].as_str().unwrap().to_string();
+
+    for i in 0..25 {
+        db::workflows::insert_run(
+            &h.state.pool,
+            &busy_id,
+            1_760_000_000 + i,
+            "manual",
+            if i % 5 == 0 { "error" } else { "ok" },
+            &format!("run {i}"),
+        )
+        .await
+        .unwrap();
+    }
+    for i in 0..3 {
+        db::workflows::insert_run(
+            &h.state.pool,
+            &quiet_id,
+            1_760_000_000 + i,
+            "manual",
+            "ok",
+            &format!("quiet {i}"),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Per workflow: newest first, clamped to the retention cap even when the
+    // client asks for more than the table keeps.
+    let (status, body) = send(
+        &h.app,
+        Method::GET,
+        &format!("/api/workflows/{busy_id}/runs?limit=500"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["data"].as_array().unwrap();
+    assert_eq!(rows.len() as i64, db::workflows::RUN_HISTORY_KEEP);
+    assert_eq!(rows[0]["run"]["note"], "run 24");
+    assert!(rows[0]["steps"].is_array(), "each run carries its step rows");
+
+    // A busy workflow must not evict a quiet one's history.
+    let (_, body) = send(&h.app, Method::GET, &format!("/api/workflows/{quiet_id}/runs"), None).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+
+    // The STATIC feed must not be captured by the `{id}` route.
+    let (status, body) = send(&h.app, Method::GET, "/api/workflows/runs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let feed = body["data"].as_array().unwrap();
+    assert!(!feed.is_empty());
+    assert!(feed.iter().all(|r| r["title"].is_string()), "the feed joins the title in");
+    assert!(feed.len() <= 50);
+
+    h.cleanup();
+}
+
+/// The activity feed carries the stamp the per-viewer filter runs on. The
+/// MEMBER half of this property — that another company's runs are invisible —
+/// is driven end to end with a real scoped cookie in `scope_p3b.rs`.
+#[tokio::test]
+async fn the_activity_feed_is_company_stamped() {
+    let h = spawn_harness().await;
+    sqlx::query(
+        "INSERT INTO companies (id, slug, display_name, root_dir, created_at, updated_at)
+         VALUES (3, 'acme', 'Acme', '/tmp/acme', 0, 0)",
+    )
+    .execute(&h.state.pool)
+    .await
+    .unwrap();
+    make_session(&h, "acme-bot", Some(3)).await;
+    make_session(&h, "main-bot", None).await;
+
+    for (session, title) in [("acme-bot", "acme wf"), ("main-bot", "main wf")] {
+        let (_, created) = send(
+            &h.app,
+            Method::POST,
+            "/api/workflows",
+            Some(json!({ "title": title, "session": session, "steps": one_step("hi") })),
+        )
+        .await;
+        let id = created["data"]["id"].as_str().unwrap().to_string();
+        db::workflows::insert_run(&h.state.pool, &id, 1_760_000_000, "manual", "ok", "done")
+            .await
+            .unwrap();
+    }
+
+    // The owner (Scope::All) sees both — including the UNSTAMPED main-bot row,
+    // which a scoped member never does (`Scope::sees` is fail-closed on None).
+    let (status, body) = send(&h.app, Method::GET, "/api/workflows/runs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let feed = body["data"].as_array().unwrap();
+    assert_eq!(feed.len(), 2, "{feed:?}");
+    let acme = feed.iter().find(|r| r["title"] == "acme wf").unwrap();
+    assert_eq!(acme["company_id"], 3, "the feed row carries the company the filter reads");
+    let main = feed.iter().find(|r| r["title"] == "main wf").unwrap();
+    assert!(main["company_id"].is_null());
+
+    h.cleanup();
+}

@@ -857,9 +857,30 @@ pub async fn cancel(state: &AppState, run_id: i64) -> Result<(), AppError> {
         state.workflow_runs.claim(run_id, k);
     }
     db::workflows::close_run(&state.pool, run_id, "cancelled", "cancelled").await?;
+    // The parked watcher wakes, sees the claim already taken and returns without
+    // touching the ledger — so the STEP row it left open is this function's to
+    // close. Left open it would sit `running` forever and read, in the timeline,
+    // as a step that never ended. ('cancelled' is not in the step CHECK; the
+    // honest terminal status for "stopped from outside" is `interrupted`.)
+    if let Ok(open) = db::workflows::step_runs_for(&state.pool, run_id).await {
+        for sr in open.into_iter().filter(|s| s.finished_at.is_none()) {
+            let _ = db::workflows::close_step_run(
+                &state.pool,
+                sr.id,
+                "interrupted",
+                "interrupted",
+                "the run was cancelled",
+            )
+            .await;
+        }
+    }
     if let Some(n) = state.workflow_runs.waker(run_id) {
         n.notify_waiters();
     }
+    // Deliberately NOT `release(run_id)`: the claims taken above are the ONLY
+    // thing stopping the woken watcher from delivering step k+1, and dropping
+    // them here would hand the chain straight back the permission cancel just
+    // took away. The run's terminal `finish` is what releases the registry.
     Ok(())
 }
 
