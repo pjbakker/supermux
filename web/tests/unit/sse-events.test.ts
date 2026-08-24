@@ -55,6 +55,19 @@ const EMITTED: string[] = (() => {
   for (const file of rustFiles(SERVER_SRC)) {
     const src = readFileSync(file, 'utf8')
     for (const m of src.matchAll(/event:\s*"([a-z-]+)"/g)) found.add(m[1]!)
+    // The COMPANY-ROUTED / global CONSTRUCTOR form. `files` (v1) is emitted
+    // exclusively through `SseEvent::for_company("files", …)`, which the
+    // struct-literal scrape above cannot see — so without this line the client
+    // adding `files` to its list would fail the "subscribes to nothing that
+    // does not exist" assertion for a channel that demonstrably exists.
+    // `\s*` is not cosmetic: the real call wraps its arguments onto the next
+    // line (`SseEvent::for_company(\n    "files",`), so a regex demanding the
+    // quote immediately after the paren finds nothing at all.
+    for (const m of src.matchAll(
+      /SseEvent::(?:for_company|global)\(\s*"([a-z-]+)"/g,
+    )) {
+      found.add(m[1]!)
+    }
     if (file.endsWith('/sse.rs')) {
       for (const m of src.matchAll(/Event::default\(\)\.event\("([a-z-]+)"\)/g)) {
         found.add(m[1]!)
@@ -72,6 +85,11 @@ describe('the SSE channel list', () => {
     for (const core of ['sessions', 'status', 'harness', 'alerts']) {
       expect(EMITTED).toContain(core)
     }
+    // `files` is the constructor-form channel the scrape was widened for. It
+    // is pinned by NAME so the channel can never half-land the way `harness`
+    // did: if the server stops emitting it, or the emit moves to a form the
+    // scrape misses, this fails here rather than silently in production.
+    expect(EMITTED).toContain('files')
   })
 
   test('EVERY channel the server emits is subscribed by the client', () => {
