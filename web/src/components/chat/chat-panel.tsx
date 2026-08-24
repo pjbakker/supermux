@@ -66,6 +66,7 @@ import { focusComposer } from './composer-draft'
 import { ChatConversation, PHONE_QUERY } from './conversation'
 import type { KbLayoutComponent } from '@/components/focus-mode/kb-modes/contract'
 import { useComposer } from './use-composer'
+import { useDelaySend } from './use-delay-send'
 import { useHarnessEvents } from './use-harness-events'
 import { useDialogAnswer } from './use-dialog-answer'
 import { LoginCard, ProviderAuthCard } from './login-card'
@@ -769,6 +770,15 @@ export default function ChatPanel({
     onInterrupt: endTurn,
   })
 
+  // SEND LATER — the composer's delay plane. It owns nothing this panel owns:
+  // the draft store is the same one `useComposer` writes to, and the delivery
+  // is a ONE-SHOT SCHEDULE against the existing `/api/schedules` (kind `tmux`,
+  // `in 10 minutes`), so a queued message survives a reload, a phone lock and a
+  // server restart — the thing that remembers is the schedules table, not this
+  // browser. No new endpoint, and no query subscription for a session nobody
+  // has queued anything in.
+  const delaySend = useDelaySend({ name })
+
   // ── What the `@`/`/` popover offers (fase A4 T9) ───────────────────────────
   // Fetched HERE, not in the picker: the panel is the data plane (the A3/A4
   // contract), and a lazily-loaded chunk that imported the API client for
@@ -1084,6 +1094,9 @@ export default function ChatPanel({
           // same rule as `mentions`/`names`.
           pickerData={pickerData}
           onSchedule={scheduleDraft}
+          // The delay plane (send later): the trailing clock, its chooser, and
+          // the queued-send receipts above the pill.
+          delay={delaySend}
           actions={actions}
           attachments={staged}
           // The dogfood number — DEV BUILDS ONLY (daily-driver QA #9).
