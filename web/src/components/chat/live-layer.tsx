@@ -662,7 +662,14 @@ export function DialogCard({
         // descriptions, which are prose rather than code, so they get the prose
         // block instead of the mono one.
         detail={
-          view.family === 'question' ? (
+          // `unknown` joins `question` here (owner report): an unmapped
+          // AskUserQuestion is the same shape read by a lens that could not
+          // fingerprint it, so its per-option descriptions are prose too. The
+          // lens only publishes them where the label line proves it did not
+          // wrap, and this renders nothing when there are none — which is every
+          // other unmapped modal. An unknown dialog has no `body` (`readBody` is
+          // permission/startup/paused only), so the two branches cannot collide.
+          view.family === 'question' || view.family === 'unknown' ? (
             <OptionMeanings view={view} />
           ) : view.body?.length ? (
             // WHICH BODIES MAY WRAP. A permission body is a shell command and a

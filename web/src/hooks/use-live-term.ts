@@ -28,6 +28,7 @@ import { attachAndroidImeBridge, isAndroid } from '@/lib/android-ime'
 import { LINK_URL_REGEX, openExternal, findLinkAt } from '@/lib/terminal-links'
 import { createKeyboardOpenDetector } from '@/hooks/use-keyboard-viewport'
 import { isTermHistoryEnabled } from '@/lib/term-history-flag'
+import { geometryNeedsSend, type TermGeometry } from '../lib/term-geometry'
 import {
   decayVelocity,
   dragRows,
@@ -537,6 +538,30 @@ export function useLiveTerm(
   // the whole lifecycle (no re-subscribe churn on re-render).
   const attemptRef = React.useRef(0)
   const authedRef = React.useRef(false)
+  /**
+   * The geometry this socket has ALREADY told the server about — `null` until it
+   * has told it anything.
+   *
+   * ONE RESIZE PER ATTACH (owner report: a question's footer hint rendered
+   * doubled and spliced — `… Esc totcancelselect · … · Esc to cancel`). Three
+   * frames used to carry the SAME cols×rows on every single attach: `onopen`
+   * batches one with `auth` (the server's `peek_initial_resize` reads it before
+   * the seed capture — that one is load-bearing), `auth_ok` pushed a second
+   * unconditionally, and the ResizeObserver's first debounced fit pushed a third
+   * because its `lastSent*` locals start at 0. Each one re-forks
+   * `tmux resize-window`, each `refresh-client` makes tmux schedule a redraw,
+   * each redraw makes Claude/Ink re-emit its whole screen — and the server arms
+   * a full mid-stream RE-SEED 300ms after any resize, which then lands in the
+   * middle of that repaint. A cursor-relative repaint applied on top of a
+   * re-seeded screen is exactly how a line gets rewritten at the wrong column
+   * with no erase, which is what a doubled, spliced footer IS.
+   *
+   * So the geometry lives in ONE place across the connect effect and the
+   * observer effect, and a resize is sent only when it actually changed. The
+   * server keeps its own belt (`ws/mod.rs` ignores a same-size resize rather
+   * than arming a re-seed for it), because this client is not the only one.
+   */
+  const sentGeomRef = React.useRef<TermGeometry | null>(null)
   const reconnectTimerRef = React.useRef<number | null>(null)
   const visibilityPendingRef = React.useRef(false) // 1013 → wait for visible
   const lastVisibleAtRef = React.useRef(0)
@@ -1900,9 +1925,17 @@ export function useLiveTerm(
               // connection — resetting here would let a connect→auth_ok→close
               // cycle storm with zero backoff. The backoff is reset only once a
               // real pty data frame arrives (see the binary branch below).
-              // Push our geometry so the pty matches the viewport immediately.
+              // Push our geometry so the pty matches the viewport immediately —
+              // but ONLY if `onopen` did not already send exactly this (it
+              // batches the resize with `auth`, and the server reads it before
+              // the seed). An identical second resize buys nothing and costs a
+              // tmux redraw plus the server's 300ms auto-heal re-seed landing on
+              // top of the repaint it caused. See `sentGeomRef`.
               const t = termRef.current
-              if (t) resize(t.cols, t.rows)
+              if (t && geometryNeedsSend(sentGeomRef.current, t.cols, t.rows)) {
+                sentGeomRef.current = { cols: t.cols, rows: t.rows }
+                resize(t.cols, t.rows)
+              }
             } else if (msg.type === 'replay_done') {
               // The server has flushed an entire snapshot (the attach seed OR a
               // mid-stream resync) and is about to resume the live fan-out. Pin
@@ -2107,6 +2140,10 @@ export function useLiveTerm(
       }
       ws.binaryType = 'arraybuffer'
       wsRef.current = ws
+      // A NEW SOCKET HAS TOLD THE SERVER NOTHING YET. The pty may have been
+      // resized by another viewer while we were away, so the previous socket's
+      // geometry is not a claim this one may make (see `sentGeomRef`).
+      sentGeomRef.current = null
 
       // Set onopen FIRST so installHandlers' message/close wiring sees a
       // consistent WebSocket. The first frame is the in-band auth (token from
@@ -2129,8 +2166,11 @@ export function useLiveTerm(
         try {
           ws.send(JSON.stringify({ type: 'auth', token: authToken() }))
           const t = termRef.current
-          if (t && t.cols > 0 && t.rows > 0) {
+          if (t && geometryNeedsSend(sentGeomRef.current, t.cols, t.rows)) {
             ws.send(JSON.stringify({ type: 'resize', cols: t.cols, rows: t.rows }))
+            // RECORDED, so the `auth_ok` push below and the observer's first fit
+            // both know the server already has this geometry.
+            sentGeomRef.current = { cols: t.cols, rows: t.rows }
           }
         } catch {
           /* will surface via onclose */
@@ -2160,6 +2200,10 @@ export function useLiveTerm(
       ws.binaryType = 'arraybuffer'
       wsRef.current = ws
       authedRef.current = true
+      // The prewarm socket sent its own geometry; this terminal is a different
+      // box, so nothing is known about it until the first fit. Same rule as a
+      // fresh connect.
+      sentGeomRef.current = null
       // Skip the auth grace timer — we've already received auth_ok upstream.
       installHandlers(ws, { skipAuth: true })
       setLiveState('live')
@@ -2264,8 +2308,9 @@ export function useLiveTerm(
     // cols/rows as last sent — a same-size `refresh-client` still makes tmux
     // schedule a redraw on some configs, which is exactly the churn this fix
     // exists to avoid.
-    let lastSentCols = 0
-    let lastSentRows = 0
+    // The geometry already sent lives in `sentGeomRef` — SHARED with the connect
+    // effect, so the first debounced fit after an attach no-ops instead of
+    // re-sending what `onopen` batched with `auth` (see `sentGeomRef`).
     // Width at the last FULL fit — 0 until then, so the first observer pass
     // always takes the full-fit path regardless of keyboard state.
     let lastFitWidth = 0
@@ -2302,10 +2347,9 @@ export function useLiveTerm(
         return
       }
       lastFitWidth = container.clientWidth
-      const geometryChanged = t.cols !== lastSentCols || t.rows !== lastSentRows
+      const geometryChanged = geometryNeedsSend(sentGeomRef.current, t.cols, t.rows)
       if (geometryChanged) {
-        lastSentCols = t.cols
-        lastSentRows = t.rows
+        sentGeomRef.current = { cols: t.cols, rows: t.rows }
         resize(t.cols, t.rows)
       }
       // Mirror cols out (exposed for parity; harmless when unused).
