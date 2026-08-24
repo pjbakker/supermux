@@ -1,6 +1,7 @@
 import * as React from 'react'
-import CodeMirror from '@uiw/react-codemirror'
+import CodeMirror, { type ReactCodeMirrorRef } from '@uiw/react-codemirror'
 import { EditorView } from '@codemirror/view'
+import { openSearchPanel, search } from '@codemirror/search'
 import { oneDark } from '@codemirror/theme-one-dark'
 import type { Extension } from '@codemirror/state'
 
@@ -33,11 +34,27 @@ export interface CodeEditorProps {
   onChange?: (value: string) => void
 }
 
+/** What the viewer's header can ask of the editor. In-file search is the only
+ *  member today, and it exists because `Mod-f` is unreachable on a phone. */
+export interface CodeEditorHandle {
+  /** Open CodeMirror's search panel (the `Mod-f` panel, opened by a button). */
+  openSearch: () => void
+}
+
 /** CodeMirror 6 editor. Loads the language grammar lazily and
  *  themes to match the active light/dark mode. */
-export function CodeEditor({ name, value, editable, onChange }: CodeEditorProps) {
+export const CodeEditor = React.forwardRef<CodeEditorHandle, CodeEditorProps>(
+  function CodeEditor({ name, value, editable, onChange }, ref) {
   const { resolvedTheme } = useTheme()
   const [lang, setLang] = React.useState<Extension | null>(null)
+  const cmRef = React.useRef<ReactCodeMirrorRef>(null)
+
+  React.useImperativeHandle(ref, () => ({
+    openSearch: () => {
+      const view = cmRef.current?.view
+      if (view) openSearchPanel(view)
+    },
+  }))
 
   React.useEffect(() => {
     // `name` is constant for a given editor instance (FileViewer is keyed by
@@ -59,7 +76,15 @@ export function CodeEditor({ name, value, editable, onChange }: CodeEditorProps)
   }, [name])
 
   const extensions = React.useMemo(() => {
-    const exts: Extension[] = [baseTheme]
+    // `search({top: true})` EXPLICITLY. `basicSetup` already pulls
+    // `@codemirror/search` in transitively (searchKeymap +
+    // highlightSelectionMatches), so `Mod-f` very likely already worked on
+    // desktop — but as an implicit transitive default, with the panel wherever
+    // the default put it and no way at all to reach it from a phone. Declaring
+    // it here makes the panel's position ours, and `@codemirror/search` is now
+    // a declared dependency instead of a phantom one resolved only by the
+    // lockfile (the thing that breaks on the next dedupe).
+    const exts: Extension[] = [baseTheme, search({ top: true })]
     if (shouldWrap(name)) exts.push(EditorView.lineWrapping)
     if (lang) exts.push(lang)
     return exts
@@ -67,6 +92,7 @@ export function CodeEditor({ name, value, editable, onChange }: CodeEditorProps)
 
   return (
     <CodeMirror
+      ref={cmRef}
       value={value}
       onChange={onChange}
       editable={editable}
@@ -84,4 +110,5 @@ export function CodeEditor({ name, value, editable, onChange }: CodeEditorProps)
       }}
     />
   )
-}
+  },
+)

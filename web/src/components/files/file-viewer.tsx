@@ -9,6 +9,7 @@ import {
   LoaderCircle,
   RotateCcw,
   Save,
+  Search,
   Trash2,
   TriangleAlert,
 } from 'lucide-react'
@@ -22,10 +23,11 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { filesApi } from '@/lib/api'
+import { filesApi, FsError } from '@/lib/api'
 import type { FileMeta } from '@/lib/api'
 import { useFileContent, useSaveFile } from '@/hooks/use-files'
 import { extOf, isMarkdown, isWritable } from './file-types'
+import type { CodeEditorHandle } from './code-editor'
 
 // Lazy-load the CodeMirror editor (and its core bundle) so it only ships when a
 // text file is actually opened — keeps the initial route bundle lean.
@@ -47,6 +49,14 @@ export interface FileViewerProps {
   /** Mobile drill-down back affordance (hidden on desktop). */
   onBack: () => void
   onRequestDelete: (path: string) => void
+  /** Report the unsaved-draft flag UP. Files' liveness needs it: a `files` SSE
+   *  frame for this path must NEVER refetch over a dirty buffer, and the route
+   *  is where that decision is made. */
+  onDirtyChange?: (dirty: boolean) => void
+  /** The route observed a `files` frame for this exact path while the buffer
+   *  was dirty. Nothing was refetched — this renders the honest banner and
+   *  lets the user choose. */
+  changedOnDisk?: boolean
 }
 
 /** Type-aware file viewer / editor. Render with a `key={path}` so editor
@@ -56,10 +66,13 @@ export function FileViewer({
   name,
   onBack,
   onRequestDelete,
+  onDirtyChange,
+  changedOnDisk,
 }: FileViewerProps) {
-  const { data, isLoading, isError, error } = useFileContent(path)
+  const { data, isLoading, isError, error, refetch } = useFileContent(path)
   const save = useSaveFile()
   const reduce = useReducedMotion()
+  const editorRef = React.useRef<CodeEditorHandle>(null)
 
   const isText = !!data && 'content' in data
   const truncated = isText && (data as { truncated?: boolean }).truncated === true
@@ -73,6 +86,28 @@ export function FileViewer({
   const value = draft ?? content
   const dirty = isText && draft !== null && draft !== content
 
+  // The `modified` the SERVER handed us with this content — the whole input to
+  // the lost-update guard. Absent (an older payload) means we send no
+  // `if_modified` and get the historical blind write, which is strictly what
+  // happened before rather than a new failure mode.
+  const modified = isText
+    ? (data as { modified?: number }).modified
+    : undefined
+
+  // Lift the dirty flag so the route can honour it in the SSE handler.
+  React.useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
+  React.useEffect(() => () => onDirtyChange?.(false), [onDirtyChange])
+
+  // A 409 from `PUT` is not a generic error: it means someone else (very
+  // likely a bot) wrote this file after we read it. Distinguished here so the
+  // banner can offer the only two honest choices — take theirs, or keep yours.
+  const conflict =
+    save.error instanceof FsError && save.error.status === 409
+      ? save.error.message
+      : null
+
   // Markdown surface mode. Opens in `preview` for `.md`/`.markdown`/
   // `.mdx`; the user flips to `source` (CodeMirror) to edit. The Preview
   // surface has no edit affordance, so the only way to dirty the buffer is
@@ -80,13 +115,25 @@ export function FileViewer({
   // path upstream, so opening a different file resets this to `preview`.
   const md = isText && isMarkdown(name)
   const [mdMode, setMdMode] = React.useState<'preview' | 'source'>('preview')
+  // Find targets the CodeMirror surface; in rendered-markdown mode the browser's
+  // own find is what's on screen, so the button would lie.
+  const renderMarkdownPreview = md && mdMode === 'preview'
 
-  const onSave = () => {
+  const onSave = (force = false) => {
     if (!dirty) return
     save.mutate(
-      { path, content: value },
+      // `force` drops the guard deliberately — the user read the conflict
+      // banner and chose to keep their version. Everything else sends it.
+      { path, content: value, ifModified: force ? undefined : modified },
       { onSuccess: () => setDraft(null) },
     )
+  }
+
+  /** Take the version on disk, discarding the local draft. */
+  const reloadFromDisk = () => {
+    setDraft(null)
+    save.reset()
+    void refetch()
   }
 
   return (
@@ -190,7 +237,7 @@ export function FileViewer({
             )}
             <Button
               size="sm"
-              onClick={onSave}
+              onClick={() => onSave()}
               disabled={!dirty || save.isPending}
               className="h-11 gap-1.5 px-3"
             >
@@ -198,6 +245,21 @@ export function FileViewer({
               Save
             </Button>
           </>
+        )}
+
+        {/* FIND — the whole point of this button is the PHONE. `Mod-f` already
+            opens CodeMirror's search panel on a desktop keyboard; a phone has
+            no `Mod-f`, and even on desktop nothing on screen said the panel
+            existed. This is the affordance, not the feature. */}
+        {isText && !renderMarkdownPreview && (
+          <button
+            type="button"
+            aria-label="Find in file"
+            onClick={() => editorRef.current?.openSearch()}
+            className="flex size-11 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <Search className="size-4" />
+          </button>
         )}
 
         <DropdownMenu>
@@ -228,6 +290,40 @@ export function FileViewer({
         </DropdownMenu>
       </header>
 
+      {/* CONFLICT / CHANGED-ON-DISK — the honest half of the lost-update guard.
+          `conflict` is a 409 the server just returned; `changedOnDisk` is a
+          `files` frame the route observed for this exact path while the buffer
+          was dirty (nothing was refetched — that is the point). Both offer the
+          only two truthful choices: take what is on disk, or keep yours and
+          overwrite deliberately. There is no third option where both survive. */}
+      {(conflict || (changedOnDisk && dirty)) && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border bg-warning/10 px-4 py-2 text-xs text-warning">
+          <TriangleAlert className="size-4 shrink-0" />
+          <span className="min-w-0 flex-1">
+            {conflict
+              ? `Not saved — ${conflict}. Someone (probably a bot) wrote this file after you opened it.`
+              : 'This file changed on disk while you were editing it.'}
+          </span>
+          <button
+            type="button"
+            onClick={reloadFromDisk}
+            className="h-8 shrink-0 rounded-md border border-warning/40 px-2 font-medium transition-colors hover:bg-warning/20"
+          >
+            Reload
+          </button>
+          {dirty && (
+            <button
+              type="button"
+              onClick={() => onSave(true)}
+              disabled={save.isPending}
+              className="h-8 shrink-0 rounded-md border border-warning/40 px-2 font-medium transition-colors hover:bg-warning/20"
+            >
+              Keep mine
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Body. */}
       <div className="relative min-h-0 flex-1">
         {isLoading ? (
@@ -252,7 +348,8 @@ export function FileViewer({
               truncated={truncated}
               value={value}
               onChange={setDraft}
-              renderMarkdown={md && mdMode === 'preview'}
+              renderMarkdown={renderMarkdownPreview}
+              editorRef={editorRef}
             />
           </motion.div>
         ) : null}
@@ -270,6 +367,7 @@ function FileBody({
   value,
   onChange,
   renderMarkdown,
+  editorRef,
 }: {
   data: FileMeta
   name: string
@@ -279,12 +377,20 @@ function FileBody({
   value: string
   onChange: (v: string) => void
   renderMarkdown: boolean
+  editorRef: React.RefObject<CodeEditorHandle | null>
 }) {
   if ('is_image' in data) {
+    // `/api/file/raw`, NOT the envelope's base64 `data_url`. Strictly better
+    // than raising the 5 MB `IMAGE_MAX`: it removes that ceiling entirely,
+    // drops the 33% base64 bloat, and makes previews browser-cacheable (the
+    // endpoint already serves Range + ETag + `private, max-age=3600,
+    // immutable`). `rawUrl` carries the `?_token=` fallback because an <img>
+    // cannot set an Authorization header. `get_file`'s image branch is
+    // untouched server-side — other callers may still rely on the envelope.
     return (
       <Centered className="bg-muted/30 p-6">
         <img
-          src={data.data_url}
+          src={filesApi.rawUrl(path)}
           alt={name}
           className="max-h-full max-w-full rounded-lg object-contain shadow-sm"
         />
@@ -353,7 +459,7 @@ function FileBody({
       {truncated && (
         <div className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-2 text-xs text-warning">
           <TriangleAlert className="size-4 shrink-0" />
-          Showing the first 200 KB — saving is disabled for truncated files.
+          Showing the first 1 MB — saving is disabled for truncated files.
         </div>
       )}
       <div className="min-h-0 flex-1 overflow-hidden">
@@ -368,6 +474,7 @@ function FileBody({
             <MarkdownViewer source={value} basePath={path} />
           ) : (
             <CodeEditor
+              ref={editorRef}
               name={name}
               value={value}
               editable={editable}

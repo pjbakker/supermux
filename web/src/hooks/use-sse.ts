@@ -83,6 +83,15 @@ export const SSE_NAMED_EVENTS = [
   // ledger, so they survive a reload. `use-harness-events.ts` subscribes.
   'harness',
   'external-edit',
+  // A file-namespace mutation — payload
+  // `{ op, path, dir, from, session }`, COMPANY-STAMPED by the path's owner
+  // (files v1 spec §3.2), so a member only ever receives frames their jail
+  // already permits. `use-files.ts::useFilesLive` subscribes: it invalidates
+  // the open directory's listing and feeds the Spaces landing's activity line.
+  // This is the app's FIRST company-routed producer — it is emitted through
+  // `SseEvent::for_company`, not the `SseEvent { event: "…" }` struct literal,
+  // which is why `sse-events.test.ts` scrapes both forms.
+  'files',
   // A 10s keep-alive — it only resets the staleness clock.
   'ping',
 ] as const

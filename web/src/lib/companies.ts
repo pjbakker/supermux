@@ -147,3 +147,36 @@ export function companyFirstOrder<T extends { company_id?: number | null }>(
   }
   return [...inSpace, ...others]
 }
+
+/** The company that OWNS an absolute path — longest `/`-delimited `root_dir`
+ *  prefix, `null` when the path is under no company root (HQ).
+ *
+ *  This is the CLIENT MIRROR of the server's one stamping rule (files v1 spec
+ *  §3.2, `server/src/files/mod.rs::company_for_path`): a `files` SSE frame is
+ *  stamped by the company that owns the path, never by the emitting session's
+ *  company, because an owner-run HQ bot can write into any company's folder.
+ *  Here it routes an incoming frame to its landing card.
+ *
+ *  Boundary discipline is `confineToCompanyRoot`'s: the compare is
+ *  `/`-delimited, so `…/acme-corp` is never read as inside `…/acme`. LONGEST
+ *  match wins, so a company nested under another company's root resolves to the
+ *  inner one — the same tie-break the server makes, and the only one that can't
+ *  hand a member the wrong space. Pure + unit-tested. */
+export function companyForPath(
+  path: string,
+  companies: readonly Company[],
+): Company | null {
+  const p = stripTrailingSlash(path)
+  let best: Company | null = null
+  let bestLen = -1
+  for (const c of companies) {
+    const root = stripTrailingSlash(c.root_dir)
+    if (!root) continue
+    if (p !== root && !p.startsWith(root + '/')) continue
+    if (root.length > bestLen) {
+      best = c
+      bestLen = root.length
+    }
+  }
+  return best
+}

@@ -855,4 +855,194 @@ async fn the_workflow_activity_feed_is_scope_filtered() {
         .map(|r| r["workflow_id"].as_str().unwrap())
         .collect();
     assert!(ids.contains(&wf_a.as_str()) && ids.contains(&wf_b.as_str()), "{ids:?}");
+// ─────────── the new /api/fs/* namespace verbs, under the member jail ──────────
+
+/// Both paths of a two-path verb ride the SAME jail. A `to` outside the
+/// member's company root is the one thing that would make this feature a
+/// vulnerability, so it is pinned per verb — and the refusal is the UNIFORM 404,
+/// byte-identical to a path that simply does not exist.
+#[tokio::test]
+async fn scoped_human_fs_verbs_cannot_escape_the_company_jail() {
+    let f = fixture().await;
+    let (alice, csrf) = login(&f.app, HOST_A, "alice-code").await;
+
+    let own = f.root_a.join("ok.txt");
+    let own_path = own.to_string_lossy().into_owned();
+
+    // The oracle question a member must never be able to answer: "does THIS path
+    // exist in company 2?" So every cross-jail refusal below is compared against
+    // a cross-jail path that genuinely does NOT exist — identical bodies mean
+    // "exists but not yours" is indistinguishable from "does not exist".
+    let (st_ghost, uniform) = post_cookie(
+        &f.app,
+        "/api/fs/mkdir",
+        &alice,
+        &csrf,
+        serde_json::json!({ "path": f.root_b.join("ghost/deeper").to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(st_ghost, StatusCode::NOT_FOUND);
+
+    // (i) mkdir OUTSIDE the jail → the same 404, and nothing is created — including
+    // onto company 2's root itself, which DOES exist (409 would be the oracle).
+    let outside_dir = f.root_b.join("planted");
+    let (st, body) = post_cookie(
+        &f.app,
+        "/api/fs/mkdir",
+        &alice,
+        &csrf,
+        serde_json::json!({ "path": outside_dir.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "mkdir outside the jail → 404");
+    assert_eq!(body, uniform, "uniform 404 — no existence oracle");
+    assert!(!outside_dir.exists(), "nothing was created in company 2");
+
+    let (st, body) = post_cookie(
+        &f.app,
+        "/api/fs/mkdir",
+        &alice,
+        &csrf,
+        serde_json::json!({ "path": f.root_b.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "an EXISTING foreign dir 404s, never 409s");
+    assert_eq!(body, uniform, "…with the identical body");
+
+    // (ii) rename FROM her own root TO company 2 → 404. The `from` resolves
+    // perfectly; only the destination is out of jail, which is exactly the
+    // two-path hole this test exists to keep closed.
+    let stolen = f.root_b.join("stolen.txt");
+    let (st, body) = post_cookie(
+        &f.app,
+        "/api/fs/rename",
+        &alice,
+        &csrf,
+        serde_json::json!({ "from": &own_path, "to": stolen.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "rename INTO another company → 404");
+    assert_eq!(body, uniform, "uniform 404");
+    assert!(!stolen.exists(), "nothing landed in company 2");
+    assert_eq!(
+        std::fs::read(&own).unwrap(),
+        b"alpha-company-a",
+        "her own file is untouched"
+    );
+
+    // (iii) …and the mirror: FROM company 2 INTO her own root → 404, no bytes.
+    let secret = f.root_b.join("secret.txt");
+    let (st, body) = post_cookie(
+        &f.app,
+        "/api/fs/copy",
+        &alice,
+        &csrf,
+        serde_json::json!({
+            "from": secret.to_string_lossy(),
+            "to": f.root_a.join("secret-copy.txt").to_string_lossy(),
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "copy OUT of another company → 404");
+    assert_eq!(body, uniform, "uniform 404 — the file's existence never leaks");
+    assert!(
+        !f.root_a.join("secret-copy.txt").exists(),
+        "company 2's bytes never reach alice's root"
+    );
+
+    // (iv) copy INTO company 2 → 404 as well.
+    let (st, _) = post_cookie(
+        &f.app,
+        "/api/fs/copy",
+        &alice,
+        &csrf,
+        serde_json::json!({
+            "from": &own_path,
+            "to": f.root_b.join("planted.txt").to_string_lossy(),
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "copy INTO another company → 404");
+    assert!(!f.root_b.join("planted.txt").exists());
+
+    // Sanity: the jail is a fence, not a wall — the same verbs work INSIDE her
+    // own company root. Without this the four 404s above could be a blanket deny.
+    let (st, _) = post_cookie(
+        &f.app,
+        "/api/fs/mkdir",
+        &alice,
+        &csrf,
+        serde_json::json!({ "path": f.root_a.join("reports").to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "alice creates a folder in her own space");
+    assert!(f.root_a.join("reports").is_dir());
+
+    let (st, _) = post_cookie(
+        &f.app,
+        "/api/fs/copy",
+        &alice,
+        &csrf,
+        serde_json::json!({
+            "from": &own_path,
+            "to": f.root_a.join("reports/ok.txt").to_string_lossy(),
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "alice copies inside her own space");
+    assert_eq!(std::fs::read(f.root_a.join("reports/ok.txt")).unwrap(), b"alpha-company-a");
+}
+
+/// A scoped human is refused every REMOTE transport (the local jail cannot fence
+/// a remote FS), and may not NAME a foreign-company session — both collapse to
+/// the same uniform 404. The new verbs inherit this by construction because they
+/// call `transport_for_session` first; pinned so a future verb cannot skip it.
+#[tokio::test]
+async fn scoped_human_fs_verbs_on_remote_or_foreign_sessions_are_404() {
+    let f = fixture().await;
+    let (alice, csrf) = login(&f.app, HOST_A, "alice-code").await;
+    let own_path = f.root_a.join("ok.txt").to_string_lossy().into_owned();
+
+    for session in ["sess-a-remote", "sess-b-remote", "sess-b"] {
+        let (st, _) = post_cookie(
+            &f.app,
+            "/api/fs/mkdir",
+            &alice,
+            &csrf,
+            serde_json::json!({
+                "path": f.root_a.join("via-session").to_string_lossy(),
+                "session": session,
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "mkdir via `{session}` → 404");
+
+        let (st, _) = post_cookie(
+            &f.app,
+            "/api/fs/rename",
+            &alice,
+            &csrf,
+            serde_json::json!({
+                "from": &own_path,
+                "to": f.root_a.join("moved.txt").to_string_lossy(),
+                "session": session,
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "rename via `{session}` → 404");
+    }
+    assert!(
+        !f.root_a.join("via-session").exists() && !f.root_a.join("moved.txt").exists(),
+        "no session-routed verb mutated anything"
+    );
+
+    // The owner, by contrast, still drives the local verbs unchanged.
+    let (st, _) = post_bearer(
+        &f.app,
+        "/api/fs/mkdir",
+        serde_json::json!({ "path": f.root_b.join("owner-made").to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "the owner reaches any local path");
+    assert!(f.root_b.join("owner-made").is_dir());
 }

@@ -79,6 +79,11 @@ describe('the SSE channel list', () => {
     for (const core of ['sessions', 'status', 'harness', 'alerts', 'workflows']) {
       expect(EMITTED).toContain(core)
     }
+    // `files` is the constructor-form channel the scrape was widened for. It
+    // is pinned by NAME so the channel can never half-land the way `harness`
+    // did: if the server stops emitting it, or the emit moves to a form the
+    // scrape misses, this fails here rather than silently in production.
+    expect(EMITTED).toContain('files')
   })
 
   test('EVERY channel the server emits is subscribed by the client', () => {

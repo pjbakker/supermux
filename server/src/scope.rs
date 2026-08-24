@@ -461,6 +461,14 @@ mod tests {
         assert!(member_may_reach(&post, "/api/connectors/mail/grant"));
         assert!(member_may_reach(&get, "/api/file/raw"));
         assert!(member_may_reach(&get, "/api/fs/delete"));
+        // The three namespace verbs became member-reachable the instant they
+        // were registered (the whole `/api/fs` prefix is admitted). That is the
+        // intended design — `company_jail` confines BOTH paths of every verb —
+        // but it is pinned here rather than assumed, and paired with the live
+        // cross-jail 404 matrix in `tests/scope_p3b.rs`.
+        assert!(member_may_reach(&post, "/api/fs/mkdir"));
+        assert!(member_may_reach(&post, "/api/fs/rename"));
+        assert!(member_may_reach(&post, "/api/fs/copy"));
         assert!(member_may_reach(&get, "/api/ls"));
         assert!(member_may_reach(&get, "/api/autocomplete/dir"));
         assert!(member_may_reach(&get, "/api/uploads/x.png"));
