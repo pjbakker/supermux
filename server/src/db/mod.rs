@@ -28,6 +28,7 @@ pub mod skills;
 pub mod steering;
 pub mod teams_dismissed;
 pub mod tracked_files;
+pub mod workflows;
 
 /// Open the pool and run migrations.
 ///
