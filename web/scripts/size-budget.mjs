@@ -1086,7 +1086,32 @@ const BUDGET_ENTRY_JS = 161 * KB
 // `connector-task` helper: the ENTRY/hero gate is UNCHANGED at 154.25 / 161 KB (the
 // feature's hero-path cost is ZERO). A genuine additive store surface, not a
 // regression to trim; ceil(measured)=345, the same rule every fase since B3 used.
-const BUDGET_APP_JS = 345 * KB
+// 347 by the chat image lightbox: measured 346.14 against 344.57 for the branch
+// parent — +1.57 KB, and it is one feature, so there is nothing to apportion.
+// Clicking an inline image in a transcript now opens it full-viewport
+// (`components/chat/ui/image-lightbox.tsx`): scrim, `object-contain` fit, a 44px
+// close target, Esc / letterbox / ✕ / swipe-down dismissal, fit ↔ actual-size
+// zoom over a native scroller, and the dialog role + focus trap none of it had.
+// The frame is `object-cover` at 340px, so before this a screenshot in a
+// transcript was a 340px illustration of a screenshot with no way to read it.
+// The last 0.22 KB of the 1.57 is the review's three fixes, and each one is a
+// defect rather than a flourish: the swipe is started from our own pointerdown
+// so a MOUSE drag across the caption cannot dismiss the lightbox mid-selection
+// (framer's listener cannot see `pointerType`), `touch-action` is then written
+// by hand at both ends of the zoom, and BOTH `<img>`s handle `onError` — a
+// capture that 404s used to render the browser's broken glyph at full-viewport
+// size under a header that promised an "honest placeholder".
+//
+// WHERE THE BYTES LAND, stated plainly rather than buried: +1.32 KB of the 1.35
+// is on the ENTRY chunk, because `chat/ui` is reached eagerly — this is a
+// hero-path spend, not a lazy one. It was weighed against `React.lazy`, and
+// lazy was rejected on measurement: the total gate counts lazy chunks too, so
+// deferring moves the byte from one column to the other and fails this gate
+// anyway, while costing a Suspense boundary and (because the chat surface's
+// `<AnimatePresence initial={false}>` rule suppresses the initial animation of
+// any child present at first render) the enter animation on the first open.
+// The entry gate stays green with room: 155.77 / 161 KB (97%), up from 96%.
+const BUDGET_APP_JS = 347 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

@@ -14,12 +14,30 @@
  * this design is flat warm neutral, so the ONE object with depth is the thing
  * the session is showing you. It renders whenever there is no `src` — a
  * placeholder that is honest about being one, rather than a grey box.
+ *
+ * THE FRAME IS A CROP (`object-cover`, 16:10), which is the right thing in the
+ * column and the wrong thing the moment somebody wants to READ what is in it. So
+ * a real capture is a button: it opens `<ImageLightbox>`, the full-viewport look
+ * at the same `rawUrl` the frame is already showing. The caption row keeps
+ * whatever `onOpen` its consumer gave it — a deep link is a different intent
+ * from "show me this bigger" — and falls back to opening the lightbox when there
+ * is none, so the filename is never a dead label under a live picture.
+ *
+ * A `src` THAT WILL NOT LOAD FALLS BACK TO THE PLACEHOLDER. The paragraph above
+ * about being honest rather than drawing a grey box was only true while `src`
+ * was ABSENT: a path that 404s (deleted, still being written, refused by the
+ * server) rendered the browser's broken-image glyph inside the warm frame, and
+ * left a button on it that opened a full-viewport version of the same glyph.
+ * `onError` retires the capture back to the placeholder — and with it the button
+ * and the caption's lightbox fallback, because there is nothing behind them.
  */
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 
 import { cn } from '../../../lib/utils'
+import { tweens } from '../../../lib/springs'
 
 import { FileIcon } from './icons'
+import { ImageLightbox } from './image-lightbox'
 import { CAPTURED_FRAME } from './metrics'
 
 /** Fractal-noise overlay, inline so the frame needs no network asset. */
@@ -49,6 +67,11 @@ export function CapturedFrameCard({
   onOpen,
   className,
 }: CapturedFrameCardProps) {
+  const [lit, setLit] = useState(false)
+  const [broken, setBroken] = useState(false)
+  const openLightbox = () => setLit(true)
+  /** A capture, only while it is actually one. */
+  const capture = broken ? undefined : src
   return (
     <div style={{ width }} className={cn('max-w-full', className)}>
       <div className="relative mt-[9px] overflow-hidden rounded-[14px] shadow-[0_12px_30px_-18px_rgba(40,20,10,0.55),0_0_0_0.5px_rgba(28,20,10,0.10)]">
@@ -89,16 +112,43 @@ export function CapturedFrameCard({
             style={{ backgroundImage: GRAIN }}
           />
           {children}
-          {src && (
-            <img
-              src={src}
-              alt={alt ?? caption}
-              className="absolute inset-0 size-full object-cover"
-            />
+          {capture && (
+            <button
+              type="button"
+              onClick={openLightbox}
+              aria-label={`Open ${caption} full screen`}
+              data-testid="captured-frame-open"
+              className="group absolute inset-0 cursor-zoom-in overflow-hidden outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white/80"
+            >
+              <img
+                src={capture}
+                alt={alt ?? caption}
+                // A path that will not load retires to the warm placeholder —
+                // see the header. Unmounting the <img> is what stops the retry
+                // loop a `setState` on a still-mounted broken image invites.
+                onError={() => setBroken(true)}
+                // The lift is the whole affordance — a frame that does nothing
+                // under the cursor reads as a picture, not as a door. `.12s`,
+                // read off the bank rather than re-typed as a literal; the
+                // reduced-motion blanket in globals.css beats the inline
+                // duration with `!important`, so this is off under Reduce Motion.
+                style={{ transitionDuration: `${tweens.hover.duration}s` }}
+                className="size-full object-cover transition-transform ease-out group-hover:scale-[1.03] group-active:scale-[0.99]"
+              />
+            </button>
           )}
         </div>
       </div>
-      <CaptionRow caption={caption} onOpen={onOpen} />
+      <CaptionRow caption={caption} onOpen={onOpen ?? (capture ? openLightbox : undefined)} />
+      {/* Mounted CLOSED rather than on first open, and the difference is
+          visible: the chat surface's rule is that every `<AnimatePresence>`
+          sets `initial={false}` (a seeded backlog must never animate), and
+          `initial={false}` skips the enter animation for children present at
+          the presence's FIRST render. A lazily-mounted overlay is therefore
+          born open — and pops. Closed, it renders no DOM at all. */}
+      {capture && (
+        <ImageLightbox open={lit} onOpenChange={setLit} src={capture} caption={caption} alt={alt} />
+      )}
     </div>
   )
 }
