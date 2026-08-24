@@ -224,10 +224,16 @@ export function StepCard({
             <span
               className={cn(
                 'block truncate text-[14px]',
-                step.text.trim() ? 'text-foreground' : 'text-muted-foreground',
+                expanded
+                  ? 'text-[12.5px] font-medium text-muted-foreground'
+                  : step.text.trim()
+                    ? 'text-foreground'
+                    : 'text-muted-foreground',
               )}
             >
-              {stepPreview(step)}
+              {/* Expanded, the prompt is right there in the textarea — repeating
+                  it in the header is a line that says nothing twice. */}
+              {expanded ? step.title || `Step ${index + 1}` : stepPreview(step)}
             </span>
             {!expanded && (step.files.length > 0 || step.connectors.length > 0) && (
               <span className="mt-1 flex flex-wrap items-center gap-1.5">

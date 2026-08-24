@@ -9,6 +9,8 @@
 // (`/workflows/new?template=standup`), and because a seed with a prompt in it
 // is content, not layout.
 
+import { Inbox, Mail, Sunrise, type LucideIcon } from 'lucide-react'
+
 import type { CompletionAction } from '@/lib/api/workflows'
 
 export interface WorkflowTemplate {
@@ -17,7 +19,10 @@ export interface WorkflowTemplate {
   title: string
   /** One line saying what it does — written for someone who has never made one. */
   blurb: string
-  emoji: string
+  /** A monochrome `currentColor` glyph, never an emoji: the app surfaces keep
+   *  the emoji taxonomy to the terminal and the tiles, and a raw pictograph
+   *  absent from the bundled font ships as a tofu box (wave-9's `⏱` bug). */
+  icon: LucideIcon
   schedule_expr: string
   steps: Array<{ title: string; prompt: string; connectors?: string[] }>
   on_complete: CompletionAction
@@ -30,7 +35,7 @@ export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
     key: 'standup',
     title: 'Daily standup digest',
     blurb: 'Every weekday morning, gather what moved and write it up.',
-    emoji: '🌅',
+    icon: Sunrise,
     schedule_expr: 'every weekday at 9:00',
     steps: [
       {
@@ -50,8 +55,8 @@ export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
     key: 'weekly-report',
     title: 'Weekly report, emailed',
     blurb: 'Monday morning: pull the week, draft the report, send it on.',
-    emoji: '📬',
-    schedule_expr: 'weekly on mon at 9:00',
+    icon: Mail,
+    schedule_expr: 'every monday at 9:00',
     steps: [
       { title: 'Pull the numbers', prompt: 'Pull last week’s numbers and note anything unusual.' },
       {
@@ -74,7 +79,7 @@ export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
     key: 'inbox-triage',
     title: 'Inbox triage',
     blurb: 'Twice a day, sort what came in and surface only what needs you.',
-    emoji: '📥',
+    icon: Inbox,
     schedule_expr: 'daily at 8:00',
     steps: [
       {

@@ -436,17 +436,21 @@ export function ComposerBody({
 
       {/* the pinned footer — the validity line lives here, always */}
       <div className="pb-safe sticky bottom-0 z-10 border-t border-border bg-background/95 px-3 py-2.5 backdrop-blur sm:px-5">
-        <div className="mx-auto flex w-full max-w-[720px] items-center gap-2">
+        {/* Stacked on a phone: three items in one row at 390px means the
+            validity line gets four words, which is not enough for a sentence
+            that has to NAME the problem. */}
+        <div className="mx-auto flex w-full max-w-[720px] flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-2">
           <p
             role="status"
             aria-live="polite"
             className={cn(
-              'min-w-0 flex-1 truncate text-[12.5px]',
+              'min-w-0 flex-1 text-[12.5px] leading-snug sm:truncate',
               problem ? 'text-amber-600 dark:text-amber-500' : 'text-muted-foreground',
             )}
           >
             {problem ?? readyLine(draft)}
           </p>
+          <div className="flex items-center justify-end gap-2">
           <button
             type="button"
             onClick={() => void save(true)}
@@ -464,6 +468,7 @@ export function ComposerBody({
             {saving && <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />}
             Save
           </button>
+          </div>
         </div>
       </div>
 

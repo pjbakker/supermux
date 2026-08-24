@@ -142,7 +142,10 @@ export function TriggerPicker({
               aria-checked={on}
               onClick={() => pickMode(m.kind)}
               className={cn(
-                'relative flex h-9 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-full px-2 text-[13px] font-medium transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                // At 320px three labelled chips do not fit WITH glyphs, and a
+                // truncated "Repeati" is worse than no icon at all — so the
+                // icon is what gives way, never the word.
+                'relative flex h-9 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-full px-2 text-[13px] font-medium transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-[360px]:gap-1 max-[360px]:px-1 max-[360px]:text-[12.5px]',
                 on ? 'text-background' : 'text-muted-foreground hover:text-foreground',
               )}
             >
@@ -154,7 +157,7 @@ export function TriggerPicker({
                 />
               )}
               <span className="relative z-10 flex items-center gap-1.5 truncate">
-                <m.icon className="size-3.5 shrink-0" aria-hidden="true" />
+                <m.icon className="size-3.5 shrink-0 max-[360px]:hidden" aria-hidden="true" />
                 {m.label}
               </span>
             </button>

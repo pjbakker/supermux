@@ -116,6 +116,12 @@ const DevComposerAttach = import.meta.env.DEV
 const DevPickers = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-pickers'))
   : null
+// The workflows bench (T5.10): list · composer · run timeline · connector
+// picker, in both themes, at phone and desktop widths, with no server behind
+// any of it. See the file header for the query flags.
+const DevWorkflows = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-workflows'))
+  : null
 // The toggle-thrash bench (fase A5 T6): the REAL RendererShell + LiveTerminal,
 // toggled 100× against a firehosing `shell` pty by
 // `tests/e2e/smoke/chat-toggle-thrash.spec.ts`. Not a product surface.
@@ -539,6 +545,16 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <DevPickers />
+                    </Suspense>
+                  }
+                />
+              )}
+              {DevWorkflows && (
+                <Route
+                  path="/dev/workflows"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevWorkflows />
                     </Suspense>
                   }
                 />

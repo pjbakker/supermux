@@ -316,7 +316,11 @@ function WorkflowCard({
           <p className="mt-1 truncate text-[12.5px] text-muted-foreground">
             <span className="text-foreground/80">{hint.human}</span>
             {' · '}
-            {running ? 'running now' : `next ${hint.next}`}
+            {running
+              ? 'running now'
+              : w.trigger_kind === 'manual'
+                ? hint.next
+                : `next ${hint.next}`}
             {' · '}
             {`ran ${hint.last}`}
           </p>
@@ -410,9 +414,7 @@ function EmptyState({ scope, onPick }: { scope: string | null; onPick: (key: str
               onClick={() => onPick(t.key)}
               className="flex w-full items-start gap-3 rounded-xl border border-border bg-card px-3 py-3 text-left transition-transform duration-100 active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:px-4"
             >
-              <span aria-hidden="true" className="text-[20px] leading-none">
-                {t.emoji}
-              </span>
+              <t.icon className="mt-0.5 size-5 shrink-0 text-muted-foreground" aria-hidden="true" />
               <span className="min-w-0 flex-1">
                 <span className="block text-[14px] font-medium text-foreground">{t.title}</span>
                 <span className="mt-0.5 block text-[12.5px] leading-snug text-muted-foreground">

@@ -266,3 +266,22 @@ describe('the live rail', () => {
     expect(html).toContain('data-status="running"')
   })
 })
+
+describe('no raw pictographs on an app surface', () => {
+  /**
+   * Wave-9's `⏱` shipped as a tofu box because the glyph was absent from the
+   * bundled font. The rule that came out of it — the emoji taxonomy stays in
+   * the terminal and the tiles, app surfaces use `currentColor` icons — is
+   * asserted here rather than remembered.
+   */
+  test('the starter templates carry lucide icons, not emoji', () => {
+    const src = readFileSync(
+      new URL('../../src/components/workflows/templates.ts', import.meta.url).pathname,
+      'utf8',
+    )
+    // No astral-plane characters anywhere in the seed data.
+    expect(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(src)).toBe(false)
+    // A lucide icon is a forwardRef object, not a plain function component.
+    for (const t of WORKFLOW_TEMPLATES) expect(t.icon).toBeDefined()
+  })
+})

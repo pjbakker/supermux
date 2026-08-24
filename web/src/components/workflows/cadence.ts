@@ -35,8 +35,11 @@ export function formatRunTime(iso: string | null | undefined): string {
   if (abs < min) {
     rel = diff >= 0 ? 'in <1m' : 'just now'
   } else if (abs < hour) {
+    // Rounding can land on 60 a second before the hour — "in 60m" is a number
+    // no clock says, so it is promoted rather than printed.
     const m = Math.round(abs / min)
-    rel = diff >= 0 ? `in ${m}m` : `${m}m ago`
+    if (m >= 60) rel = diff >= 0 ? 'in 1h' : '1h ago'
+    else rel = diff >= 0 ? `in ${m}m` : `${m}m ago`
   } else if (abs < day) {
     const h = Math.round(abs / hour)
     rel = diff >= 0 ? `in ${h}h` : `${h}h ago`
@@ -577,7 +580,7 @@ export const QUICK_CADENCES: QuickCadence[] = [
   { key: 'weekday-morning', label: 'Every weekday, 9:00', expr: 'every weekday at 9:00' },
   { key: 'daily-morning', label: 'Every morning, 9:00', expr: 'daily at 9:00' },
   { key: 'daily-evening', label: 'Every evening, 18:00', expr: 'daily at 18:00' },
-  { key: 'weekly-monday', label: 'Mondays, 9:00', expr: 'weekly on mon at 9:00' },
+  { key: 'weekly-monday', label: 'Mondays, 9:00', expr: 'every monday at 9:00' },
   { key: 'hourly', label: 'Every hour', expr: 'every 1h' },
 ]
 
