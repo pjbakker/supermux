@@ -55,6 +55,13 @@ const EMITTED: string[] = (() => {
   for (const file of rustFiles(SERVER_SRC)) {
     const src = readFileSync(file, 'utf8')
     for (const m of src.matchAll(/event:\s*"([a-z-]+)"/g)) found.add(m[1]!)
+    // …and the two CONSTRUCTORS, which name the event positionally rather than
+    // through the `event:` field. `workflows` is emitted only this way, so a
+    // scrape that read the struct literal alone would have called the newest
+    // channel an orphan — the exact rot this file exists to prevent.
+    for (const m of src.matchAll(/SseEvent::(?:for_company|global)\(\s*"([a-z-]+)"/g)) {
+      found.add(m[1]!)
+    }
     if (file.endsWith('/sse.rs')) {
       for (const m of src.matchAll(/Event::default\(\)\.event\("([a-z-]+)"\)/g)) {
         found.add(m[1]!)
@@ -69,7 +76,7 @@ describe('the SSE channel list', () => {
     // A sanity floor: if the scrape stops finding anything, the assertions
     // below would pass vacuously.
     expect(EMITTED.length).toBeGreaterThan(5)
-    for (const core of ['sessions', 'status', 'harness', 'alerts']) {
+    for (const core of ['sessions', 'status', 'harness', 'alerts', 'workflows']) {
       expect(EMITTED).toContain(core)
     }
   })

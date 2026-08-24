@@ -513,6 +513,7 @@ pub async fn start(state: &AppState, wf: Workflow, trigger: Trigger) -> Result<i
     }
 
     let run_id = db::workflows::open_run(&state.pool, &wf.id, trigger.as_str()).await?;
+    super::emit_workflow_run(state, &wf, "run-started", run_id, Some((0, steps.len())));
     let st = state.clone();
     tokio::spawn(async move {
         advance(&st, &wf, &steps, run_id, 0, trigger).await;
@@ -679,6 +680,9 @@ async fn advance(
                 )
                 .await;
                 let _ = db::workflows::bump_heartbeat(&state.pool, run_id, (k + 1) as i64).await;
+                // The step delta, company-stamped: a list can repaint one row's
+                // "step 2 of 4" instead of refetching the whole surface.
+                super::emit_workflow_run(state, wf, "step", run_id, Some((k, n)));
                 fire_step_complete(state, wf, run_id, step).await;
             }
             StepSignal::Timeout => {
@@ -788,14 +792,24 @@ async fn finish(
         "alerts",
         json!({
             "level": if status == "ok" || status == "skipped" { "info" } else { "error" },
+            // Spec §5.5 spells this `"workflow"`; the value shipped in Phase 2
+            // (and asserted by `workflows_reaper` / `workflows_port`) is
+            // `"workflows"`, matching the SSE event name and the module. Kept as
+            // the one name rather than carrying two spellings of the same thing.
             "source": "workflows",
             "workflow": wf.id,
             "run_id": run_id,
+            // Which step it stopped on — so an alert says WHERE, not just that
+            // something happened.
+            "step": k + 1,
+            "steps": n,
             "status": status,
             "detail": format!("Workflow '{}' — {status}", wf.title),
         }),
         wf.company_id,
     ));
+    // …and the list/step channel, so the surface repaints without a refetch.
+    super::emit_workflow_run(state, wf, "run-finished", run_id, Some((k, n)));
 
     // Phone push on FAILURE only — successes would be too noisy for a workflow
     // firing all day. `send_push_for` honours the `schedule_error` category

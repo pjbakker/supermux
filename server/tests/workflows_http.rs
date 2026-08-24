@@ -1091,3 +1091,101 @@ async fn every_write_verb_is_410_gone_with_the_reload_sentence() {
 
     h.cleanup();
 }
+
+// ── SSE (T3.7) ───────────────────────────────────────────────────────────────
+
+/// Every scheduler frame was `company_id: None`, i.e. owner-only — so a company
+/// member never saw their own bot's job fire. `Scope::sees` is fail-closed on
+/// `None`, which means an UNSTAMPED frame is not "visible to everyone", it is
+/// "visible to the owner alone": forgetting the stamp is silent.
+#[tokio::test]
+async fn every_workflow_frame_is_company_stamped() {
+    let h = spawn_harness().await;
+    sqlx::query(
+        "INSERT INTO companies (id, slug, display_name, root_dir, created_at, updated_at)
+         VALUES (3, 'acme', 'Acme', '/tmp/acme', 0, 0)",
+    )
+    .execute(&h.state.pool)
+    .await
+    .unwrap();
+    make_session(&h, "acme-bot", Some(3)).await;
+
+    let mut sse = h.state.sse_tx.subscribe();
+
+    // Create (a `workflows` frame), run (more of them), finish (an `alerts`
+    // frame too) — the whole lifecycle in one pass.
+    let (status, created) = send(
+        &h.app,
+        Method::POST,
+        "/api/workflows",
+        Some(json!({
+            "title": "acme nightly", "session": "acme-bot",
+            "steps": [{ "prompt": "one" }, { "prompt": "two" }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["data"]["id"].as_str().unwrap().to_string();
+
+    let (_, body) = send(&h.app, Method::POST, &format!("/api/workflows/{id}/run"), None).await;
+    let run_id = body["data"]["run_id"].as_i64().unwrap();
+    until("step 1 delivered", || async { delivered(&h.state, "acme-bot", "one").await }).await;
+    idle_edge(&h.state, "acme-bot");
+    until("step 2 delivered", || async { delivered(&h.state, "acme-bot", "two").await }).await;
+    idle_edge(&h.state, "acme-bot");
+    until("the run finishes", || async {
+        db::workflows::get_run(&h.state.pool, run_id)
+            .await
+            .unwrap()
+            .map(|r| r.finished_at.is_some())
+            .unwrap_or(false)
+    })
+    .await;
+    // PATCH and DELETE stamp too.
+    send(
+        &h.app,
+        Method::PATCH,
+        &format!("/api/workflows/{id}"),
+        Some(json!({ "title": "renamed" })),
+    )
+    .await;
+    send(&h.app, Method::DELETE, &format!("/api/workflows/{id}"), None).await;
+
+    let mut workflows_frames = 0;
+    let mut alerts_frames = 0;
+    let mut saw_step = false;
+    while let Ok(frame) = sse.try_recv() {
+        let is_workflow_alert = frame.event == "alerts"
+            && frame.payload.get("source").and_then(|s| s.as_str()) == Some("workflows");
+        if frame.event != "workflows" && !is_workflow_alert {
+            continue;
+        }
+        assert_eq!(
+            frame.company_id,
+            Some(3),
+            "an unstamped frame is owner-only, i.e. invisible to the bot's own \
+             people: {:?} {:?}",
+            frame.event,
+            frame.payload,
+        );
+        if frame.event == "workflows" {
+            workflows_frames += 1;
+            assert_eq!(frame.payload["workflow"], id);
+            if frame.payload["change"] == "step" {
+                saw_step = true;
+                assert_eq!(frame.payload["run_id"], run_id);
+                assert!(frame.payload["step"].is_number(), "{:?}", frame.payload);
+            }
+        } else {
+            alerts_frames += 1;
+            // The alert says WHERE it stopped, not only that something happened.
+            assert!(frame.payload["step"].is_number(), "{:?}", frame.payload);
+            assert_eq!(frame.payload["run_id"], run_id);
+        }
+    }
+    assert!(workflows_frames >= 4, "created/run/step/finished/patch/delete: {workflows_frames}");
+    assert!(saw_step, "a step delta must be published as the chain advances");
+    assert_eq!(alerts_frames, 1, "one terminal alert for the run");
+
+    h.cleanup();
+}

@@ -67,6 +67,10 @@ export const SSE_NAMED_EVENTS = [
   // created / renamed / deleted / registered for a team.
   'boards',
   'schedules',
+  // Workflows v1 — list/step deltas (`{change, workflow, session, title, run_id?,
+  // step?, steps?}`). COMPANY-STAMPED server-side, so a bot's own people see it
+  // and not only the owner. An INVALIDATION TICK: `use-workflows.ts` refetches.
+  'workflows',
   'alerts',
   'status',
   'prefs',

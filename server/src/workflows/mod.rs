@@ -1021,16 +1021,36 @@ async fn all_runs_handler(
 /// Every scheduler frame was `company_id: None`, i.e. owner-only, so a company
 /// member never saw their own bot's job change. `SseEvent::for_company` with the
 /// row's own derived `company_id` is the whole fix; `Scope::sees` does the rest
-/// per subscriber.
+/// per subscriber — and it is fail-closed on `None`, so an UNSTAMPED frame would
+/// silently become owner-only again. That is why every emit site in this module
+/// and in [`engine`] goes through these two functions rather than building an
+/// `SseEvent` by hand.
 pub fn emit_workflows(state: &AppState, wf: &Workflow, change: &str) {
-    let _ = state.sse_tx.send(SseEvent::for_company(
-        "workflows",
-        json!({
-            "change": change,
-            "workflow": wf.id,
-            "session": wf.session,
-            "title": wf.title,
-        }),
-        wf.company_id,
-    ));
+    emit_frame(state, wf, json!({ "change": change }));
+}
+
+/// The step/run delta frame — the same `workflows` event, carrying which run and
+/// which step moved so a list can repaint one row instead of refetching.
+pub fn emit_workflow_run(
+    state: &AppState,
+    wf: &Workflow,
+    change: &str,
+    run_id: i64,
+    step: Option<(usize, usize)>,
+) {
+    let mut detail = json!({ "change": change, "run_id": run_id });
+    if let Some((k, n)) = step {
+        detail["step"] = json!(k + 1);
+        detail["steps"] = json!(n);
+    }
+    emit_frame(state, wf, detail);
+}
+
+fn emit_frame(state: &AppState, wf: &Workflow, mut detail: serde_json::Value) {
+    if let Some(obj) = detail.as_object_mut() {
+        obj.insert("workflow".into(), json!(wf.id));
+        obj.insert("session".into(), json!(wf.session));
+        obj.insert("title".into(), json!(wf.title));
+    }
+    let _ = state.sse_tx.send(SseEvent::for_company("workflows", detail, wf.company_id));
 }
