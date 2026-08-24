@@ -43,11 +43,17 @@ const lsKey = (path: string, hidden: boolean) =>
   ['files', 'ls', path, hidden] as const
 const fileKey = (path: string) => ['files', 'file', path] as const
 
-/** List a directory. Returns the resolved absolute `path` + `parent` + entries. */
-export function useDirListing(path: string, hidden: boolean) {
+/** List a directory. Returns the resolved absolute `path` + `parent` + entries.
+ *
+ *  `enabled` exists for the two surfaces that hold a path they are not looking
+ *  at: the Spaces landing (no directory at all) and a CLOSED destination sheet.
+ *  Without it both would fire an `/api/ls` — and the landing's would be for the
+ *  empty string. */
+export function useDirListing(path: string, hidden: boolean, enabled = true) {
   return useQuery<FsListing>({
     queryKey: lsKey(path, hidden),
     queryFn: () => filesApi.ls(path, hidden),
+    enabled: enabled && !!path,
     // Listings change off-app (other agents write files); a short stale window
     // keeps re-navigation snappy without polling.
     staleTime: 5_000,
@@ -291,19 +297,14 @@ export function useFilesLive(
 
   // The context is read through a ref so a keystroke in the editor (which flips
   // `dirty`) does not rebuild the handlers and re-register the subscription.
+  // Written in an EFFECT, never during render: a ref mutated while rendering is
+  // a torn read under concurrent React.
   const ctxRef = React.useRef(ctx)
-  ctxRef.current = ctx
   const companiesRef = React.useRef(companies)
-  companiesRef.current = companies
-
-  // A saved (clean) buffer, or a different file, clears any standing banner.
-  // Deps are the two facts that can retire it; the frame handler below sets it
-  // without either changing, so this effect cannot immediately undo it.
   React.useEffect(() => {
-    setStaleOpen((cur) =>
-      cur && (cur !== ctx.openPath || !ctx.dirty) ? null : cur,
-    )
-  }, [ctx.dirty, ctx.openPath])
+    ctxRef.current = ctx
+    companiesRef.current = companies
+  })
 
   const handlers = React.useMemo(
     () => ({
@@ -342,5 +343,8 @@ export function useFilesLive(
   )
   useSse(handlers)
 
-  return staleOpen
+  // DERIVED, not cleaned up by an effect: a banner is only meaningful while the
+  // same file is still open AND still dirty. Saving it (or opening another
+  // file) retires the banner without a second state write.
+  return staleOpen && staleOpen === ctx.openPath && ctx.dirty ? staleOpen : null
 }

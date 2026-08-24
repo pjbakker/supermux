@@ -57,8 +57,12 @@ export function activityKey(companyId: number | null): string {
 
 /** "now" / "2m" / "3h" / "5d" — the compact relative stamp the card's live line
  *  uses. Under a minute reads `now`, because the line exists to say "a bot just
- *  touched this space" and "12s" is noise at that size. Pure + unit-tested. */
-export function relativeStamp(at: number, now: number): string {
+ *  touched this space" and "12s" is noise at that size.
+ *
+ *  `now` DEFAULTS HERE, in a plain module function, rather than at the call site
+ *  in a component: reading the clock during render is impure (and the lint rule
+ *  that says so is right). Tests pass it explicitly. */
+export function relativeStamp(at: number, now: number = Date.now()): string {
   const secs = Math.max(0, Math.floor((now - at) / 1000))
   if (secs < 60) return 'now'
   const mins = Math.floor(secs / 60)
