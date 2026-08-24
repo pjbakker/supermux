@@ -69,7 +69,9 @@ import * as React from 'react'
 import {
   ChevronLeft,
   ChevronRight,
+  ClipboardPaste,
   Keyboard,
+  KeyRound,
   Loader2,
   Minimize2,
   Power,
@@ -90,11 +92,13 @@ import {
   TakeoverSocket,
   driveDpr,
   modifiersFor,
+  signInOps,
   subjectName,
   type TakeoverOptions,
   type TakeoverSnapshot,
   type TakeoverSubject,
 } from '@/lib/browser/takeover-socket'
+import { SignInSheet, type SignInCreds } from '@/components/browser/sign-in-sheet'
 import {
   ClickCounter,
   TAP_MS,
@@ -372,6 +376,7 @@ export function TakeoverPanel({
   const boxRef = React.useRef<HTMLDivElement | null>(null)
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null)
   const socketRef = React.useRef<TakeoverSocket | null>(null)
+  const [signInOpen, setSignInOpen] = React.useState(false)
 
   /** The frame currently ON the canvas — the mapping basis for every gesture.
    *  A ref, not state: sixty re-renders a second to paint a canvas React does
@@ -1068,6 +1073,34 @@ export function TakeoverPanel({
     socketRef.current?.text(text)
   }
 
+  // Relay a password-manager fill into the page — the ordered text/Tab/text the
+  // sign-in sheet produced (`signInOps`), each op onto its socket verb. Gated on
+  // `driving`: typing into a page you are only watching is the exact thing the
+  // wheel exists to prevent.
+  const relaySignIn = (creds: SignInCreds) => {
+    const sock = socketRef.current
+    if (!sock || !driving) return
+    for (const op of signInOps(creds)) {
+      if (op.kind === 'text') sock.text(op.text)
+      else sock.pressKey(op.key)
+    }
+  }
+
+  // One tap: the clipboard the human already holds, typed into the focused page
+  // field. `readText()` can reject (permission, an insecure origin, a browser
+  // that still wants its own gesture) — when it does, the trap input's
+  // long-press paste and the sign-in sheet are the fallbacks, so this fails
+  // quietly rather than raising a toast for a non-error.
+  const pasteFromClipboard = async () => {
+    if (!driving) return
+    try {
+      const text = await navigator.clipboard.readText()
+      if (text) socketRef.current?.text(text)
+    } catch {
+      /* clipboard blocked — trap-input paste + the sheet still work */
+    }
+  }
+
   // ── what the box is doing, and the one thing to do about it ────────────────
   const view = viewportState({
     hasTab: true,
@@ -1324,6 +1357,42 @@ export function TakeoverPanel({
           className="absolute left-0 top-0 size-px border-0 bg-transparent p-0 text-transparent caret-transparent opacity-0 outline-none"
         />
 
+        {/* THE FILL CLUSTER. A canvas cannot be autofilled — the human's own
+            password manager and their clipboard cannot see fields that live in
+            a picture — so paste and sign-in reach the page from HERE. Shown
+            only while driving (typing into a watched page is what the wheel
+            prevents) and only when a page is visible (a `screen` cover means
+            there is nothing to fill yet). Bottom-RIGHT so it clears the centred
+            zoom-reset; `stopPropagation` on pointer-down so a tap on the pill
+            never also lands as a click on the page beneath it. */}
+        {driving && view.cover !== 'screen' && (
+          <div
+            style={{ bottom: 'max(12px, env(safe-area-inset-bottom))' }}
+            className="absolute right-3 z-20 flex items-center gap-2"
+          >
+            <button
+              type="button"
+              data-takeover-paste=""
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => void pasteFromClipboard()}
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-full border border-hairline bg-surface/95 px-4 text-[12.5px] font-medium text-ink shadow-lg backdrop-blur transition-colors hover:bg-fill-soft motion-reduce:transition-none"
+            >
+              <ClipboardPaste className="size-3.5" aria-hidden />
+              Paste
+            </button>
+            <button
+              type="button"
+              data-takeover-signin=""
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => setSignInOpen(true)}
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-full border border-hairline bg-surface/95 px-4 text-[12.5px] font-medium text-ink shadow-lg backdrop-blur transition-colors hover:bg-fill-soft motion-reduce:transition-none"
+            >
+              <KeyRound className="size-3.5" aria-hidden />
+              Sign in
+            </button>
+          </div>
+        )}
+
         {view.cover === 'screen' && (
           <ViewportScreen view={view} onAct={act} canWake={!!onWake} canReload={!!onReload} />
         )}
@@ -1342,6 +1411,10 @@ export function TakeoverPanel({
         {keyboardUp && <KeyboardDoneBar onDone={() => trapRef.current?.blur()} />}
         <StatusVeil refused={snap.refused} />
       </div>
+
+      {/* The password-manager bridge. Portals to body, so it lives at the panel
+          root rather than inside the clipped, `touch-none` canvas box. */}
+      <SignInSheet open={signInOpen} onOpenChange={setSignInOpen} onFill={relaySignIn} />
     </div>
   )
 }

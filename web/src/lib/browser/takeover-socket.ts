@@ -218,6 +218,39 @@ export function keyText(e: {
 }
 
 /**
+ * The ordered relay a password-manager sign-in becomes — pure, so the sequence
+ * is a unit test rather than a socket dance the panel maps `text()`/`pressKey()`
+ * onto.
+ *
+ * Type the username, Tab to the next field, type the password, and — only if
+ * asked — press Enter. A blank field is SKIPPED, which is what makes the two
+ * "fill just this field" buttons fall out of the same function: a lone username
+ * types into whatever the human focused and presses no Tab, a lone password the
+ * same. The Tab is emitted ONLY between two filled fields, or a single-field
+ * fill would tab straight back out of the box it just typed into. Enter is
+ * opt-in because a submit into the wrong field is worse than one the human
+ * presses themselves once they can see the values landed.
+ */
+export type FillOp =
+  | { kind: 'text'; text: string }
+  | { kind: 'key'; key: 'Tab' | 'Enter' }
+
+export function signInOps(creds: {
+  username?: string
+  password?: string
+  submit?: boolean
+}): FillOp[] {
+  const user = creds.username ?? ''
+  const pass = creds.password ?? ''
+  const ops: FillOp[] = []
+  if (user) ops.push({ kind: 'text', text: user })
+  if (user && pass) ops.push({ kind: 'key', key: 'Tab' })
+  if (pass) ops.push({ kind: 'text', text: pass })
+  if (creds.submit && (user || pass)) ops.push({ kind: 'key', key: 'Enter' })
+  return ops
+}
+
+/**
  * **The viewer's box** — the one fact only the client can know, and the whole
  * of legibility.
  *
@@ -413,6 +446,19 @@ export class TakeoverSocket {
   text(text: string): void {
     if (!text) return
     this.send({ type: 'text', text })
+  }
+
+  /**
+   * Press-and-release a named navigation key. Tab moves between form fields,
+   * Enter submits — the two the sign-in fill needs and the address bar's own
+   * keystrokes do not cover. Down AND up: a field commits its value on keyDown,
+   * but focus handlers and a form's submit-on-Enter expect the matching keyUp,
+   * so a lone down leaves some pages half-notified.
+   */
+  pressKey(key: 'Tab' | 'Enter'): void {
+    const keyCode = key === 'Tab' ? 9 : 13
+    this.key('down', { key, code: key, keyCode })
+    this.key('up', { key, code: key, keyCode })
   }
 
   touch(kind: 'start' | 'move' | 'end' | 'cancel', point?: { x: number; y: number }): void {
