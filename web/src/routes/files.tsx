@@ -150,7 +150,13 @@ export function Files() {
 
   // A one-card chooser is condescending — see `spacesSkipTarget` for exactly
   // what this client can observe and what it deliberately does not claim.
-  const skipTarget = spacesSkipTarget(companies, projectEntries.length)
+  //
+  // Held at null WHILE THE PROJECTS QUERY IS IN FLIGHT: an in-flight query looks
+  // exactly like an empty one, so deciding on it would route a two-space owner
+  // into a company for a frame and then bounce them back to the grid.
+  const skipTarget = projects.isLoading
+    ? null
+    : spacesSkipTarget(companies, projectEntries.length)
 
   // ── which surface? ──────────────────────────────────────────────────────
   // `?path=` → a directory. `?view=hq` → HQ's projects list. `?view=spaces` →
@@ -234,15 +240,15 @@ export function Files() {
 
   const setSelected = React.useCallback(
     (next: string | null) => {
-      setSearchParams(
-        (prev) => {
-          const p = new URLSearchParams(prev)
-          if (next) p.set('select', next)
-          else p.delete('select')
-          return p
-        },
-        { replace: true },
-      )
+      // PUSHED, not replaced: the whole point of putting the viewer in the URL
+      // is that browser Back closes it. A replace would make Back leave Files
+      // entirely, which is what it did before there was a param at all.
+      setSearchParams((prev) => {
+        const p = new URLSearchParams(prev)
+        if (next) p.set('select', next)
+        else p.delete('select')
+        return p
+      })
     },
     [setSearchParams],
   )
