@@ -855,6 +855,8 @@ async fn the_workflow_activity_feed_is_scope_filtered() {
         .map(|r| r["workflow_id"].as_str().unwrap())
         .collect();
     assert!(ids.contains(&wf_a.as_str()) && ids.contains(&wf_b.as_str()), "{ids:?}");
+}
+
 // ─────────── the new /api/fs/* namespace verbs, under the member jail ──────────
 
 /// Both paths of a two-path verb ride the SAME jail. A `to` outside the
