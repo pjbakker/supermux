@@ -293,6 +293,9 @@ export interface ChatConversationProps {
    *  `headerTrailing` (the renderer toggle) so the phone header groups the status
    *  bits and gives the toggle its own place (mobile polish #1). */
   headerStatus?: React.ReactNode
+  /** Open this bot's details from the header NAME (mobile parity with the
+   *  terminal chrome's `<FocusHeader onTitleClick>`). Omitted → inert name. */
+  onTitleClick?: () => void
   /** The chat data plane has GIVEN UP (`ChatPresentation === 'offline'`, A6):
    *  greys the header presence dot so it stops reading as a live green "ready"
    *  next to the "Offline" chip. Composer gating is the panel's job (it owns the
@@ -377,6 +380,7 @@ export function ChatConversation({
   headerLeading,
   headerTrailing,
   headerStatus,
+  onTitleClick,
   offline = false,
   stat,
   scrollRef,
@@ -509,6 +513,10 @@ export function ChatConversation({
           leading={headerLeading}
           trailing={headerTrailing}
           connection={headerStatus}
+          // The name opens the bot's details when the shell gives us a door
+          // (mobile chat); on the desktop seam it is omitted and the name stays
+          // the span it has always been.
+          onTitleClick={onTitleClick}
           offline={offline}
           workflow={workflow}
           // The live turn signal, straight from the chat plane: a running turn

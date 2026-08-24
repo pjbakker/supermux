@@ -738,46 +738,218 @@ export function CopyableMono({
 }
 
 /**
+ * Where a preset lands in an instruction that ALREADY has text: at the caret the
+ * user last left, otherwise at the end — and always as its own paragraph, so a
+ * preset can never glue itself into the middle of a sentence. An empty field is
+ * the one case where the preset simply becomes the text.
+ *
+ * Pure, and exported, because "a preset never destroys what is there" is the
+ * contract `tests/unit/bot-panel-settings.test.ts` pins.
+ */
+export function insertPreset(
+  prev: string,
+  text: string,
+  caret: number | null,
+): { next: string; caret: number } {
+  const body = prev ?? ''
+  if (!body.trim()) return { next: text, caret: text.length }
+  const at = caret === null || caret < 0 || caret > body.length ? body.length : caret
+  const head = body.slice(0, at).replace(/\s+$/, '')
+  const tail = body.slice(at).replace(/^\s+/, '')
+  const upto = head ? `${head}\n\n${text}` : text
+  return { next: tail ? `${upto}\n\n${tail}` : upto, caret: upto.length }
+}
+
+/** What a preset row can do to the field it sits above. Deliberately narrow:
+ *  the pills may ADD text and put a previous draft BACK, and nothing else — the
+ *  editor keeps owning when the value is persisted. */
+export interface DescEditorHandle {
+  /** Insert `text` without destroying what is there, and keep the caret in the
+   *  field. Returns the draft from BEFORE the insert (the caller's Undo) and the
+   *  one it produced (the caller's guard — see `restore`). */
+  insert: (text: string) => { prev: string; next: string }
+  /** Put a previous draft back (the Undo path) and WRITE IT THROUGH. `expect`
+   *  guards it: an Undo offered for one insert must never wipe what the user
+   *  typed AFTER it, so a field that has moved on refuses (returns `false`)
+   *  instead of reverting — callers must branch on the boolean rather than
+   *  assume the revert happened. */
+  restore: (value: string, expect?: string) => boolean
+}
+
+/**
+ * The handle's behaviour, as a pure factory over the field's current state.
+ *
+ * Extracted from the component on purpose: `bun test` has no DOM, so the two
+ * rules that actually matter — an insert never destroys, and an undo is REFUSED
+ * once the field has moved on (and PERSISTED when it hasn't) — would otherwise
+ * be unreachable by anything but an e2e run. See
+ * `tests/unit/bot-panel-settings.test.ts`.
+ */
+export function makeDescHandle(field: {
+  /** The draft as it stands right now. */
+  draft: string
+  /** Where an insert should land — read at CALL time (the caret moves). */
+  caret: () => number | null
+  setDraft: (value: string) => void
+  setCaret: (pos: number) => void
+  /** Write a value through to the row — the same path blur-commit uses. */
+  persist: (value: string) => void
+  /** Put the caret back in the field at `pos`. */
+  refocus: (pos: number) => void
+}): DescEditorHandle {
+  return {
+    insert(text: string) {
+      const prev = field.draft
+      const { next, caret } = insertPreset(prev, text, field.caret())
+      field.setDraft(next)
+      field.setCaret(caret)
+      // NOT persisted here. The field keeps focus, so an insert is an ordinary
+      // edit and the existing blur-commit owns when it lands — which is what
+      // makes it undoable without a round trip.
+      field.refocus(caret)
+      return { prev, next }
+    },
+    restore(value: string, expect?: string) {
+      if (expect !== undefined && expect !== field.draft) return false
+      field.setDraft(value)
+      field.setCaret(value.length)
+      // An undo IS persisted, immediately: the preset it reverts may already
+      // have been blur-committed, and a revert living only in React state would
+      // leave the server holding the preset if the app closed first.
+      field.persist(value)
+      return true
+    },
+  }
+}
+
+/**
  * The session's standing instructions (`desc`).
  *
  * A textarea that commits on blur, not on every keystroke: the config PATCH
  * invalidates the sessions query, and doing that per character would refetch the
  * whole roster while the user types.
+ *
+ * The role-preset pills above it (`<InstructionsTab>`) drive it through
+ * `DescEditorHandle` rather than writing `desc` behind its back: a pill that
+ * PATCHes while this field holds an unsaved draft is exactly how a click used to
+ * wipe an authored instruction. An insert is an EDIT — same draft, same
+ * blur-commit — so undo, re-edit and cancel all keep working.
  */
-export function DescEditor({ name, desc }: { name: string; desc: string }) {
-  const { setDesc, pending } = useSessionConfig()
-  const [draft, setDraft] = React.useState(desc)
-  // Re-seed when the row lands / changes underneath us, but never while the
-  // field is focused — that would eat what the user is typing.
-  const focused = React.useRef(false)
-  React.useEffect(() => {
-    if (!focused.current) setDraft(desc)
-  }, [desc])
+export const DescEditor = React.forwardRef<DescEditorHandle, { name: string; desc: string }>(
+  function DescEditor({ name, desc }, ref) {
+    const { setDesc, pending } = useSessionConfig()
+    const [draft, setDraft] = React.useState(desc)
+    // Re-seed when the row lands / changes underneath us, but never while the
+    // field is focused — that would eat what the user is typing.
+    const focused = React.useRef(false)
+    React.useEffect(() => {
+      if (!focused.current) setDraft(desc)
+    }, [desc])
 
-  const commit = () => {
-    focused.current = false
-    const next = draft.trim()
-    if (next === (desc ?? '').trim()) return
-    void setDesc(name, next)
-  }
+    const box = React.useRef<HTMLTextAreaElement | null>(null)
+    // The caret the user last left behind. Read live off the element while it is
+    // focused; remembered here for the pills, which can fire long after a blur.
+    const caret = React.useRef<number | null>(null)
+    const rememberCaret = () => {
+      if (box.current) caret.current = box.current.selectionStart
+    }
 
-  return (
-    <textarea
-      value={draft}
-      onChange={(e) => setDraft(e.target.value)}
-      onFocus={() => {
-        focused.current = true
-      }}
-      onBlur={commit}
-      disabled={pending}
-      rows={3}
-      placeholder="Durable rules for this agent — always run the unit suite, never touch main…"
-      aria-label="Standing instructions"
-      data-vr="session-desc"
-      className="w-full resize-y rounded-md border border-input bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-    />
-  )
-}
+    /** The one write path — blur, unmount and an undo all go through it. */
+    const persist = (value: string) => {
+      const next = value.trim()
+      if (next === (desc ?? '').trim()) return
+      void setDesc(name, next)
+    }
+
+    const commit = () => {
+      focused.current = false
+      persist(draft)
+    }
+
+    /** Put the caret back at `pos`, focusing the field if it isn't already. rAF
+     *  so the controlled value has reached the DOM before the caret is placed. */
+    const place = (pos: number) => {
+      const apply = () => {
+        const el = box.current
+        if (!el || el.disabled) return
+        el.focus()
+        try {
+          el.setSelectionRange(pos, pos)
+        } catch {
+          /* not a caret-bearing field (jsdom) — the draft is what matters */
+        }
+      }
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(apply)
+      else apply()
+    }
+
+    // Commit on UNMOUNT as well. The sheet can close (or the tab can switch) while
+    // the field still holds focus, and a blur that never fires used to drop the
+    // edit silently — the one way a preset insert could still be lost. Refs, not
+    // deps: `setDesc`'s identity changes with `pending`, and re-running this
+    // cleanup mid-edit would commit a half-typed draft.
+    const latest = React.useRef({ name, draft, desc, setDesc })
+    React.useEffect(() => {
+      latest.current = { name, draft, desc, setDesc }
+    })
+    React.useEffect(
+      () => () => {
+        const l = latest.current
+        const next = l.draft.trim()
+        if (next === (l.desc ?? '').trim()) return
+        void l.setDesc(l.name, next)
+      },
+      [],
+    )
+
+    React.useImperativeHandle(
+      ref,
+      () =>
+        makeDescHandle({
+          draft,
+          // Read live off the element while it is focused (a pill does not blur
+          // it); the remembered caret is the fallback for a field the user left.
+          caret: () =>
+            focused.current && box.current ? box.current.selectionStart : caret.current,
+          setDraft,
+          setCaret: (pos) => {
+            caret.current = pos
+          },
+          persist,
+          refocus: place,
+        }),
+      // `persist`/`place` are re-made every render and close over exactly these.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [draft, desc, name, setDesc],
+    )
+
+    return (
+      <textarea
+        ref={box}
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value)
+          caret.current = e.target.selectionStart
+        }}
+        onFocus={() => {
+          focused.current = true
+        }}
+        onSelect={rememberCaret}
+        onKeyUp={rememberCaret}
+        onBlur={(e) => {
+          caret.current = e.currentTarget.selectionStart
+          commit()
+        }}
+        disabled={pending}
+        rows={3}
+        placeholder="Durable rules for this agent — always run the unit suite, never touch main…"
+        aria-label="Standing instructions"
+        data-vr="session-desc"
+        className="w-full resize-y rounded-md border border-input bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      />
+    )
+  },
+)
 
 /**
  * Tag chips + an add field. Comma or Enter commits; the ✕ on a chip removes it.

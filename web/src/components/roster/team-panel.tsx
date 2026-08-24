@@ -19,7 +19,7 @@
  *   • variant="sheet" — the phone's bottom sheet (Phase 6a mounts it).
  *
  * Tabs: Overview (facepile · crew · task ledger · lead cost/context/dir) ·
- * Instructions (the LEAD's) · Tools (the lead's grants, crew-scoped) ·
+ * Instructions (the LEAD's) · Connectors (the lead's grants, crew-scoped) ·
  * Activity (the team board — Phase 4).
  *
  * Data: `useTeams()` (SSE-live, via the `team` prop the roster passes down) +
@@ -141,7 +141,9 @@ type TabKey = 'overview' | 'instructions' | 'tools' | 'activity'
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: 'Overview' },
   { key: 'instructions', label: 'Instructions' },
-  { key: 'tools', label: 'Tools' },
+  // The key stays `'tools'` (router state + bench selectors); the WORD follows
+  // the bot panel's — see `bot-panel.tsx`'s `TABS`.
+  { key: 'tools', label: 'Connectors' },
   { key: 'activity', label: 'Activity' },
 ]
 
@@ -862,7 +864,7 @@ function TeamPanelBody({
               <ToolsTab name={lead} session={leadSession} />
             </div>
           ) : (
-            <NoLead what="tools" />
+            <NoLead what="connectors" />
           ))}
         {tab === 'activity' && <ActivityTab team={team} />}
 

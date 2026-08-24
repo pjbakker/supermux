@@ -90,6 +90,7 @@ export default function ChatPanel({
   surface,
   headerLeading,
   headerTrailing,
+  onTitleClick,
   actions,
   layout,
 }: {
@@ -125,6 +126,14 @@ export default function ChatPanel({
    */
   headerLeading?: React.ReactNode
   headerTrailing?: React.ReactNode
+  /**
+   * Open this bot's details from the header NAME — the mobile route's own
+   * `<BotPanel variant="sheet">`, the same panel its terminal chrome opens from
+   * `<FocusHeader onTitleClick>`. Under chat the header card IS the route's
+   * header, so without this the sheet has no door. Omitted by the desktop seam
+   * and the benches, where the name stays inert.
+   */
+  onTitleClick?: () => void
   /**
    * The route-owned actions behind the composer's leading `+` (mobile chat only).
    * The phone's old global dock — session switcher, command palette, snippets —
@@ -955,6 +964,7 @@ export default function ChatPanel({
       // The workflow tell — null (and therefore invisible) unless a run of this
       // bot's own is in flight right now.
       workflow={headerWorkflow}
+      onTitleClick={onTitleClick}
       pinFor={pinFor}
       // The header's honesty half: an `offline` plane greys the presence dot so
       // it stops reading as a live green "ready" beside the "Offline" chip. Only

@@ -124,7 +124,7 @@ const benchStep = (workflowId: string, position: number, title: string) => ({
 const BOT_PANEL_TABS: { tab: BotPanelTabKey; label: string }[] = [
   { tab: 'overview', label: 'Overview' },
   { tab: 'instructions', label: 'Instructions' },
-  { tab: 'tools', label: 'Tools' },
+  { tab: 'tools', label: 'Connectors' },
   { tab: 'memory', label: 'Memory' },
   { tab: 'workflows', label: 'Workflows' },
 ]
