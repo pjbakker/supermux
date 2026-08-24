@@ -132,11 +132,15 @@ pub async fn list(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<AuditEntry>
 /// in `audit_log` is operator forensics, not conversation: keeping the list
 /// explicit here means a new destructive action can never start narrating
 /// itself into someone's chat by accident.
-pub const SURFACED_ACTIONS: [&str; 4] = [
+pub const SURFACED_ACTIONS: [&str; 6] = [
     DELEGATE_ACTION,
     "session.rename",
     "schedule.create",
     "schedule.run",
+    // Workflows v1. Same shape as the schedule pair — the target is a WORKFLOW
+    // id, so the row reaches its feed through the `detail.session` arm below.
+    "workflow.create",
+    "workflow.run",
 ];
 
 /// The one surfaced action whose `detail.from` is a session SLUG.

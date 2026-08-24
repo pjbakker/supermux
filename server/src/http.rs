@@ -175,6 +175,11 @@ fn protected_router(state: AppState) -> Router {
         // Scheduler CRUD — P3d owner/admin-only (the agent→scheduler HOOK router,
         // merged outside the bearer layer in `router`, is unaffected).
         .merge(scheduler::router_for(state.clone()).route_layer(from_fn(require_admin_mw)))
+        // Workflows CRUD — deliberately NOT `require_admin`-gated: a company
+        // member must be able to see and drive their own bot's workflows, so the
+        // fence is the per-handler `Scope::sees` 404 plus the `member_may_reach`
+        // allowlist entry (spec §5.1) rather than a blanket owner-only layer.
+        .merge(crate::workflows::router_for(state.clone()))
         .merge(sse::router_for(state.clone())) // GET /api/events SSE stream
         .merge(teams::router_for(state.clone())) // GET /api/teams + settings
         .merge(agents::router_for(state.clone()))
