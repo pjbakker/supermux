@@ -245,6 +245,11 @@ pub fn router_for(state: AppState) -> Router {
         // Static segments are registered alongside the `{id}` capture; axum's
         // router prioritizes static segments, so the order is unambiguous —
         // exactly the shape `scheduler::router_for` had.
+        .route("/api/workflows/preview", post(preview_handler))
+        // The REAL installed agent commands for the step / command picker
+        // (skills + user/managed commands + claude.ai MCP connectors — never
+        // built-ins).
+        .route("/api/workflows/commands", get(commands_handler))
         .route("/api/workflows/runs", get(all_runs_handler))
         .route(
             "/api/workflows/{id}",
@@ -868,6 +873,52 @@ async fn delete_handler(
     let _ = db::audit::log(&state.pool, "user", "workflow.delete", &id, json!({})).await;
     emit_workflows(&state, &wf, "deleted");
     Ok(Json(json!({ "ok": true, "data": { "deleted": true } })))
+}
+
+// ── preview + commands — verbatim ports ───────────────────────────────────────
+
+/// `POST /api/workflows/preview`. Parse `expression` WITHOUT persisting and
+/// return the next up-to-5 fire times as RFC3339 strings, so the composer can
+/// preview a cadence as the user types.
+///
+/// Moved from `scheduler::preview_handler` unchanged — the next-5-runs preview
+/// is one of the few genuinely good bits of today's create dialog, so it is
+/// moved, not redesigned.
+async fn preview_handler(
+    State(_state): State<AppState>,
+    Json(input): Json<PreviewInput>,
+) -> Result<Json<Envelope<serde_json::Value>>, AppError> {
+    let runs = preview_runs(&input.expression, 5).map_err(AppError::BadRequest)?;
+    let iso: Vec<String> = runs.iter().map(|d| d.to_rfc3339()).collect();
+    Ok(ok(json!({ "next_runs": iso })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewInput {
+    expression: String,
+}
+
+/// `GET /api/workflows/commands?cwd=<dir>` — the REAL installed agent commands
+/// the step / command picker offers: the user's skills + user/managed commands +
+/// claude.ai MCP connectors. Built-in Claude slash commands are deliberately
+/// excluded (a workflow step wants a skill/MCP, not `/clear`). Backed by the
+/// same filesystem read the Claude-tools registry uses — one source of truth.
+///
+/// Moved from `scheduler::commands_handler` unchanged.
+async fn commands_handler(
+    State(state): State<AppState>,
+    Query(q): Query<CommandsQuery>,
+) -> Result<Json<Envelope<Vec<crate::claude_tools::registry::InstalledCommand>>>, AppError> {
+    let cwd = q.cwd.as_deref().filter(|s| !s.is_empty());
+    Ok(ok(crate::claude_tools::registry::installed_commands(&state, cwd).await?))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CommandsQuery {
+    /// Optional focused session dir; when present, project-scoped skills and
+    /// commands are included alongside the global ones.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 // ── run now, cancel, and the run ledger ───────────────────────────────────────

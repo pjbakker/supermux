@@ -893,3 +893,88 @@ async fn the_activity_feed_is_company_stamped() {
 
     h.cleanup();
 }
+
+// ── preview + commands — the ports (T3.3) ────────────────────────────────────
+
+/// Parse an expression WITHOUT persisting and get the next 5 runs.
+#[tokio::test]
+async fn preview_returns_next_runs_without_persisting() {
+    let h = spawn_harness().await;
+
+    let (status, body) = send(
+        &h.app,
+        Method::POST,
+        "/api/workflows/preview",
+        Some(json!({ "expression": "every 5m" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = body["data"]["next_runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 5, "recurring expression previews 5 runs");
+    let parsed: Vec<chrono::DateTime<chrono::Utc>> = runs
+        .iter()
+        .map(|v| v.as_str().unwrap().parse().unwrap())
+        .collect();
+    for w in parsed.windows(2) {
+        assert!(w[1] > w[0], "preview runs must strictly ascend");
+    }
+
+    let (status, body) = send(
+        &h.app,
+        Method::POST,
+        "/api/workflows/preview",
+        Some(json!({ "expression": "in 30m" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["next_runs"].as_array().unwrap().len(), 1);
+
+    let (status, _) = send(
+        &h.app,
+        Method::POST,
+        "/api/workflows/preview",
+        Some(json!({ "expression": "whenever" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    assert!(db::workflows::list(&h.state.pool).await.unwrap().is_empty());
+    h.cleanup();
+}
+
+/// `/api/workflows/commands` returns the REAL installed agent commands and NEVER
+/// the built-in Claude slash commands like `/clear` / `/init`.
+#[tokio::test]
+async fn commands_endpoint_excludes_builtins_and_requires_auth() {
+    let h = spawn_harness().await;
+
+    let unauth = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/workflows/commands")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let (status, body) = send(&h.app, Method::GET, "/api/workflows/commands", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["data"].as_array().expect("data is an array");
+    for it in items {
+        let cmd = it["cmd"].as_str().unwrap_or("");
+        let source = it["source"].as_str().unwrap_or("");
+        assert!(
+            matches!(source, "skill" | "command" | "mcp"),
+            "every entry carries a real source, got {source:?}"
+        );
+        for builtin in ["/clear", "/init", "/compact", "/mcp", "/help"] {
+            assert_ne!(cmd, builtin, "built-in {builtin} must be excluded");
+        }
+    }
+    h.cleanup();
+}
