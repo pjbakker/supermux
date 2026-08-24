@@ -5,7 +5,6 @@ import {
   Globe,
   LayoutGrid,
   Plug,
-  Search,
   Settings as SettingsIcon,
   Terminal,
   Workflow,
@@ -32,7 +31,6 @@ import { useTheme } from '@/components/theme-provider'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ReconnectBanner } from '@/components/status-banner/reconnect-banner'
 import { CommandPalette } from '@/components/command-palette/command-palette'
-import { triggerCommandPalette } from '@/components/command-palette/trigger'
 import { ArchivedSheet } from '@/components/archived/archived-sheet'
 import { useArchivedSheet } from '@/stores/archived-sheet-store'
 import { useStandaloneMode } from '@/hooks/use-standalone-mode'
@@ -260,8 +258,9 @@ function BottomNav({ grok }: { grok: boolean }) {
   // Always drop `desktopOnly` (base Focus). Under grok, keep the `grokOnly`
   // doorway (Connectors) and drop `grokHidden`; under base, drop the `grokOnly`
   // doorways so the default tab bar is byte-identical (Overview / Files /
-  // Settings + the Search control). The `data-tab-count` (route cells + the
-  // Search button) + `--nav-n` let grok-mode.css place the sliding pill.
+  // Settings). The `data-tab-count` (the route cells) + `--nav-n` let
+  // grok-mode.css place the sliding pill. (The bottom-nav Search button was
+  // removed — Overview carries the roster search and ⌘K the command palette.)
   const items = NAV.filter(
     (item) => !item.desktopOnly && (grok ? !item.grokHidden : !item.grokOnly),
   )
@@ -305,12 +304,12 @@ function BottomNav({ grok }: { grok: boolean }) {
       // (active cell index) + `--nav-n` (cell count) drive the sliding pill in
       // grok-mode.css. All omitted off grok (`undefined` drops the attribute /
       // no style) so the base tab bar's DOM + render are byte-identical.
-      data-tab-count={grok ? items.length + 1 : undefined}
+      data-tab-count={grok ? items.length : undefined}
       style={
         grok
           ? ({
               '--nav-i': activeIndex,
-              '--nav-n': items.length + 1,
+              '--nav-n': items.length,
             } as React.CSSProperties)
           : undefined
       }
@@ -379,30 +378,6 @@ function BottomNav({ grok }: { grok: boolean }) {
           </MorphNavLink>
         )
       })}
-      {/* SEARCH — a control, not a route, and the reason it is here: ⌘K was
-          unreachable on a phone. Every trigger the palette had lived in the
-          DESKTOP dock, so enumerating every visible control at 390×844
-          returned nothing matching /palette|search|command|jump/ and the app's
-          discovery spine could only be opened by a physical keyboard. Styled
-          as a tab so the row stays one grammar; it carries no `aria-current`
-          because it goes nowhere — the pill never parks on it. */}
-      <button
-        type="button"
-        aria-label="Search"
-        data-vr="bottom-nav-search"
-        onClick={triggerCommandPalette}
-        className="relative flex min-h-14 flex-1 flex-col items-center justify-center gap-1 py-2 text-muted-foreground transition-colors active:text-foreground"
-      >
-        <span className="relative">
-          <Search className="size-5" />
-        </span>
-        <span
-          data-nav-label={grok ? '' : undefined}
-          className="text-[10px] font-medium leading-none"
-        >
-          Search
-        </span>
-      </button>
     </nav>
   )
 }
