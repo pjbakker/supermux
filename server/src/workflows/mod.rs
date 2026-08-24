@@ -8,6 +8,7 @@
 
 pub mod complete;
 pub mod engine;
+pub mod hook;
 pub mod parser;
 pub mod port;
 

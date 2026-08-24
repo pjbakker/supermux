@@ -11,7 +11,6 @@
 //! **Router-registry pattern.** [`router_for`] returns this module's
 //! sub-router; `http::router` merges it under the shared bearer-auth layer.
 
-pub mod hook;
 pub mod runner;
 pub mod watch;
 
@@ -163,13 +162,6 @@ async fn tick_once(state: &AppState) -> anyhow::Result<()> {
 }
 
 // ── HTTP router ───────────────────────────────────────────────────────────────
-
-/// The agent→scheduler hook sub-router (`/api/hook/schedule/*`). Merged at the
-/// top level of `http::router` OUTSIDE the bearer layer — auth is the per-session
-/// hook token, like the board hook router.
-pub fn hook_router_for(state: AppState) -> Router {
-    hook::router_for(state)
-}
 
 /// Build the scheduler sub-router (no auth layer — applied by `http::router`).
 pub fn router_for(state: AppState) -> Router {

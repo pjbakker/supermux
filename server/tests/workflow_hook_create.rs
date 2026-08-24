@@ -1,9 +1,10 @@
-//! Fase B4 T6 — the auth-scope matrix for `POST /api/hook/schedule/create`.
+//! The auth-scope matrix for the agent→workflows hook — ported wholesale from
+//! `schedule_hook_create.rs`, every case kept.
 //!
-//! This endpoint gives a running agent the ability to arm a recurring job on the
-//! host with no human in the loop. That is a real capability increase, so the
-//! matrix is written as NEGATIVES first: what must never work, proved, before
-//! anything about what does.
+//! These endpoints give a running agent the ability to arm a recurring job on
+//! the host with no human in the loop, and to advance a chain. That is a real
+//! capability increase, so the matrix is written as NEGATIVES first: what must
+//! never work, proved, before anything about what does.
 //!
 //! The rule being defended is the one `board/hook.rs` documents and this
 //! codebase repeats in four places: **authentication proves which session you
@@ -16,8 +17,8 @@ use std::path::PathBuf;
 
 use supermux_server::config::{Config, ProviderDefaults, TlsConfig, WsConfig};
 use supermux_server::db::sessions::NewSession;
-use supermux_server::scheduler::hook::MAX_SCHEDULES_PER_SESSION;
 use supermux_server::state::AppState;
+use supermux_server::workflows::{MAX_STEPS_VIA_HOOK, MAX_WORKFLOWS_PER_SESSION};
 use supermux_server::{db, http};
 
 use axum::body::Body;
@@ -26,8 +27,12 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-const TOKEN: &str = "sched-hook-bearer";
+const TOKEN: &str = "wf-hook-bearer";
 const HOOK_HEADER: &str = "X-Supermux-Hook-Token";
+/// The canonical route. Every case runs against it; the alias cases below prove
+/// `/api/hook/schedule/create` behaves identically.
+const CREATE: &str = "/api/hook/workflow/create";
+const LEGACY_CREATE: &str = "/api/hook/schedule/create";
 
 struct Harness {
     app: axum::Router,
@@ -45,7 +50,7 @@ impl Harness {
 }
 
 fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("supermux-schedhook-{tag}-{}", uuid::Uuid::new_v4()));
+    let d = std::env::temp_dir().join(format!("supermux-wfhook-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -75,7 +80,7 @@ async fn spawn_harness() -> Harness {
     Harness { app, state, data_dir, work_dir }
 }
 
-/// A session plus its hook token (`hook-<name>`, so a test can present it).
+/// A session plus its hook token (`hook-token-for-<name>`, so a test can present it).
 async fn make_session(h: &Harness, name: &str) -> String {
     db::sessions::create(
         &h.state.pool,
@@ -107,15 +112,11 @@ async fn make_session(h: &Harness, name: &str) -> String {
     token
 }
 
-/// POST the create hook with an arbitrary set of headers.
-async fn create_with(
-    h: &Harness,
-    headers: &[(&str, String)],
-    body: Value,
-) -> (StatusCode, Value) {
+/// POST an arbitrary hook route with an arbitrary set of headers.
+async fn post_to(h: &Harness, uri: &str, headers: &[(&str, String)], body: Value) -> (StatusCode, Value) {
     let mut req = Request::builder()
         .method(Method::POST)
-        .uri("/api/hook/schedule/create")
+        .uri(uri)
         .header(header::CONTENT_TYPE, "application/json");
     for (k, v) in headers {
         req = req.header(*k, v.clone());
@@ -131,6 +132,10 @@ async fn create_with(
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
+async fn create_with(h: &Harness, headers: &[(&str, String)], body: Value) -> (StatusCode, Value) {
+    post_to(h, CREATE, headers, body).await
+}
+
 fn valid(session: &str) -> Value {
     json!({
         "session": session,
@@ -140,13 +145,8 @@ fn valid(session: &str) -> Value {
     })
 }
 
-async fn schedules_for(h: &Harness, session: &str) -> Vec<supermux_server::db::schedules::Schedule> {
-    db::schedules::list(&h.state.pool)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|s| s.session == session)
-        .collect()
+async fn workflows_for(h: &Harness, session: &str) -> Vec<supermux_server::db::workflows::Workflow> {
+    db::workflows::list_for_session(&h.state.pool, session).await.unwrap()
 }
 
 // ── 1. the negatives ─────────────────────────────────────────────────────────
@@ -162,18 +162,18 @@ async fn a_session_may_not_schedule_for_another_session() {
 
     let (status, body) = create_with(&h, &[(HOOK_HEADER, a)], valid("b4-b")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-    assert!(schedules_for(&h, "b4-b").await.is_empty());
-    assert!(schedules_for(&h, "b4-a").await.is_empty());
+    assert!(workflows_for(&h, "b4-b").await.is_empty());
+    assert!(workflows_for(&h, "b4-a").await.is_empty());
     h.cleanup();
 }
 
 #[tokio::test]
-async fn no_token_no_schedule() {
+async fn no_token_no_workflow() {
     let h = spawn_harness().await;
     make_session(&h, "b4-a").await;
     let (status, _) = create_with(&h, &[], valid("b4-a")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(schedules_for(&h, "b4-a").await.is_empty());
+    assert!(workflows_for(&h, "b4-a").await.is_empty());
     h.cleanup();
 }
 
@@ -193,7 +193,7 @@ async fn the_dashboard_bearer_buys_nothing_on_a_hook_route() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(schedules_for(&h, "b4-a").await.is_empty());
+    assert!(workflows_for(&h, "b4-a").await.is_empty());
     h.cleanup();
 }
 
@@ -237,9 +237,11 @@ async fn a_session_that_does_not_exist_is_unauthorized_not_a_500() {
 
 #[tokio::test]
 async fn a_session_token_may_not_become_host_command_execution() {
-    // Owner gate G2. `done_action: "command:…"` is legal on the BEARER path and
+    // Owner gate G2. `done_action: "command:…"` was legal on the BEARER path and
     // refused here: it would turn a per-session token into arbitrary host
-    // command execution at a time of the agent's choosing.
+    // command execution at a time of the agent's choosing. The shape no longer
+    // exists anywhere — and the refusal STAYS, so an old payload gets a legible
+    // answer rather than a surprise.
     let h = spawn_harness().await;
     let a = make_session(&h, "b4-a").await;
     let mut body = valid("b4-a");
@@ -248,15 +250,15 @@ async fn a_session_token_may_not_become_host_command_execution() {
     let (status, resp) = create_with(&h, &[(HOOK_HEADER, a)], body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
     assert!(resp["error"].as_str().unwrap_or("").contains("done_action"));
-    assert!(schedules_for(&h, "b4-a").await.is_empty());
+    assert!(workflows_for(&h, "b4-a").await.is_empty());
     h.cleanup();
 }
 
 #[tokio::test]
 async fn the_fields_that_reach_beyond_the_pane_are_refused_by_name() {
     // Refused rather than silently dropped: serde ignores unknown fields, so an
-    // agent asking for `kind: "shell"` would otherwise get a `tmux` schedule
-    // back and no indication that its request was not honoured.
+    // agent asking for `kind: "shell"` would otherwise get something it did not
+    // ask for back and no indication that its request was not honoured.
     let h = spawn_harness().await;
     let a = make_session(&h, "b4-a").await;
     for (field, value) in [
@@ -278,16 +280,23 @@ async fn the_fields_that_reach_beyond_the_pane_are_refused_by_name() {
             "the refusal must name the field: {resp}"
         );
     }
-    assert!(schedules_for(&h, "b4-a").await.is_empty());
+    // …and `command` may not walk back in through a STEP either.
+    let mut body = valid("b4-a");
+    body["steps"] = json!([{ "prompt": "ok", "command": "/dangerous" }]);
+    let (status, resp) = create_with(&h, &[(HOOK_HEADER, a)], body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert!(resp["error"].as_str().unwrap_or("").contains("command"), "{resp}");
+
+    assert!(workflows_for(&h, "b4-a").await.is_empty());
     h.cleanup();
 }
 
 #[tokio::test]
 async fn wrapper_markup_is_refused_in_the_title_and_in_the_prompt() {
-    // A hook-created schedule's `title` becomes a `SystemEntity` in a transcript
-    // and its `prompt` is delivered inside a `<supermux-schedule>` wrapper. Both
-    // are therefore the same injection surface a delegated prompt is, and they
-    // are refused by the same rule (`agents::delegate::wrapper_markup`).
+    // A hook-created workflow's `title` becomes a `SystemEntity` in a transcript
+    // and its step prompts are delivered inside a `<supermux-schedule>` wrapper.
+    // Both are therefore the same injection surface a delegated prompt is, and
+    // they are refused by the same rule (`agents::delegate::wrapper_markup`).
     let h = spawn_harness().await;
     let a = make_session(&h, "b4-a").await;
     for (field, hostile) in [
@@ -301,7 +310,7 @@ async fn wrapper_markup_is_refused_in_the_title_and_in_the_prompt() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{field}={hostile:?} -> {resp}");
         assert!(resp["error"].as_str().unwrap_or("").contains("wrapper markup"), "{resp}");
     }
-    assert!(schedules_for(&h, "b4-a").await.is_empty());
+    assert!(workflows_for(&h, "b4-a").await.is_empty());
     h.cleanup();
 }
 
@@ -324,11 +333,44 @@ async fn the_required_fields_are_required_and_the_grammar_is_the_servers() {
     body["schedule_expr"] = json!("sometime next week when the tests are green");
     let (status, resp) = create_with(&h, &[(HOOK_HEADER, a)], body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
-    assert!(schedules_for(&h, "b4-a").await.is_empty());
+    assert!(workflows_for(&h, "b4-a").await.is_empty());
     h.cleanup();
 }
 
-// ── 3. the cap ──────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn on_complete_connector_send_and_message_bot_are_400_on_the_hook_path() {
+    // A session token must not be able to arm something that emails the world,
+    // or that types into another bot's pane — both are perfectly legal over the
+    // bearer API and a hard 400 here (`complete::parse_for_hook`).
+    let h = spawn_harness().await;
+    let a = make_session(&h, "b4-a").await;
+    for hostile in [
+        json!({
+            "kind": "connector_send", "connector_id": "gmail",
+            "account_ref": "acct-1", "to": "anyone@example.com",
+        }),
+        json!({ "kind": "message_bot", "session": "b4-a" }),
+        json!({ "kind": "command", "text": "rm -rf /" }),
+    ] {
+        let mut body = valid("b4-a");
+        body["on_complete"] = hostile.clone();
+        let (status, resp) = create_with(&h, &[(HOOK_HEADER, a.clone())], body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{hostile} -> {resp}");
+    }
+    assert!(workflows_for(&h, "b4-a").await.is_empty());
+
+    // The three an agent MAY arm.
+    for good in ["none", "notify", "disable"] {
+        let mut body = valid("b4-a");
+        body["on_complete"] = json!({ "kind": good });
+        body["title"] = json!(format!("watch {good}"));
+        let (status, resp) = create_with(&h, &[(HOOK_HEADER, a.clone())], body).await;
+        assert_eq!(status, StatusCode::CREATED, "{good} -> {resp}");
+    }
+    h.cleanup();
+}
+
+// ── 3. the caps ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn the_per_session_cap_holds_at_the_boundary_and_is_scoped_to_the_session() {
@@ -336,24 +378,51 @@ async fn the_per_session_cap_holds_at_the_boundary_and_is_scoped_to_the_session(
     let a = make_session(&h, "b4-a").await;
     let b = make_session(&h, "b4-b").await;
 
-    for i in 0..MAX_SCHEDULES_PER_SESSION {
+    for i in 0..MAX_WORKFLOWS_PER_SESSION {
         let mut body = valid("b4-a");
         body["title"] = json!(format!("watch {i}"));
         let (status, resp) = create_with(&h, &[(HOOK_HEADER, a.clone())], body).await;
         assert_eq!(status, StatusCode::CREATED, "#{i} -> {resp}");
     }
-    assert_eq!(schedules_for(&h, "b4-a").await.len(), MAX_SCHEDULES_PER_SESSION);
+    assert_eq!(workflows_for(&h, "b4-a").await.len(), MAX_WORKFLOWS_PER_SESSION);
 
     // One over: 429, with a message the agent can act on.
     let (status, resp) = create_with(&h, &[(HOOK_HEADER, a)], valid("b4-a")).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{resp}");
     assert!(resp["error"].as_str().unwrap_or("").contains("delete one"), "{resp}");
-    assert_eq!(schedules_for(&h, "b4-a").await.len(), MAX_SCHEDULES_PER_SESSION);
+    assert_eq!(workflows_for(&h, "b4-a").await.len(), MAX_WORKFLOWS_PER_SESSION);
 
     // ONE SESSION FILLING ITS QUOTA MUST NOT STOP ANOTHER. The cap is per
     // session, not a global table limit.
     let (status, resp) = create_with(&h, &[(HOOK_HEADER, b)], valid("b4-b")).await;
     assert_eq!(status, StatusCode::CREATED, "{resp}");
+    h.cleanup();
+}
+
+#[tokio::test]
+async fn a_hook_created_workflow_may_hold_at_most_five_steps() {
+    // v1 lets an agent chain its own follow-ups; the single-prompt form stays
+    // the default, and the chain form is capped well below the bearer path's 20
+    // because a session token arms less than a human at a keyboard does.
+    let h = spawn_harness().await;
+    let a = make_session(&h, "b4-a").await;
+
+    let steps = |n: usize| -> Value {
+        (0..n).map(|i| json!({ "prompt": format!("step {i}") })).collect()
+    };
+
+    let mut body = valid("b4-a");
+    body["steps"] = steps(MAX_STEPS_VIA_HOOK);
+    let (status, resp) = create_with(&h, &[(HOOK_HEADER, a.clone())], body).await;
+    assert_eq!(status, StatusCode::CREATED, "{resp}");
+    assert_eq!(resp["data"]["steps"].as_array().unwrap().len(), MAX_STEPS_VIA_HOOK);
+
+    let mut body = valid("b4-a");
+    body["title"] = json!("six");
+    body["steps"] = steps(MAX_STEPS_VIA_HOOK + 1);
+    let (status, resp) = create_with(&h, &[(HOOK_HEADER, a)], body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(workflows_for(&h, "b4-a").await.len(), 1, "the sixth-step attempt persisted nothing");
     h.cleanup();
 }
 
@@ -367,26 +436,25 @@ async fn a_session_scheduling_its_own_prompt_lands_and_narrates_itself() {
     let (status, resp) = create_with(&h, &[(HOOK_HEADER, a)], valid("b4-a")).await;
     assert_eq!(status, StatusCode::CREATED, "{resp}");
 
-    let mine = schedules_for(&h, "b4-a").await;
+    let mine = workflows_for(&h, "b4-a").await;
     assert_eq!(mine.len(), 1);
-    let s = &mine[0];
-    assert_eq!(s.session, "b4-a");
-    assert_eq!(s.kind, "tmux", "forced, whatever was asked for");
-    assert_eq!(s.done_action, "disable");
-    assert_eq!(s.command, "", "a hook-created schedule delivers a prompt, never a command");
-    assert_eq!(s.bypass_permissions, 0);
-    assert!(s.next_run.is_some(), "the cadence parsed and a first fire is armed");
+    let w = &mine[0];
+    assert_eq!(w.session, "b4-a", "forced, whatever was asked for");
+    assert_eq!(w.on_complete, r#"{"kind":"disable"}"#);
+    assert!(w.next_run.is_some(), "the cadence parsed and a first fire is armed");
+    let steps = db::workflows::steps_for(&h.state.pool, &w.id).await.unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].command, "", "a hook-created step delivers a prompt, never a command");
+    assert_eq!(steps[0].prompt, "check whether the release job is green");
 
     // The transcript line falls out of the ledger for free — this is the whole
-    // reason the handler calls `audit_schedule_create` rather than inserting
+    // reason the handler calls `audit_workflow_create` rather than inserting
     // and going quiet.
-    let feed = db::audit::events_for_session(&h.state.pool, "b4-a", 0, 50)
-        .await
-        .unwrap();
+    let feed = db::audit::events_for_session(&h.state.pool, "b4-a", 0, 50).await.unwrap();
     assert_eq!(feed.len(), 1, "{feed:?}");
-    assert_eq!(feed[0].action, "schedule.create");
+    assert_eq!(feed[0].action, "workflow.create");
     assert_eq!(feed[0].actor, "agent:b4-a", "attributed to the agent, not the owner");
-    assert_eq!(feed[0].target, s.id);
+    assert_eq!(feed[0].target, w.id);
     let detail: Value = serde_json::from_str(&feed[0].detail).unwrap();
     assert_eq!(detail["session"], json!("b4-a"));
     assert_eq!(detail["title"], json!("Nightly release watch"));
@@ -409,38 +477,175 @@ async fn notify_is_the_other_done_action_an_agent_may_choose() {
     body["done_action"] = json!("notify");
     let (status, resp) = create_with(&h, &[(HOOK_HEADER, a)], body).await;
     assert_eq!(status, StatusCode::CREATED, "{resp}");
-    assert_eq!(schedules_for(&h, "b4-a").await[0].done_action, "notify");
+    assert_eq!(workflows_for(&h, "b4-a").await[0].on_complete, r#"{"kind":"notify"}"#);
     h.cleanup();
 }
 
-// ── 5. the router's shape ───────────────────────────────────────────────────
+// ── 5. the legacy aliases ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_legacy_alias_enforces_the_identical_forced_fields() {
+    // A live pane holds a footer — and an already-read skill — naming the old
+    // routes, so they stay registered permanently. What must NOT differ is a
+    // single guarantee: the alias is the same handler, refusal sentences and all.
+    let h = spawn_harness().await;
+    let a = make_session(&h, "b4-a").await;
+    make_session(&h, "b4-b").await;
+
+    // Cross-session: 401 through the alias too.
+    let (status, _) = post_to(&h, LEGACY_CREATE, &[(HOOK_HEADER, a.clone())], valid("b4-b")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The refusal SENTENCES are byte-identical between the two routes.
+    for hostile in [
+        ("kind", json!("shell")),
+        ("command", json!("rm -rf /")),
+        ("bypass_permissions", json!(true)),
+        ("_test_fire", json!(true)),
+        ("done_action", json!("command:whatever")),
+    ] {
+        let mut body = valid("b4-a");
+        body[hostile.0] = hostile.1.clone();
+        let (canon_s, canon_b) = create_with(&h, &[(HOOK_HEADER, a.clone())], body.clone()).await;
+        let (alias_s, alias_b) = post_to(&h, LEGACY_CREATE, &[(HOOK_HEADER, a.clone())], body).await;
+        assert_eq!(canon_s, StatusCode::BAD_REQUEST, "{canon_b}");
+        assert_eq!(alias_s, canon_s, "{}: status differs", hostile.0);
+        assert_eq!(alias_b, canon_b, "{}: refusal sentence differs", hostile.0);
+    }
+
+    // And the happy path lands the same row shape.
+    let (status, resp) = post_to(&h, LEGACY_CREATE, &[(HOOK_HEADER, a)], valid("b4-a")).await;
+    assert_eq!(status, StatusCode::CREATED, "{resp}");
+    let mine = workflows_for(&h, "b4-a").await;
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].session, "b4-a");
+    h.cleanup();
+}
+
+#[tokio::test]
+async fn the_legacy_done_route_resolves_a_sched_id_as_a_workflow_id() {
+    // Ported rows keep their SCHED-… id, so no mapping table is needed — and a
+    // footer already sitting in a live pane must still work.
+    let h = spawn_harness().await;
+    let a = make_session(&h, "b4-a").await;
+    make_session(&h, "b4-b").await;
+
+    // A ported-shaped workflow: a SCHED-… id on the new tables.
+    let now = chrono::Utc::now().timestamp();
+    let wf = supermux_server::db::workflows::Workflow {
+        id: "SCHED-deadbeef".into(),
+        title: "ported".into(),
+        session: "b4-a".into(),
+        company_id: None,
+        enabled: 1,
+        trigger_kind: "manual".into(),
+        schedule_expr: None,
+        next_run: None,
+        last_run: None,
+        run_count: 0,
+        on_complete: r#"{"kind":"none"}"#.into(),
+        created: now,
+        updated: now,
+        deleted: None,
+    };
+    db::workflows::insert(&h.state.pool, &wf).await.unwrap();
+    let run_id = db::workflows::open_run(&h.state.pool, &wf.id, "tick").await.unwrap();
+
+    // Another session's token cannot confirm it: the row exists, the caller
+    // simply isn't its owner.
+    let b_token = format!("hook-token-for-{}", "b4-b");
+    let (status, _) = post_to(
+        &h,
+        "/api/hook/schedule/done",
+        &[(HOOK_HEADER, b_token)],
+        json!({ "session": "b4-b", "schedule_id": wf.id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The owner's token resolves the SCHED- id as a workflow id and finds the
+    // in-flight run.
+    let (status, resp) = post_to(
+        &h,
+        "/api/hook/schedule/done",
+        &[(HOOK_HEADER, a.clone())],
+        json!({ "session": "b4-a", "schedule_id": wf.id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["workflow"], json!("SCHED-deadbeef"));
+    assert_eq!(resp["run_id"], json!(run_id));
+
+    // An id that is not there at all is a 404, not a 500.
+    let (status, _) = post_to(
+        &h,
+        "/api/hook/schedule/done",
+        &[(HOOK_HEADER, a)],
+        json!({ "session": "b4-a", "schedule_id": "SCHED-nope" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    h.cleanup();
+}
+
+#[tokio::test]
+async fn the_canonical_step_done_route_takes_a_run_id() {
+    let h = spawn_harness().await;
+    let a = make_session(&h, "b4-a").await;
+    let (status, _) = post_to(
+        &h,
+        "/api/hook/workflow/step-done",
+        &[(HOOK_HEADER, "not-the-token".to_string())],
+        json!({ "session": "b4-a", "run_id": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "auth comes first");
+
+    // An unknown run is a silent no-op, not an error: a footer can outlive its
+    // run, and a failing curl at the end of a finished job teaches nothing.
+    let (status, resp) = post_to(
+        &h,
+        "/api/hook/workflow/step-done",
+        &[(HOOK_HEADER, a)],
+        json!({ "session": "b4-a", "run_id": 4242 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["status"], json!("done"));
+    h.cleanup();
+}
+
+// ── 6. the router's shape ───────────────────────────────────────────────────
 
 #[tokio::test]
 async fn the_hook_route_is_outside_the_bearer_layer_and_the_admin_routes_are_not() {
-    // Two halves of one property. If `/api/hook/schedule/create` ever drifted
-    // INSIDE the bearer layer it would stop working for agents; if any
-    // `/api/schedules*` route ever drifted OUTSIDE it, a session token would be
-    // able to run, patch or delete anybody's schedule.
+    // Two halves of one property. If the create hook ever drifted INSIDE the
+    // bearer layer it would stop working for agents; if any `/api/workflows*`
+    // route ever drifted OUTSIDE it, a session token would be able to run, patch
+    // or delete anybody's workflow.
     let h = spawn_harness().await;
     let a = make_session(&h, "b4-a").await;
 
-    // Reachable with no bearer: it gets as far as the handler's own validation
-    // (400 on an empty body's missing fields, never 401-from-the-layer).
+    // Reachable with no bearer.
     let (status, _) = create_with(&h, &[(HOOK_HEADER, a.clone())], valid("b4-a")).await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // The admin surface, presented with the SESSION's hook token and nothing
+    // The bearer surface, presented with the SESSION's hook token and nothing
     // else: every one of them must refuse.
-    let id = schedules_for(&h, "b4-a").await[0].id.clone();
+    let id = workflows_for(&h, "b4-a").await[0].id.clone();
     for (method, uri) in [
-        (Method::GET, "/api/schedules".to_string()),
-        (Method::POST, "/api/schedules".to_string()),
-        (Method::POST, "/api/schedules/preview".to_string()),
-        (Method::GET, format!("/api/schedules/{id}")),
-        (Method::PATCH, format!("/api/schedules/{id}")),
-        (Method::DELETE, format!("/api/schedules/{id}")),
-        (Method::POST, format!("/api/schedules/{id}/run")),
-        (Method::GET, format!("/api/schedules/{id}/runs")),
+        (Method::GET, "/api/workflows".to_string()),
+        (Method::POST, "/api/workflows".to_string()),
+        (Method::POST, "/api/workflows/preview".to_string()),
+        (Method::GET, "/api/workflows/commands".to_string()),
+        (Method::GET, "/api/workflows/runs".to_string()),
+        (Method::GET, format!("/api/workflows/{id}")),
+        (Method::PATCH, format!("/api/workflows/{id}")),
+        (Method::DELETE, format!("/api/workflows/{id}")),
+        (Method::PUT, format!("/api/workflows/{id}/steps")),
+        (Method::POST, format!("/api/workflows/{id}/run")),
+        (Method::POST, format!("/api/workflows/{id}/cancel")),
+        (Method::GET, format!("/api/workflows/{id}/runs")),
     ] {
         let req = Request::builder()
             .method(method.clone())
@@ -459,10 +664,10 @@ async fn the_hook_route_is_outside_the_bearer_layer_and_the_admin_routes_are_not
     h.cleanup();
 }
 
-// ── 6. the DOCUMENTED curl actually works ───────────────────────────────────
+// ── 7. the DOCUMENTED curl actually works ───────────────────────────────────
 
 /// POST a raw body with an explicit (or absent) `Content-Type`, bypassing the
-/// `create_with` helper's hard-coded `application/json`.
+/// helpers' hard-coded `application/json`.
 async fn post_raw(
     h: &Harness,
     uri: &str,
@@ -489,7 +694,7 @@ async fn post_raw(
 }
 
 #[tokio::test]
-async fn the_documented_curl_d_form_creates_a_schedule() {
+async fn the_documented_curl_d_form_creates_a_workflow() {
     // THE CONTRACT BUG. `agents/supermux-schedule.md` teaches `curl -d '{…}'`,
     // and `curl -d` sends `application/x-www-form-urlencoded`. axum's `Json`
     // extractor answered that with a bare 415 and a plain-text body, so the
@@ -504,15 +709,7 @@ async fn the_documented_curl_d_form_creates_a_schedule() {
     let body = valid("b4-doc").to_string();
 
     for ct in [Some("application/x-www-form-urlencoded"), None] {
-        db::schedules::list(&h.state.pool).await.unwrap();
-        let (status, raw) = post_raw(
-            &h,
-            "/api/hook/schedule/create",
-            ct,
-            Some(&a),
-            &body,
-        )
-        .await;
+        let (status, raw) = post_raw(&h, CREATE, ct, Some(&a), &body).await;
         assert_eq!(
             status,
             StatusCode::CREATED,
@@ -521,7 +718,7 @@ async fn the_documented_curl_d_form_creates_a_schedule() {
         );
     }
     assert_eq!(
-        schedules_for(&h, "b4-doc").await.len(),
+        workflows_for(&h, "b4-doc").await.len(),
         2,
         "both documented forms must have landed a row",
     );
@@ -530,22 +727,33 @@ async fn the_documented_curl_d_form_creates_a_schedule() {
 
 #[tokio::test]
 async fn the_done_hook_takes_the_documented_curl_d_form_too() {
-    // `scheduler::runner::confirm_footer` teaches the same `-d` shape for
-    // `/done`, so the same 415 killed agent-declared completion. Auth failure is
-    // the interesting bit: the request must reach the AUTHENTICATOR (401), not
-    // die at the content-type gate (415), because 401 is a status an agent can
-    // act on and 415 is not.
+    // `engine::confirm_footer` teaches the same `-d` shape for step-done, so the
+    // same 415 killed agent-declared completion. Auth failure is the interesting
+    // bit: the request must reach the AUTHENTICATOR (401), not die at the
+    // content-type gate (415), because 401 is a status an agent can act on and
+    // 415 is not. Both the canonical route and the legacy alias are asserted.
     let h = spawn_harness().await;
     make_session(&h, "b4-done").await;
-    let (status, _) = post_raw(
-        &h,
-        "/api/hook/schedule/done",
-        Some("application/x-www-form-urlencoded"),
-        Some("not-the-token"),
-        &json!({ "session": "b4-done", "schedule_id": "SCHED-nope" }).to_string(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for (uri, body) in [
+        (
+            "/api/hook/workflow/step-done",
+            json!({ "session": "b4-done", "run_id": 1 }),
+        ),
+        (
+            "/api/hook/schedule/done",
+            json!({ "session": "b4-done", "schedule_id": "SCHED-nope" }),
+        ),
+    ] {
+        let (status, _) = post_raw(
+            &h,
+            uri,
+            Some("application/x-www-form-urlencoded"),
+            Some("not-the-token"),
+            &body.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
     h.cleanup();
 }
 
@@ -563,18 +771,18 @@ async fn a_body_that_is_not_json_is_a_readable_400_not_a_bare_415() {
         (Some("text/plain"), "not json at all"),
         (None, ""),
     ] {
-        let (status, raw) =
-            post_raw(&h, "/api/hook/schedule/create", ct, Some(&a), body).await;
+        let (status, raw) = post_raw(&h, CREATE, ct, Some(&a), body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "ct {ct:?} body {body:?}");
-        let parsed: Value = serde_json::from_slice(&raw)
-            .unwrap_or_else(|e| panic!("the error body must be JSON ({e}): {:?}", String::from_utf8_lossy(&raw)));
+        let parsed: Value = serde_json::from_slice(&raw).unwrap_or_else(|e| {
+            panic!("the error body must be JSON ({e}): {:?}", String::from_utf8_lossy(&raw))
+        });
         assert_eq!(parsed["ok"], json!(false));
         assert!(
             parsed["error"].as_str().is_some_and(|s| s.len() > 10),
             "the error must be a readable sentence, got {parsed}",
         );
     }
-    assert!(schedules_for(&h, "b4-junk").await.is_empty());
+    assert!(workflows_for(&h, "b4-junk").await.is_empty());
     h.cleanup();
 }
 

@@ -67,11 +67,13 @@ pub fn router(state: AppState) -> Router {
         // `X-Supermux-Hook-Token` auth as the status hook, plus the scope rule
         // (an agent may only mutate its own session's issue).
         .merge(board::hook_router_for(state.clone()))
-        // Agent→scheduler hook (`/api/hook/schedule/done`) — NO bearer layer; SAME
-        // per-session `X-Supermux-Hook-Token` auth + scope (an agent may only
-        // confirm a schedule that targets its own session). The agent-confirmed
-        // finish tier for "notify me when done" schedules.
-        .merge(scheduler::hook_router_for(state.clone()))
+        // Agent→workflows hook (`/api/hook/workflow/{step-done,create}`, plus the
+        // PERMANENT `/api/hook/schedule/{done,create}` aliases a live pane's
+        // footer still names) — NO bearer layer; SAME per-session
+        // `X-Supermux-Hook-Token` auth + scope (an agent may only confirm a run
+        // in its own pane). The agent-confirmed finish tier, which in a chain
+        // decides whether step k+1 ever happens.
+        .merge(crate::workflows::hook::router_for(state.clone()))
         // Bot→app capability hooks (`/api/hook/notify`, `/api/hook/delegate`) —
         // NO bearer layer; SAME per-session `X-Supermux-Hook-Token` auth, each
         // scope-locked to the calling session's own pane / same-company peers.
