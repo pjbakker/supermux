@@ -11,6 +11,7 @@ pub mod engine;
 pub mod hook;
 pub mod parser;
 pub mod port;
+pub mod shim;
 
 use std::time::Duration;
 

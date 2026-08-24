@@ -27,7 +27,6 @@ use crate::hosts;
 use crate::prefs;
 use crate::public;
 use crate::push;
-use crate::scheduler;
 use crate::sessions;
 use crate::sse;
 use crate::state::AppState;
@@ -174,9 +173,15 @@ fn protected_router(state: AppState) -> Router {
         // provided); `.with_state` resolves it to `Router<()>` so it merges
         // alongside the already-stateful sessions router.
         .merge(files::router_for().with_state(state.clone()))
-        // Scheduler CRUD — P3d owner/admin-only (the agent→scheduler HOOK router,
-        // merged outside the bearer layer in `router`, is unaffected).
-        .merge(scheduler::router_for(state.clone()).route_layer(from_fn(require_admin_mw)))
+        // `/api/schedules` — the legacy READ-SHIM: three GETs projected from the
+        // workflows tables in the old JSON shape, `410 Gone` on every write. It
+        // exists so a PWA wedged on a stale bundle renders a correct-if-
+        // simplified list instead of crashing, and is told to reload rather
+        // than redirected (a 307 on POST re-plays a mutating body against a
+        // different contract). Still P3d owner/admin-only, exactly as the
+        // scheduler router was — `member_may_reach` does not name it. DELETE in
+        // the release after v1 (spec §5.2).
+        .merge(crate::workflows::shim::router_for(state.clone()).route_layer(from_fn(require_admin_mw)))
         // Workflows CRUD — deliberately NOT `require_admin`-gated: a company
         // member must be able to see and drive their own bot's workflows, so the
         // fence is the per-handler `Scope::sees` 404 plus the `member_may_reach`

@@ -21,6 +21,12 @@ pub enum AppError {
     Conflict(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// The contract itself is retired, not the request. Used by the
+    /// `/api/schedules` read-shim on every write verb (spec §5.2): a stale PWA
+    /// bundle must be told to reload rather than redirected — a 307/308 on POST
+    /// re-plays a mutating body against a DIFFERENT contract.
+    #[error("{0}")]
+    Gone(String),
     /// A quota the caller can act on: it is not wrong, it has simply had
     /// enough. Distinct from `BadRequest` because the right response is "delete
     /// one and try again", not "fix your payload" — and an agent reads the
@@ -39,6 +45,7 @@ impl AppError {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Gone(_) => StatusCode::GONE,
             AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

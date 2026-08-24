@@ -978,3 +978,116 @@ async fn commands_endpoint_excludes_builtins_and_requires_auth() {
     }
     h.cleanup();
 }
+
+// ── the /api/schedules read-shim (T3.6) ──────────────────────────────────────
+
+/// The three old GETs keep answering — from the NEW tables, in the OLD shape —
+/// so a PWA wedged on a stale bundle renders a correct-if-simplified list
+/// instead of crashing.
+#[tokio::test]
+async fn the_old_get_routes_serve_a_derived_read_only_projection() {
+    let h = spawn_harness().await;
+    make_session(&h, "alpha", None).await;
+    let (status, created) = send(
+        &h.app,
+        Method::POST,
+        "/api/workflows",
+        Some(json!({
+            "title": "Weekly report", "session": "alpha",
+            "schedule_expr": "every 1h",
+            "on_complete": { "kind": "notify" },
+            "steps": [
+                { "command": "/supermux-task", "prompt": "draft it" },
+                { "prompt": "send it" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["data"]["id"].as_str().unwrap().to_string();
+    db::workflows::insert_run(&h.state.pool, &id, 1_760_000_000, "tick", "ok", "done")
+        .await
+        .unwrap();
+
+    let (status, body) = send(&h.app, Method::GET, "/api/schedules", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let s = &rows[0];
+    assert_eq!(s["id"], id, "the workflow id IS the schedule id");
+    assert_eq!(s["kind"], "tmux", "shell and boot cannot be expressed any more");
+    assert_eq!(s["command"], "/supermux-task", "command comes from step 0");
+    assert_eq!(s["prompt"], "draft it", "…and so does the prompt");
+    assert_eq!(s["done_action"], "notify", "on_complete mapped back");
+    assert_eq!(s["sched_type"], "recurring");
+    assert!(s["next_run"].is_string());
+    // Nothing in the projection can ever emit the dragon.
+    assert!(!body.to_string().contains("command:"), "{body}");
+
+    let (status, body) = send(&h.app, Method::GET, &format!("/api/schedules/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["title"], "Weekly report");
+
+    let (status, body) =
+        send(&h.app, Method::GET, &format!("/api/schedules/{id}/runs"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = body["data"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["schedule_id"], id, "the old ScheduleRun key name");
+    assert_eq!(runs[0]["ran_at"], 1_760_000_000i64);
+    assert_eq!(runs[0]["status"], "ok");
+
+    // An id that is not there answers in the OLD vocabulary, not the new one.
+    let (status, body) = send(&h.app, Method::GET, "/api/schedules/SCHED-nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap_or("").contains("schedule 'SCHED-nope'"), "{body}");
+
+    h.cleanup();
+}
+
+/// Every write verb is 410 — NOT a redirect. A 307/308 on POST re-plays a
+/// mutating body against a contract that has never heard of its fields.
+#[tokio::test]
+async fn every_write_verb_is_410_gone_with_the_reload_sentence() {
+    let h = spawn_harness().await;
+    make_session(&h, "alpha", None).await;
+    let (_, created) = send(
+        &h.app,
+        Method::POST,
+        "/api/workflows",
+        Some(json!({ "title": "t", "session": "alpha", "steps": one_step("hi") })),
+    )
+    .await;
+    let id = created["data"]["id"].as_str().unwrap().to_string();
+
+    for (method, uri, body) in [
+        (Method::POST, "/api/schedules".to_string(), Some(json!({ "title": "x" }))),
+        (Method::PATCH, "/api/schedules".to_string(), Some(json!({}))),
+        (Method::DELETE, "/api/schedules".to_string(), None),
+        (Method::PATCH, format!("/api/schedules/{id}"), Some(json!({ "enabled": false }))),
+        (Method::DELETE, format!("/api/schedules/{id}"), None),
+        (Method::POST, format!("/api/schedules/{id}/run"), None),
+        (
+            Method::POST,
+            "/api/schedules/preview".to_string(),
+            Some(json!({ "expression": "every 5m" })),
+        ),
+        (Method::GET, "/api/schedules/commands".to_string(), None),
+    ] {
+        let (status, resp) = send(&h.app, method.clone(), &uri, body).await;
+        assert_eq!(status, StatusCode::GONE, "{method} {uri} -> {resp}");
+        assert_eq!(resp["ok"], false, "{resp}");
+        assert_eq!(
+            resp["error"],
+            "Schedules were replaced by Workflows — reload supermux to continue.",
+            "{method} {uri}",
+        );
+    }
+
+    // The write refusals changed nothing.
+    let row = db::workflows::get(&h.state.pool, &id).await.unwrap().unwrap();
+    assert_eq!(row.enabled, 1);
+    assert!(row.deleted.is_none());
+
+    h.cleanup();
+}
