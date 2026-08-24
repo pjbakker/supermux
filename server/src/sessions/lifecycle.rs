@@ -800,6 +800,33 @@ fn agent_busy(capture: &str) -> bool {
     capture.to_lowercase().contains("esc to interrupt")
 }
 
+/// LIVE Claude/Codex bottom chrome, read over the WHOLE capture rather than the
+/// 10-line tail. The composer glyph and the busy footer sit at a FIXED height
+/// above the bottom of a normal agent screen — but this deployment draws a
+/// teammate/swarm roster (`● main` / `◯ <bot>` / `↓ N more`, under a
+/// `View teammates:` line) BELOW them, so on a busy agent with many teammates
+/// the composer and footer are pushed clean out of `current_screen_tail`. The
+/// tail then holds only the roster, `agent_composer_visible`/`agent_busy` both
+/// miss, and a healthy agent is refused `NoAgent` — the send-guard regression
+/// that broke chat + scheduled delivery. These markers are drawn ONLY while a
+/// Claude/Codex agent owns the pane (its mode footer, its idle hint, its busy
+/// footer); a bare shell or a foreign program draws none of them, and the
+/// picker/trust/selection screens are refused ABOVE this on the current screen,
+/// so reading agent-presence wide can only widen an ADMIT, never a refusal.
+fn agent_footer_live(capture: &str) -> bool {
+    let c = capture.to_lowercase();
+    // Deliberately NOT `? for shortcuts` / `esc to interrupt`: those also appear in
+    // the SCROLLBACK of a session that has since exited to a shell, and admitting on
+    // them would defeat `pty_ready_for_send_ignores_stale_scrollback_above_a_bare_shell`.
+    // The mode footer and the swarm roster header, by contrast, are redrawn at the
+    // BOTTOM of the live agent UI every frame — a bare shell or a foreign program
+    // never carries them, so their presence means an agent owns the pane right now,
+    // even when its composer has been pushed above the tail by the roster beneath it.
+    c.contains("bypass permissions") // the ⏵⏵ mode footer (persistent, live)
+        || c.contains("auto mode on")
+        || c.contains("view teammates:") // the swarm roster header, drawn live at the bottom
+}
+
 /// WHY [`send_harness_text`] may NOT type `text`+Enter into the pty showing this
 /// CURRENT capture — or `None` when it may. The SEND-path twin of
 /// [`classify_ready_tick`]'s ready arm.
@@ -869,7 +896,16 @@ fn send_block(capture: &str) -> Option<SendBlock> {
     if selection_screen(&screen) {
         return Some(SendBlock::Selection);
     }
-    if agent_composer_visible(&screen) || agent_busy(&screen) || codex_ready(&screen) {
+    // Agent presence is read over the WHOLE capture (`agent_busy` / `agent_footer_live`),
+    // not just the current tail: a teammate/swarm roster drawn below the composer can push
+    // the composer glyph and the footer out of `current_screen_tail`, and the danger screens
+    // (picker / trust / selection) have already been refused above, so widening the ADMIT
+    // path cannot reach them.
+    if agent_composer_visible(&screen)
+        || agent_busy(&screen)
+        || codex_ready(&screen)
+        || agent_footer_live(capture)
+    {
         return None;
     }
     Some(SendBlock::NoAgent)
@@ -3419,6 +3455,38 @@ mod agent_ready_heuristics_tests {
 
         // REFUSE: an unrecognised screen. The default is closed.
         assert_eq!(send_block("some program printing along\nno prompt we know"), Some(SendBlock::NoAgent));
+    }
+
+    /// REGRESSION: a swarm/teammate roster drawn BELOW the composer + footer
+    /// pushes them out of the 10-line tail, so a tail-only presence check refused
+    /// a healthy busy agent (`NoAgent`) — breaking chat and scheduled delivery.
+    /// Agent presence read over the whole capture must ADMIT.
+    #[test]
+    fn a_teammate_roster_below_the_composer_still_admits() {
+        let screen = "  the real capture confirms the root cause here.\n\
+                      \n\
+                      ● Bash(curl … /api/sessions/supermux/peek)\n\
+                      \x20 ⎿ Running…\n\
+                      \n\
+                      ✽ Waddling… (8m 6s · ↓ 26.0k tokens)\n\
+                      \n\
+                      ─ View teammates: `tmux -L claude-swarm-3193337 a` ─\n\
+                      ❯ \n\
+                      ────────────────────────────────────────────────────\n\
+                      \x20 ⏵⏵ bypass permissions on · 1 shell · esc to int…\n\
+                      \x20           ✔ Update installed · Restart to update\n\
+                      \n\
+                      \x20 ● main\n\
+                      \x20 ◯ build-lightbox         You are a s… 9h 25m 43s\n\
+                      \x20 ◯ build-settings         You are a s… 9h 25m 18s\n\
+                      \x20 ◯ build-delaysend        You are a s… 9h 24m 54s\n\
+                      \x20 ◯ spec-workflows         You are a s…  9h 24m 6s\n\
+                      \x20 ↓ 27 more";
+        assert_eq!(
+            send_block(&status::prepare_capture(screen)),
+            None,
+            "a live agent whose composer/footer sit above a teammate roster must admit",
+        );
     }
 
     /// A PICKER WHOSE TITLE HAS SCROLLED OUT still refuses.
