@@ -250,6 +250,52 @@ function MobileTopBar(_props: { overview: boolean }) {
   return null
 }
 
+/** The grok bottom-bar cells for a given grok state — `NAV` minus the mobile
+ *  drops (`desktopOnly` always; `grokHidden` under grok, `grokOnly` off grok).
+ *  Exported so the pill-truth test can assert the path→cell mapping against the
+ *  SAME array the render + `--nav-n` use (see `bottom-nav-pill.test.ts`). */
+export function bottomNavItems(grok: boolean): NavItem[] {
+  return NAV.filter(
+    (item) => !item.desktopOnly && (grok ? !item.grokHidden : !item.grokOnly),
+  )
+}
+
+/** The index of the cell that owns the current route — the SAME `end`/prefix
+ *  rule react-router's `NavLink` uses for `aria-current="page"`, so the pill
+ *  always parks under exactly the cell the screen reader announces. `-1` when
+ *  the active route is a chromeful sub-route not in the bar (the pill hides).
+ *  This is the ONE source of pill truth: the render, the `--nav-i` style prop
+ *  AND the reconcile effect all read it, so they can never disagree. */
+export function activeNavIndex(
+  items: ReadonlyArray<Pick<NavItem, 'to' | 'end'>>,
+  pathname: string,
+): number {
+  return items.findIndex((item) =>
+    item.end
+      ? pathname === item.to
+      : pathname === item.to || pathname.startsWith(`${item.to}/`),
+  )
+}
+
+/** Re-assert the pill's cell (`--nav-i`) on the live `<nav>` to the active-route
+ *  truth. This is what makes the pill robust: `onNavTap` writes `--nav-i`
+ *  IMPERATIVELY for the pre-commit glide, and React's `style`-prop reconciler
+ *  compares each render against its OWN recorded value — NOT the live DOM — so
+ *  it silently skips the write whenever the new `activeIndex` equals the value
+ *  it last rendered, leaving a tapped-but-never-active cell (often the middle
+ *  one) STRANDED under the pill while `aria-current` sits elsewhere. Calling
+ *  this from a layout effect keyed on the route makes the committed truth the
+ *  final word after every navigation, before paint (no flash). No-op off grok
+ *  and with no node, so the base/desktop bars are never touched. */
+export function reconcileNavPill(
+  el: { style: Pick<CSSStyleDeclaration, 'setProperty'> } | null,
+  grok: boolean,
+  activeIndex: number,
+): void {
+  if (!grok || !el) return
+  el.style.setProperty('--nav-i', String(activeIndex))
+}
+
 /** Mobile: bottom tab bar, safe-area inset (≤md). Filters out `desktopOnly`
  *  items so the mobile chrome stays at its 5-tab footprint — on mobile the
  *  natural way into a focused session is tapping a tile in Overview. */
@@ -261,9 +307,7 @@ function BottomNav({ grok }: { grok: boolean }) {
   // Settings). The `data-tab-count` (the route cells) + `--nav-n` let
   // grok-mode.css place the sliding pill. (The bottom-nav Search button was
   // removed — Overview carries the roster search and ⌘K the command palette.)
-  const items = NAV.filter(
-    (item) => !item.desktopOnly && (grok ? !item.grokHidden : !item.grokOnly),
-  )
+  const items = bottomNavItems(grok)
   // ── The sliding-pill driver (grok phone nav, "Liquid Rail") ────────────────
   //  The active-indicator is ONE persistent pill (`data-nav-pill`, painted below
   //  the cells) translated by whole cells via a single `--nav-i` custom prop and
@@ -273,18 +317,11 @@ function BottomNav({ grok }: { grok: boolean }) {
   //  is hidden then. Same `end`/prefix rule react-router's NavLink uses, so the
   //  pill parks under exactly the cell that shows `aria-current="page"`.
   const { pathname } = useLocation()
-  const activeIndex = grok
-    ? items.findIndex((item) =>
-        item.end
-          ? pathname === item.to
-          : pathname === item.to || pathname.startsWith(`${item.to}/`),
-      )
-    : -1
+  const activeIndex = grok ? activeNavIndex(items, pathname) : -1
   // Tap-drive: on tap, set `--nav-i` on the live <nav> BEFORE react-router
   // commits the route, so the pill starts gliding <100ms while the route
-  // transition runs underneath. The `style` prop below re-asserts the same value
-  // from `activeIndex` once the route commits (idempotent). Cheap haptic tick on
-  // supporting devices; silently absent on iOS Safari.
+  // transition runs underneath. Cheap haptic tick on supporting devices;
+  // silently absent on iOS Safari.
   const navRef = React.useRef<HTMLElement | null>(null)
   const onNavTap = React.useCallback(
     (index: number) => {
@@ -294,6 +331,22 @@ function BottomNav({ grok }: { grok: boolean }) {
     },
     [grok],
   )
+  // ── Reconcile the pill to the ACTIVE cell after every route commit ─────────
+  //  The optimistic `onNavTap` write above is the glide's start, but it is a
+  //  SPECULATIVE mutation of the live DOM that React does not know about: on the
+  //  next render React diffs the `--nav-i` style prop against its OWN recorded
+  //  value, not the DOM, so whenever the committed `activeIndex` equals the value
+  //  React last rendered it SKIPS the write and the tapped cell (frequently the
+  //  middle one) stays stranded under the pill while `aria-current` is elsewhere.
+  //  A layout effect keyed on the route re-asserts the committed truth on the
+  //  live node after every navigation — before paint, so no flash, and it fires
+  //  even when `activeIndex` is unchanged across the pathname change (the exact
+  //  case the style-prop diff skips). Off grok it is a no-op, so the base/desktop
+  //  bars are untouched. This is belt-and-suspenders with the `style` prop below:
+  //  the style prop covers the fast path, this guarantees eventual truth.
+  React.useLayoutEffect(() => {
+    reconcileNavPill(navRef.current, grok, activeIndex)
+  }, [grok, pathname, activeIndex])
   return (
     <nav
       ref={navRef}
