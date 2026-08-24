@@ -19,6 +19,17 @@
 //                   and the asleep card's "Waking…"
 //   ?address=<txt>  seed the omnibox as if it had been typed into, so the
 //                   GO/SEARCH lead icon and the clear (×) are screenshot-able
+//   ?drive=1        the human holds the wheel — the accent ring, the live
+//                   keyboard trap, the drive-profile negotiation
+//   ?kb=<px>        pretend a soft keyboard that tall is up (the rig has none):
+//                   the viewport lifts above it and the Done bar appears
+//   ?state=<name>   PHASE 2 — force one viewport state, each with its own fake
+//                   socket (a real close code, not a faked state), so all of
+//                   them are screenshot-able offline:
+//                     live · needs-login · asleep · waking · connecting
+//                     busy · offline · reconnecting · crashed
+//                   `asleep`/`waking` pick the dehydrated fixture tab, which is
+//                   also the pair that must NOT dial: attaching would rehydrate.
 import * as React from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
@@ -27,7 +38,43 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { BrowserWorkspace } from '@/components/browser/workspace'
 import type { BrowserTab } from '@/lib/api/browser'
 import type { TakeoverOptions } from '@/lib/browser/takeover-socket'
+import type { MockFailure } from './dev-browser-takeover.fixture'
 import { BENCH_BOTS, BENCH_TABS } from './dev-browser-workspace.fixture'
+
+/** The phase-2 viewport states, as `?state=` spells them. */
+type ViewportBenchState =
+  | ''
+  | 'live'
+  | 'needs-login'
+  | 'asleep'
+  | 'waking'
+  | 'connecting'
+  | 'busy'
+  | 'offline'
+  | 'reconnecting'
+  | 'crashed'
+
+/** Each terminal state is a real close code off the real close-code table —
+ *  the bench socket does not fake the STATE, it fakes the CLOSE that produces
+ *  it, so a change to the table shows up here rather than being papered over. */
+const SOCKET_FAILURE: Partial<Record<ViewportBenchState, MockFailure>> = {
+  asleep: { code: 4404, reason: 'no browser context' },
+  busy: { code: 1013, reason: 'already attached' },
+  offline: { code: 1008, reason: 'auth required' },
+  // Keeps the frame, THEN drops: the state that must show the last picture,
+  // dimmed, rather than a blank box.
+  reconnecting: { code: 1006, reason: '', afterSeed: true },
+}
+
+/** States where the socket simply never answers the handshake. */
+const SILENT_STATES: ViewportBenchState[] = ['connecting', 'waking']
+
+/** States that only exist on a particular kind of tab. */
+const STATE_TAB: Partial<Record<ViewportBenchState, string>> = {
+  'needs-login': 'tb_bank',
+  asleep: 'tb_crm',
+  waking: 'tb_crm',
+}
 
 const BENCH_QC = new QueryClient({
   defaultOptions: { queries: { retry: false, staleTime: Infinity } },
@@ -44,8 +91,14 @@ export default function DevBrowserWorkspace() {
   const live = params.get('live') === '1'
   const busy = params.get('busy') === '1'
   const address = params.get('address')
-  const startTab = params.get('tab')
   const sheet = params.get('sheet') === '1'
+  const drive = params.get('drive') === '1'
+  const kb = Number(params.get('kb') ?? '') || 0
+  const state = (params.get('state') ?? '') as ViewportBenchState
+  // A state that only exists on a particular KIND of tab picks that tab, so the
+  // flag is one flag: `?state=needs-login` is the signed-out one, `?state=asleep`
+  // the dehydrated one.
+  const startTab = params.get('tab') ?? STATE_TAB[state] ?? null
 
   // The takeover fixture carries a 17 KB base64 frame; import it lazily, exactly
   // like the takeover bench does.
@@ -53,12 +106,15 @@ export default function DevBrowserWorkspace() {
   React.useEffect(() => {
     let alive = true
     void import('./dev-browser-takeover.fixture').then((m) => {
-      if (alive) setOptions(m.mockOptions('agent_driving'))
+      if (!alive) return
+      const mode = drive ? 'human_driving' : 'agent_driving'
+      const fail = SOCKET_FAILURE[state]
+      setOptions(m.mockOptions(mode, fail, SILENT_STATES.includes(state)))
     })
     return () => {
       alive = false
     }
-  }, [])
+  }, [drive, state])
 
   return (
     <QueryClientProvider client={BENCH_QC}>
@@ -84,6 +140,8 @@ export default function DevBrowserWorkspace() {
                     address={address}
                     startTab={startTab}
                     sheet={sheet}
+                    state={state}
+                    kb={kb}
                     options={options}
                     contentTheme={dark ? 'dark' : 'light'}
                   />
@@ -103,6 +161,8 @@ export default function DevBrowserWorkspace() {
                     address={address}
                     startTab={startTab}
                     sheet={sheet && onlyDesktop}
+                    state={state}
+                    kb={kb}
                     options={options}
                     contentTheme={dark ? 'dark' : 'light'}
                   />
@@ -164,6 +224,8 @@ function Bench({
   address,
   startTab,
   sheet,
+  state,
+  kb,
   options,
   contentTheme,
 }: {
@@ -173,6 +235,8 @@ function Bench({
   address: string | null
   startTab: string | null
   sheet: boolean
+  state: ViewportBenchState
+  kb: number
   options?: TakeoverOptions
   contentTheme: 'light' | 'dark'
 }) {
@@ -256,10 +320,14 @@ function Bench({
       onWake={(id) => patch(id, (t) => ({ ...t, live: true }))}
       onSleep={(id) => patch(id, (t) => ({ ...t, live: false }))}
       onOrigins={(id, origins) => patch(id, (t) => ({ ...t, origins }))}
-      busy={busy}
+      busy={busy || state === 'waking'}
       bots={BENCH_BOTS}
       panelOptions={options}
-      forceLive={live}
+      // `?state=asleep|waking` wants the ROW to say asleep, so the state matrix
+      // reaches those branches rather than being overridden into "live".
+      forceLive={live && state !== 'asleep' && state !== 'waking'}
+      crashed={state === 'crashed'}
+      benchKeyboard={kb || undefined}
       contentTheme={contentTheme}
       className="min-h-0 flex-1"
     />

@@ -25,21 +25,23 @@
 // block every agent granted on it — the one footgun a workspace surface would
 // hit constantly. Drive sends `take_over`, Watch hands it straight back.
 //
-// A DEHYDRATED TAB IS STILL NOT MOUNTED — the server refuses to rehydrate from
-// a takeover socket on purpose ("a takeover takes over something"). But the
-// dead end is gone: `POST …/open` is a human verb now, so the asleep card
-// offers **Wake tab**, and Enter in the address bar wakes-and-navigates in one
-// call. The honesty is kept; the cul-de-sac is not.
+// THE LIVE PANEL IS THE DEFAULT FOR ANY TAB (phase 2). The tab route
+// rehydrates on attach (`tab_takeover_socket`), so attaching to an asleep tab
+// IS waking it: the panel is mounted for every selected tab and its own state
+// matrix draws asleep / waking / connecting / busy / crashed, each with the one
+// verb that fixes it. The old dead-end card is gone — not because the honesty
+// went, but because the honesty moved INTO the viewport, where the human is
+// already looking, and grew a button.
 //
 // PRESENTATIONAL ON PURPOSE. Every verb is a prop, so `/browser` wires the live
 // hooks and `/dev/browser-workspace` wires fixtures — the same component, and
 // the bench cannot drift from the product.
 import * as React from 'react'
 
-import { Globe, Power } from 'lucide-react'
+import { Globe } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
-import { tabHost, tabState, type BrowserTab, type GrantCandidate } from '@/lib/api/browser'
+import { tabHost, type BrowserTab, type GrantCandidate } from '@/lib/api/browser'
 import type { TakeoverOptions, TakeoverSnapshot } from '@/lib/browser/takeover-socket'
 import {
   TakeoverPanel,
@@ -86,9 +88,14 @@ export interface BrowserWorkspaceProps {
   bots: GrantCandidate[]
   /** Injected for the bench; production passes nothing. */
   panelOptions?: TakeoverOptions
-  /** Bench only: mount the live panel even for an asleep tab, so the offline
-   *  rig can screenshot the viewport with a fake socket. */
+  /** Bench only: tell the viewport the row is live even when the fixture says
+   *  asleep, so the offline rig can screenshot a driving viewport. */
   forceLive?: boolean
+  /** Bench only until the `Inspector.targetCrashed` relay lands (phase 3): draw
+   *  the crashed state. */
+  crashed?: boolean
+  /** Bench only — see `TakeoverPanel.benchKeyboard`. */
+  benchKeyboard?: number
   /** Offline bench only — see `ResponsiveSheet.contentTheme`. */
   contentTheme?: 'light' | 'dark'
   className?: string
@@ -111,6 +118,8 @@ export function BrowserWorkspace({
   bots,
   panelOptions,
   forceLive,
+  crashed,
+  benchKeyboard,
   contentTheme,
   className,
 }: BrowserWorkspaceProps) {
@@ -128,7 +137,10 @@ export function BrowserWorkspace({
   const chosen = tabs.find((t) => t.id === activeId) ?? null
   const active = newTab ? null : chosen
   const sheetTab = tabs.find((t) => t.id === sheetFor) ?? null
-  const live = !!active && (active.live || !!forceLive)
+  // "There is a page" — the row's flag, or the socket's own attachment, which
+  // outranks it: a tab the socket just rehydrated is live before the next poll
+  // says so.
+  const live = !!active && (active.live || !!forceLive || head?.state === 'live')
   // The live page's own url outranks the row's: an agent that navigated three
   // pages deep must not leave the human's address bar showing where the tab
   // STARTED. Falls back to the row when nothing is attached yet.
@@ -185,7 +197,7 @@ export function BrowserWorkspace({
 
       {!active ? (
         <NewTabPage tabs={tabs} onOpen={(u) => onNew(u)} />
-      ) : live ? (
+      ) : (
         <TakeoverPanel
           // KEYED BY TAB. A tab switch is a different page, so the panel starts
           // over: a fresh canvas (never the previous tab's pixels under this
@@ -196,15 +208,18 @@ export function BrowserWorkspace({
           subject={{ kind: 'tab', id: active.id }}
           options={panelOptions}
           controlsRef={ctl}
+          tabLive={active.live || !!forceLive}
+          // Only an OPEN tab is attached on sight. Attaching rehydrates, and a
+          // human selecting a row must not start a browser by looking at it.
+          attach={active.live || !!forceLive}
+          waking={busy}
+          needsLogin={active.login_state === 'needs_login'}
+          crashed={crashed}
+          benchKeyboard={benchKeyboard}
+          onWake={onWake ? () => onWake(active.id) : undefined}
+          onReload={onNavigate && url ? () => onNavigate(active.id, url) : undefined}
           className="min-h-0 flex-1"
           renderHeader={(state) => <PanelBridge head={state} onChange={setHead} />}
-        />
-      ) : (
-        <AsleepState
-          tab={active}
-          waking={!!busy}
-          onWake={onWake ? () => onWake(active.id) : undefined}
-          onMenu={() => setSheetFor(active.id)}
         />
       )}
 
@@ -296,59 +311,6 @@ function NewTabPage({
           ))}
         </div>
       )}
-    </div>
-  )
-}
-
-/** Dehydrated: the row is here, the page is not. Says exactly that — and now
- *  offers the verb that fixes it, because one exists: `POST …/open` wakes the
- *  tab at its own url with the on-disk profile, so the sign-in comes back with
- *  the page. (When the host passes no `onWake`, the card keeps the old honest
- *  dead end rather than drawing a button that would do nothing.) */
-function AsleepState({
-  tab,
-  waking,
-  onWake,
-  onMenu,
-}: {
-  tab: BrowserTab
-  waking?: boolean
-  onWake?: () => void
-  onMenu: () => void
-}) {
-  const state = tabState(tab)
-  return (
-    <div
-      data-tab-asleep={tab.id}
-      className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center"
-    >
-      <span className="text-[13px] font-medium text-foreground">
-        {tab.title || tabHost(tab.url)} — {state.label}
-      </span>
-      <p className="max-w-[46ch] text-[12.5px] leading-relaxed text-muted-foreground">
-        {state.detail}
-      </p>
-      <div className="flex flex-wrap items-center justify-center gap-2">
-        {onWake && (
-          <button
-            type="button"
-            onClick={onWake}
-            disabled={waking}
-            data-tab-wake={tab.id}
-            className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-primary px-4 text-[13px] font-medium text-primary-foreground disabled:opacity-60"
-          >
-            <Power className="size-4" aria-hidden />
-            {waking ? 'Waking…' : 'Wake tab'}
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={onMenu}
-          className="min-h-11 rounded-xl border border-border px-4 text-[12.5px] font-medium text-foreground"
-        >
-          Tab settings
-        </button>
-      </div>
     </div>
   )
 }

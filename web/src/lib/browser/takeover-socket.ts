@@ -174,6 +174,70 @@ export function keyText(e: {
   return [...e.key].length === 1 ? e.key : undefined
 }
 
+/**
+ * **The viewer's box** — the one fact only the client can know, and the whole
+ * of legibility.
+ *
+ * Without it the server lays the page out at its own default and caps the
+ * stream at 512², so a phone reads a 1366px desktop render downscaled to a
+ * third and a laptop reads a blur. With it (`ClientMsg::Viewport` →
+ * `Emulation.setDeviceMetricsOverride` + a matching screencast cap) the page is
+ * laid out at the box the human is actually looking at: a phone gets the site's
+ * MOBILE layout at 390pt, and a desktop gets type at 1:1.
+ *
+ * `mobile` is the coarse-pointer answer, not a width guess — a 390px window on
+ * a laptop is a narrow desktop, and telling a site it is a phone there would be
+ * a lie with touch-sized buttons attached.
+ */
+export interface ViewportBox {
+  /** The canvas' CSS width/height — the box frames are painted into. */
+  width: number
+  height: number
+  /** `devicePixelRatio`. Clamped: see [[MAX_VIEWPORT_DPR]]. */
+  dpr: number
+  /** A touch viewport that should get the site's phone layout. */
+  mobile: boolean
+}
+
+/** The server clamps to this too (`context::MAX_DEVICE_SCALE`); we clamp first
+ *  so a 3× phone never ASKS for a frame three times the size of the one it can
+ *  show. */
+export const MAX_VIEWPORT_DPR = 2
+
+/** The wire shape of `ClientMsg::Viewport`, or `null` for a box that is not
+ *  laid out yet.
+ *
+ *  `null` is the common case on mount — a `ResizeObserver` fires once with a
+ *  zero box before layout — and the server would reject it anyway
+ *  (`ViewportRequest::sanitized`). Not sending it keeps the profile we have
+ *  instead of asking chrome to lay a page out at nothing. */
+export function viewportPayload(box: ViewportBox): Record<string, unknown> | null {
+  const width = Math.round(box.width)
+  const height = Math.round(box.height)
+  if (!(width > 0) || !(height > 0)) return null
+  const dpr =
+    Number.isFinite(box.dpr) && box.dpr > 0 ? Math.min(box.dpr, MAX_VIEWPORT_DPR) : 1
+  return { type: 'viewport', width, height, dpr, mobile: !!box.mobile }
+}
+
+/**
+ * The device scale to ASK for, which is how a client picks its streaming
+ * profile without a second message.
+ *
+ * Driving is reading: the human is about to click a link they have to be able
+ * to read, so ask for their real pixels (capped at 2×, past which a JPEG buys
+ * nothing an eye resolves). Watching is watching: 1× is a quarter of the bytes
+ * of a retina stream and loses nothing at a glance — the audit's "drop back to
+ * a cheap profile on hand-back", expressed in the field the server already
+ * parses rather than a new one.
+ */
+export function driveDpr(driving: boolean, devicePixelRatio: number): number {
+  if (!driving) return 1
+  return Number.isFinite(devicePixelRatio) && devicePixelRatio > 0
+    ? Math.min(devicePixelRatio, MAX_VIEWPORT_DPR)
+    : 1
+}
+
 export class TakeoverSocket {
   private ws: SocketLike | null = null
   private authed = false
@@ -181,6 +245,13 @@ export class TakeoverSocket {
   private attempt = 0
   private retry: unknown = null
   private snap: TakeoverSnapshot = { ...EMPTY_SNAPSHOT }
+  /** The last box we were ASKED to negotiate, and the last one actually put on
+   *  the wire. Two fields, not one: the ask outlives a reconnect (the new
+   *  socket has to be told again, or a rehydrated page lays itself out at
+   *  chrome's default), while the sent value is what de-duplicates a
+   *  `ResizeObserver` that fires four times per rotation. */
+  private wantBox: Record<string, unknown> | null = null
+  private sentBox: string | null = null
 
   // Plain fields, not constructor parameter properties: the app's tsconfig
   // sets `erasableSyntaxOnly`, so every construct that emits runtime code from
@@ -305,6 +376,28 @@ export class TakeoverSocket {
     this.send({ type: 'touch', kind, x: point?.x ?? 0, y: point?.y ?? 0 })
   }
 
+  /**
+   * Tell the server what box we are painting into. Idempotent: the same box
+   * twice is one message, because a rotation fires the observer several times
+   * and each one costs a `setDeviceMetricsOverride`, a screencast renegotiation
+   * and a full still frame on the server.
+   */
+  viewport(box: ViewportBox): void {
+    const msg = viewportPayload(box)
+    if (!msg) return
+    this.wantBox = msg
+    this.flushViewport()
+  }
+
+  private flushViewport(): void {
+    const msg = this.wantBox
+    if (!msg || !this.authed) return
+    const key = JSON.stringify(msg)
+    if (key === this.sentBox) return
+    this.sentBox = key
+    this.send(msg)
+  }
+
   /** Give the wheel back but keep watching. */
   handBack(): void {
     this.send({ type: 'hand_back' })
@@ -313,6 +406,24 @@ export class TakeoverSocket {
   /** Grab it again. */
   takeOver(): void {
     this.send({ type: 'take_over' })
+  }
+
+  /**
+   * Dial again after a TERMINAL state — busy, offline, or a `no-context` we
+   * have since fixed by waking the tab.
+   *
+   * `stop()` is one-way on purpose (a React cleanup must not be undoable), so
+   * this is the ONE door back, and it is only ever opened by a human pressing
+   * Retry or Wake. Nothing here retries on its own.
+   */
+  restart(): void {
+    if (this.ws) return
+    this.stopped = false
+    this.attempt = 0
+    this.authed = false
+    this.sentBox = null
+    this.patch({ state: 'connecting', refused: null })
+    this.start()
   }
 
   /** Ask for a fresh still — a static page emits no frames of its own. */
@@ -334,6 +445,12 @@ export class TakeoverSocket {
       case 'auth_ok':
         this.authed = true
         this.attempt = 0
+        // A fresh socket knows nothing about our box, and on a TAB route it may
+        // have just rehydrated the page at chrome's default size. Re-negotiate
+        // before the first frame lands, so the seed still is already the right
+        // shape rather than a full-desktop render the human watches snap.
+        this.sentBox = null
+        this.flushViewport()
         this.patch({ state: 'live' })
         return
       case 'target':

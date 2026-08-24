@@ -184,8 +184,18 @@ describe('the transient compose bar is gone for good', () => {
     expect(branchAt).toBeGreaterThan(chromeAt)
   })
 
-  test('the asleep card offers the wake verb the server now has', () => {
-    expect(workspace).toContain('data-tab-wake')
-    expect(workspace).toContain('Wake tab')
+  test('the asleep state still offers the wake verb — inside the viewport now', () => {
+    // Phase 2 moved the asleep CARD into the panel's state matrix: the live
+    // panel is mounted for every selected tab (the tab socket rehydrates on
+    // attach), so the honesty and its button live where the human is already
+    // looking instead of replacing the viewport with a card. The workspace's
+    // job is to keep wiring the verb through.
+    expect(workspace).toContain('onWake={onWake ? () => onWake(active.id) : undefined}')
+    expect(readFileSync('src/lib/browser/viewport-state.ts', 'utf8')).toContain(
+      "label: 'Wake this tab'",
+    )
+    expect(readFileSync('src/components/browser/takeover-panel.tsx', 'utf8')).toContain(
+      'data-viewport-action',
+    )
   })
 })

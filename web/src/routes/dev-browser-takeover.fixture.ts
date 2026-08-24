@@ -200,10 +200,28 @@ export const MOCK_SENT: string[] = []
  * [`MOCK_SENT`] and `hand_back` / `take_over` flip the mode for real, so the
  * pill and the read-only state are exercised end to end with no server.
  */
-export function mockOptions(mode: 'human_driving' | 'agent_driving' = 'human_driving'): TakeoverOptions {
+/** How a bench socket should MISBEHAVE — one per terminal state the viewport
+ *  has to draw. `afterSeed` sends the frames first, so the states that keep the
+ *  last frame (reconnecting, offline) have one to keep. */
+export interface MockFailure {
+  code: number
+  reason: string
+  afterSeed?: boolean
+}
+
+export function mockOptions(
+  mode: 'human_driving' | 'agent_driving' = 'human_driving',
+  fail?: MockFailure,
+  /** Never answer the handshake at all — the `connecting` / `waking` states. */
+  silent = false,
+): TakeoverOptions {
   return {
     token: () => 'bench',
     baseUrl: () => 'ws://bench',
+    // A bench socket must never redial: a state screen that flickers back to
+    // "live" two seconds into a capture is a screenshot of nothing.
+    schedule: () => 0,
+    cancel: () => undefined,
     factory: () => {
       let live = mode
       const sock: SocketLike = {
@@ -214,7 +232,12 @@ export function mockOptions(mode: 'human_driving' | 'agent_driving' = 'human_dri
         send(raw: string) {
           MOCK_SENT.push(raw)
           const msg = JSON.parse(raw) as { type: string }
+          if (silent) return
           if (msg.type === 'auth') {
+            if (fail && !fail.afterSeed) {
+              sock.onclose?.({ code: fail.code, reason: fail.reason })
+              return
+            }
             sock.onmessage?.({ data: JSON.stringify({ type: 'auth_ok' }) })
             sock.onmessage?.({
               data: JSON.stringify({
@@ -238,6 +261,9 @@ export function mockOptions(mode: 'human_driving' | 'agent_driving' = 'human_dri
                 },
               }),
             })
+            if (fail?.afterSeed) {
+              sock.onclose?.({ code: fail.code, reason: fail.reason })
+            }
           }
           if (msg.type === 'hand_back' || msg.type === 'take_over') {
             live = msg.type === 'hand_back' ? 'agent_driving' : 'human_driving'

@@ -308,6 +308,26 @@ pub enum ClientMsg {
     HandBack,
     /// Grab the wheel again after a `hand_back`.
     TakeOver,
+    /// **The viewer's box** — sent on attach and on every resize, and the one
+    /// thing only the client can know.
+    ///
+    /// `width`/`height` are CSS pixels of the canvas the frames are painted
+    /// into, `dpr` its `devicePixelRatio`, `mobile` whether this is a touch
+    /// viewport that should get the site's phone layout. It drives BOTH halves
+    /// of legibility: the page is laid out at this box
+    /// (`Emulation.setDeviceMetricsOverride`) and the stream is capped to the
+    /// real pixels behind it, instead of a 1366px render pushed through a
+    /// 512px pipe. Aliased `w`/`h` because the client is free to send either.
+    Viewport {
+        #[serde(default, alias = "w")]
+        width: u32,
+        #[serde(default, alias = "h")]
+        height: u32,
+        #[serde(default = "one_dpr")]
+        dpr: f64,
+        #[serde(default)]
+        mobile: bool,
+    },
     /// Re-send a full still frame — a static page emits no screencast frames
     /// (spike gotcha #1), so a client that missed the seed would otherwise sit
     /// on a blank canvas until something on the page moved.
@@ -343,6 +363,95 @@ impl ServerMsg<'_> {
             serde_json::to_string(self).unwrap_or_else(|_| r#"{"type":"refused"}"#.to_string()),
         ))
     }
+}
+
+/// A client that omits `dpr` is telling us nothing, not telling us zero.
+fn one_dpr() -> f64 {
+    1.0
+}
+
+// ── the viewer's box ────────────────────────────────────────────────────────
+
+/// A sanitised [`ClientMsg::Viewport`]: the box we will lay the page out at and
+/// cap the stream to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewportRequest {
+    pub width: u32,
+    pub height: u32,
+    pub dpr: f64,
+    pub mobile: bool,
+}
+
+impl ViewportRequest {
+    /// Narrowest box worth laying a page out at — below this every site's
+    /// layout collapses and no human is reading it anyway.
+    pub const MIN_CSS: u32 = 200;
+    /// Widest. Well past any real window; a guard against a client asking us to
+    /// composite a wall.
+    pub const MAX_CSS: u32 = 4096;
+
+    /// Sanitise a client-supplied box.
+    ///
+    /// `None` ⇒ unusable — a zero-sized frame from a client that has not laid
+    /// itself out yet, which arrives routinely on attach. Keeping the profile
+    /// we have is right there; resizing the page to nothing is not.
+    pub fn sanitized(width: u32, height: u32, dpr: f64, mobile: bool) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let dpr = if dpr.is_finite() && dpr > 0.0 {
+            dpr.clamp(1.0, super::context::MAX_DEVICE_SCALE)
+        } else {
+            1.0
+        };
+        Some(Self {
+            width: width.clamp(Self::MIN_CSS, Self::MAX_CSS),
+            height: height.clamp(Self::MIN_CSS, Self::MAX_CSS),
+            dpr,
+            mobile,
+        })
+    }
+}
+
+/// Pick this viewer's streaming profile. Pure, so the choice is testable
+/// without chrome or a socket.
+///
+/// `None` — a client that never told us its size — is the **in-chat takeover
+/// card**, and it keeps today's 512²/q60/every-frame stream byte for byte. A
+/// client that negotiated is the **workspace viewport**, and it gets frames
+/// sized to its own screen at q75 and a quarter of the frame rate. Both ack as
+/// [`AckPolicy::Viewer`]: the end-to-end backpressure contract is a property of
+/// this socket, not of the profile.
+pub fn screencast_profile(req: Option<ViewportRequest>) -> ScreencastOptions {
+    let base = match req {
+        Some(v) => ScreencastOptions::drive(v.width, v.height, v.dpr),
+        None => ScreencastOptions::watch(),
+    };
+    ScreencastOptions {
+        ack: AckPolicy::Viewer,
+        ..base
+    }
+}
+
+/// The `metadata` box a still frame needs, synthesised from the viewport the
+/// page is actually laid out at.
+///
+/// A seed/resync still is a `Page.captureScreenshot`, not a screencast frame,
+/// so CDP hands us no metadata with it. Sending `{}` (what this did) made
+/// [`Viewport::from_metadata`] fail, which left the server clamp at
+/// [`COORD_CEILING`] and the client with no scale factor to map taps through —
+/// so every click before the first real frame landed somewhere else. On a
+/// **static page**, which emits no screencast frames at all (gotcha #1), that
+/// is every click.
+pub fn seed_metadata(width: u32, height: u32) -> Value {
+    json!({
+        "offsetTop": 0,
+        "pageScaleFactor": 1,
+        "deviceWidth": width,
+        "deviceHeight": height,
+        "scrollOffsetX": 0,
+        "scrollOffsetY": 0,
+    })
 }
 
 // ── input → CDP ─────────────────────────────────────────────────────────────
@@ -515,10 +624,14 @@ pub fn to_cdp(msg: &ClientMsg, viewport: Viewport) -> Option<CdpCall> {
                 json!({ "type": kind_str, "touchPoints": points }),
             ))
         }
+        // Control frames: no page effect of their own. `Viewport` is handled
+        // in `drive` (it resizes the page and renegotiates the stream) and must
+        // never reach `dispatch_input`.
         ClientMsg::Auth { .. }
         | ClientMsg::HandBack
         | ClientMsg::TakeOver
         | ClientMsg::Resync
+        | ClientMsg::Viewport { .. }
         | ClientMsg::Ping => None,
     }
 }
@@ -727,13 +840,21 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Out
     // load-bearing — a static page produces NO screencast frames (gotcha #1),
     // so without it a client attaching to an idle page sees a blank canvas.
     let url = ctx.current_url().await.unwrap_or_default();
+    // The REAL render size, not the `0, 0` this used to claim: it is the box we
+    // last pushed with `setDeviceMetricsOverride`, so the client can scale its
+    // canvas correctly on the very first frame.
+    let (seed_w, seed_h) = ctx.viewport_css();
+    let seed_meta = seed_metadata(seed_w, seed_h);
+    // …and the same box seeds the server-side clamp, so input mapping is right
+    // BEFORE frame #1 rather than after the page next repaints.
+    let mut viewport = Viewport::from_metadata(&seed_meta).unwrap_or_default();
     if socket
         .send(
             ServerMsg::Target {
                 session,
                 url,
-                width: 0,
-                height: 0,
+                width: seed_w,
+                height: seed_h,
             }
             .to_frame(),
         )
@@ -743,12 +864,11 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Out
         return Outcome::SendFailed;
     }
     if let Ok(still) = ctx.screenshot().await {
-        let meta = json!({});
         if socket
             .send(
                 ServerMsg::Frame {
                     data: &still,
-                    metadata: &meta,
+                    metadata: &seed_meta,
                 }
                 .to_frame(),
             )
@@ -768,14 +888,12 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Out
 
     // The screencast, with the ack handed to US (see the module docs on
     // backpressure).
+    // Start on the **watch** profile: it is what the in-chat card wants and all
+    // it will ever ask for, and it is the honest default for a client that has
+    // not yet told us how big it is. A workspace viewport upgrades itself one
+    // round trip later with a `viewport` frame.
     let mut frames = match ctx
-        .start_screencast(
-            Actor::Human,
-            ScreencastOptions {
-                ack: AckPolicy::Viewer,
-                ..ScreencastOptions::default()
-            },
-        )
+        .start_screencast(Actor::Human, screencast_profile(None))
         .await
     {
         Ok(rx) => rx,
@@ -786,7 +904,6 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Out
     };
 
     let mut modes = ctx.lock().subscribe();
-    let mut viewport = Viewport::default();
     // The newest ack token, kept so DROPPED frames can still be acked — an
     // unacked frame permanently stalls chrome's 2-slot in-flight window.
     let mut last_ack: Option<Value> = None;
@@ -824,10 +941,69 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Out
                             }
                             ClientMsg::Resync => {
                                 if let Ok(still) = ctx.screenshot().await {
-                                    let meta = json!({});
+                                    // The live box, not `{}` — a resync that
+                                    // cannot be mapped is a resync that breaks
+                                    // clicking on a static page.
+                                    let (w, h) = ctx.viewport_css();
+                                    let meta = seed_metadata(w, h);
                                     if socket.send(ServerMsg::Frame { data: &still, metadata: &meta }.to_frame()).await.is_err() {
                                         return Outcome::SendFailed;
                                     }
+                                }
+                                continue;
+                            }
+                            ClientMsg::Viewport { width, height, dpr, mobile } => {
+                                // **This is the legibility path.** A control
+                                // frame, deliberately handled ABOVE the drive
+                                // gate: a watcher who never pressed Drive still
+                                // needs the page to lay out at their screen's
+                                // size, or they are reading a 1366px render
+                                // squeezed into a phone.
+                                let Some(req) = ViewportRequest::sanitized(width, height, dpr, mobile) else {
+                                    continue;
+                                };
+                                // 1. Lay the PAGE out at the viewer's box. Half
+                                //    of readability, and all of "a phone gets
+                                //    the mobile site".
+                                if let Err(e) = ctx
+                                    .set_viewport_scaled(Actor::Human, req.width, req.height, req.dpr, req.mobile)
+                                    .await
+                                {
+                                    debug!(session = %session, error = %e, "browser takeover: setDeviceMetricsOverride");
+                                    continue;
+                                }
+                                // 2. The clamp follows immediately — we KNOW the
+                                //    box we just set, so there is no window in
+                                //    which input maps to the old one.
+                                viewport = Viewport { width: f64::from(req.width), height: f64::from(req.height) };
+                                // 3. Re-cap the stream to match. The other half:
+                                //    a matching cap is what keeps the frame 1:1
+                                //    instead of a downscale of the new render.
+                                match ctx.start_screencast(Actor::Human, screencast_profile(Some(req))).await {
+                                    Ok(rx) => frames = rx,
+                                    Err(e) => {
+                                        warn!(session = %session, error = %e, "browser takeover: screencast renegotiate");
+                                    }
+                                }
+                                // 4. A static page emits NO frames (gotcha #1),
+                                //    so without a still the resize would be
+                                //    invisible until something moved.
+                                let meta = seed_metadata(req.width, req.height);
+                                if let Ok(still) = ctx.screenshot().await {
+                                    if socket.send(ServerMsg::Frame { data: &still, metadata: &meta }.to_frame()).await.is_err() {
+                                        return Outcome::SendFailed;
+                                    }
+                                }
+                                // 5. And say what it is now looking at — the
+                                //    seed's `Target` was the OLD size, and the
+                                //    url may have moved since.
+                                let url = ctx.current_url().await.unwrap_or_default();
+                                if socket
+                                    .send(ServerMsg::Target { session, url, width: req.width, height: req.height }.to_frame())
+                                    .await
+                                    .is_err()
+                                {
+                                    return Outcome::SendFailed;
                                 }
                                 continue;
                             }
@@ -930,6 +1106,123 @@ mod tests {
         serde_json::from_str(s).expect("client frame")
     }
 
+    // ── the viewer's box: profiles, seeds, control-frame handling ───────
+
+    #[test]
+    fn a_viewport_frame_is_a_control_frame_and_takes_either_field_spelling() {
+        // The web half is free to send `width`/`height` or `w`/`h`; both must
+        // land on the same message, and neither may reach `dispatch_input`.
+        let long = parse(r#"{"type":"viewport","width":1200,"height":800,"dpr":2,"mobile":false}"#);
+        let short = parse(r#"{"type":"viewport","w":1200,"h":800,"dpr":2}"#);
+        for msg in [&long, &short] {
+            let ClientMsg::Viewport { width, height, dpr, mobile } = msg else {
+                panic!("not a viewport frame");
+            };
+            assert_eq!((*width, *height), (1200, 800));
+            assert_eq!(*dpr, 2.0);
+            assert!(!*mobile);
+            assert!(to_cdp(msg, Viewport::default()).is_none(), "control frame");
+        }
+        // dpr is optional: absent means "unknown", i.e. 1.0 — never 0.
+        let bare = parse(r#"{"type":"viewport","width":390,"height":844,"mobile":true}"#);
+        let ClientMsg::Viewport { dpr, mobile, .. } = bare else {
+            panic!("not a viewport frame");
+        };
+        assert_eq!(dpr, 1.0);
+        assert!(mobile);
+    }
+
+    #[test]
+    fn an_unusable_box_is_ignored_rather_than_applied() {
+        // A client that has not laid itself out yet routinely sends 0×0 on
+        // attach. Resizing the page to nothing would be worse than waiting.
+        assert!(ViewportRequest::sanitized(0, 800, 2.0, false).is_none());
+        assert!(ViewportRequest::sanitized(1200, 0, 2.0, false).is_none());
+        // Absurd or non-finite values are clamped, not trusted.
+        let tiny = ViewportRequest::sanitized(10, 10, f64::NAN, false).unwrap();
+        assert_eq!((tiny.width, tiny.height), (ViewportRequest::MIN_CSS, ViewportRequest::MIN_CSS));
+        assert_eq!(tiny.dpr, 1.0, "NaN dpr falls back to 1:1");
+        let huge = ViewportRequest::sanitized(99_999, 99_999, 9.0, false).unwrap();
+        assert_eq!((huge.width, huge.height), (ViewportRequest::MAX_CSS, ViewportRequest::MAX_CSS));
+        assert_eq!(huge.dpr, 2.0, "the render scale is capped");
+    }
+
+    #[test]
+    fn the_watch_profile_is_todays_stream_and_the_drive_profile_is_the_viewers() {
+        // WATCH — the in-chat takeover card. Nothing about it may move: the
+        // agent path is not the thing being fixed here.
+        let watch = screencast_profile(None);
+        assert_eq!(watch.max_width, 512);
+        assert_eq!(watch.max_height, 512);
+        assert_eq!(watch.quality, 60);
+        assert_eq!(watch.every_nth_frame, 1);
+        assert_eq!(watch.ack, AckPolicy::Viewer, "this socket always owns the ack");
+        assert_eq!(
+            ScreencastOptions { ack: AckPolicy::Immediate, ..watch },
+            ScreencastOptions::default(),
+            "byte for byte the profile the card streams today",
+        );
+
+        // DRIVE — a laptop viewport at 1:1. The cap is the viewer's REAL
+        // pixels, so the frame is not a downscale of the render.
+        let laptop = screencast_profile(Some(
+            ViewportRequest::sanitized(1200, 800, 1.0, false).unwrap(),
+        ));
+        assert_eq!((laptop.max_width, laptop.max_height), (1200, 800));
+        assert_eq!(laptop.quality, 75);
+        assert!(laptop.every_nth_frame > 1, "sharp frames over many frames");
+
+        // A retina viewer gets its own pixels…
+        let retina = screencast_profile(Some(
+            ViewportRequest::sanitized(700, 500, 2.0, false).unwrap(),
+        ));
+        assert_eq!((retina.max_width, retina.max_height), (1400, 1000));
+
+        // …up to the cap, past which a sharper frame buys nothing visible.
+        let wall = screencast_profile(Some(
+            ViewportRequest::sanitized(1500, 1200, 2.0, false).unwrap(),
+        ));
+        assert_eq!(wall.max_width, ScreencastOptions::MAX_STREAM_PX);
+        assert_eq!(wall.max_height, ScreencastOptions::MAX_STREAM_PX);
+    }
+
+    #[test]
+    fn a_phone_box_stays_a_phone_box() {
+        // The point of `mobile`: 390 CSS px must reach the page as 390, so the
+        // site serves its phone layout — never 1366 shrunk into a canvas.
+        let req = ViewportRequest::sanitized(390, 844, 3.0, true).unwrap();
+        assert_eq!((req.width, req.height), (390, 844));
+        assert!(req.mobile);
+        let profile = screencast_profile(Some(req));
+        assert_eq!(profile.max_width, 780, "390 CSS px at the capped 2× scale");
+        assert_eq!(profile.max_height, 1600, "844 × 2 clamped to the stream cap");
+    }
+
+    #[test]
+    fn the_seed_metadata_is_mappable_and_clamps_immediately() {
+        // The defect: `{}` made `from_metadata` fail, so the clamp stayed at
+        // COORD_CEILING and every pre-frame-1 click landed in the wrong place.
+        assert!(Viewport::from_metadata(&json!({})).is_none());
+        let meta = seed_metadata(1200, 800);
+        let vp = Viewport::from_metadata(&meta).expect("a mappable seed");
+        assert_eq!((vp.width, vp.height), (1200.0, 800.0));
+        assert_eq!(meta["offsetTop"], json!(0), "a still has no browser chrome above it");
+        assert_eq!(meta["pageScaleFactor"], json!(1));
+        // …and the clamp that follows is the page's, not the 100_000 fallback.
+        assert_eq!(vp.clamp(5_000.0, -1.0), (1200.0, 0.0));
+        assert_eq!(Viewport::default().clamp(5_000.0, 5_000.0), (5_000.0, 5_000.0));
+    }
+
+    #[test]
+    fn a_zero_sized_context_still_yields_a_usable_fallback_clamp() {
+        // A context whose metrics we somehow do not know must not produce a
+        // metadata box that maps everything to (0, 0).
+        let meta = seed_metadata(0, 0);
+        assert!(Viewport::from_metadata(&meta).is_none());
+        let vp = Viewport::from_metadata(&meta).unwrap_or_default();
+        assert_eq!(vp.width, COORD_CEILING);
+    }
+
     #[test]
     fn a_tap_becomes_a_clamped_left_press() {
         let vp = Viewport { width: 400.0, height: 300.0 };
@@ -1008,6 +1301,7 @@ mod tests {
             r#"{"type":"hand_back"}"#,
             r#"{"type":"take_over"}"#,
             r#"{"type":"resync"}"#,
+            r#"{"type":"viewport","width":1200,"height":800,"dpr":2}"#,
             r#"{"type":"ping"}"#,
             r#"{"type":"auth","token":"x"}"#,
         ] {
@@ -1073,6 +1367,19 @@ mod tests {
         let meta = json!({ "deviceWidth": 512 });
         let frame = serde_json::to_string(&ServerMsg::Frame { data: "AAA", metadata: &meta }).unwrap();
         assert!(frame.starts_with(r#"{"type":"frame","data":"AAA""#), "{frame}");
+        // `Target` carries the REAL render box — it used to say `0, 0`, which
+        // left the client no way to scale its canvas until a frame arrived.
+        let target = serde_json::to_string(&ServerMsg::Target {
+            session: "s",
+            url: "https://example.test/".to_string(),
+            width: 1200,
+            height: 800,
+        })
+        .unwrap();
+        assert_eq!(
+            target,
+            r#"{"type":"target","session":"s","url":"https://example.test/","width":1200,"height":800}"#,
+        );
     }
     // ── real-chrome end-to-end (phase 2's whole claim) ──────────────────────
 
@@ -1336,6 +1643,154 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
         );
         assert!(!state.browser.is_running().await, "and it spawns nothing on the way");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **REAL-CHROME — P0-3, the legibility claim.** Run with
+    /// `cargo test -- --ignored real_chrome_viewport`.
+    ///
+    /// The unit tests above prove the *arithmetic* of the two profiles. This
+    /// proves the part only a browser can answer: that a negotiated viewport
+    /// actually **re-lays-out the page** and actually **re-caps the stream**,
+    /// and that renegotiating does not hang up on a subscriber who is mid-watch.
+    #[tokio::test]
+    #[ignore = "spawns a real chrome-headless-shell; run with --ignored on a box that has the pinned binary"]
+    async fn real_chrome_viewport_relayouts_the_page_and_recaps_the_stream() {
+        use super::super::{BrowserConfig, BrowserService};
+        use std::time::Duration;
+
+        let svc = BrowserService::new(BrowserConfig {
+            profile: crate::connectors::browser::launch::ProfileMode::Ephemeral,
+            ..BrowserConfig::default()
+        });
+        if !svc.config().executable.exists() {
+            eprintln!("skipping: no pinned chrome at {:?}", svc.config().executable);
+            return;
+        }
+        let ctx = svc.context_for("viewport").await.expect("context");
+        ctx.navigate(Actor::Agent, &takeover_page())
+            .await
+            .expect("navigate");
+
+        // The configured render box is what the SEED reports — no longer `0, 0`.
+        let (w, h) = ctx.viewport_css();
+        assert_eq!((w, h), (svc.config().width, svc.config().height));
+        assert_eq!(
+            ctx.evaluate("window.innerWidth").await.expect("innerWidth"),
+            json!(svc.config().width),
+            "the page really is laid out at the configured box",
+        );
+
+        // Watch first — the in-chat card's profile, and a live subscriber that
+        // must SURVIVE the renegotiation below.
+        let mut watching = ctx
+            .start_screencast(Actor::Human, screencast_profile(None))
+            .await
+            .expect("watch screencast");
+
+        // ── negotiate: a laptop viewport at 2× ─────────────────────────────
+        let req = ViewportRequest::sanitized(900, 700, 2.0, false).expect("a usable box");
+        ctx.set_viewport_scaled(Actor::Human, req.width, req.height, req.dpr, req.mobile)
+            .await
+            .expect("setDeviceMetricsOverride");
+
+        // 1. THE PAGE LAID OUT AT THE VIEWER'S SIZE. This is the whole point:
+        //    a site branching on width now serves the layout for THAT width,
+        //    instead of a 1366px render squeezed into the viewer's canvas.
+        assert_eq!(
+            ctx.evaluate("window.innerWidth").await.expect("innerWidth"),
+            json!(900),
+        );
+        assert_eq!(
+            ctx.evaluate("window.devicePixelRatio")
+                .await
+                .expect("dpr")
+                .as_f64(),
+            Some(2.0),
+            "the render is at the viewer's pixel density, not upscaled from 1×",
+        );
+        assert_eq!(ctx.viewport_css(), (900, 700), "and the seed box followed it");
+
+        // 2. THE STREAM RE-CAPPED to match, without closing the watcher.
+        let mut driving = ctx
+            .start_screencast(Actor::Human, screencast_profile(Some(req)))
+            .await
+            .expect("renegotiated screencast");
+
+        let mut seen = 0usize;
+        let mut metadata_box = None;
+        let window = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < window && seen < 3 {
+            match tokio::time::timeout(Duration::from_millis(600), driving.recv()).await {
+                Ok(Ok(f)) => {
+                    seen += 1;
+                    if let Some(vp) = Viewport::from_metadata(&f.metadata) {
+                        metadata_box = Some(vp);
+                    }
+                    if let Some(ack) = &f.ack {
+                        ctx.ack_frame(ack).expect("ack");
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(seen > 0, "no frames after renegotiating the profile");
+        let vp = metadata_box.expect("a frame carrying metadata");
+        assert_eq!(
+            (vp.width, vp.height),
+            (900.0, 700.0),
+            "frames must describe the NEGOTIATED box — the client maps taps through this",
+        );
+
+        // 3. The mid-watch subscriber was not hung up on. A fresh channel would
+        //    have handed it `Closed`, which `drive` reads as ScreencastGone.
+        assert!(
+            !matches!(
+                watching.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+            ),
+            "renegotiating closed a live watcher's receiver",
+        );
+
+        // ── 4. `mobile: true` is REAL mobile emulation, not just a narrow box ──
+        //
+        // Measured, not assumed: with `mobile` set, chrome applies the same
+        // layout-viewport rules a phone does. A page that declares
+        // `width=device-width` lays out at the negotiated 390…
+        let mobile = ViewportRequest::sanitized(390, 844, 2.0, true).expect("a usable box");
+        ctx.set_viewport_scaled(
+            Actor::Human,
+            mobile.width,
+            mobile.height,
+            mobile.dpr,
+            mobile.mobile,
+        )
+        .await
+        .expect("setDeviceMetricsOverride");
+        ctx.navigate(
+            Actor::Human,
+            "data:text/html,<meta%20name=viewport%20content=width=device-width><body>m",
+        )
+        .await
+        .expect("navigate responsive");
+        assert_eq!(
+            ctx.evaluate("window.innerWidth").await.expect("innerWidth"),
+            json!(390),
+            "a responsive page must lay out at the phone's own width",
+        );
+        // …and one that does NOT declare it gets chrome's 980px fallback
+        // layout viewport, scaled down — which is exactly what the same page
+        // does on a real phone. Pinned so nobody later "fixes" it into a lie.
+        ctx.navigate(Actor::Human, &takeover_page())
+            .await
+            .expect("navigate legacy");
+        assert_eq!(
+            ctx.evaluate("window.innerWidth").await.expect("innerWidth"),
+            json!(980),
+            "no viewport meta ⇒ the mobile fallback layout viewport, as on a phone",
+        );
+
+        ctx.stop_screencast(Actor::Human).await.expect("stop");
+        svc.shutdown().await;
     }
 
     /// **REAL-CHROME — P0-2.** Run with

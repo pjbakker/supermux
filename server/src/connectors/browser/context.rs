@@ -41,6 +41,7 @@
 //! [`Actor::Human`] always passes. Read-only helpers are ungated — observing
 //! the page is never a conflict.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +64,19 @@ const LOAD_BUDGET: Duration = Duration::from_secs(20);
 /// design (see `SPIKE-RESULT.md` gotcha #2) — a lagging viewer skips ahead
 /// rather than pushing back on the browser.
 const FRAME_CHANNEL_CAP: usize = 16;
+
+/// Ceiling on `deviceScaleFactor`. Chrome composites `width × scale` REAL
+/// pixels, so the render cost is quadratic in this number while the legibility
+/// win stops at "one frame pixel per screen pixel". A 3× phone therefore
+/// renders at 2× and the extra third is left on the client's downscale, which
+/// is free.
+pub const MAX_DEVICE_SCALE: f64 = 2.0;
+
+/// `everyNthFrame` for the drive profile. Chrome paints up to ~60 fps; a person
+/// READING a page wants ~15 sharp frames far more than 60 that spent their
+/// quality budget on motion, and it is the same trade the 512-cap made in the
+/// other direction.
+const DRIVE_EVERY_NTH: u32 = 4;
 
 /// One JPEG/PNG frame off `Page.screencastFrame`.
 #[derive(Debug, Clone)]
@@ -101,7 +115,7 @@ pub enum AckPolicy {
 
 /// Screencast tuning. Defaults are the spike's mobile-friendly recommendation:
 /// jpeg q60 capped at 512px, which measured ~138 KB/s at 60 fps.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScreencastOptions {
     pub format: String,
     pub quality: u32,
@@ -126,6 +140,69 @@ impl Default for ScreencastOptions {
             every_nth_frame: 1,
             ack: AckPolicy::Immediate,
         }
+    }
+}
+
+/// **Two profiles, and the gap between them is the whole legibility story.**
+///
+/// The same page streamed to a phone-sized card next to a chat transcript and
+/// to a laptop viewport somebody is trying to READ are not the same problem.
+/// One wants motion at ~138 KB/s; the other wants type it can resolve. The
+/// server cannot guess which it is serving, so the client says
+/// (`ClientMsg::Viewport`) and this picks.
+impl ScreencastOptions {
+    /// The largest frame either profile will ever ask chrome for — a cap on the
+    /// encoder, on the wire and on the canvas the client has to paint. Past it a
+    /// sharper frame buys nothing an eye can see on a real screen.
+    pub const MAX_STREAM_PX: u32 = 1600;
+
+    /// **watch** — the in-chat takeover card. The spike's measured mobile
+    /// profile (jpeg q60, 512², every frame), byte for byte, because a person
+    /// watching an agent work wants motion and a small bill, not typography.
+    /// This is what a client that never negotiates keeps getting.
+    pub fn watch() -> Self {
+        Self::default()
+    }
+
+    /// **drive** — the workspace viewport, sized for the human looking at it.
+    ///
+    /// `css_w`/`css_h` are the viewer's CSS box and `dpr` its device pixel
+    /// ratio, so the cap is the count of REAL pixels their screen can show.
+    /// Paired with [`AgentContext::set_viewport_scaled`], which lays the page
+    /// out at that same box, the result is 1:1 and readable instead of a 1366px
+    /// render squeezed through a 512px pipe and re-upscaled in a canvas.
+    pub fn drive(css_w: u32, css_h: u32, dpr: f64) -> Self {
+        let scale = if dpr.is_finite() {
+            dpr.clamp(1.0, MAX_DEVICE_SCALE)
+        } else {
+            1.0
+        };
+        let px = |css: u32| -> u32 {
+            let want = f64::from(css.max(1)) * scale;
+            (want.round() as u32).clamp(1, Self::MAX_STREAM_PX)
+        };
+        Self {
+            format: "jpeg".to_string(),
+            quality: 75,
+            max_width: px(css_w),
+            max_height: px(css_h),
+            every_nth_frame: DRIVE_EVERY_NTH,
+            ack: AckPolicy::Immediate,
+        }
+    }
+
+    /// The `Page.startScreencast` payload. Split out so the mapping is testable
+    /// without chrome AND so the renegotiation path below cannot drift from the
+    /// start path — the bug that would show up as "the profile changed but the
+    /// picture did not".
+    pub fn cdp_params(&self) -> Value {
+        json!({
+            "format": self.format,
+            "quality": self.quality,
+            "maxWidth": self.max_width,
+            "maxHeight": self.max_height,
+            "everyNthFrame": self.every_nth_frame.max(1),
+        })
     }
 }
 
@@ -211,6 +288,13 @@ pub struct AgentContext {
     cdp_session_id: String,
     client: Arc<CdpClient>,
     lock: DriveLock,
+    /// The CSS-pixel box this target is laid out at — mirrored from every
+    /// `Emulation.setDeviceMetricsOverride` we issue, which is authoritative
+    /// because nothing else in the tree ever sets one. Atomic, not behind the
+    /// screencast mutex, because the takeover seed reads it on a path with
+    /// nothing to await.
+    viewport_w: AtomicU32,
+    viewport_h: AtomicU32,
     /// Live screencast pump, if one is running.
     screencast: Mutex<Option<Screencast>>,
 }
@@ -218,6 +302,10 @@ pub struct AgentContext {
 struct Screencast {
     tx: broadcast::Sender<ScreencastFrame>,
     pump: JoinHandle<()>,
+    /// The options this cast is RUNNING with. Kept so a second caller asking
+    /// for a different profile is honoured instead of silently inheriting the
+    /// first attacher's — see [`AgentContext::start_screencast`].
+    options: ScreencastOptions,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -359,6 +447,8 @@ impl AgentContext {
             cdp_session_id,
             client,
             lock: DriveLock::new(session),
+            viewport_w: AtomicU32::new(width),
+            viewport_h: AtomicU32::new(height),
             screencast: Mutex::new(None),
         };
         // Domains we need events + evaluation from.
@@ -611,7 +701,7 @@ impl AgentContext {
         .map(|_| ())
     }
 
-    /// Resize this target's viewport (per-target, not browser-wide).
+    /// Resize this target's viewport (per-target, not browser-wide) at 1:1.
     pub async fn set_viewport(
         &self,
         actor: Actor,
@@ -619,16 +709,71 @@ impl AgentContext {
         height: u32,
         mobile: bool,
     ) -> Result<()> {
+        self.set_viewport_scaled(actor, width, height, 1.0, mobile)
+            .await
+    }
+
+    /// The same override, **at the viewer's device pixel ratio** — the call
+    /// that makes a shared browser legible.
+    ///
+    /// Two distinct things happen here and both matter:
+    ///
+    /// * `width`/`height` decide how the PAGE LAYS OUT. A 390px box gets the
+    ///   site's mobile layout; a 1200px box gets the desktop one. Streaming a
+    ///   1366px render to a 390px phone is not the same picture shrunk — it is
+    ///   the wrong page.
+    /// * `deviceScaleFactor` decides how SHARP it is. Chrome composites
+    ///   `width × scale` real pixels, so a retina viewer asking for its own box
+    ///   gets a frame with its own pixels in it rather than an upscale of a
+    ///   CSS-pixel render. Clamped to [`MAX_DEVICE_SCALE`]: the cost is
+    ///   quadratic and the benefit stops at one frame pixel per screen pixel.
+    ///
+    /// `Actor::Human` is never refused by the lock, deliberately: a person
+    /// whose window is 390px wide must be able to make the page lay out at
+    /// 390px even while an agent holds the wheel, because the alternative is a
+    /// picture they cannot read. It is the same escalation rule the input relay
+    /// runs on.
+    pub async fn set_viewport_scaled(
+        &self,
+        actor: Actor,
+        width: u32,
+        height: u32,
+        dpr: f64,
+        mobile: bool,
+    ) -> Result<()> {
         self.lock.gate(actor)?;
+        let (width, height) = (width.max(1), height.max(1));
+        let scale = if dpr.is_finite() {
+            dpr.clamp(1.0, MAX_DEVICE_SCALE)
+        } else {
+            1.0
+        };
         self.session_call(
             "Emulation.setDeviceMetricsOverride",
             json!({
                 "width": width, "height": height,
-                "deviceScaleFactor": 1, "mobile": mobile,
+                "deviceScaleFactor": scale, "mobile": mobile,
             }),
         )
-        .await
-        .map(|_| ())
+        .await?;
+        self.viewport_w.store(width, Ordering::Relaxed);
+        self.viewport_h.store(height, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The CSS-pixel box this target is currently laid out at.
+    ///
+    /// Free (no CDP round trip) and always true, because it mirrors the only
+    /// `setDeviceMetricsOverride` any code path here issues. The takeover seed
+    /// uses it to send a real `width`/`height` and a real `metadata` box
+    /// **before frame #1**, so the input clamp is right from the first click
+    /// instead of from whenever the page next repaints — which on a static page
+    /// is never.
+    pub fn viewport_css(&self) -> (u32, u32) {
+        (
+            self.viewport_w.load(Ordering::Relaxed),
+            self.viewport_h.load(Ordering::Relaxed),
+        )
     }
 
     // ── screencast (phase 2 consumes this) ──────────────────────────────────
@@ -640,6 +785,23 @@ impl AgentContext {
     /// **mandatory** — without it Chrome delivers ~3 frames and stalls — and it
     /// doubles as free backpressure (spike gotcha #2). Phase 2 may move the ack
     /// to "after the client socket accepted the frame"; the hook is one line.
+    ///
+    /// # Options are negotiable, not first-come
+    ///
+    /// This used to hand every later caller the running cast and drop their
+    /// options on the floor, which made the profile a property of *whoever
+    /// attached first*. A viewer telling us its screen size (the whole point of
+    /// [`ScreencastOptions::drive`]) would then be answered with somebody
+    /// else's 512px stream. Now:
+    ///
+    /// * same options ⇒ plain re-subscribe, as before;
+    /// * different encoder options, same [`AckPolicy`] ⇒ chrome is stopped and
+    ///   restarted with the new payload while the **pump and the channel stay
+    ///   alive**, so existing subscribers keep their receiver (a fresh channel
+    ///   would hand them `Closed`, which the takeover socket reads as "the
+    ///   screencast died" and hangs up on the human);
+    /// * a different ack policy ⇒ the pump itself is wrong (the policy is baked
+    ///   in at spawn), so it is aborted and rebuilt below.
     pub async fn start_screencast(
         &self,
         actor: Actor,
@@ -647,8 +809,25 @@ impl AgentContext {
     ) -> Result<broadcast::Receiver<ScreencastFrame>> {
         self.lock.gate(actor)?;
         let mut slot = self.screencast.lock().await;
-        if let Some(existing) = slot.as_ref() {
-            return Ok(existing.tx.subscribe());
+        // Copied out so no borrow of `slot` is alive across the awaits below.
+        let running = slot.as_ref().map(|sc| (sc.tx.clone(), sc.options.clone()));
+        if let Some((tx, current)) = running {
+            if current == options {
+                return Ok(tx.subscribe());
+            }
+            if current.ack == options.ack {
+                self.session_call("Page.stopScreencast", json!({})).await?;
+                self.session_call("Page.startScreencast", options.cdp_params())
+                    .await?;
+                if let Some(sc) = slot.as_mut() {
+                    sc.options = options;
+                }
+                return Ok(tx.subscribe());
+            }
+            if let Some(old) = slot.take() {
+                old.pump.abort();
+            }
+            self.session_call("Page.stopScreencast", json!({})).await?;
         }
 
         let (tx, rx) = broadcast::channel(FRAME_CHANNEL_CAP);
@@ -707,18 +886,9 @@ impl AgentContext {
             })
         };
 
-        self.session_call(
-            "Page.startScreencast",
-            json!({
-                "format": options.format,
-                "quality": options.quality,
-                "maxWidth": options.max_width,
-                "maxHeight": options.max_height,
-                "everyNthFrame": options.every_nth_frame.max(1),
-            }),
-        )
-        .await?;
-        *slot = Some(Screencast { tx, pump });
+        self.session_call("Page.startScreencast", options.cdp_params())
+            .await?;
+        *slot = Some(Screencast { tx, pump, options });
         Ok(rx)
     }
 
@@ -836,6 +1006,61 @@ impl AgentContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cdp_payload_matches_the_profile() {
+        let opts = ScreencastOptions::drive(1200, 800, 1.0);
+        let p = opts.cdp_params();
+        assert_eq!(p["format"], "jpeg");
+        assert_eq!(p["quality"], json!(75));
+        assert_eq!(p["maxWidth"], json!(1200));
+        assert_eq!(p["maxHeight"], json!(800));
+        assert_eq!(p["everyNthFrame"], json!(DRIVE_EVERY_NTH));
+        // `everyNthFrame: 0` is a protocol error; the floor is enforced at the
+        // payload, so no caller can construct one that stalls the cast.
+        let zero = ScreencastOptions {
+            every_nth_frame: 0,
+            ..ScreencastOptions::watch()
+        };
+        assert_eq!(zero.cdp_params()["everyNthFrame"], json!(1));
+    }
+
+    #[test]
+    fn the_drive_profile_is_the_viewers_real_pixels_capped() {
+        // 1:1 laptop.
+        let laptop = ScreencastOptions::drive(1366, 768, 1.0);
+        assert_eq!((laptop.max_width, laptop.max_height), (1366, 768));
+        // Retina: the cap is real pixels, or the frame is an upscale of a
+        // CSS-pixel render and the text stays soft.
+        let retina = ScreencastOptions::drive(700, 500, 2.0);
+        assert_eq!((retina.max_width, retina.max_height), (1400, 1000));
+        // The device-scale ceiling is a cost guard: rendering is quadratic in it.
+        let phone = ScreencastOptions::drive(390, 400, 3.0);
+        assert_eq!(phone.max_width, 780, "dpr clamped to MAX_DEVICE_SCALE");
+        // A wall is still capped.
+        let wall = ScreencastOptions::drive(4096, 4096, 2.0);
+        assert_eq!(wall.max_width, ScreencastOptions::MAX_STREAM_PX);
+        // Nonsense in, sane out.
+        let bad = ScreencastOptions::drive(0, 0, f64::NAN);
+        assert_eq!((bad.max_width, bad.max_height), (1, 1));
+    }
+
+    #[test]
+    fn the_watch_profile_is_the_spikes_measured_default() {
+        // The in-chat card's stream. If this moves, the agent-watch path
+        // regressed — which this change is explicitly not allowed to do.
+        assert_eq!(ScreencastOptions::watch(), ScreencastOptions::default());
+        let w = ScreencastOptions::watch();
+        assert_eq!((w.max_width, w.max_height, w.quality, w.every_nth_frame), (512, 512, 60, 1));
+        // …and it is a DIFFERENT profile from any negotiated one, which is what
+        // makes `start_screencast` restart the cast instead of re-subscribing.
+        assert_ne!(ScreencastOptions::watch(), ScreencastOptions::drive(1200, 800, 1.0));
+        assert_eq!(
+            ScreencastOptions::drive(1200, 800, 1.0),
+            ScreencastOptions::drive(1200, 800, 1.0),
+            "same request ⇒ same options ⇒ a plain re-subscribe",
+        );
+    }
 
     #[test]
     fn named_keys_carry_the_full_payload() {

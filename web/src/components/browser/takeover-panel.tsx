@@ -23,6 +23,35 @@
  * MOTION. There is no decorative animation here at all: the only thing that
  * moves is the page itself, which is content. The live dot's pulse is the one
  * exception and it is `motion-reduce:animate-none`.
+ *
+ * ── PHASE 2: A PAGE A HUMAN CAN ACTUALLY DRIVE ───────────────────────────────
+ *
+ * Everything above shipped a canvas you could WATCH on a phone and drive only
+ * with a mouse. Three things were missing, and all three were client-side —
+ * every server primitive has existed since phase 0:
+ *
+ *   1. **Touch.** `Input.dispatchTouchEvent` has been wired in `takeover.rs`
+ *      the whole time; the client only ever sent mouse events, so a thumb could
+ *      not scroll. `TouchGesture` (`lib/browser/gestures.ts`) decides tap vs
+ *      scroll and this panel relays the result: scroll as real touch events (so
+ *      the page's own handlers and chrome's fling both work), tap as a real
+ *      click. Never both — see that file's note on the double-click that would
+ *      otherwise land on every tap.
+ *   2. **A keyboard.** A canvas cannot raise a soft keyboard; only a focused
+ *      editable can. So there is a hidden `<input>` — the KEYBOARD TRAP — that
+ *      a tap focuses while driving, and whose keystrokes are relayed as text
+ *      (IME- and emoji-safe) or as key events (`lib/browser/keyboard-trap.ts`).
+ *      The viewport lifts above the keyboard rather than letting iOS scroll the
+ *      page out from under the thumb, and the tapped point is scrolled back
+ *      into the band that is left.
+ *   3. **A box the page is laid out at.** `ClientMsg::Viewport` tells the
+ *      server the canvas' real CSS size and pixel ratio; it answers with
+ *      `Emulation.setDeviceMetricsOverride` and a stream capped to the same
+ *      pixels. That is the difference between a phone reading a 1366px desktop
+ *      render at a third scale and a phone reading the site's MOBILE layout.
+ *
+ * Plus the state matrix (`lib/browser/viewport-state.ts`): every non-live state
+ * is a screen with an action, not a pill floating over black.
  */
 /* eslint-disable jsx-a11y/no-noninteractive-element-interactions,
                   jsx-a11y/no-noninteractive-tabindex --
@@ -37,6 +66,8 @@
    contains exactly one such element. */
 import * as React from 'react'
 
+import { Keyboard, Loader2, Power, RotateCw } from 'lucide-react'
+
 import { cn } from '@/lib/utils'
 import {
   decodeFrame,
@@ -49,12 +80,17 @@ import {
 import {
   EMPTY_SNAPSHOT,
   TakeoverSocket,
+  driveDpr,
   modifiersFor,
   subjectName,
   type TakeoverOptions,
   type TakeoverSnapshot,
   type TakeoverSubject,
 } from '@/lib/browser/takeover-socket'
+import { ClickCounter, TouchGesture, type GestureAction } from '@/lib/browser/gestures'
+import { keyboardScrollDelta, trapKeyAction } from '@/lib/browser/keyboard-trap'
+import { viewportState, type ViewportVerb, type ViewportView } from '@/lib/browser/viewport-state'
+import { useKeyboardViewport } from '@/hooks/use-keyboard-viewport'
 
 /** Cap the backing store at 2× — a 3× phone would triple the fill cost of
  *  every frame for a JPEG that is 512px wide to begin with. */
@@ -116,6 +152,9 @@ export interface TakeoverControls {
   takeOver: () => void
   handBack: () => void
   resync: () => void
+  /** Dial again after a terminal state (busy / offline / no-context). The tab
+   *  route rehydrates on attach, so on an asleep tab this IS the wake. */
+  retry: () => void
 }
 
 /** What a host-drawn header renders from. Plain values only. */
@@ -148,6 +187,39 @@ export interface TakeoverPanelProps {
   renderHeader?: (state: TakeoverHeaderState) => React.ReactNode
   /** Where to publish [[TakeoverControls]] for a host-drawn header. */
   controlsRef?: { current: TakeoverControls | null }
+  /** The tab ROW says a live page exists. Distinct from the socket's state:
+   *  the row is what the workspace polls, the socket is what is attached right
+   *  now, and the gap between them is exactly "waking". */
+  tabLive?: boolean
+  /**
+   * DIAL, or stand ready without dialling. Defaults to `true` (every existing
+   * caller keeps today's behaviour).
+   *
+   * The tab route REHYDRATES on attach, which is exactly what makes the live
+   * panel a sane default for an open tab — and exactly why merely selecting an
+   * ASLEEP one must not attach: that would start a real chrome, spend a slot
+   * against the tab cap and change what the agents see, all as a side effect of
+   * a human glancing at a row. So the workspace passes the row's own `live`
+   * here, the asleep state screen is drawn without a socket, and pressing
+   * **Wake** is what dials (which is also what wakes it).
+   */
+  attach?: boolean
+  /** A wake / navigate is in flight on the host's side. */
+  waking?: boolean
+  /** The tab's last login probe said signed out — drawn as a banner OVER the
+   *  page, never instead of it (the sign-in form is on that page). */
+  needsLogin?: boolean
+  /** The renderer died. Nothing sets this in production yet — the
+   *  `Inspector.targetCrashed` relay is phase 3 — so today only the bench does. */
+  crashed?: boolean
+  /** Wake the tab row (`POST …/open`). The socket restarts either way. */
+  onWake?: () => void
+  /** Re-navigate to the current url — the crashed state's one verb. */
+  onReload?: () => void
+  /** BENCH ONLY. The offline screenshot rig has no soft keyboard, so the lift
+   *  and the Done bar can only be captured by pretending one is up. Pixels of
+   *  pretend keyboard; production never passes it. */
+  benchKeyboard?: number
   className?: string
 }
 
@@ -158,6 +230,14 @@ export function TakeoverPanel({
   embedded,
   renderHeader,
   controlsRef,
+  tabLive,
+  attach,
+  waking,
+  needsLogin,
+  crashed,
+  onWake,
+  onReload,
+  benchKeyboard,
   className,
 }: TakeoverPanelProps) {
   // Primitives, not the object: a caller passing `subject={{kind:'tab',id}}`
@@ -167,6 +247,13 @@ export function TakeoverPanel({
   const name = subject ? subjectName(subject) : session ?? ''
 
   const [snap, setSnap] = React.useState<TakeoverSnapshot>(EMPTY_SNAPSHOT)
+  /** The human pressed Wake on a tab the host still thinks is asleep. Latched
+   *  so the dial does not un-happen on the next poll that has not caught up. */
+  const [dialled, setDialled] = React.useState(false)
+  const attached = (attach ?? true) || dialled
+  /** The ONE thing a host must not get wrong: the human holds the wheel. Every
+   *  input path below is gated on it. */
+  const driving = snap.mode === 'human_driving'
   const boxRef = React.useRef<HTMLDivElement | null>(null)
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null)
   const socketRef = React.useRef<TakeoverSocket | null>(null)
@@ -236,9 +323,10 @@ export function TakeoverPanel({
         takeOver: () => sock.takeOver(),
         handBack: () => sock.handBack(),
         resync: () => sock.resync(),
+        retry: () => sock.restart(),
       }
     }
-    sock.start()
+    if (attached) sock.start()
     return () => {
       alive = false
       pending = null
@@ -251,7 +339,42 @@ export function TakeoverPanel({
       release(paintedRef.current?.image)
       paintedRef.current = null
     }
-  }, [kind, name, options, controlsRef])
+  }, [kind, name, options, controlsRef, attached])
+
+  // ── the viewer's box ───────────────────────────────────────────────────────
+  // Sent on attach, on every resize, and whenever the wheel changes hands (the
+  // drive profile asks for the human's real pixels; watching asks for 1×). The
+  // socket de-duplicates identical boxes and re-sends the last one after a
+  // reconnect, so this only has to be called generously.
+  const negotiateAt = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const negotiate = React.useCallback(() => {
+    if (negotiateAt.current) clearTimeout(negotiateAt.current)
+    negotiateAt.current = setTimeout(() => {
+      negotiateAt.current = null
+      const box = boxRef.current
+      const sock = socketRef.current
+      if (!box || !sock) return
+      sock.viewport({
+        width: box.clientWidth,
+        height: box.clientHeight,
+        dpr: driveDpr(driving, window.devicePixelRatio || 1),
+        // A COARSE POINTER, not a narrow window: a 390px browser window on a
+        // laptop is a narrow desktop, and telling a site it is a phone there
+        // would hand a mouse touch-sized buttons.
+        mobile: !!window.matchMedia?.('(pointer: coarse)').matches,
+      })
+    }, 120)
+  }, [driving])
+  React.useEffect(
+    () => () => {
+      if (negotiateAt.current) clearTimeout(negotiateAt.current)
+    },
+    [],
+  )
+  // Taking the wheel re-negotiates: same box, sharper pixels.
+  React.useEffect(() => {
+    negotiate()
+  }, [negotiate])
 
   // Repaint from the frame we ALREADY hold when the box resizes — a rotation, a
   // split-pane drag, an iOS URL-bar collapse. `blit` sizes the backing store, so
@@ -264,10 +387,18 @@ export function TakeoverPanel({
     const ro = new ResizeObserver(() => {
       const painted = paintedRef.current
       if (painted) blit(canvas, box, painted.image)
+      // The box moved, so the box we told the SERVER about is stale — the page
+      // is now being laid out for a viewport that no longer exists. Debounced,
+      // because each negotiation costs chrome a metrics override, a screencast
+      // restart and a full still, and a rotation fires this observer four times.
+      negotiate()
     })
     ro.observe(box)
     return () => ro.disconnect()
-  }, [])
+    // Re-installed when the wheel changes hands, because `negotiate` closes
+    // over `driving` (the drive profile asks for sharper pixels). That happens
+    // twice a session and never mid-gesture, so it costs nothing.
+  }, [negotiate])
 
   /** A pointer/wheel event's position in PAGE coordinates, or `null` when it
    *  landed on the letterbox (or before the first frame). */
@@ -284,7 +415,113 @@ export function TakeoverPanel({
     )
   }, [])
 
-  const driving = snap.mode === 'human_driving'
+
+  // ── the soft keyboard ──────────────────────────────────────────────────────
+  // The app's own keyboard observer, reused rather than re-derived: it already
+  // knows the iOS-overlay / Android-resizes-content split that every naive
+  // `innerHeight` check gets wrong.
+  const kb = useKeyboardViewport()
+  const trapRef = React.useRef<HTMLInputElement | null>(null)
+  const composingRef = React.useRef(false)
+  /** Where the last tap landed, in PAGE px — what the keyboard has to be kept
+   *  off. Cleared once used so an old tap cannot scroll a later page. */
+  const lastTapRef = React.useRef<{ x: number; y: number } | null>(null)
+  // While driving on a phone the keyboard OVERLAYS the layout viewport (iOS) —
+  // so the canvas is lifted above it and, because the box shrank, the page is
+  // re-laid-out at what is left. The human keeps seeing the whole page, smaller,
+  // instead of a page scrolled out from under their thumb.
+  const kbInset = benchKeyboard ?? (kb.keyboardOpen ? kb.keyboardInset : 0)
+  const keyboardUp = driving && kbInset > 0
+  const lift = keyboardUp ? kbInset : 0
+
+  const focusTrap = React.useCallback(() => {
+    // `preventScroll`: the trap is a 1px box inside the viewport, and letting
+    // the platform scroll it into view would move the supermux page under a
+    // human who is looking at somebody else's.
+    trapRef.current?.focus({ preventScroll: true })
+  }, [])
+
+  // Leaving drive puts the keyboard away. A trap that keeps focus after the
+  // wheel went back to the agent is a keyboard over a page that is ignoring it.
+  React.useEffect(() => {
+    if (!driving) trapRef.current?.blur()
+  }, [driving])
+
+  // The keyboard just came up over the point the human tapped: scroll the page
+  // so the field they are typing into is in the band that is left. Delayed past
+  // the negotiation above, so the height read here is the page's NEW one.
+  React.useEffect(() => {
+    if (!kb.keyboardOpen || !driving) return
+    const tap = lastTapRef.current
+    if (!tap) return
+    const t = setTimeout(() => {
+      const painted = paintedRef.current
+      const pageHeight = painted?.frame.metadata.deviceHeight ?? 0
+      const dy = keyboardScrollDelta(tap.y, pageHeight)
+      if (dy) socketRef.current?.wheel(tap, { dx: 0, dy })
+      lastTapRef.current = null
+    }, 420)
+    return () => clearTimeout(t)
+  }, [kb.keyboardOpen, driving])
+
+  // ── touch ──────────────────────────────────────────────────────────────────
+  const gestureRef = React.useRef<TouchGesture | null>(null)
+  if (gestureRef.current == null) {
+    gestureRef.current = new TouchGesture()
+  }
+
+  /** Relay what the recogniser decided. A tap is a click AND the moment the
+   *  keyboard may be wanted, so it is also what focuses the trap. */
+  const relay = React.useCallback(
+    (actions: GestureAction[]) => {
+      const sock = socketRef.current
+      if (!sock) return
+      for (const a of actions) {
+        if (a.kind === 'touch') {
+          sock.touch(a.phase, a.point)
+          continue
+        }
+        lastTapRef.current = a.point
+        sock.mouse('down', a.point, { buttons: 1, clickCount: a.clickCount })
+        sock.mouse('up', a.point, { buttons: 0, clickCount: a.clickCount })
+        // Focusing INSIDE the touchend handler is what makes iOS raise the
+        // keyboard at all: a focus() outside a user gesture is ignored there.
+        focusTrap()
+      }
+    },
+    [focusTrap],
+  )
+
+  const touchPoint = (t: { clientX: number; clientY: number }) =>
+    pagePoint(t.clientX, t.clientY)
+
+  const onTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (!driving) return
+    const t = e.touches[0]
+    if (!t) return
+    const p = touchPoint(t)
+    if (!p) return
+    relay(gestureRef.current!.begin(p, e.timeStamp))
+  }
+
+  const onTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (!driving) return
+    const t = e.touches[0]
+    if (!t) return
+    const p = touchPoint(t)
+    if (!p) return
+    relay(gestureRef.current!.move(p, e.timeStamp))
+  }
+
+  const onTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (!driving) return
+    const t = e.changedTouches[0]
+    relay(gestureRef.current!.end(t ? touchPoint(t) : null, e.timeStamp))
+  }
+
+  const onTouchCancel = () => {
+    relay(gestureRef.current!.cancel())
+  }
 
   // Wheel has to be a native listener: React's synthetic `onWheel` is passive
   // in every current engine, so `preventDefault` there is a no-op and the
@@ -303,19 +540,46 @@ export function TakeoverPanel({
     return () => box.removeEventListener('wheel', onWheel)
   }, [driving, pagePoint])
 
+  // ── mouse (desktop) ────────────────────────────────────────────────────────
+  // Pointer events fire for TOUCH too, and a finger that produced both a
+  // pointer stream and a touch stream would click twice and scroll twice. Touch
+  // has its own recogniser above, so this path is mouse and pen only.
+  const isMouse = (e: React.PointerEvent<HTMLDivElement>) => e.pointerType !== 'touch'
+
+  /** A pointer event's `detail` is 0 in chrome — it is a `MouseEvent` field —
+   *  so the count is kept here, and the `up` reuses the `down`'s. */
+  const clicksRef = React.useRef<ClickCounter | null>(null)
+  if (clicksRef.current == null) {
+    clicksRef.current = new ClickCounter()
+  }
+  const clickCountRef = React.useRef(1)
+
+  const mouseButton = (button: number) =>
+    button === 2 ? 'right' : button === 1 ? 'middle' : 'left'
+
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    // Focus first so the keyboard follows the pointer into the page, even when
-    // the gesture itself lands on the letterbox.
-    e.currentTarget.focus({ preventScroll: true })
+    if (!isMouse(e)) return
+    // Focus the trap, not the box: it is the one element that owns the keyboard
+    // while driving (and on desktop it raises nothing — it is just where the
+    // keystrokes land). Not driving: focus the box, so the surface is still
+    // keyboard-reachable and Drive is one Tab away.
+    if (driving) focusTrap()
+    else e.currentTarget.focus({ preventScroll: true })
     if (!driving) return
     const p = pagePoint(e.clientX, e.clientY)
     if (!p) return
     e.currentTarget.setPointerCapture?.(e.pointerId)
-    socketRef.current?.mouse('down', p, { buttons: 1, modifiers: modifiersFor(e) })
+    clickCountRef.current = clicksRef.current!.next(p, e.timeStamp)
+    socketRef.current?.mouse('down', p, {
+      buttons: 1,
+      clickCount: clickCountRef.current,
+      button: mouseButton(e.button),
+      modifiers: modifiersFor(e),
+    })
   }
 
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!driving) return
+    if (!driving || !isMouse(e)) return
     const p = pagePoint(e.clientX, e.clientY)
     if (!p) return
     socketRef.current?.mouse('move', p, {
@@ -325,30 +589,101 @@ export function TakeoverPanel({
   }
 
   const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!driving) return
+    if (!driving || !isMouse(e)) return
     const p = pagePoint(e.clientX, e.clientY)
     if (!p) return
     e.currentTarget.releasePointerCapture?.(e.pointerId)
-    socketRef.current?.mouse('up', p, { buttons: 0, modifiers: modifiersFor(e) })
+    socketRef.current?.mouse('up', p, {
+      buttons: 0,
+      // The pair has to agree: a `down` that opened a double click and an `up`
+      // that says "1" is a page that never sees the double click at all.
+      clickCount: clickCountRef.current,
+      button: mouseButton(e.button),
+      modifiers: modifiersFor(e),
+    })
   }
 
-  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+  /**
+   * Keep the FOCUS on the trap.
+   *
+   * A tap fires compatibility mouse events after `touchend`, and the browser's
+   * default `mousedown` behaviour moves focus to the nearest focusable
+   * ancestor — which is this box, `tabIndex={0}`. That silently un-focused the
+   * trap on every single tap: the keyboard came up and then typed into nothing.
+   * Cancelling the default keeps focus where the tap put it, and costs nothing
+   * we want (the box's own selection and drag behaviour are relayed to the page
+   * anyway, not performed locally).
+   */
+  const onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (driving) e.preventDefault()
+  }
+
+  /** Right-click belongs to the PAGE while driving — the server has accepted
+   *  `button:'right'` since phase 0, and a supermux context menu over somebody
+   *  else's page is not a menu about anything the human can see. */
+  const onContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (driving) e.preventDefault()
+  }
+
+  // ── keys ───────────────────────────────────────────────────────────────────
+  // TWO SURFACES, ONE RULE SET, AND THE DIFFERENCE IS WHERE PRINTABLES GO.
+  //
+  //   · THE TRAP is an `<input>`, so a printable key also produces an `input`
+  //     event carrying the text — which is the path that survives IME, dead
+  //     keys and Android's `Unidentified`. Relaying the key event AS WELL would
+  //     type every character twice, so `insert` is left to `onTrapInput`.
+  //   · THE BOX is a `<div>`. No input event will ever fire on it, so a
+  //     printable key that is not relayed here is a keystroke that vanishes.
+  //     `key()` carries `text` for exactly this case (`keyText`).
+  //
+  // Everything else — named keys, chords, and the ⌘ shortcuts the platform
+  // keeps — is identical on both.
+  const relayKey = (kind: 'down' | 'up', e: React.KeyboardEvent, fromTrap: boolean) => {
+    // THE TRAP IS INSIDE THE BOX, so every key it handles would bubble into the
+    // box's handler and be relayed a SECOND time — every character typed twice,
+    // every Enter submitting twice. One surface handles a given event; that is
+    // what this line buys.
+    if (fromTrap) e.stopPropagation()
     if (!driving) return
-    // Let the platform keep its own shortcuts (⌘R, ⌘T, devtools): a takeover
-    // canvas that swallows them is a trap.
-    if (e.metaKey && e.key !== 'Meta') return
+    const action = trapKeyAction(e)
+    if (action === 'ignore') return
+    if (action === 'insert' && fromTrap) return
     e.preventDefault()
-    socketRef.current?.key('down', e)
+    socketRef.current?.key(kind, e)
   }
 
-  const onKeyUp = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!driving) return
-    if (e.metaKey && e.key !== 'Meta') return
-    e.preventDefault()
-    socketRef.current?.key('up', e)
+  const onKeyDown = (e: React.KeyboardEvent) => relayKey('down', e, false)
+  const onKeyUp = (e: React.KeyboardEvent) => relayKey('up', e, false)
+  const onTrapKeyDown = (e: React.KeyboardEvent) => relayKey('down', e, true)
+  const onTrapKeyUp = (e: React.KeyboardEvent) => relayKey('up', e, true)
+
+  /** The trap's text, drained on every input event so it never accumulates a
+   *  shadow copy of what the human typed — and never shows a second caret
+   *  disagreeing with the page's. */
+  const drainTrap = (el: HTMLInputElement): string => {
+    const value = el.value
+    el.value = ''
+    return value
   }
 
-  const onPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
+  const onTrapInput = (e: React.FormEvent<HTMLInputElement>) => {
+    e.stopPropagation()
+    const value = drainTrap(e.currentTarget)
+    // Mid-composition the value is a half-written glyph; `compositionend` sends
+    // the finished one.
+    if (!driving || composingRef.current || !value) return
+    socketRef.current?.text(value)
+  }
+
+  const onCompositionEnd = (e: React.CompositionEvent<HTMLInputElement>) => {
+    e.stopPropagation()
+    composingRef.current = false
+    const value = drainTrap(e.currentTarget) || e.data
+    if (!driving || !value) return
+    socketRef.current?.text(value)
+  }
+
+  const onPaste = (e: React.ClipboardEvent) => {
     if (!driving) return
     const text = e.clipboardData?.getData('text/plain') ?? ''
     if (!text) return
@@ -356,6 +691,43 @@ export function TakeoverPanel({
     // `insertText`, not per-key events: it is the only path that carries
     // non-ASCII and emoji intact.
     socketRef.current?.text(text)
+  }
+
+  // ── what the box is doing, and the one thing to do about it ────────────────
+  const view = viewportState({
+    hasTab: true,
+    tabLive: tabLive ?? true,
+    waking: !!waking,
+    // A socket that was never dialled has no state to report — `null` is what
+    // sends the matrix down the row's own asleep/connecting branch.
+    socket: attached ? snap.state : null,
+    mode: snap.mode,
+    needsLogin: !!needsLogin,
+    crashed: !!crashed,
+    subject: kind,
+  })
+
+  const act = (verb: ViewportVerb) => {
+    const sock = socketRef.current
+    switch (verb) {
+      case 'wake':
+        // Both halves: the host's row has to learn it is awake (or the chrome
+        // keeps offering Wake), and the socket dials — which, on the tab route,
+        // IS the wake: `tab_takeover_socket` rehydrates on attach.
+        onWake?.()
+        setDialled(true)
+        sock?.restart()
+        return
+      case 'retry':
+        sock?.restart()
+        return
+      case 'drive':
+        sock?.takeOver()
+        return
+      case 'reload':
+        onReload?.()
+        return
+    }
   }
 
   return (
@@ -404,21 +776,91 @@ export function TakeoverPanel({
           kind === 'tab' ? 'Shared browser tab' : `Shared browser for ${name}`
         }
         tabIndex={0}
+        data-takeover-driving={driving ? 'yes' : 'no'}
+        data-viewport-phase={view.phase}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
+        onMouseDown={onMouseDown}
+        onContextMenu={onContextMenu}
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchCancel}
         onKeyDown={onKeyDown}
         onKeyUp={onKeyUp}
         onPaste={onPaste}
+        // The lift is the keyboard's height (iOS overlays the layout viewport;
+        // on Android the layout already shrank and this is 0). The resize it
+        // causes re-negotiates the page's own box, so the page gets SMALLER
+        // rather than scrolling out from under the thumb.
+        style={lift ? { marginBottom: lift } : undefined}
         className={cn(
           'relative min-h-0 flex-1 touch-none select-none outline-none',
+          // `touch-none` stops the BROWSER panning (we recognise the gesture
+          // ourselves); `overscroll-contain` stops a fling at the page's top
+          // from pulling supermux itself down to refresh.
+          '[overscroll-behavior:contain]',
           'bg-[var(--sm-code-bg)]',
           driving ? 'cursor-default' : 'cursor-not-allowed',
+          // The one moment worth marking: a ring that says "you are IN the
+          // page", so nobody types a password into a surface that is watching.
+          driving && 'ring-2 ring-inset ring-primary',
         )}
       >
-        <canvas ref={canvasRef} className="block h-full w-full" data-takeover-canvas />
-        <StatusVeil state={snap.state} refused={snap.refused} kind={kind} />
+        {/* Dimmed while the state says the picture is not a claim about now —
+            the honest half of "keep the last frame": it stays readable, and it
+            stops looking live. */}
+        <canvas
+          ref={canvasRef}
+          className={cn(
+            'block h-full w-full',
+            view.dim && view.cover !== 'screen' && 'opacity-50',
+          )}
+          data-takeover-canvas
+        />
+
+        {/* THE KEYBOARD TRAP. A real, focusable input — the only thing on a
+            phone that raises a keyboard — kept visually out of the way rather
+            than `display:none`, which is unfocusable. 16px because iOS zooms
+            the whole supermux page when a focused field is smaller, which is
+            the exact bug the address bar was fixed for in phase 1. */}
+        <input
+          ref={trapRef}
+          data-keyboard-trap=""
+          aria-label="Type into the page"
+          type="text"
+          inputMode="text"
+          autoCapitalize="off"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck={false}
+          tabIndex={-1}
+          disabled={!driving}
+          onKeyDown={onTrapKeyDown}
+          onKeyUp={onTrapKeyUp}
+          onInput={onTrapInput}
+          onCompositionStart={() => {
+            composingRef.current = true
+          }}
+          onCompositionEnd={onCompositionEnd}
+          onPaste={(e) => {
+            // Same double-relay hazard as the keys above: the box would paste
+            // the clipboard a second time on the way up.
+            e.stopPropagation()
+            onPaste(e)
+          }}
+          style={{ fontSize: 16 }}
+          className="absolute left-0 top-0 size-px border-0 bg-transparent p-0 text-transparent caret-transparent opacity-0 outline-none"
+        />
+
+        {view.cover === 'screen' && (
+          <ViewportScreen view={view} onAct={act} canWake={!!onWake} canReload={!!onReload} />
+        )}
+        {view.cover === 'banner' && <ViewportBanner view={view} onAct={act} />}
+        {keyboardUp && <KeyboardDoneBar onDone={() => trapRef.current?.blur()} />}
+        <StatusVeil refused={snap.refused} />
       </div>
     </div>
   )
@@ -457,42 +899,134 @@ function ModePill({
   )
 }
 
-/** The only things worth covering the page for. A live socket renders nothing. */
-function StatusVeil({
-  state,
-  refused,
-  kind,
-}: {
-  state: TakeoverSnapshot['state']
-  refused: string | null
-  /** A tab's 4404 means something different from a session's: the tab exists and
-   *  its login is on disk, it just is not open right now. Saying "the agent has
-   *  to open one" there would be plain wrong. */
-  kind?: 'session' | 'tab'
-}) {
-  const message =
-    state === 'no-context'
-      ? kind === 'tab'
-        ? "This tab isn't open right now — it went to sleep, and its sign-in is kept on disk."
-        : 'This session has no open page yet — the agent has to open one before you can take over.'
-      : state === 'busy'
-        ? 'Someone else is already driving this page.'
-        : state === 'offline'
-          ? 'Disconnected.'
-          : state === 'reconnecting'
-            ? 'Reconnecting…'
-            : state === 'connecting'
-              ? 'Connecting…'
-              : null
-  if (!message && !refused) return null
+/** The transient one: an input the server DROPPED, and why. Everything else a
+ *  human needs to act on is a state screen now (see `viewport-state.ts`) —
+ *  a pill floating over a black rectangle was the audit's headline complaint. */
+function StatusVeil({ refused }: { refused: string | null }) {
+  if (!refused) return null
   return (
     <div
       className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center p-3"
       data-takeover-status
     >
       <span className="rounded-full border border-hairline bg-surface px-3 py-1 text-[12px] text-ink-2 backdrop-blur">
-        {message ?? `Input ignored — ${refused}`}
+        {`Input ignored — ${refused}`}
       </span>
+    </div>
+  )
+}
+
+/** A state that owns the box: there is nothing truthful to show behind it.
+ *
+ *  Always a title, a sentence that says what is actually true, and — where one
+ *  exists — the single verb that fixes it, at thumb size. A state screen whose
+ *  action the host did not wire renders WITHOUT the button rather than with a
+ *  dead one. */
+function ViewportScreen({
+  view,
+  onAct,
+  canWake,
+  canReload,
+}: {
+  view: ViewportView
+  onAct: (verb: ViewportVerb) => void
+  canWake: boolean
+  canReload: boolean
+}) {
+  const action =
+    view.action &&
+    (view.action.verb === 'wake' ? canWake : view.action.verb === 'reload' ? canReload : true)
+      ? view.action
+      : null
+  return (
+    <div
+      data-viewport-screen={view.phase}
+      className={cn(
+        'absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center',
+        // Opaque over a dimmed frame, or over nothing at all. Either way the
+        // human is reading words, not squinting past them.
+        view.keepFrame ? 'bg-background/85 backdrop-blur-[2px]' : 'bg-background',
+      )}
+    >
+      {view.spinner && (
+        <Loader2
+          className="size-5 animate-spin text-muted-foreground motion-reduce:animate-none"
+          aria-hidden
+        />
+      )}
+      <p className="text-[13px] font-medium text-foreground">{view.title}</p>
+      <p className="max-w-[46ch] text-[12.5px] leading-relaxed text-muted-foreground">
+        {view.detail}
+      </p>
+      {action && (
+        <button
+          type="button"
+          onClick={() => onAct(action.verb)}
+          data-viewport-action={action.verb}
+          className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-primary px-4 text-[13px] font-medium text-primary-foreground"
+        >
+          {action.verb === 'wake' && <Power className="size-4" aria-hidden />}
+          {action.verb === 'reload' && <RotateCw className="size-4" aria-hidden />}
+          {action.label}
+        </button>
+      )}
+    </div>
+  )
+}
+
+/** A state that sits OVER a live page — signed-out, and reconnecting. Both are
+ *  cases where covering the page would hide the very thing the human came for
+ *  (the sign-in form; the last frame). Top-anchored, out of the thumb zone. */
+function ViewportBanner({
+  view,
+  onAct,
+}: {
+  view: ViewportView
+  onAct: (verb: ViewportVerb) => void
+}) {
+  return (
+    <div
+      data-viewport-banner={view.phase}
+      className="pointer-events-none absolute inset-x-0 top-0 flex justify-center p-2"
+    >
+      <div className="pointer-events-auto flex max-w-full items-center gap-2 rounded-xl border border-border bg-card/95 px-3 py-2 shadow-sm backdrop-blur">
+        {view.spinner && (
+          <Loader2
+            className="size-3.5 shrink-0 animate-spin text-muted-foreground motion-reduce:animate-none"
+            aria-hidden
+          />
+        )}
+        <span className="min-w-0 truncate text-[12.5px] text-foreground">{view.title}</span>
+        {view.action && (
+          <button
+            type="button"
+            onClick={() => onAct(view.action!.verb)}
+            data-viewport-action={view.action.verb}
+            className="relative shrink-0 rounded-lg bg-primary px-3 py-1.5 text-[12px] font-medium text-primary-foreground after:absolute after:-inset-1.5 after:content-['']"
+          >
+            {view.action.label}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** The way OUT of the soft keyboard. Without it the only dismissal is the
+ *  platform's swipe-down, which on a page that has just been tapped tends to
+ *  re-open — and a keyboard you cannot put away is a page you cannot read. */
+function KeyboardDoneBar({ onDone }: { onDone: () => void }) {
+  return (
+    <div className="absolute inset-x-0 bottom-0 flex justify-end border-t border-border bg-card/95 p-1.5 backdrop-blur">
+      <button
+        type="button"
+        onClick={onDone}
+        data-keyboard-done=""
+        className="inline-flex min-h-11 items-center gap-1.5 rounded-lg px-4 text-[13px] font-medium text-foreground"
+      >
+        <Keyboard className="size-4" aria-hidden />
+        Done
+      </button>
     </div>
   )
 }
