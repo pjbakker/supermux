@@ -376,7 +376,11 @@ describe('find-in-page degrades to "cannot", never to "did not answer"', () => {
   test('a missing caps frame is NO, not maybe', () => {
     expect(parseCaps({})).toEqual(NO_CAPS)
     expect(parseCaps({ find: 'yes', copy: 1 })).toEqual(NO_CAPS)
-    expect(parseCaps({ find: true, copy: false })).toEqual({ find: true, copy: false })
+    expect(parseCaps({ find: true, copy: false })).toEqual({
+      find: true,
+      copy: false,
+      signIn: false,
+    })
   })
 
   test('the wire shape is the SERVER spelling, so the day it lands nothing changes', () => {
@@ -489,7 +493,7 @@ describe('the DOM verbs fail CLOSED, and loudly in the UI rather than on the wir
   test('a caps frame turns them on, and the frames are the server spelling', () => {
     const { sock, ws, latest } = harness()
     ws.deliver({ type: 'caps', find: true, copy: true })
-    expect(latest().caps).toEqual({ find: true, copy: true })
+    expect(latest().caps).toEqual({ find: true, copy: true, signIn: false })
     expect(sock.find('inbox', { forward: false })).toBe(true)
     expect(sock.copySelection()).toBe(true)
     const sent = ws.sent.map((s) => JSON.parse(s) as Record<string, unknown>)
@@ -570,7 +574,7 @@ describe('the find bar says what it cannot do', () => {
         query="inbox"
         onQuery={noop}
         result={{ query: 'inbox', index: 2, total: 7 }}
-        caps={{ find: true, copy: true }}
+        caps={{ find: true, copy: true, signIn: false }}
         onNext={noop}
         onPrev={noop}
         onClose={noop}
@@ -589,7 +593,7 @@ describe('the find bar says what it cannot do', () => {
         query=""
         onQuery={noop}
         result={NO_FIND}
-        caps={{ find: true, copy: false }}
+        caps={{ find: true, copy: false, signIn: false }}
         onNext={noop}
         onPrev={noop}
         onClose={noop}

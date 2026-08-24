@@ -401,6 +401,31 @@ pub enum ClientMsg {
     /// Read the page's current SELECTION as text, for the client's clipboard.
     Copy,
 
+    // ── smart sign-in (P4+) ─────────────────────────────────────────────
+    //
+    // Three more DOM verbs, the same CONTROL-frame shape as `Find`/`Copy`:
+    // `to_cdp` returns `None` for all three (none is an `Input.*` dispatch),
+    // and `drive` runs each itself, gated on the wheel. `ScanLogin` and
+    // `FocusField` are `Runtime.evaluate` reads; `FillField` focuses via
+    // `evaluate` and then types the secret through the GATED trusted keystroke
+    // path (`insert_text`), never a synthetic `el.value =` a controlled input
+    // would drop.
+    /// Scan the page for a login form. A pure DOM read — never an `Input.*`
+    /// dispatch. Answered with [`ServerMsg::LoginFields`].
+    ScanLogin,
+    /// Focus a detected field by its stable selector: scroll it into view and
+    /// `.focus()` it. Read-ish (it moves the caret, not the value); still gated.
+    FocusField { selector: String },
+    /// Fill a detected field. `value` is the secret and lives ONLY for this
+    /// call — never stored, never audited, never on the snapshot. `role` is
+    /// re-checked against the field's kind before a single keystroke, so a
+    /// password can never be typed into a username/search/2FA box.
+    FillField {
+        selector: String,
+        value: String,
+        role: String,
+    },
+
     /// Client-initiated liveness ping.
     Ping,
 }
@@ -451,7 +476,11 @@ pub enum ServerMsg<'a> {
     /// (`page-tools.ts`: every flag defaults FALSE) — so this frame is the only
     /// thing that lights the find bar and the copy-selection control up, and a
     /// server that stops answering `find` must stop sending it.
-    Caps { find: bool, copy: bool },
+    Caps {
+        find: bool,
+        copy: bool,
+        sign_in: bool,
+    },
     /// Where a find landed: the query the server actually searched for, and the
     /// position in its own result set.
     ///
@@ -469,6 +498,30 @@ pub enum ServerMsg<'a> {
     /// Capped at [`MAX_COPY_BYTES`]: a select-all on a long page is megabytes,
     /// and a clipboard is not a file transfer.
     Copied { text: &'a str },
+
+    // ── smart sign-in's answers (P4+) ───────────────────────────────────────
+    /// Answer to [`ClientMsg::ScanLogin`]. `form` is the whole gate: `false`
+    /// disables the sheet with `reason`; `true` offers `fields`. `fields`/`otp`
+    /// pass through as opaque JSON — the client owns their shape (§1.1) — while
+    /// the small fixed vocabularies (`reason`, `multi_step`, `frame_hint`) are
+    /// mapped to known constants by [`parse_login_fields`] so a page cannot put
+    /// an arbitrary string on our wire. `frame_hint` names a login-looking
+    /// cross-origin iframe the top frame could not scan.
+    LoginFields {
+        form: bool,
+        reason: Option<&'a str>,
+        fields: Value,
+        otp: Value,
+        multi_step: &'a str,
+        frame_hint: Option<&'a str>,
+    },
+    /// Answer to [`ClientMsg::FocusField`]: whether the selector resolved to a
+    /// focusable field and the caret landed on it.
+    Focused { selector: String, ok: bool },
+    /// Answer to [`ClientMsg::FillField`]: `ok` is true only when the field was
+    /// focused, its kind matched the asked-for `role`, AND the trusted
+    /// keystrokes were accepted. The `value` is never echoed.
+    Filled { selector: String, ok: bool },
 }
 
 impl ServerMsg<'_> {
@@ -767,6 +820,12 @@ pub fn to_cdp(msg: &ClientMsg, viewport: Viewport) -> Option<CdpCall> {
         | ClientMsg::Find { .. }
         | ClientMsg::FindClose
         | ClientMsg::Copy
+        // Smart sign-in's verbs are the same shape: `ScanLogin`/`FocusField`
+        // run through `Runtime.evaluate`, and `FillField`'s secret write goes
+        // through the GATED `insert_text` — never this `Input.*` allowlist.
+        | ClientMsg::ScanLogin
+        | ClientMsg::FocusField { .. }
+        | ClientMsg::FillField { .. }
         | ClientMsg::Ping => None,
     }
 }
@@ -937,6 +996,555 @@ pub fn find_counts(value: &Value) -> (u32, u32) {
     };
     let total = read("total");
     (read("index").min(total), total)
+}
+
+// ── smart sign-in (P4+): scan, focus, fill ──────────────────────────────────
+//
+// Three more page verbs, built the same way the find/copy pair is: pure script
+// builders here (all the escaping and the shape in one testable place), run as
+// `Runtime.evaluate` in `drive`. `ScanLogin` reads the login form's structure;
+// `FocusField`/`FillField` act on ONE field the scan named. The secret write
+// itself is NOT here — `drive` types it through the gated `insert_text`; this
+// module only focuses the field and re-checks its kind, so the fill can never
+// land a password in a username box.
+
+/// Longest field selector we will resolve. A stable `#id` / `:nth-of-type`
+/// path is short; anything past this is not one [`SCAN_LOGIN_JS`] produced, and
+/// the cap keeps the socket from handing chrome an arbitrarily long selector.
+pub const MAX_SELECTOR_BYTES: usize = 2 * 1024;
+
+/// The anchor-first login detection (spec §1.2), injected via `Runtime.evaluate`
+/// and returning the §1.1 JSON-serialisable shape that [`parse_login_fields`]
+/// maps unchanged:
+/// ```jsonc
+/// { "form": bool, "reason": null | string, "fields": [ {selector,role,label,visible,source,rect}… ],
+///   "otp": null | {selector,label}, "multiStep": "combined"|"username-only"|"password-only",
+///   "frameHint": null | "cross-origin-iframe" }
+/// ```
+///
+/// **ONE source of truth.** The body below is generated from — and kept
+/// byte-identical to — `web/src/lib/browser/login-detect.ts`
+/// (`SCAN_LOGIN_JS = "(() => {" + LOGIN_DETECT_BODY + "})()"`), which a jsdom
+/// test exercises over hand-built DOM fixtures. `login-detect.test.ts` reads
+/// this const back out of the Rust source and asserts equality, so the page can
+/// never run a detector the tests did not. Edit the TS module, re-generate, and
+/// let the sync test guard the copy — never hand-edit only one side.
+pub const SCAN_LOGIN_JS: &str = r##"(() => {
+  var doc = document;
+  var win = window;
+  var MAX_PARSEABLE_FIELDS = 100; // spec \u00A71.3(c) \u2014 mirror Chromium kMaxParseableFields
+  var FIELD_CAP = 24; // never hand the socket an unbounded field list (\u00A71.4)
+
+  var cssEscape =
+    win.CSS && typeof win.CSS.escape === 'function'
+      ? function (s) { return win.CSS.escape(s); }
+      : function (s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, function (ch) { return '\\' + ch; }); };
+  var gcs = function (el) { try { return win.getComputedStyle(el) || {}; } catch (e) { return {}; } };
+  var norm = function (s) { return (s == null ? '' : String(s)).toLowerCase().replace(/[^a-z0-9]+/g, ''); };
+
+  // Does this environment lay out the DOM? Real Chrome yes; layout-less jsdom no.
+  // When it does NOT, the rect gate would drop every field, so we lean on
+  // computed style alone (spec \u00A71.2 STEP 5 stays the rule where layout exists).
+  var hasLayout = (function () {
+    try {
+      var p = doc.createElement('div');
+      p.style.cssText = 'position:absolute;width:12px;height:12px;left:-9999px;top:-9999px';
+      (doc.body || doc.documentElement).appendChild(p);
+      var ok = p.getClientRects().length > 0 || p.offsetWidth > 0 || p.offsetHeight > 0;
+      p.parentNode && p.parentNode.removeChild(p);
+      return ok;
+    } catch (e) { return true; }
+  })();
+
+  var USER_KW = ['user', 'email', 'login', 'name', 'tel', 'phone', 'mobile', 'username', 'signin', 'loginid'];
+  var PW_KW = ['password', 'passwort', 'kennwort', 'contrasena', 'senha', 'motdepasse', 'passe', 'adgangskode', 'haslo', 'wachtwoord', 'pin'];
+  var OTP_KW = ['otp', 'onetime', 'onetimecode', 'verification', 'verificationcode', '2fa', 'twofactor', 'authcode', 'securitycode'];
+
+  var typeOf = function (el) {
+    return ((el.getAttribute && el.getAttribute('type')) || el.type || 'text').toLowerCase();
+  };
+  var isUsernameType = function (t) { return t === '' || t === 'text' || t === 'email' || t === 'tel'; };
+
+  var acTokens = function (el) {
+    var raw = (el.getAttribute && el.getAttribute('autocomplete')) || '';
+    return String(raw).toLowerCase().split(/\s+/).filter(Boolean);
+  };
+  var acHas = function (el, token) { return acTokens(el).indexOf(token) >= 0; };
+
+  var labelText = function (el) {
+    var t = '';
+    try { if (el.labels && el.labels.length) { for (var i = 0; i < el.labels.length; i++) t += ' ' + (el.labels[i].textContent || ''); } } catch (e) {}
+    if (!t && el.id) { try { var l = doc.querySelector('label[for="' + cssEscape(el.id) + '"]'); if (l) t = l.textContent || ''; } catch (e2) {} }
+    if (!t && el.closest) { try { var lc = el.closest('label'); if (lc) t = lc.textContent || ''; } catch (e3) {} }
+    return (t || '').trim();
+  };
+
+  var fieldLabel = function (el) {
+    return (
+      (el.getAttribute && (el.getAttribute('aria-label') || '')) ||
+      labelText(el) ||
+      (el.getAttribute && (el.getAttribute('placeholder') || '')) ||
+      (el.getAttribute && (el.getAttribute('name') || '')) ||
+      el.id ||
+      ''
+    ).trim();
+  };
+
+  var haystack = function (el) {
+    return [
+      el.getAttribute && el.getAttribute('name'),
+      el.id,
+      el.getAttribute && el.getAttribute('placeholder'),
+      el.getAttribute && el.getAttribute('aria-label'),
+      labelText(el),
+    ].map(norm).filter(Boolean);
+  };
+  var kwScore = function (hay, set) {
+    var best = 0;
+    for (var i = 0; i < hay.length; i++) {
+      var h = hay[i];
+      for (var j = 0; j < set.length; j++) {
+        var kw = set[j];
+        if (h === kw) best = Math.max(best, 3); // exact
+        else if (h.indexOf(kw) === 0) best = Math.max(best, 2); // startsWith
+        else if (h.indexOf(kw) >= 0) best = Math.max(best, 1); // contains
+      }
+    }
+    return best;
+  };
+  // Keyword role \u2014 tie-breaker only (spec \u00A71.2 STEP 3.4). Never consulted where a
+  // higher signal already labelled the field.
+  var keywordRole = function (el) {
+    var hay = haystack(el);
+    var p = kwScore(hay, PW_KW);
+    var u = kwScore(hay, USER_KW);
+    if (p > 0 && p >= u) return 'password';
+    if (u > 0) return 'username';
+    return null;
+  };
+  var keywordOtp = function (el) {
+    var hay = haystack(el);
+    if (kwScore(hay, OTP_KW) === 0) return false;
+    var ml = parseInt((el.getAttribute && el.getAttribute('maxlength')) || '0', 10);
+    var t = typeOf(el);
+    var im = ((el.getAttribute && el.getAttribute('inputmode')) || '').toLowerCase();
+    return t === 'number' || t === 'tel' || im === 'numeric' || (ml > 0 && ml <= 8);
+  };
+
+  var ignored = function (el) {
+    try { return !!(el.closest && el.closest('[data-1p-ignore],[data-op-ignore]')); } catch (e) { return false; }
+  };
+
+  // spec \u00A71.2 STEP 5 \u2014 interactability. In a layout-less DOM the rect clause is
+  // skipped (see hasLayout); everywhere else it is the decisive signal.
+  var viewable = function (el) {
+    if (el.disabled) return false;
+    if (typeOf(el) === 'hidden') return false;
+    var st = gcs(el);
+    if (st.display === 'none') return false;
+    if (st.visibility === 'hidden' || st.visibility === 'collapse') return false;
+    var op = parseFloat(st.opacity);
+    if (!isNaN(op) && op <= 0.1) return false;
+    if (hasLayout) {
+      var rects;
+      try { rects = el.getClientRects(); } catch (e) { rects = { length: 0 }; }
+      if (!rects || rects.length === 0) {
+        if ((el.offsetWidth || 0) <= 2 && (el.offsetHeight || 0) <= 2) return false;
+      }
+    }
+    return true;
+  };
+
+  var rectOf = function (el) {
+    try {
+      var r = el.getBoundingClientRect();
+      return { x: r.left || 0, y: r.top || 0, w: r.width || 0, h: r.height || 0 };
+    } catch (e) { return { x: 0, y: 0, w: 0, h: 0 }; }
+  };
+
+  // spec \u00A71.4 \u2014 a stable selector within one root: CSS.escape'd #id when unique,
+  // else an :nth-of-type path up to the nearest id'd ancestor / root.
+  var localSelector = function (el, root) {
+    if (el.id) {
+      var idSel = '#' + cssEscape(el.id);
+      try { if (root.querySelectorAll(idSel).length === 1) return idSel; } catch (e) {}
+    }
+    var parts = [];
+    var node = el;
+    var guard = 0;
+    while (node && node.nodeType === 1 && node !== root && guard++ < 40) {
+      if (node.id) { parts.unshift('#' + cssEscape(node.id)); break; }
+      var tag = node.tagName.toLowerCase();
+      var i = 1;
+      var sib = node;
+      while ((sib = sib.previousElementSibling)) { if (sib.tagName === node.tagName) i++; }
+      parts.unshift(tag + ':nth-of-type(' + i + ')');
+      node = node.parentElement;
+      if (node === root) break;
+    }
+    return parts.join(' > ');
+  };
+
+  // spec \u00A71.2 STEP 0 \u2014 collect candidates, piercing open shadow roots and
+  // same-origin iframes. A cross-origin boundary throws or returns null: caught,
+  // recorded via frameHint, never fatal.
+  var crossOrigin = false;
+  var cands = []; // { el, prefix }
+  var boundary = 0;
+  var seenRoots = [];
+  var collect = function (root, prefix, depth) {
+    if (!root || depth > 6 || seenRoots.indexOf(root) >= 0) return;
+    seenRoots.push(root);
+    var inputs;
+    try { inputs = root.querySelectorAll('input'); } catch (e) { return; }
+    for (var i = 0; i < inputs.length; i++) cands.push({ el: inputs[i], prefix: prefix });
+    var all;
+    try { all = root.querySelectorAll('*'); } catch (e2) { all = []; }
+    for (var j = 0; j < all.length; j++) {
+      var node = all[j];
+      if (node.shadowRoot) { boundary++; collect(node.shadowRoot, prefix + '__frame(' + boundary + ') > ', depth + 1); }
+      var tag = node.tagName ? node.tagName.toLowerCase() : '';
+      if (tag === 'iframe' || tag === 'frame') {
+        var idoc = null;
+        try { idoc = node.contentDocument; } catch (e3) { crossOrigin = true; continue; }
+        if (idoc) {
+          try { void idoc.body; } catch (e4) { crossOrigin = true; continue; }
+          boundary++;
+          collect(idoc, prefix + '__frame(' + boundary + ') > ', depth + 1);
+        } else {
+          var src = (node.getAttribute && node.getAttribute('src')) || '';
+          if (src) {
+            try {
+              var base = doc.baseURI || (win.location && win.location.href) || undefined;
+              var u = new URL(src, base);
+              if (win.location && u.origin !== win.location.origin) crossOrigin = true;
+            } catch (e5) {}
+          }
+        }
+      }
+    }
+  };
+  try { collect(doc, '', 0); } catch (e) {}
+
+  var frameHint = crossOrigin ? 'cross-origin-iframe' : null;
+
+  var offerNothing = function (reason) {
+    return { form: false, reason: reason, fields: [], otp: null, multiStep: 'combined', frameHint: frameHint };
+  };
+
+  // spec \u00A71.3(e) \u2014 a page-wide opt-out silences the whole page.
+  try {
+    var pageOptOut = (doc.body && (doc.body.hasAttribute('data-1p-ignore') || doc.body.hasAttribute('data-op-ignore'))) ||
+      (doc.documentElement && (doc.documentElement.hasAttribute('data-1p-ignore') || doc.documentElement.hasAttribute('data-op-ignore')));
+    if (pageOptOut) return offerNothing('no-password-field');
+  } catch (e) {}
+
+  // Per-field opt-out (spec \u00A71.3(e)).
+  cands = cands.filter(function (c) { return !ignored(c.el); });
+
+  // spec \u00A71.3(c) \u2014 too many candidates: bail rather than mis-parse.
+  if (cands.length > MAX_PARSEABLE_FIELDS) return offerNothing('too-many-fields');
+
+  // Enrich each candidate once.
+  var fs = [];
+  for (var k = 0; k < cands.length; k++) {
+    var c = cands[k];
+    var el = c.el;
+    fs.push({
+      el: el,
+      prefix: c.prefix,
+      type: typeOf(el),
+      visible: viewable(el),
+      selector: c.prefix + localSelector(el, c.prefix ? null : doc),
+    });
+  }
+  // Selectors inside a boundary can't be re-resolved from the top document, so
+  // give them a best-effort local path (root=null falls back to document-order
+  // nth from the element's own parent chain \u2014 informational for now).
+  for (var s = 0; s < fs.length; s++) {
+    if (fs[s].prefix) {
+      var el2 = fs[s].el;
+      var loc = localSelector(el2, el2.getRootNode ? el2.getRootNode() : null);
+      fs[s].selector = fs[s].prefix + loc;
+    }
+  }
+
+  var byEl = function (el) { for (var i = 0; i < fs.length; i++) if (fs[i].el === el) return fs[i]; return null; };
+  var fieldObj = function (f, role, source) {
+    return { selector: f.selector, role: role, label: fieldLabel(f.el), visible: f.visible, source: source, rect: rectOf(f.el) };
+  };
+
+  var passwords = fs.filter(function (f) { return f.type === 'password'; });
+  var visiblePasswords = passwords.filter(function (f) { return f.visible; });
+  var anchor = visiblePasswords.length ? visiblePasswords[0] : null;
+
+  // spec \u00A71.2 STEP 7 \u2014 OTP, surfaced separately from fields.
+  var otpSlot = null;
+  for (var o = 0; o < fs.length; o++) {
+    var of = fs[o];
+    if (of.type === 'password') continue;
+    if (!of.visible) continue;
+    if (acHas(of.el, 'one-time-code') || keywordOtp(of.el)) {
+      otpSlot = { selector: of.selector, label: fieldLabel(of.el) };
+      break;
+    }
+  }
+
+  // \u2500\u2500 no password anchor \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  if (!anchor) {
+    if (passwords.length === 0) {
+      // spec \u00A71.2 STEP 6 \u2014 username-first multi-step.
+      for (var u2 = 0; u2 < fs.length; u2++) {
+        var uf = fs[u2];
+        if (!isUsernameType(uf.type) || !uf.visible) continue;
+        var byAc = acHas(uf.el, 'username') || acHas(uf.el, 'email');
+        if (byAc || keywordRole(uf.el) === 'username') {
+          return {
+            form: true, reason: null,
+            fields: [fieldObj(uf, 'username', byAc ? 'autocomplete' : 'keyword')],
+            otp: otpSlot, multiStep: 'username-only', frameHint: frameHint,
+          };
+        }
+      }
+      if (crossOrigin) return offerNothing('cross-origin-frame');
+      var anyUserEligible = fs.some(function (f) { return isUsernameType(f.type); });
+      var anyUserVisible = fs.some(function (f) { return isUsernameType(f.type) && f.visible; });
+      if (anyUserEligible && !anyUserVisible) return offerNothing('all-hidden');
+      return offerNothing('no-password-field');
+    }
+    // Passwords exist but every one failed the visibility gate.
+    if (crossOrigin) return offerNothing('cross-origin-frame');
+    return offerNothing('all-hidden');
+  }
+
+  // \u2500\u2500 password anchor present \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  // spec \u00A71.2 STEP 4 \u2014 multi-password disambiguation (current vs new-password).
+  // Only the current-password (or the sole password) is fillable.
+  var pwKind = function () {
+    var kind = []; // parallel to passwords
+    var m = {};
+    var anyCurrent = false;
+    for (var i = 0; i < passwords.length; i++) {
+      if (acHas(passwords[i].el, 'current-password')) { m[i] = 'current'; anyCurrent = true; }
+      else if (acHas(passwords[i].el, 'new-password')) { m[i] = 'new'; }
+    }
+    var undecided = [];
+    for (var q = 0; q < passwords.length; q++) if (m[q] == null) undecided.push(q);
+    if (undecided.length) {
+      if (passwords.length === 1) {
+        m[undecided[0]] = 'current';
+      } else {
+        // Value heuristic: a value shared by >1 field is a new+confirm pair.
+        for (var a = 0; a < undecided.length; a++) {
+          var vi = passwords[undecided[a]].el.value || '';
+          if (!vi) continue;
+          var dup = 0;
+          for (var b = 0; b < undecided.length; b++) if ((passwords[undecided[b]].el.value || '') === vi) dup++;
+          if (dup > 1) m[undecided[a]] = 'new';
+        }
+        var leftover = [];
+        for (var c2 = 0; c2 < undecided.length; c2++) if (m[undecided[c2]] == null) leftover.push(undecided[c2]);
+        for (var d = 0; d < leftover.length; d++) {
+          m[leftover[d]] = d === 0 && !anyCurrent ? 'current' : 'new';
+        }
+      }
+    }
+    for (var e2 = 0; e2 < passwords.length; e2++) kind[e2] = m[e2] || 'new';
+    return kind;
+  }();
+
+  var currentPwIndex = -1;
+  for (var pi = 0; pi < passwords.length; pi++) {
+    if (pwKind[pi] === 'current' && passwords[pi].visible) { currentPwIndex = pi; break; }
+  }
+
+  // spec \u00A71.3(d) \u2014 nothing fillable: a generate-only signup/change field.
+  if (currentPwIndex < 0) {
+    return { form: true, reason: null, fields: [], otp: otpSlot, multiStep: 'combined', frameHint: frameHint, generateOnly: true };
+  }
+  var currentPw = passwords[currentPwIndex];
+
+  // spec \u00A71.2 STEP 2/3 \u2014 resolve username. autocomplete first (authoritative,
+  // even when hidden \u2014 the deliberate username carrier, spec \u00A71.2 STEP 5
+  // exception), then a backward walk, then a keyword tie-break.
+  var username = null;
+  var usernameSource = null;
+  for (var au = 0; au < fs.length; au++) {
+    var af = fs[au];
+    if (af.type === 'password') continue;
+    if (acHas(af.el, 'username') || acHas(af.el, 'email')) { username = af; usernameSource = 'autocomplete'; break; }
+  }
+  var anchorIdx = fs.indexOf(currentPw);
+  if (!username) {
+    var before = [];
+    for (var w = 0; w < anchorIdx; w++) {
+      var wf = fs[w];
+      if (isUsernameType(wf.type) && wf.visible) before.push(wf);
+    }
+    var sameForm = before.filter(function (f) { try { return f.el.form && f.el.form === currentPw.el.form; } catch (e) { return false; } });
+    var pool = sameForm.length ? sameForm : before;
+    if (pool.length) {
+      username = pool[pool.length - 1];
+      usernameSource = username.type === 'email' ? 'type' : 'adjacency';
+    }
+  }
+  if (!username) {
+    for (var kw2 = anchorIdx - 1; kw2 >= 0; kw2--) {
+      var kf = fs[kw2];
+      if (isUsernameType(kf.type) && kf.visible && keywordRole(kf.el) === 'username') { username = kf; usernameSource = 'keyword'; break; }
+    }
+  }
+
+  var out = [];
+  if (username) {
+    // Kept even when hidden IF it carries autocomplete=username (spec \u00A71.2 STEP 5
+    // exception); an otherwise-invisible username is dropped.
+    var keepHidden = acHas(username.el, 'username') || acHas(username.el, 'email');
+    if (username.visible || keepHidden) out.push(fieldObj(username, 'username', usernameSource || 'adjacency'));
+  }
+  var pwSource = acHas(currentPw.el, 'current-password') ? 'autocomplete' : 'type';
+  out.push(fieldObj(currentPw, 'password', pwSource));
+  out = out.slice(0, FIELD_CAP);
+
+  var multiStep = username ? 'combined' : 'password-only';
+
+  return { form: true, reason: null, fields: out, otp: otpSlot, multiStep: multiStep, frameHint: frameHint };
+})()"##;
+
+/// The body of the focus routine. Prefixed at call time with `SEL`/`ROLE` (see
+/// [`build_focus_js`]); its own constant so the Rust needs no brace escaping.
+///
+/// It resolves the selector (same-origin `document.querySelector` for now — the
+/// stub scanner emits no cross-boundary selectors), scrolls the field to the
+/// centre and focuses it, and returns whether the caret actually landed there.
+/// When `ROLE` is set it FIRST re-checks the field's kind against the role and
+/// bails (`false`, no focus) on a mismatch — the server's half of "never type a
+/// password into a username field", enforced before a single keystroke.
+const FOCUS_BODY: &str = r##"
+const el = (() => { try { return document.querySelector(SEL); } catch (e) { return null; } })();
+if (!el || typeof el.focus !== 'function') return false;
+if (ROLE) {
+  const type = ((el.getAttribute && el.getAttribute('type')) || el.type || 'text').toLowerCase();
+  const isPw = type === 'password';
+  // A password may only go into a password field; a username/otp may not go
+  // into one. Anything else the scan classified, we accept as-is.
+  if (ROLE === 'password' && !isPw) return false;
+  if ((ROLE === 'username' || ROLE === 'otp') && isPw) return false;
+}
+try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { try { el.scrollIntoView(); } catch (e2) {} }
+try { el.focus({ preventScroll: false }); } catch (e) { try { el.focus(); } catch (e2) {} }
+return document.activeElement === el;
+"##;
+
+/// Build the focus-a-field routine. The selector is embedded as a JSON string
+/// literal, so one containing quotes or backslashes is a *selector*, not a
+/// syntax error or an injection. `role` is `None` for a plain focus and
+/// `Some(kind)` when the caller is about to type a secret — see [`FOCUS_BODY`].
+pub fn build_focus_js(selector: &str, role: Option<&str>) -> String {
+    let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+    let role_lit = match role {
+        Some(r) => serde_json::to_string(r).unwrap_or_else(|_| "null".to_string()),
+        None => "null".to_string(),
+    };
+    let mut js = String::with_capacity(FOCUS_BODY.len() + sel.len() + role_lit.len() + 64);
+    js.push_str("(() => { const SEL = ");
+    js.push_str(&sel);
+    js.push_str(", ROLE = ");
+    js.push_str(&role_lit);
+    js.push_str(";");
+    js.push_str(FOCUS_BODY);
+    js.push_str("})()");
+    js
+}
+
+/// The reason vocabulary (§1.1/§1.3), mapped to `'static` constants. Anything a
+/// page returns that is NOT one of the documented reasons degrades to
+/// `scan-error`, so a scanned page can never put an arbitrary string on our
+/// wire. Only consulted when `form` is false.
+fn scan_reason(s: Option<&str>) -> &'static str {
+    match s {
+        Some("no-password-field") => "no-password-field",
+        Some("all-hidden") => "all-hidden",
+        Some("too-many-fields") => "too-many-fields",
+        Some("cross-origin-frame") => "cross-origin-frame",
+        Some("stub") => "stub",
+        _ => "scan-error",
+    }
+}
+
+/// The multi-step vocabulary (§1.1), mapped to `'static`. A missing or unknown
+/// value is the ordinary single-step `combined` form.
+fn scan_multi_step(s: Option<&str>) -> &'static str {
+    match s {
+        Some("username-only") => "username-only",
+        Some("password-only") => "password-only",
+        _ => "combined",
+    }
+}
+
+/// The frame-hint vocabulary (§1.1), mapped to `'static`. The only hint today
+/// is a login-looking cross-origin iframe the top frame could not scan.
+fn scan_frame_hint(s: Option<&str>) -> Option<&'static str> {
+    match s {
+        Some("cross-origin-iframe") => Some("cross-origin-iframe"),
+        _ => None,
+    }
+}
+
+/// Turn what [`SCAN_LOGIN_JS`] returned into a [`ServerMsg::LoginFields`].
+///
+/// Total, like every other parse on this wire: a missing or garbled value
+/// degrades to `{form:false, reason:"scan-error"}` rather than to a wrong
+/// offer. `fields`/`otp` pass through as opaque JSON (the client owns their
+/// §1.1 shape), but a non-array `fields` or a non-object `otp` is normalised to
+/// empty/null, and `fields` is dropped entirely when `form` is false — a
+/// disabled sheet has nothing to offer. The three small vocabularies are mapped
+/// to `'static` constants, so the whole result borrows nothing from `value`.
+pub fn parse_login_fields(value: &Value) -> ServerMsg<'static> {
+    let form = value.get("form").and_then(Value::as_bool).unwrap_or(false);
+    let fields = match value.get("fields") {
+        Some(v) if form && v.is_array() => v.clone(),
+        _ => Value::Array(Vec::new()),
+    };
+    let otp = match value.get("otp") {
+        Some(v) if form && v.is_object() => v.clone(),
+        _ => Value::Null,
+    };
+    let reason = if form {
+        None
+    } else {
+        Some(scan_reason(value.get("reason").and_then(Value::as_str)))
+    };
+    let multi_step = scan_multi_step(value.get("multiStep").and_then(Value::as_str));
+    let frame_hint = scan_frame_hint(value.get("frameHint").and_then(Value::as_str));
+    ServerMsg::LoginFields {
+        form,
+        reason,
+        fields,
+        otp,
+        multi_step,
+        frame_hint,
+    }
+}
+
+/// Would the relay refuse this frame right now? True when the frame is one of
+/// the gated DOM / sign-in verbs AND the wheel is not the human's.
+///
+/// The gate itself lives inline in each `drive` match arm (mirroring the
+/// `Find`/`Copy` arms). This mirrors those guards in one testable place so the
+/// "refuse every sign-in verb while an agent drives" contract can be asserted
+/// without standing up a socket. `FindClose` is deliberately absent — it only
+/// ever removes state our own find created, and is ungated for that reason.
+pub fn should_refuse(msg: &ClientMsg, mode: DriveMode) -> bool {
+    let gated = matches!(
+        msg,
+        ClientMsg::Find { .. }
+            | ClientMsg::Copy
+            | ClientMsg::ScanLogin
+            | ClientMsg::FocusField { .. }
+            | ClientMsg::FillField { .. }
+    );
+    gated && !human_may_drive(mode)
 }
 
 /// What a takeover socket is attached to — the scratch session or a workspace
@@ -1316,6 +1924,7 @@ async fn drive(
             ServerMsg::Caps {
                 find: true,
                 copy: true,
+                sign_in: true,
             }
             .to_frame(),
         )
@@ -1613,6 +2222,111 @@ async fn drive(
                                     );
                                 }
                                 if socket.send(ServerMsg::Copied { text: out }.to_frame()).await.is_err() {
+                                    return Outcome::SendFailed;
+                                }
+                                continue;
+                            }
+                            // ── smart sign-in (P4+) ─────────────────────────
+                            //
+                            // GATED exactly like Find/Copy, and for the same
+                            // reason: `evaluate` is UNGATED, so reading a
+                            // signed-in page's form structure — or focusing and
+                            // typing a secret into it — while an agent drives is
+                            // still a human action on a page the agent may be
+                            // working. `lock.gate` does not save us (evaluate
+                            // bypasses it), so the `human_may_drive` check HERE
+                            // is the real gate, and the refusal is spoken so the
+                            // sheet never spins.
+                            ClientMsg::ScanLogin => {
+                                if !human_may_drive(ctx.mode()) {
+                                    let no = ServerMsg::Refused { reason: "agent is driving" };
+                                    if socket.send(no.to_frame()).await.is_err() {
+                                        return Outcome::SendFailed;
+                                    }
+                                    continue;
+                                }
+                                // An in-page READ: ask the page for its login
+                                // structure, parse it into the login_fields
+                                // frame. ALWAYS answer — a dropped answer is a
+                                // sheet that spins forever, the failure the caps
+                                // frame exists to prevent.
+                                let out = match ctx.evaluate(SCAN_LOGIN_JS).await {
+                                    Ok(v) => parse_login_fields(&v),
+                                    Err(e) => {
+                                        debug!(subject = %session, error = %e, "browser takeover: scan_login");
+                                        ServerMsg::LoginFields {
+                                            form: false,
+                                            reason: Some("scan-error"),
+                                            fields: Value::Array(Vec::new()),
+                                            otp: Value::Null,
+                                            multi_step: "combined",
+                                            frame_hint: None,
+                                        }
+                                    }
+                                };
+                                if socket.send(out.to_frame()).await.is_err() {
+                                    return Outcome::SendFailed;
+                                }
+                                continue;
+                            }
+                            ClientMsg::FocusField { selector } => {
+                                if !human_may_drive(ctx.mode()) {
+                                    let no = ServerMsg::Refused { reason: "agent is driving" };
+                                    if socket.send(no.to_frame()).await.is_err() {
+                                        return Outcome::SendFailed;
+                                    }
+                                    continue;
+                                }
+                                let ok = if selector.is_empty() || selector.len() > MAX_SELECTOR_BYTES {
+                                    false
+                                } else {
+                                    match ctx.evaluate(&build_focus_js(&selector, None)).await {
+                                        Ok(v) => v.as_bool().unwrap_or(false),
+                                        Err(e) => {
+                                            debug!(subject = %session, error = %e, "browser takeover: focus_field");
+                                            false
+                                        }
+                                    }
+                                };
+                                if socket.send(ServerMsg::Focused { selector, ok }.to_frame()).await.is_err() {
+                                    return Outcome::SendFailed;
+                                }
+                                continue;
+                            }
+                            ClientMsg::FillField { selector, value, role } => {
+                                if !human_may_drive(ctx.mode()) {
+                                    let no = ServerMsg::Refused { reason: "agent is driving" };
+                                    if socket.send(no.to_frame()).await.is_err() {
+                                        return Outcome::SendFailed;
+                                    }
+                                    continue;
+                                }
+                                // 1) focus the field AND re-check its kind
+                                //    matches `role` (the server's half of "never
+                                //    a password into a username box"). A stale
+                                //    selector, a wrong kind, or an over-long
+                                //    selector all short-circuit to `ok:false`
+                                //    BEFORE the secret is ever typed.
+                                let focused = if selector.is_empty() || selector.len() > MAX_SELECTOR_BYTES {
+                                    false
+                                } else {
+                                    match ctx.evaluate(&build_focus_js(&selector, Some(&role))).await {
+                                        Ok(v) => v.as_bool().unwrap_or(false),
+                                        Err(e) => {
+                                            debug!(subject = %session, error = %e, "browser takeover: fill_field focus");
+                                            false
+                                        }
+                                    }
+                                };
+                                // 2) the actual secret write goes through the
+                                //    GATED trusted keystroke path
+                                //    (`Input.insertText` as `Actor::Human`),
+                                //    never a synthetic `el.value =` a controlled
+                                //    React/Vue input would silently drop. The
+                                //    value is dropped after this call — never
+                                //    echoed, never audited.
+                                let ok = focused && ctx.insert_text(Actor::Human, &value).await.is_ok();
+                                if socket.send(ServerMsg::Filled { selector, ok }.to_frame()).await.is_err() {
                                     return Outcome::SendFailed;
                                 }
                                 continue;
@@ -2162,8 +2876,13 @@ mod tests {
     fn the_phase_four_frames_are_the_shapes_the_client_parses() {
         // `page-tools.ts::parseCaps` / `parseFindResult`, and the `copied` arm
         // of `takeover-socket.ts::receive`.
-        let caps = serde_json::to_string(&ServerMsg::Caps { find: true, copy: true }).unwrap();
-        assert_eq!(caps, r#"{"type":"caps","find":true,"copy":true}"#);
+        let caps = serde_json::to_string(&ServerMsg::Caps {
+            find: true,
+            copy: true,
+            sign_in: true,
+        })
+        .unwrap();
+        assert_eq!(caps, r#"{"type":"caps","find":true,"copy":true,"sign_in":true}"#);
 
         let found = serde_json::to_string(&ServerMsg::FindResult {
             query: "needle",
@@ -2236,6 +2955,247 @@ mod tests {
         let js = find_clear_script();
         assert!(js.contains("removeAllRanges"), "the highlight IS the selection");
         assert!(js.contains("window.__supermuxFind = null"), "and the cursor goes too");
+    }
+
+    // ── smart sign-in (P4+) ─────────────────────────────────────────────────
+
+    #[test]
+    fn the_sign_in_verbs_parse_exactly_as_the_client_spells_them() {
+        // Byte-for-byte the payloads the client builds (Phase 3's
+        // `scanLogin`/`focusField`/`fillField`). A rename on either side fails
+        // here instead of the frame being silently dropped as garbled.
+        assert!(matches!(parse(r#"{"type":"scan_login"}"#), ClientMsg::ScanLogin));
+
+        let ClientMsg::FocusField { selector } = parse(r##"{"type":"focus_field","selector":"#pw"}"##)
+        else {
+            panic!("not a focus_field");
+        };
+        assert_eq!(selector, "#pw");
+
+        let ClientMsg::FillField { selector, value, role } =
+            parse(r##"{"type":"fill_field","selector":"#pw","value":"s3cret","role":"password"}"##)
+        else {
+            panic!("not a fill_field");
+        };
+        assert_eq!((selector.as_str(), value.as_str(), role.as_str()), ("#pw", "s3cret", "password"));
+    }
+
+    #[test]
+    fn the_sign_in_verbs_are_control_frames_and_never_reach_dispatch_input() {
+        // Like Find/Copy: `ScanLogin`/`FocusField` run through
+        // `Runtime.evaluate` and `FillField`'s secret write through the gated
+        // `insert_text`, so `to_cdp` must refuse to translate any of them — a
+        // `Runtime.*`/secret leaking into the `Input.*` path would be a hole.
+        for raw in [
+            r#"{"type":"scan_login"}"#,
+            r##"{"type":"focus_field","selector":"#u"}"##,
+            r##"{"type":"fill_field","selector":"#pw","value":"x","role":"password"}"##,
+        ] {
+            assert!(
+                to_cdp(&parse(raw), Viewport::default()).is_none(),
+                "{raw} must be handled by drive(), not forwarded as input"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sign_in_answer_frames_are_the_shapes_the_client_parses() {
+        // `caps` now carries the third flag; a client that reads only
+        // `find`/`copy` is unaffected, and one that reads `sign_in` lights the
+        // sheet. Pinned because the web half parses these names.
+        let caps = serde_json::to_string(&ServerMsg::Caps {
+            find: false,
+            copy: false,
+            sign_in: true,
+        })
+        .unwrap();
+        assert_eq!(caps, r#"{"type":"caps","find":false,"copy":false,"sign_in":true}"#);
+
+        let scanned = serde_json::to_string(&ServerMsg::LoginFields {
+            form: true,
+            reason: None,
+            fields: json!([{ "selector": "#email", "role": "username" }]),
+            otp: Value::Null,
+            multi_step: "combined",
+            frame_hint: None,
+        })
+        .unwrap();
+        assert_eq!(
+            scanned,
+            r##"{"type":"login_fields","form":true,"reason":null,"fields":[{"role":"username","selector":"#email"}],"otp":null,"multi_step":"combined","frame_hint":null}"##,
+        );
+
+        let empty = serde_json::to_string(&ServerMsg::LoginFields {
+            form: false,
+            reason: Some("no-password-field"),
+            fields: Value::Array(Vec::new()),
+            otp: Value::Null,
+            multi_step: "combined",
+            frame_hint: Some("cross-origin-iframe"),
+        })
+        .unwrap();
+        assert_eq!(
+            empty,
+            r##"{"type":"login_fields","form":false,"reason":"no-password-field","fields":[],"otp":null,"multi_step":"combined","frame_hint":"cross-origin-iframe"}"##,
+        );
+
+        let focused = serde_json::to_string(&ServerMsg::Focused {
+            selector: "#pw".into(),
+            ok: true,
+        })
+        .unwrap();
+        assert_eq!(focused, r##"{"type":"focused","selector":"#pw","ok":true}"##);
+
+        let filled = serde_json::to_string(&ServerMsg::Filled {
+            selector: "#pw".into(),
+            ok: false,
+        })
+        .unwrap();
+        // The secret is NEVER echoed — the answer is just which field and ok.
+        assert_eq!(filled, r##"{"type":"filled","selector":"#pw","ok":false}"##);
+    }
+
+    #[test]
+    fn parse_login_fields_maps_a_real_scan_result() {
+        // A form=true scan with two fields and an OTP slot passes through, and
+        // the small vocabularies are honoured.
+        let v = json!({
+            "form": true,
+            "reason": null,
+            "fields": [
+                { "selector": "#email", "role": "username", "label": "Email", "visible": true, "source": "autocomplete" },
+                { "selector": "#pw", "role": "password", "label": "Password", "visible": true, "source": "type" }
+            ],
+            "otp": { "selector": "#otp", "label": "Code" },
+            "multiStep": "combined",
+            "frameHint": null
+        });
+        let ServerMsg::LoginFields { form, reason, fields, otp, multi_step, frame_hint } =
+            parse_login_fields(&v)
+        else {
+            panic!("not login_fields");
+        };
+        assert!(form);
+        assert!(reason.is_none(), "a real form carries no reason");
+        assert_eq!(fields.as_array().unwrap().len(), 2);
+        assert_eq!(fields[1]["role"], "password");
+        assert_eq!(otp["selector"], "#otp");
+        assert_eq!(multi_step, "combined");
+        assert!(frame_hint.is_none());
+    }
+
+    #[test]
+    fn parse_login_fields_is_total_and_maps_the_form_false_reasons() {
+        // The Phase-1 stub: honest "no login form".
+        let stub = json!({ "form": false, "reason": "stub", "fields": [], "otp": null, "multiStep": "combined", "frameHint": null });
+        let ServerMsg::LoginFields { form, reason, fields, .. } = parse_login_fields(&stub) else {
+            panic!("not login_fields");
+        };
+        assert!(!form);
+        assert_eq!(reason, Some("stub"));
+        assert!(fields.as_array().unwrap().is_empty());
+
+        // form=false drops fields even if the page returned some, and normalises
+        // an unknown reason to `scan-error` so no arbitrary string reaches the
+        // wire.
+        let weird = json!({ "form": false, "reason": "totally-made-up", "fields": [{ "selector": "#x" }], "otp": { "selector": "#o" } });
+        let ServerMsg::LoginFields { reason, fields, otp, .. } = parse_login_fields(&weird) else {
+            panic!("not login_fields");
+        };
+        assert_eq!(reason, Some("scan-error"));
+        assert!(fields.as_array().unwrap().is_empty(), "a disabled sheet offers nothing");
+        assert_eq!(otp, Value::Null);
+
+        // Missing/garbled top-level value degrades to disabled + scan-error.
+        for v in [Value::Null, json!({}), json!({ "form": "yes" })] {
+            let ServerMsg::LoginFields { form, reason, .. } = parse_login_fields(&v) else {
+                panic!("not login_fields");
+            };
+            assert!(!form);
+            assert_eq!(reason, Some("scan-error"));
+        }
+
+        // The known reason + multi-step + frame-hint vocabularies map through.
+        let coif = json!({ "form": false, "reason": "cross-origin-frame", "multiStep": "username-only", "frameHint": "cross-origin-iframe" });
+        let ServerMsg::LoginFields { reason, multi_step, frame_hint, .. } = parse_login_fields(&coif) else {
+            panic!("not login_fields");
+        };
+        assert_eq!(reason, Some("cross-origin-frame"));
+        assert_eq!(multi_step, "username-only");
+        assert_eq!(frame_hint, Some("cross-origin-iframe"));
+    }
+
+    #[test]
+    fn the_scan_login_body_is_the_anchor_first_detector() {
+        // Phase 2 ships the real anchor-first detection (spec §1.2). The body is
+        // a well-formed IIFE that references the page globals it runs against and
+        // is kept byte-identical to the jsdom-tested TS module (guarded there by
+        // the "kept in sync" assertion). Whatever it returns, `parse_login_fields`
+        // already maps it — the algorithm itself is exercised in jsdom, not here.
+        assert!(SCAN_LOGIN_JS.starts_with("(() => {") && SCAN_LOGIN_JS.ends_with("})()"));
+        assert!(SCAN_LOGIN_JS.contains("var anchor"), "the anchor-first pipeline");
+        assert!(SCAN_LOGIN_JS.contains("no-password-field") && SCAN_LOGIN_JS.contains("too-many-fields"));
+        assert!(!SCAN_LOGIN_JS.contains("PLACEHOLDER"), "the Phase-1 stub is gone");
+        // A parse of a representative real return still maps to a form.
+        let out = json!({
+            "form": true, "reason": null,
+            "fields": [{ "selector": "#u", "role": "username", "label": "Email", "visible": true, "source": "autocomplete" }],
+            "otp": null, "multiStep": "combined", "frameHint": null
+        });
+        let ServerMsg::LoginFields { form, reason, fields, .. } = parse_login_fields(&out) else {
+            panic!("not login_fields");
+        };
+        assert!(form);
+        assert!(reason.is_none());
+        assert_eq!(fields.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn build_focus_js_embeds_its_selector_as_a_json_literal() {
+        // A selector with quotes/backslashes is a SELECTOR, not a syntax error
+        // or an injection into the page's world.
+        let js = build_focus_js("#a\"b\\c", None);
+        assert!(js.contains(r##"const SEL = "#a\"b\\c""##), "selector is a JSON literal: {js}");
+        assert!(js.contains("ROLE = null"), "a plain focus carries no role");
+        assert!(js.contains("querySelector(SEL)") && js.contains("el.focus"));
+        assert!(js.starts_with("(() => {") && js.ends_with("})()"));
+
+        // A fill focuses WITH the role, so the JS can re-check the field's kind
+        // before the caller types — the server's half of "never a password into
+        // a username box".
+        let fill = build_focus_js("#pw", Some("password"));
+        assert!(fill.contains(r#"ROLE = "password""#));
+        assert!(fill.contains("ROLE === 'password'") && fill.contains("isPw"));
+    }
+
+    #[test]
+    fn the_gate_refuses_every_sign_in_verb_while_an_agent_drives() {
+        // `evaluate`/`insert_text` would happily read or fill a page mid-drive,
+        // so the `human_may_drive` guard in each arm is the real gate. Mirrored
+        // by `should_refuse` for a socket-free assertion.
+        for raw in [
+            r#"{"type":"scan_login"}"#,
+            r##"{"type":"focus_field","selector":"#u"}"##,
+            r##"{"type":"fill_field","selector":"#pw","value":"x","role":"password"}"##,
+            // Find/Copy share the gate.
+            r#"{"type":"find","query":"x"}"#,
+            r#"{"type":"copy"}"#,
+        ] {
+            let msg = parse(raw);
+            assert!(
+                should_refuse(&msg, DriveMode::AgentDriving),
+                "{raw} must be refused while the agent holds the wheel"
+            );
+            assert!(
+                !should_refuse(&msg, DriveMode::HumanDriving),
+                "{raw} runs once the human takes the wheel"
+            );
+        }
+        // `find_close` is UNGATED — it only removes state our own find created,
+        // and a human who loses the wheel mid-find must still close the bar.
+        assert!(!should_refuse(&parse(r#"{"type":"find_close"}"#), DriveMode::AgentDriving));
+        // Ordinary input/control frames are not sign-in verbs.
+        assert!(!should_refuse(&parse(r#"{"type":"ping"}"#), DriveMode::AgentDriving));
     }
 
     #[test]

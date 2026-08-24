@@ -35,11 +35,16 @@ import {
   NO_CAPS,
   NO_FIND,
   copyPayload,
+  fillFieldPayload,
   findClosePayload,
   findPayload,
+  focusFieldPayload,
   parseCaps,
   parseFindResult,
+  parseLoginScan,
+  scanLoginPayload,
   type FindResult,
+  type LoginScan,
   type PageCaps,
 } from './page-tools'
 
@@ -114,6 +119,18 @@ export interface TakeoverSnapshot {
   caps: PageCaps
   /** The live find, as the server counts it. [[NO_FIND]] until one answers. */
   find: FindResult
+  /**
+   * **The last login scan** (smart sign-in, spec §3) — `null` until a
+   * `scanLogin()` answers, and the shape `login-detect.ts` owns: `form` is the
+   * whole gate (`false` ⇒ the sheet disables itself with `reason`), `fields`
+   * carry the detected selectors/roles/rects Phase 4 anchors its offer to.
+   *
+   * A SNAPSHOT field, not a callback, because unlike a copy or a fill result
+   * this is durable page STATE the UI reads while the sheet is open — but note
+   * it is only the DETECTED structure, never a secret: the value typed into a
+   * field rides the transient `fillField()` call and is never parked here.
+   */
+  loginScan: LoginScan | null
 }
 
 export const EMPTY_SNAPSHOT: TakeoverSnapshot = {
@@ -124,6 +141,7 @@ export const EMPTY_SNAPSHOT: TakeoverSnapshot = {
   refused: null,
   caps: NO_CAPS,
   find: NO_FIND,
+  loginScan: null,
 }
 
 export interface TakeoverOptions {
@@ -140,6 +158,16 @@ export interface TakeoverOptions {
    *  parking it in state would leave a signed-in page's content sitting in a
    *  React tree long after the copy. */
   onCopied?: (text: string) => void
+  /**
+   * A field the server focused (`focusField()`) or filled (`fillField()`) — the
+   * per-field answers to smart sign-in's two acting verbs. Callbacks, not
+   * snapshot fields, for the same reason as [[onCopied]]: each is a one-shot
+   * result the §3.1 state machine reacts to (advance to the next field, mark
+   * "filled", or surface an `ok:false`), and a fill result must not linger in a
+   * React tree next to the secret that produced it.
+   */
+  onFocused?: (selector: string, ok: boolean) => void
+  onFilled?: (selector: string, ok: boolean) => void
 }
 
 /**
@@ -648,6 +676,45 @@ export class TakeoverSocket {
     return true
   }
 
+  // ── smart sign-in (phase 3) — gated on `caps.signIn`, same as find/copy ─────
+  //
+  // FAIL CLOSED. An older relay sends no `caps` frame, `caps.signIn` stays
+  // false, and all three verbs are no-ops that return false — Phase 4's sheet
+  // reads the same flag and degrades to today's blind text/Tab path rather than
+  // spinning against a server that will never answer. The secret in `fillField`
+  // lives for exactly one `send`: it is spelled into the frame and never parked
+  // on the snapshot (spec §5).
+
+  /**
+   * Scan the page for a login form. No-op (and `false`) when the server cannot.
+   * The answer arrives as a `login_fields` frame → [[TakeoverSnapshot.loginScan]]
+   * — or, if an agent holds the wheel, as a `refused` frame the banner surfaces.
+   */
+  scanLogin(): boolean {
+    if (!this.snap.caps.signIn) return false
+    this.send(scanLoginPayload())
+    return true
+  }
+
+  /** Scroll a detected field into view and focus it. Answered by `focused`. */
+  focusField(selector: string): boolean {
+    if (!this.snap.caps.signIn || !selector) return false
+    this.send(focusFieldPayload(selector))
+    return true
+  }
+
+  /**
+   * Type a secret into a detected field on the trusted keystroke path. Answered
+   * by `filled`. The value is NEVER retained: it is handed straight to
+   * [[fillFieldPayload]] and put on the wire, and nothing on this object or the
+   * snapshot holds it afterwards.
+   */
+  fillField(selector: string, value: string, role: string): boolean {
+    if (!this.snap.caps.signIn || !selector) return false
+    this.send(fillFieldPayload(selector, value, role))
+    return true
+  }
+
   // ── inbound ───────────────────────────────────────────────────────────────
 
   private receive(raw: unknown): void {
@@ -694,6 +761,23 @@ export class TakeoverSocket {
       case 'copied': {
         const text = typeof msg.text === 'string' ? msg.text : ''
         this.opts.onCopied?.(text)
+        return
+      }
+      case 'login_fields':
+        // The answer to `scanLogin()`. Parsed fail-closed (a garbled frame is a
+        // disabled offer, never a wrong one) and parked on the snapshot for the
+        // sheet to read.
+        this.patch({ loginScan: parseLoginScan(msg) })
+        return
+      case 'focused': {
+        // One-shot per-field result → callback, not state (see `onFocused`).
+        const selector = typeof msg.selector === 'string' ? msg.selector : ''
+        this.opts.onFocused?.(selector, msg.ok === true)
+        return
+      }
+      case 'filled': {
+        const selector = typeof msg.selector === 'string' ? msg.selector : ''
+        this.opts.onFilled?.(selector, msg.ok === true)
         return
       }
       case 'mode':
