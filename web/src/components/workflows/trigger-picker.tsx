@@ -290,21 +290,26 @@ function usePreview(
   expr: string | null,
   previewFn: (expression: string) => Promise<{ next_runs: string[] }>,
 ): PreviewState {
-  const [state, setState] = React.useState<PreviewState>({ runs: [], loading: false, error: null })
+  // The snapshot remembers WHICH expression it answers. That is what lets the
+  // "loading" and "cleared" states be derived during render instead of written
+  // by the effect — and it is also what stops the previous cadence's fire times
+  // sitting under a newly typed one for the length of the debounce, which would
+  // be the most misleading 300ms on the page.
+  const [snap, setSnap] = React.useState<{ expr: string; runs: string[]; error: string | null }>({
+    expr: '',
+    runs: [],
+    error: null,
+  })
   React.useEffect(() => {
-    if (!expr) {
-      setState({ runs: [], loading: false, error: null })
-      return
-    }
+    if (!expr) return
     let live = true
-    setState((s) => ({ ...s, loading: true, error: null }))
     const t = setTimeout(() => {
       previewFn(expr)
         .then((r) => {
-          if (live) setState({ runs: r.next_runs ?? [], loading: false, error: null })
+          if (live) setSnap({ expr, runs: r.next_runs ?? [], error: null })
         })
         .catch((e: Error) => {
-          if (live) setState({ runs: [], loading: false, error: e.message })
+          if (live) setSnap({ expr, runs: [], error: e.message })
         })
     }, 320)
     return () => {
@@ -312,7 +317,13 @@ function usePreview(
       clearTimeout(t)
     }
   }, [expr, previewFn])
-  return state
+
+  const fresh = !!expr && snap.expr === expr
+  return {
+    runs: fresh ? snap.runs : [],
+    loading: !!expr && !fresh,
+    error: fresh ? snap.error : null,
+  }
 }
 
 function CadenceReadback({

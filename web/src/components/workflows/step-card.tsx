@@ -143,10 +143,16 @@ export function StepCard({
   // object-URL revoke) is `use-staged-attachments`'s; only the disposition is
   // ours, which is the whole reason it is reused rather than re-implemented.
   const folded = React.useRef<Set<string>>(new Set())
+  // Point the refs at the latest props from an EFFECT, never during render:
+  // the fold below has to read "the step as it is now" without re-subscribing
+  // to every keystroke, and a render-time ref write is the pattern the lint
+  // (rightly) refuses.
   const changeRef = React.useRef(onChange)
-  changeRef.current = onChange
   const stepRef = React.useRef(step)
-  stepRef.current = step
+  React.useEffect(() => {
+    changeRef.current = onChange
+    stepRef.current = step
+  })
   React.useEffect(() => {
     const ready = staged.attachments.filter(
       (a) => a.path && !a.uploading && !a.error && !folded.current.has(a.id),
