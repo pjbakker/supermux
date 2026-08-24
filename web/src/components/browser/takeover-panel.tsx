@@ -99,6 +99,7 @@ import {
   type TakeoverSubject,
 } from '@/lib/browser/takeover-socket'
 import { SignInSheet, type SignInCreds } from '@/components/browser/sign-in-sheet'
+import { signInGate, type DetectedFill } from '@/lib/browser/sign-in-state'
 import {
   ClickCounter,
   TAP_MS,
@@ -1125,6 +1126,25 @@ export function TakeoverPanel({
     }
   }
 
+  // The SMART fill: each detected selector gets its OWN value typed into it via
+  // the server's field-scoped `fillField` (focus + trusted keystrokes, role
+  // re-checked server-side) — never a blind Tab into whatever was focused. The
+  // secret rides the `fillField` call and is never parked. Enter is opt-in and
+  // pressed ONCE, after every field landed (spec §3.5.2). Gated on `driving`.
+  const relayDetectedFill = (fills: DetectedFill[], submit: boolean) => {
+    const sock = socketRef.current
+    if (!sock || !driving) return
+    for (const f of fills) sock.fillField(f.selector, f.value, f.role)
+    if (submit && fills.length > 0) sock.pressKey('Enter')
+  }
+
+  // Scroll a detected field into view + focus it, so the human sees where a fill
+  // will land before they commit — the sheet's "show me this field".
+  const focusDetectedField = (selector: string) => {
+    if (!driving) return
+    socketRef.current?.focusField(selector)
+  }
+
   // One tap: the clipboard the human already holds, typed into the focused page
   // field. `readText()` can reject (permission, an insecure origin, a browser
   // that still wants its own gesture) — when it does, the trap input's
@@ -1153,6 +1173,22 @@ export function TakeoverPanel({
     crashed: !!crashed,
     subject: kind,
   })
+
+  // PROACTIVELY SCAN the page for a login form whenever we can — the moment the
+  // human takes the wheel on a capable relay, and again when the page navigates.
+  // The answer lands on `snap.loginScan`, which is what gates the Sign-in
+  // control (`signInGate`): no round-trip on the tap, and the button is never a
+  // spinner. No-op on an older relay (`scanLogin` returns false without caps).
+  const canScan = driving && snap.caps.signIn && view.cover !== 'screen'
+  React.useEffect(() => {
+    if (!canScan) return
+    socketRef.current?.scanLogin()
+  }, [canScan, snap.url])
+
+  // The gate: usable-or-not, from the relay's caps + the last scan. `disabled`
+  // is the owner's "not usable when there are no fields"; the button below shows
+  // its reason and the sheet, when opened, explains rather than spins.
+  const signIn = signInGate(snap.caps.signIn, snap.loginScan)
 
   // The page's own modal, straight off the feed. The bench reaches this through
   // a real `nav_state` frame on its mock socket, not through a prop — so the
@@ -1419,12 +1455,29 @@ export function TakeoverPanel({
               <ClipboardPaste className="size-3.5" aria-hidden />
               Paste
             </button>
+            {/* GATED on the scan (spec §3.1): when the page has no login form
+                the control is not usable — muted, `aria-disabled`, and carrying
+                the reason. It still opens the sheet (which explains, never
+                spins), because a dead button on a phone has no way to say why.
+                Tapping it also re-scans on a capable relay, so a form that
+                appeared after a client-side route change is picked up. */}
             <button
               type="button"
               data-takeover-signin=""
+              data-signin-gate={signIn.kind}
+              aria-disabled={signIn.kind === 'disabled' ? true : undefined}
+              title={signIn.kind === 'disabled' || signIn.kind === 'frame' ? signIn.reason : undefined}
               onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => setSignInOpen(true)}
-              className="inline-flex min-h-11 items-center gap-1.5 rounded-full border border-hairline bg-surface/95 px-4 text-[12.5px] font-medium text-ink shadow-lg backdrop-blur transition-colors hover:bg-fill-soft motion-reduce:transition-none"
+              onClick={() => {
+                if (snap.caps.signIn) socketRef.current?.scanLogin()
+                setSignInOpen(true)
+              }}
+              className={cn(
+                'inline-flex min-h-11 items-center gap-1.5 rounded-full border border-hairline bg-surface/95 px-4 text-[12.5px] font-medium shadow-lg backdrop-blur transition-colors motion-reduce:transition-none',
+                signIn.kind === 'disabled'
+                  ? 'text-ink-3 hover:bg-surface/95'
+                  : 'text-ink hover:bg-fill-soft',
+              )}
             >
               <KeyRound className="size-3.5" aria-hidden />
               Sign in
@@ -1451,9 +1504,20 @@ export function TakeoverPanel({
         <StatusVeil refused={snap.refused} />
       </div>
 
-      {/* The password-manager bridge. Portals to body, so it lives at the panel
-          root rather than inside the clipped, `touch-none` canvas box. */}
-      <SignInSheet open={signInOpen} onOpenChange={setSignInOpen} onFill={relaySignIn} />
+      {/* The password-manager bridge, now FIELD-AWARE. Portals to body, so it
+          lives at the panel root rather than inside the clipped, `touch-none`
+          canvas box. The gate + scan decide blind vs detected vs no-form; the
+          two relays are the blind text/Tab path and the field-scoped fill. */}
+      <SignInSheet
+        open={signInOpen}
+        onOpenChange={setSignInOpen}
+        gate={signIn}
+        scan={snap.loginScan}
+        url={snap.url}
+        onFillDetected={relayDetectedFill}
+        onBlindFill={relaySignIn}
+        onFocusField={focusDetectedField}
+      />
     </div>
   )
 }

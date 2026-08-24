@@ -167,6 +167,12 @@ const DevBrowserTakeover = import.meta.env.DEV
 const DevBrowserWorkspace = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-browser-workspace'))
   : null
+// Smart sign-in bench — every state of the FIELD-AWARE sign-in sheet (no-form /
+// detected / ambiguous-mapper / otp / generate-only / frame / blind) on a
+// hand-built LoginScan, offline. The page the sign-in shots come from.
+const DevSignIn = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-sign-in'))
+  : null
 // Connector-store bench — the grid + bot-scoped sheet + inline connect-card, in
 // both themes and the [data-grok] skin, offline. The page the store shots come
 // from.
@@ -425,6 +431,16 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <DevBrowserWorkspace />
+                    </Suspense>
+                  }
+                />
+              )}
+              {DevSignIn && (
+                <Route
+                  path="/dev/sign-in"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevSignIn />
                     </Suspense>
                   }
                 />
