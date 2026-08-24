@@ -728,6 +728,19 @@ async fn fs_delete(
     let jail = jail_for(&state, &ctx).await?;
     let abs = safe_path_scoped(&transport, &to_abs(&body.path, body.cwd.as_deref()), jail.as_deref()).await?;
 
+    // A company ROOT is never deletable — and this is the sharpest edge of the
+    // three, because `safe_path_scoped` cannot catch it: the jail check is
+    // `abs.starts_with(jail_canon)`, which the jail ROOT trivially satisfies on
+    // itself. Without this guard a scoped member could name their own
+    // `root_dir` (which `GET /api/companies` hands them) and `remove_dir_all`
+    // the entire company Drive in one request. Same helper, same 403 as
+    // `fs_rename`.
+    if is_company_root(&state, &abs).await {
+        return Err(AppError::Forbidden(
+            "a company root cannot be deleted".into(),
+        ));
+    }
+
     if is_local_transport(&transport) {
         let meta = tokio::fs::symlink_metadata(&abs).await.map_err(map_io)?;
         if meta.is_dir() {
@@ -950,6 +963,18 @@ pub(crate) async fn emit_files_event(
     session: Option<&str>,
 ) {
     let company = company_for_path(state, path).await;
+    // The frame is stamped by its DESTINATION, but it also carries `from`. An
+    // OWNER can rename/copy ACROSS company roots (jail `None`), and that frame
+    // reaches the DESTINATION company's members — so a foreign `from` would ride
+    // company A's absolute path into company B's stream. Drop the source
+    // whenever it belongs to a different company than the one being notified;
+    // the destination is what the recipients are entitled to see. (A member
+    // cannot produce this shape at all: their jail fences both paths into one
+    // root.)
+    let from = match from {
+        Some(f) if company_for_path(state, f).await == company => Some(f),
+        _ => None,
+    };
     let _ = state.sse_tx.send(crate::state::SseEvent::for_company(
         "files",
         json!({

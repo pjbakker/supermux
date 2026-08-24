@@ -789,6 +789,55 @@ async fn rename_of_a_company_root_is_403() {
     assert_eq!(resp.status(), StatusCode::OK, "files inside a company root move freely");
 }
 
+/// BLOCKER regression: `safe_path_scoped` only asserts `abs.starts_with(jail)`,
+/// and a jail ROOT trivially satisfies that on ITSELF — so a scoped member could
+/// `DELETE /api/fs/delete` their own company's `root_dir` and `remove_dir_all`
+/// the entire Drive in one request. The root is not secret either: `GET
+/// /api/companies` hands `root_dir` to the member. Same 403 as rename.
+#[tokio::test]
+async fn delete_of_a_company_root_is_403() {
+    let env = setup().await;
+    let root = env.work_dir.join("acme-root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("keep.md"), b"the whole drive").unwrap();
+    db::companies::create(&env.state.pool, "acme", "Acme", &root.to_string_lossy())
+        .await
+        .expect("company row");
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::DELETE,
+            "/api/fs/delete",
+            &json!({ "path": root.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a company root cannot be deleted");
+    assert!(root.is_dir(), "the Drive is still there");
+    assert_eq!(
+        std::fs::read(root.join("keep.md")).unwrap(),
+        b"the whole drive",
+        "and so is its content"
+    );
+
+    // Everything INSIDE the root still deletes freely — this is a guard on one
+    // path, not a blanket deny.
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::DELETE,
+            "/api/fs/delete",
+            &json!({ "path": root.join("keep.md").to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "files inside a company root delete freely");
+    assert!(!root.join("keep.md").exists());
+}
+
 #[tokio::test]
 async fn copy_file_leaves_source_intact() {
     let env = setup().await;
@@ -1196,4 +1245,72 @@ async fn put_delete_and_rename_all_emit_files_frames() {
     assert_eq!(resp.status(), StatusCode::OK);
     let f = rx.try_recv().expect("delete emits");
     assert_eq!(f.payload["op"], "delete");
+}
+
+/// An OWNER can rename ACROSS company roots (jail `None`). The destination
+/// company's members legitimately learn the new filename — but the frame also
+/// carried `from` verbatim, so company A's naming leaked into company B's
+/// stream. A cross-company `from` is dropped.
+#[tokio::test]
+async fn cross_company_rename_frame_drops_the_foreign_from_path() {
+    let env = setup().await;
+    let root_a = env.work_dir.join("acme");
+    let root_b = env.work_dir.join("beta");
+    std::fs::create_dir(&root_a).unwrap();
+    std::fs::create_dir(&root_b).unwrap();
+    let _a = db::companies::create(&env.state.pool, "acme", "Acme", &root_a.to_string_lossy())
+        .await
+        .expect("company A");
+    let b = db::companies::create(&env.state.pool, "beta", "Beta", &root_b.to_string_lossy())
+        .await
+        .expect("company B");
+
+    let from = root_a.join("acme-secret-codename.md");
+    std::fs::write(&from, b"x").unwrap();
+    let to = root_b.join("moved.md");
+
+    let mut rx = env.state.sse_tx.subscribe();
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the owner may move across roots");
+
+    let frame = rx.try_recv().expect("a files frame was published");
+    assert_eq!(frame.company_id, Some(b.id), "stamped with the DESTINATION's company");
+    assert_eq!(frame.payload["path"], to.to_string_lossy().into_owned());
+    assert_eq!(
+        frame.payload["from"],
+        Value::Null,
+        "company A's path must not ride into company B's stream"
+    );
+
+    // Within ONE company the `from` is kept — it is what lets the client drop
+    // the old row instead of refetching.
+    let inside_from = root_b.join("moved.md");
+    let inside_to = root_b.join("moved2.md");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": inside_from.to_string_lossy(), "to": inside_to.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let frame = rx.try_recv().expect("a files frame was published");
+    assert_eq!(frame.company_id, Some(b.id));
+    assert_eq!(
+        frame.payload["from"],
+        inside_from.to_string_lossy().into_owned(),
+        "a same-company from is preserved"
+    );
 }
