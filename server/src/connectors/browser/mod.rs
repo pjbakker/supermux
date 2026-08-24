@@ -122,6 +122,9 @@ const TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
 pub const ENV_MAX_CONTEXTS: &str = "SUPERMUX_BROWSER_MAX_CONTEXTS";
 /// Env override: max simultaneous LIVE workspace tabs.
 pub const ENV_MAX_TABS: &str = "SUPERMUX_BROWSER_MAX_TABS";
+/// Env override: the durable profile directory (an operator escape hatch — e.g.
+/// putting the credential store on a different volume).
+pub const ENV_PROFILE_DIR: &str = "SUPERMUX_BROWSER_PROFILE_DIR";
 /// Env override: idle minutes before the shell is reaped (`0` disables).
 pub const ENV_IDLE_MINUTES: &str = "SUPERMUX_BROWSER_IDLE_MINUTES";
 
@@ -160,6 +163,9 @@ pub struct BrowserConfig {
 /// **It is a credential store.** Mode 0700, excluded from any backup or
 /// support-bundle sweep, and logged by PATH only — never by contents (§8.5).
 pub fn default_profile_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os(ENV_PROFILE_DIR) {
+        return PathBuf::from(p);
+    }
     let base = std::env::var_os("SUPERMUX_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -168,6 +174,20 @@ pub fn default_profile_dir() -> PathBuf {
                 .join(".supermux")
         });
     base.join("browser").join("profile")
+}
+
+/// The profile dir for an ALREADY-RESOLVED data dir.
+///
+/// [`default_profile_dir`] re-reads the environment, which is right for a
+/// standalone `BrowserConfig::default()` and **wrong** for the running server:
+/// `config.data_dir` is the resolved answer (env → `config.toml` → `$HOME`), and
+/// a test harness with its own temp data dir must land its profile there rather
+/// than in the live one. The explicit [`ENV_PROFILE_DIR`] override still wins.
+pub fn profile_dir_for(data_dir: &std::path::Path) -> PathBuf {
+    if let Some(p) = std::env::var_os(ENV_PROFILE_DIR) {
+        return PathBuf::from(p);
+    }
+    data_dir.join("browser").join("profile")
 }
 
 impl Default for BrowserConfig {
@@ -186,6 +206,14 @@ impl Default for BrowserConfig {
 }
 
 impl BrowserConfig {
+    /// [`from_env`](Self::from_env) with the durable profile pinned under an
+    /// already-resolved `data_dir` — what the server actually constructs.
+    pub fn for_data_dir(data_dir: &std::path::Path) -> Self {
+        let mut cfg = Self::from_env();
+        cfg.profile = ProfileMode::Durable(profile_dir_for(data_dir));
+        cfg
+    }
+
     /// [`Default`] with the documented env overrides applied.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
@@ -1012,8 +1040,57 @@ mod tests {
     fn defaults_are_conservative() {
         let cfg = BrowserConfig::default();
         assert!(cfg.max_contexts >= 1 && cfg.max_contexts <= 32);
+        assert!(cfg.max_tabs >= cfg.max_contexts, "a workspace needs more room than scratch");
         assert!(cfg.idle_timeout >= Duration::from_secs(60));
-        assert_eq!((cfg.width, cfg.height), (1024, 768));
+        // Raised for v1: a login viewport, and a less unusual fingerprint.
+        assert_eq!((cfg.width, cfg.height), (1366, 900));
+        // The DEFAULT is the persistent workspace jar, living under the data dir
+        // — never the repo checkout, never a worktree, never /tmp.
+        match &cfg.profile {
+            ProfileMode::Durable(dir) => {
+                assert!(dir.ends_with("browser/profile"), "got {}", dir.display());
+                assert!(
+                    !dir.starts_with(std::env::temp_dir()),
+                    "the durable profile must not live in temp: {}",
+                    dir.display()
+                );
+            }
+            other => panic!("the default profile must be Durable, got {other:?}"),
+        }
+    }
+
+    /// A tab id that never passed the shape gate must not reach the registry —
+    /// and must not start a browser on its way to being rejected.
+    #[tokio::test]
+    async fn a_malformed_tab_id_is_refused_without_spawning_anything() {
+        let svc = BrowserService::new(BrowserConfig::default());
+        for bad in ["", "alice", "tb_", "tb_../../etc", "tb_a b"] {
+            let err = svc
+                .ensure_tab(bad, TabMeta::default())
+                .await
+                .expect_err("must be refused");
+            assert!(matches!(err, BrowserError::NoSuchTab(_)), "{bad}: {err:?}");
+        }
+        assert!(!svc.is_running().await, "no chrome may be spawned");
+        assert_eq!(svc.tab_count().await, 0);
+    }
+
+    /// The tab-scoped lock API needs a LIVE tab, exactly as the session-scoped
+    /// one needs a live context — and neither may spawn one to answer.
+    #[tokio::test]
+    async fn the_tab_lock_api_needs_a_live_tab() {
+        let svc = BrowserService::new(BrowserConfig::default());
+        let err = svc
+            .request_human_takeover_tab("tb_nothinghere1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BrowserError::NoSuchTab(_)), "got {err:?}");
+        let err = svc.tab_mode("tb_nothinghere1").await.unwrap_err();
+        assert!(matches!(err, BrowserError::NoSuchTab(_)), "got {err:?}");
+        assert!(svc.tab("tb_nothinghere1").await.is_none());
+        // Dehydrating a tab that is not live is a normal state, not an error.
+        assert!(!svc.dehydrate_tab("tb_nothinghere1").await.unwrap());
+        assert!(!svc.is_running().await);
     }
 
     // ── FINDING 1: the registry's lifetime contract ─────────────────────────
@@ -1049,6 +1126,7 @@ mod tests {
 
         let svc = BrowserService::new(BrowserConfig {
             max_contexts: 3,
+            profile: ProfileMode::Ephemeral,
             ..BrowserConfig::default()
         });
 
@@ -1111,7 +1189,13 @@ mod tests {
             std::path::Path::new(&format!("/proc/{pid}")).exists()
         }
 
-        let svc = BrowserService::new(BrowserConfig::default());
+        // **Explicitly ephemeral.** This test asserts the profile dir is REMOVED,
+        // which is the scratch guarantee; the default is now the durable
+        // workspace jar, whose whole job is to survive exactly this.
+        let svc = BrowserService::new(BrowserConfig {
+            profile: ProfileMode::Ephemeral,
+            ..BrowserConfig::default()
+        });
         // First context lazily spawns the single shell.
         svc.context_for("alice").await.expect("spawn + context alice");
         assert!(svc.is_running().await, "chrome should be running after context_for");

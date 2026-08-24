@@ -315,14 +315,18 @@ impl AgentContext {
         height: u32,
         url: &str,
     ) -> Result<Self> {
-        let mut params = json!({
-            "url": url,
-            "width": width,
-            "height": height,
-        });
+        let mut params = json!({ "url": url });
         // Present ⇒ isolated context. ABSENT ⇒ the default, persistent one.
+        //
+        // `width`/`height` ride along ONLY on the isolated path, unchanged. In
+        // the default context Chrome refuses them outright ("Target position can
+        // only be set for new windows" — measured against Chrome 149), and they
+        // buy nothing there: the viewport is per-target and is pinned below with
+        // `Emulation.setDeviceMetricsOverride` either way (gotcha #11).
         if let Some(bcid) = browser_context_id {
             params["browserContextId"] = json!(bcid);
+            params["width"] = json!(width);
+            params["height"] = json!(height);
         }
         let target = client.call("Target.createTarget", params).await?;
         let target_id = target["targetId"]

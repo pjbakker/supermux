@@ -365,6 +365,14 @@ impl ChromeProcess {
         // Taken BEFORE the spawn: a second instance must be refused without ever
         // pointing a Chrome at a profile someone else is writing.
         let owner_lock = ProfileLock::take(&user_data_dir, durable)?;
+        // **Clear the previous run's port file.** `await_devtools_port` polls for
+        // this file, and on a DURABLE profile the last run left one behind with a
+        // dead port — so without this the very first launch on an existing
+        // profile "succeeds" instantly against a port nothing is listening on and
+        // fails at `/json/version`. (Measured: exactly that, on run #2 of the
+        // persistence test.) An ephemeral profile never has one; removing it is a
+        // harmless no-op there.
+        let _ = std::fs::remove_file(user_data_dir.join("DevToolsActivePort"));
 
         let args = launch_args(&user_data_dir, width, height);
         let mut cmd = Command::new(executable);

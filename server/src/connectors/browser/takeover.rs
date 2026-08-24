@@ -1093,7 +1093,12 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
             std::path::Path::new(&format!("/proc/{pid}")).exists()
         }
 
-        let svc = BrowserService::new(BrowserConfig::default());
+        // Explicitly ephemeral: this test's teardown assertion is the scratch
+        // one (the profile dir is removed), not the workspace one.
+        let svc = BrowserService::new(BrowserConfig {
+            profile: crate::connectors::browser::launch::ProfileMode::Ephemeral,
+            ..BrowserConfig::default()
+        });
         let ctx = svc.context_for("takeover").await.expect("context");
         let pid = svc.chrome_pid().await.expect("a chrome pid");
         let udd = svc.user_data_dir().await.expect("a user-data-dir");

