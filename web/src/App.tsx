@@ -41,6 +41,11 @@ const Store = lazy(() =>
 const Workflows = lazy(() =>
   import('@/routes/workflows').then((m) => ({ default: m.Workflows })),
 )
+// The composer is its OWN chunk: the step tree, the cadence grammar and the
+// upload engine are only paid for by somebody who is actually composing.
+const WorkflowEdit = lazy(() =>
+  import('@/routes/workflow-edit').then((m) => ({ default: m.WorkflowEdit })),
+)
 // The phone team-detail surface (Phase 6a). Lazy so the 160 KB entry gate never
 // carries ChatPanel/TeamPanel/MemberPane for a route the roster only reaches on a
 // phone tap (and which redirects to /focus when bot mode is off).
@@ -279,6 +284,25 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <Workflows />
+                    </Suspense>
+                  }
+                />
+                {/* `new` is registered BEFORE `:id` so the literal wins — the
+                    same static-before-capture ordering the server router keeps
+                    for `/api/workflows/preview`. */}
+                <Route
+                  path="/workflows/new"
+                  element={
+                    <Suspense fallback={null}>
+                      <WorkflowEdit />
+                    </Suspense>
+                  }
+                />
+                <Route
+                  path="/workflows/:id/edit"
+                  element={
+                    <Suspense fallback={null}>
+                      <WorkflowEdit />
                     </Suspense>
                   }
                 />
