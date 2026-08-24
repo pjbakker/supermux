@@ -23,7 +23,9 @@ import { ApiError } from '../../src/lib/api/client'
 import {
   activeGrantees,
   ago,
+  closeTabPage,
   createTab,
+  displayUrl,
   grantCandidates,
   mayGrantAll,
   deleteTab,
@@ -31,7 +33,10 @@ import {
   grantTab,
   isSecure,
   listTabs,
+  navigateTab,
   normalizeUrl,
+  openTab,
+  parseAddress,
   patchTab,
   revokeTabGrant,
   sortTabs,
@@ -176,6 +181,105 @@ describe('rail ordering + url helpers', () => {
   })
 })
 
+/* ── the omnibox: GO vs SEARCH ───────────────────────────────────────────── */
+
+/**
+ * The parse is the whole of complaint #2's second half.
+ *
+ * The box this replaces prefixed `https://` to ANYTHING without a scheme, so
+ * `how to bake bread` became `https://how to bake bread`, the server's
+ * `host_of` failed, and the human got a red toast reading "a tab needs an
+ * http(s) URL" for typing a sentence into a search box. Every case below is a
+ * branch a real browser has and that one did not.
+ */
+describe('parseAddress — one line of typing, one act', () => {
+  test('a scheme is honoured verbatim', () => {
+    expect(parseAddress('https://mail.example/inbox')).toEqual({
+      kind: 'navigate',
+      url: 'https://mail.example/inbox',
+    })
+    expect(parseAddress('  http://docs.internal/handbook  ')).toEqual({
+      kind: 'navigate',
+      url: 'http://docs.internal/handbook',
+    })
+  })
+
+  test('a bare hostname gets https, keeping port, path and query', () => {
+    expect(parseAddress('mail.example')).toEqual({
+      kind: 'navigate',
+      url: 'https://mail.example',
+    })
+    expect(parseAddress('a.b.co.uk/x?q=1#f')).toEqual({
+      kind: 'navigate',
+      url: 'https://a.b.co.uk/x?q=1#f',
+    })
+    expect(parseAddress('example.com:8080/path')).toEqual({
+      kind: 'navigate',
+      url: 'https://example.com:8080/path',
+    })
+  })
+
+  test('loopback and IP literals go to http — https there has no certificate', () => {
+    // The dev-server case. `https://localhost:3000` is the one prefix that is
+    // wrong more often than it is right, and every real browser agrees.
+    expect(parseAddress('localhost:3000')).toEqual({
+      kind: 'navigate',
+      url: 'http://localhost:3000',
+    })
+    expect(parseAddress('localhost')).toEqual({ kind: 'navigate', url: 'http://localhost' })
+    expect(parseAddress('192.168.1.10:8080')).toEqual({
+      kind: 'navigate',
+      url: 'http://192.168.1.10:8080',
+    })
+    expect(parseAddress('[::1]:8080')).toEqual({ kind: 'navigate', url: 'http://[::1]:8080' })
+  })
+
+  test('a sentence SEARCHES instead of 400-ing', () => {
+    expect(parseAddress('how to bake bread')).toEqual({
+      kind: 'search',
+      query: 'how to bake bread',
+      url: 'https://www.google.com/search?q=how%20to%20bake%20bread',
+    })
+  })
+
+  test('one word with no dot, a leading `?`, and a dotted non-host all search', () => {
+    expect(parseAddress('github').kind).toBe('search')
+    expect(parseAddress('?mail.example')).toEqual({
+      kind: 'search',
+      query: 'mail.example',
+      url: 'https://www.google.com/search?q=mail.example',
+    })
+    // `3.5` is dotted but is not a host: a browser searches for it.
+    expect(parseAddress('3.5').kind).toBe('search')
+  })
+
+  test('a non-http scheme is refused IN PLACE, naming itself', () => {
+    const r = parseAddress('javascript:alert(1)')
+    expect(r.kind).toBe('refuse')
+    if (r.kind === 'refuse') expect(r.reason).toContain('javascript')
+    expect(parseAddress('file:///etc/passwd').kind).toBe('refuse')
+    expect(parseAddress('mailto:a@b.example').kind).toBe('refuse')
+  })
+
+  test('empty is a no-op, not a request', () => {
+    expect(parseAddress('   ')).toEqual({ kind: 'empty' })
+  })
+})
+
+describe('displayUrl — the idle form hides the noise, never the risk', () => {
+  test('https and www are trimmed, a bare slash path drops', () => {
+    expect(displayUrl('https://www.example.com/')).toBe('example.com')
+    expect(displayUrl('https://mail.example/inbox?q=1')).toBe('mail.example/inbox?q=1')
+  })
+  test('http stays visible — hiding the insecure scheme is the phishing half', () => {
+    expect(displayUrl('http://docs.internal/handbook')).toBe('http://docs.internal/handbook')
+  })
+  test('anything unparseable is echoed rather than thrown', () => {
+    expect(displayUrl('half-typed')).toBe('half-typed')
+    expect(displayUrl('')).toBe('')
+  })
+})
+
 /* ── the wire ────────────────────────────────────────────────────────────── */
 
 describe('the tab CRUD hits the HUMAN door, with the right verbs', () => {
@@ -258,6 +362,48 @@ describe('the tab CRUD hits the HUMAN door, with the right verbs', () => {
     stub({ grants: [] })
     await revokeTabGrant('tb_one', '*')
     expect(calls[0].url).toBe('/api/browser/tabs/tb_one/grant/*')
+  })
+
+  test('create?open=true is the HUMAN path — a row that is already a page', async () => {
+    stub(tab({ live: true }))
+    await createTab('https://mail.example', null, true)
+    expect(calls[0].url).toBe('/api/browser/tabs?open=true')
+    expect(calls[0].init?.method).toBe('POST')
+    // The agent's lazy path is unchanged and must stay the default.
+    stub(tab())
+    await createTab('https://mail.example')
+    expect(calls[0].url).toBe('/api/browser/tabs')
+  })
+
+  test('navigate POSTs the url to /navigate — never PATCH, which is a lie', async () => {
+    // PATCH {url} writes the COLUMN: the text would change and the page would
+    // not move. The navigate door wakes the tab and drives the page.
+    stub(tab({ live: true, url: 'https://elsewhere.example' }))
+    const t = await navigateTab('tb_one', 'https://elsewhere.example')
+    expect(calls[0].url).toBe('/api/browser/tabs/tb_one/navigate')
+    expect(calls[0].init?.method).toBe('POST')
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+      url: 'https://elsewhere.example',
+    })
+    expect(t.live).toBe(true)
+  })
+
+  test('open wakes a dehydrated tab, with the id ENCODED and no body', async () => {
+    stub(tab({ live: true }))
+    await openTab('tb one/2')
+    expect(calls[0].url).toBe('/api/browser/tabs/tb%20one%2F2/open')
+    expect(calls[0].init?.method).toBe('POST')
+    expect(calls[0].init?.body).toBeUndefined()
+  })
+
+  test('close DEHYDRATES and delete DESTROYS — two doors, never one', async () => {
+    // The row, the grants and the cookies survive a close; only the page goes.
+    stub({ ...tab({ live: false }), closed: true })
+    const c = await closeTabPage('tb_one')
+    expect(calls[0].url).toBe('/api/browser/tabs/tb_one/close')
+    expect(calls[0].init?.method).toBe('POST')
+    expect(c.closed).toBe(true)
+    expect(c.live).toBe(false)
   })
 
   test('delete is honest that it clears no cookies', async () => {

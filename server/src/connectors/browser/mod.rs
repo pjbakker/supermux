@@ -647,7 +647,11 @@ impl BrowserService {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
-        if url.is_empty() {
+        // `about:blank` is not a location — it is the absence of one. Writing it
+        // through would erase where the human actually was and make the next
+        // rehydrate land on a blank page (`tools::landing_drift` treats it the
+        // same way: no host, no claim).
+        if url.is_empty() || url == "about:blank" {
             return;
         }
         tab.set_location(url.clone(), title.clone()).await;

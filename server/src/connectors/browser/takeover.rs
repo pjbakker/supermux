@@ -633,6 +633,8 @@ async fn takeover_socket(
 /// 3. **Hand-back on exit is conditional.** Releasing a wheel we never took would
 ///    be a lie to a parked agent, so the release only fires if this socket
 ///    actually took it.
+/// 4. **It rehydrates** (P0-2). An asleep workspace tab is woken on attach
+///    instead of being hung up on; see the comment at the lookup.
 async fn tab_takeover_socket(
     mut socket: WebSocket,
     tab_id: String,
@@ -661,12 +663,32 @@ async fn tab_takeover_socket(
         return;
     }
 
-    // The tab must ALREADY be live: a takeover takes over something. We do not
-    // rehydrate here — that would let an unauthorised surface spawn chrome, and
-    // it would present a freshly-opened page as if it were what was there.
-    let Some(tab) = state.browser.tab(&tab_id).await else {
-        close(&mut socket, CLOSE_NO_CONTEXT, REASON_NO_CONTEXT).await;
-        return;
+    // **Rehydrate on attach** (P0-2). The scratch route above still refuses —
+    // there, a freshly-opened `about:blank` really would be presented as the
+    // agent's work. Here it is the opposite: a workspace tab reopens at its
+    // stored URL in the persistent profile, so the same page with the same
+    // cookies and the same sign-in comes back. That IS what was there; refusing
+    // it left a human staring at a dead socket for a tab they own.
+    //
+    // The "unauthorised surface must never spawn chrome" rule is honoured, not
+    // waived: this line is reached only AFTER the in-band bearer auth above —
+    // the same credential the REST wake door demands.
+    let tab = match state.browser.tab(&tab_id).await {
+        Some(tab) => tab,
+        None => match super::api::wake_tab_by_id(&state, &tab_id).await {
+            Ok(tab) => {
+                info!(tab = %tab_id, "browser takeover: rehydrated an asleep tab on attach");
+                tab
+            }
+            Err(e) => {
+                // No row, a chrome that will not start, the tab cap — all of them
+                // mean "there is no page to show", which is what the client's
+                // no-context branch already handles honestly.
+                debug!(tab = %tab_id, error = %e, "browser takeover: rehydrate failed");
+                close(&mut socket, CLOSE_NO_CONTEXT, REASON_NO_CONTEXT).await;
+                return;
+            }
+        },
     };
     let Some(_slot) = ViewerSlot::claim(&tab_key(&tab_id)) else {
         close(&mut socket, close_code::AGAIN, REASON_ALREADY_ATTACHED).await;
@@ -1214,5 +1236,185 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
         }
         assert!(!pid_alive(pid), "LEAK: chrome pid {pid} still alive");
         assert!(!udd.exists(), "LEAK: user-data-dir {udd:?} survived");
+    }
+
+    // ── P0-2: rehydrate-on-attach, and the line it is NOT drawn on ──────────
+
+    const WS_TOKEN: &str = "takeover-rehydrate-token";
+
+    async fn ws_state() -> (AppState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("supermux-tab-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::config::Config {
+            data_dir: dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            extra_binds: vec![],
+            tls: Default::default(),
+            auth_token: WS_TOKEN.to_string(),
+            provider_defaults: Default::default(),
+            ws: Default::default(),
+            remote_callback_url: None,
+            push_sub: None,
+            github_token: None,
+            statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
+            extra_origins: Vec::new(),
+        };
+        let pool = crate::db::init(&config).await.expect("init pool");
+        (AppState::new(pool, config), dir)
+    }
+
+    /// Bind the REAL takeover router on a loopback port — a WS upgrade cannot be
+    /// exercised through `oneshot`, and the whole point of this pair of tests is
+    /// that the two routes behave differently at the same wire.
+    async fn serve(state: &AppState) -> std::net::SocketAddr {
+        let app = router_for(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// Connect, send the in-band auth frame, and return the socket.
+    async fn dial(
+        addr: std::net::SocketAddr,
+        path: &str,
+    ) -> tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    > {
+        use futures_util::SinkExt;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}{path}"))
+            .await
+            .expect("ws connect");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(format!(
+            r#"{{"type":"auth","token":"{WS_TOKEN}"}}"#
+        )))
+        .await
+        .expect("send auth");
+        ws
+    }
+
+    /// The next text frame, or the close code, whichever the server sends.
+    async fn next_event(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Option<Result<String, u16>> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as M;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(20), ws.next()).await {
+                Ok(Some(Ok(M::Text(t)))) => return Some(Ok(t)),
+                Ok(Some(Ok(M::Close(Some(cf))))) => return Some(Err(u16::from(cf.code))),
+                Ok(Some(Ok(_))) => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    /// **The SCRATCH route keeps its 4404.** P0-2 rehydrates the workspace tab
+    /// and nothing else: for a scratch context the original objection still
+    /// holds — a freshly-spawned `about:blank` really would be presented as the
+    /// agent's work, and there is no stored URL that would make it the truth.
+    #[tokio::test]
+    async fn the_scratch_takeover_socket_still_refuses_a_session_with_no_context() {
+        let (state, dir) = ws_state().await;
+        let addr = serve(&state).await;
+        let mut ws = dial(addr, "/ws/browser/ghost/takeover").await;
+        assert_eq!(
+            next_event(&mut ws).await,
+            Some(Ok(r#"{"type":"auth_ok"}"#.to_string())),
+            "auth must still succeed — the refusal is about the context, not the token"
+        );
+        assert_eq!(
+            next_event(&mut ws).await,
+            Some(Err(CLOSE_NO_CONTEXT)),
+            "a scratch takeover takes over something that exists"
+        );
+        assert!(!state.browser.is_running().await, "and it spawns nothing on the way");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **REAL-CHROME — P0-2.** Run with
+    /// `cargo test -- --ignored real_chrome_tab_socket`.
+    ///
+    /// A human attaching to an ASLEEP workspace tab used to be hung up on with
+    /// 4404, which is why P0-1's wake still showed a blank canvas half the time.
+    /// Now the socket rehydrates behind the same in-band bearer auth the REST
+    /// wake door demands, and the seed `target` frame carries the tab's own
+    /// stored URL — the same page, from the same on-disk profile.
+    #[tokio::test]
+    #[ignore = "spawns a real chrome; run with --ignored on a box that has the pinned binary"]
+    async fn real_chrome_tab_socket_rehydrates_an_asleep_tab_on_attach() {
+        let (state, dir) = ws_state().await;
+        if !state.browser.config().executable.exists() {
+            eprintln!("SKIP: no chrome at {}", state.browser.config().executable.display());
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        // A loopback page so the seed frame's URL is checkable.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = "<title>Rehydrated</title><body>still-here</body>";
+                    let _ = sock
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let id = "tb_rehydrateonattach";
+        crate::db::browser_tabs::create(&state.pool, id, &url, None, &["127.0.0.1".to_string()])
+            .await
+            .unwrap();
+        assert!(state.browser.tab(id).await.is_none(), "the tab starts ASLEEP");
+
+        let addr = serve(&state).await;
+        let mut ws = dial(addr, &format!("/ws/browser/tab/{id}")).await;
+        assert_eq!(
+            next_event(&mut ws).await,
+            Some(Ok(r#"{"type":"auth_ok"}"#.to_string()))
+        );
+        let seed = match next_event(&mut ws).await {
+            Some(Ok(t)) => t,
+            other => panic!("expected the seed target frame, got {other:?}"),
+        };
+        assert!(
+            seed.starts_with(r#"{"type":"target""#),
+            "attaching to an asleep tab must WAKE it, not close 4404: {seed}"
+        );
+        assert!(
+            seed.contains(&format!("127.0.0.1:{port}")),
+            "the rehydrated page is the tab's own stored URL: {seed}"
+        );
+        assert!(
+            state.browser.tab(id).await.is_some(),
+            "the tab is live once a human has attached"
+        );
+
+        drop(ws);
+        state.browser.shutdown().await;
+        server.abort();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -414,7 +414,12 @@ async fn audit_tab_call(state: &AppState, session: &str, tool: &str, tab_id: &st
 /// Map a browser error onto HTTP. The ONE that matters is the lock refusal:
 /// `409 Conflict` is what the MCP server turns into the agent-readable
 /// "the human is driving" result.
-fn browser_err(e: BrowserError) -> AppError {
+///
+/// `pub(super)` so the HUMAN door ([`super::api`]) renders the same typed
+/// outcomes — a launch failure, a tab cap, a locked profile — instead of
+/// growing a second, drifting mapping. The two doors differ in what they
+/// *allow*, never in how they *name* what went wrong.
+pub(super) fn browser_err(e: BrowserError) -> AppError {
     match e {
         BrowserError::HumanDriving { .. } | BrowserError::TakeoverWait { .. } => {
             AppError::Conflict(e.to_string())

@@ -37,6 +37,15 @@ export function BrowserRoute() {
             if (tab) setActiveId(tab.id)
           })
         }}
+        // Enter in the omnibox. `navigate` wakes the tab if it is asleep and
+        // then drives the page, so one keystroke covers both — the human never
+        // has to know that "asleep" was a state.
+        onNavigate={(id, url) => void actions.navigate(id, url)}
+        onWake={(id) => void actions.wake(id)}
+        // "Close" on the chip DELETES the row; this closes the PAGE and keeps
+        // the tab, its grants and its cookies. Two acts, two verbs.
+        onSleep={(id) => void actions.sleep(id)}
+        busy={actions.pending}
         onClose={(id) => void actions.close(id)}
         onPin={(id, pinned) => void actions.setPinned(id, pinned)}
         onGrant={(id, grantee) => actions.grant(id, grantee)}

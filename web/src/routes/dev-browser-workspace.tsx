@@ -15,6 +15,10 @@
 //   ?sheet=1        open the per-tab grant sheet on the active tab
 //   ?live=1         mount the takeover canvas even for an asleep tab
 //   ?empty=1        the no-tabs-at-all first-run surface
+//   ?busy=1         a navigate/wake in flight — the chrome's loading hairline
+//                   and the asleep card's "Waking…"
+//   ?address=<txt>  seed the omnibox as if it had been typed into, so the
+//                   GO/SEARCH lead icon and the clear (×) are screenshot-able
 import * as React from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
@@ -38,6 +42,8 @@ export default function DevBrowserWorkspace() {
   const onlyDesktop = params.get('desktop') === '1'
   const empty = params.get('empty') === '1'
   const live = params.get('live') === '1'
+  const busy = params.get('busy') === '1'
+  const address = params.get('address')
   const startTab = params.get('tab')
   const sheet = params.get('sheet') === '1'
 
@@ -74,6 +80,8 @@ export default function DevBrowserWorkspace() {
                   <Bench
                     empty={empty}
                     live={live}
+                    busy={busy}
+                    address={address}
                     startTab={startTab}
                     sheet={sheet}
                     options={options}
@@ -91,6 +99,8 @@ export default function DevBrowserWorkspace() {
                   <Bench
                     empty={empty}
                     live={live}
+                    busy={busy}
+                    address={address}
                     startTab={startTab}
                     sheet={sheet && onlyDesktop}
                     options={options}
@@ -150,6 +160,8 @@ function Frame({
 function Bench({
   empty,
   live,
+  busy,
+  address,
   startTab,
   sheet,
   options,
@@ -157,6 +169,8 @@ function Bench({
 }: {
   empty: boolean
   live: boolean
+  busy: boolean
+  address: string | null
   startTab: string | null
   sheet: boolean
   options?: TakeoverOptions
@@ -177,6 +191,20 @@ function Bench({
     const chip = document.querySelector<HTMLElement>(`[data-tab-chip="${CSS.escape(id)}"]`)
     chip?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
   }, [sheet, activeId])
+
+  // `?address=` types into the REAL omnibox rather than adding a bench-only
+  // prop: the lead icon, the clear button and the refusal line are all driven
+  // by the component's own draft state, so the capture has to go through it.
+  React.useEffect(() => {
+    if (address === null) return
+    const input = document.querySelector<HTMLInputElement>('[data-address-bar] input')
+    if (!input) return
+    const proto = Object.getPrototypeOf(input) as object
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+    input.focus()
+    setter?.call(input, address)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  }, [address])
 
   const patch = (id: string, fn: (t: BrowserTab) => BrowserTab) =>
     setTabs((prev) => prev.map((t) => (t.id === id ? fn(t) : t)))
@@ -224,7 +252,11 @@ function Bench({
       onRevoke={async (id, grantee) => {
         patch(id, (t) => ({ ...t, grants: t.grants.filter((g) => g.grantee !== grantee) }))
       }}
+      onNavigate={(id, url) => patch(id, (t) => ({ ...t, url, live: true }))}
+      onWake={(id) => patch(id, (t) => ({ ...t, live: true }))}
+      onSleep={(id) => patch(id, (t) => ({ ...t, live: false }))}
       onOrigins={(id, origins) => patch(id, (t) => ({ ...t, origins }))}
+      busy={busy}
       bots={BENCH_BOTS}
       panelOptions={options}
       forceLive={live}

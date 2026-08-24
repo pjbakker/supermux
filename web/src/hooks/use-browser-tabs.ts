@@ -13,10 +13,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import {
+  closeTabPage,
   createTab,
   deleteTab,
   grantTab,
   listTabs,
+  navigateTab,
+  openTab,
   patchTab,
   revokeTabGrant,
   sortTabs,
@@ -29,10 +32,22 @@ import { useToast } from '@/components/ui/use-toast'
 export const BROWSER_TABS_KEY = ['browser-tabs'] as const
 
 /** What was being attempted, for the failure line. */
-export type TabVerb = 'open' | 'pin' | 'update' | 'close' | 'grant' | 'revoke'
+export type TabVerb =
+  | 'open'
+  | 'navigate'
+  | 'wake'
+  | 'sleep'
+  | 'pin'
+  | 'update'
+  | 'close'
+  | 'grant'
+  | 'revoke'
 
 const VERB_LEAD: Record<TabVerb, string> = {
   open: "Couldn't open that tab",
+  navigate: "Couldn't go there",
+  wake: "Couldn't wake the tab",
+  sleep: "Couldn't close the page",
   pin: "Couldn't change the pin",
   update: "Couldn't save that change",
   close: "Couldn't close the tab",
@@ -99,9 +114,18 @@ export function useBrowserTabs(): UseBrowserTabsResult {
 
 export interface BrowserTabActions {
   pending: boolean
-  /** Mint a tab row (the page opens lazily on first use). `null` = it failed,
-   *  and the human has already been told why. */
+  /** Mint a tab AND open it (`?open=true`), because a human who typed an
+   *  address meant "load this", not "insert a row". `null` = it failed, and the
+   *  human has already been told why. */
   create: (url: string) => Promise<BrowserTab | null>
+  /** Point an EXISTING tab at a url — waking it first if it is asleep. This is
+   *  the address bar's Enter. */
+  navigate: (id: string, url: string) => Promise<BrowserTab | null>
+  /** Wake a dehydrated tab where it stands, at its own url. */
+  wake: (id: string) => Promise<BrowserTab | null>
+  /** Close the PAGE and keep the tab — the inverse of `wake`. Not `close`,
+   *  which drops the row. */
+  sleep: (id: string) => Promise<BrowserTab | null>
   /** Pin / unpin — a pinned tab is not reaped and sorts first. */
   setPinned: (id: string, pinned: boolean) => Promise<boolean>
   patch: (id: string, patch: TabPatch) => Promise<boolean>
@@ -126,10 +150,42 @@ export function useBrowserTabActions(): BrowserTabActions {
   const fail = (verb: TabVerb) => (e: unknown) =>
     toast({ message: tabErrorMessage(verb, e), tone: 'error', duration: 5000 })
 
+  // A tab the server just navigated or woke comes back ALREADY LIVE. Writing it
+  // straight into the cache is what makes the UI flip to the viewport on the
+  // same tick — the list is polled every 30 s, and waiting for that poll is the
+  // "I pressed Go and nothing happened" half-minute the audit measured.
+  const settle = (tab: BrowserTab) => {
+    qc.setQueryData<BrowserTab[]>(BROWSER_TABS_KEY, (prev) =>
+      prev ? prev.map((t) => (t.id === tab.id ? tab : t)) : prev,
+    )
+    invalidate()
+  }
+
   const createM = useMutation({
-    mutationFn: (url: string) => createTab(url),
-    onSuccess: invalidate,
+    // `open: true` — see [[createTab]]. The lazy path stays the agent's.
+    mutationFn: (url: string) => createTab(url, null, true),
+    onSuccess: (tab) => {
+      qc.setQueryData<BrowserTab[]>(BROWSER_TABS_KEY, (prev) =>
+        prev ? [...prev.filter((t) => t.id !== tab.id), tab] : prev,
+      )
+      invalidate()
+    },
     onError: fail('open'),
+  })
+  const navigateM = useMutation({
+    mutationFn: (v: { id: string; url: string }) => navigateTab(v.id, v.url),
+    onSuccess: settle,
+    onError: fail('navigate'),
+  })
+  const wakeM = useMutation({
+    mutationFn: (id: string) => openTab(id),
+    onSuccess: settle,
+    onError: fail('wake'),
+  })
+  const sleepM = useMutation({
+    mutationFn: (id: string) => closeTabPage(id),
+    onSuccess: settle,
+    onError: fail('sleep'),
   })
   const patchM = useMutation({
     mutationFn: (v: { id: string; patch: TabPatch; verb: TabVerb }) =>
@@ -156,11 +212,17 @@ export function useBrowserTabActions(): BrowserTabActions {
   return {
     pending:
       createM.isPending ||
+      navigateM.isPending ||
+      wakeM.isPending ||
+      sleepM.isPending ||
       patchM.isPending ||
       closeM.isPending ||
       grantM.isPending ||
       revokeM.isPending,
     create: (url) => settled(createM.mutateAsync(url)),
+    navigate: (id, url) => settled(navigateM.mutateAsync({ id, url })),
+    wake: (id) => settled(wakeM.mutateAsync(id)),
+    sleep: (id) => settled(sleepM.mutateAsync(id)),
     setPinned: async (id, pinned) =>
       (await settled(patchM.mutateAsync({ id, patch: { pinned }, verb: 'pin' }))) !== null,
     patch: async (id, patch) =>

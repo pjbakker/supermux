@@ -73,14 +73,47 @@ export async function listTabs(): Promise<BrowserTab[]> {
 }
 
 /** `POST /api/browser/tabs` — mint a tab row, seeded with the exact host of its
- *  first URL. Does NOT open the page (lazy start: Chrome spawns on first use). */
+ *  first URL.
+ *
+ *  `open` is the human's half of the lazy-start invariant. Without it the call
+ *  mints a BOOKMARK: a row whose `live` is `false`, which is exactly the dead
+ *  end the workspace used to hand a human who typed an address and pressed
+ *  Enter. `?open=true` asks the server to `ensure_tab` the row it just wrote
+ *  and hand it back already live, so `+` means "open a page", not "insert a
+ *  row". Agents keep the lazy path (they pass nothing). */
 export async function createTab(
   url: string,
   companyId?: number | null,
+  open = false,
 ): Promise<BrowserTab> {
-  return settingsRequest<BrowserTab>('/api/browser/tabs', {
+  return settingsRequest<BrowserTab>(`/api/browser/tabs${open ? '?open=true' : ''}`, {
     method: 'POST',
     body: JSON.stringify({ url, company_id: companyId ?? null }),
+  })
+}
+
+/** `POST /api/browser/tabs/{id}/navigate` — the human's NAVIGATE verb.
+ *
+ *  Not `PATCH {url}`: that writes the `url` column and never touches a page, so
+ *  a human editing the address bar with it would watch the text change and the
+ *  page stay put. This wakes the tab if it is asleep (`ensure_tab`) and then
+ *  drives `PageContext::navigate`, so the response is the tab AS IT NOW IS —
+ *  `live: true`, the real URL, the real title. */
+export async function navigateTab(id: string, url: string): Promise<BrowserTab> {
+  return settingsRequest<BrowserTab>(`/api/browser/tabs/${enc(id)}/navigate`, {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+  })
+}
+
+/** `POST /api/browser/tabs/{id}/open` — wake a dehydrated tab where it stands.
+ *
+ *  Idempotent (`ensure_tab` is), and it reopens at the row's own `url` with the
+ *  on-disk profile, so the sign-in comes back with the page. This is the button
+ *  the asleep card was missing. */
+export async function openTab(id: string): Promise<BrowserTab> {
+  return settingsRequest<BrowserTab>(`/api/browser/tabs/${enc(id)}/open`, {
+    method: 'POST',
   })
 }
 
@@ -103,6 +136,21 @@ export async function patchTab(id: string, patch: TabPatch): Promise<BrowserTab>
   return settingsRequest<BrowserTab>(`/api/browser/tabs/${enc(id)}`, {
     method: 'PATCH',
     body: JSON.stringify(patch),
+  })
+}
+
+/** `POST /api/browser/tabs/{id}/close` — **close the page, keep the tab.**
+ *
+ *  Dehydrate: the target closes, the row, the grants and the cookies stay. The
+ *  exact inverse of [[openTab]], and deliberately NOT an overload of `DELETE`,
+ *  which destroys the row — one verb per act. `closed:false` is the honest
+ *  answer for a tab that was already asleep; it is a state, not an error. */
+export interface CloseTabResult extends BrowserTab {
+  closed: boolean
+}
+export async function closeTabPage(id: string): Promise<CloseTabResult> {
+  return settingsRequest<CloseTabResult>(`/api/browser/tabs/${enc(id)}/close`, {
+    method: 'POST',
   })
 }
 
@@ -200,19 +248,20 @@ export function tabState(tab: BrowserTab, now: number = Date.now() / 1000): TabS
       // nothing about, so name it rather than leaving them hunting (§7.1a).
       detail: tab.live
         ? `Signed out${age ? ` — seen ${age}` : ''}. Take the wheel and sign in again.`
-        : 'Signed out by a browser restart. Open the tab and sign in again.',
+        : 'Signed out by a browser restart. Wake the tab and sign in again.',
     }
   }
   if (!tab.live) {
     return {
       tone: 'dehydrated',
       label: 'Asleep',
-      // Deliberately NOT "open it to come back": nothing on the human's API
-      // rehydrates a tab (the takeover socket refuses to, on purpose — a viewer
-      // must not be able to spawn Chrome). The next agent verb or keep-alive
-      // wakes it, and saying otherwise would offer a button that cannot exist.
+      // This line used to end "…the tab wakes the next time a granted agent uses
+      // it", because at the time nothing on the human's API could rehydrate a
+      // tab. `POST …/open` changed that, so the copy names the human's own verb
+      // first: a state line that points at somebody else's action, when the
+      // reader is looking straight at a Wake button, is the stale one.
       detail:
-        'Not open right now. The sign-in is kept on disk; the tab wakes the next time a granted agent uses it.',
+        'Not open right now — the sign-in is kept on disk. Wake it, or the next granted agent will.',
     }
   }
   if (tab.login_state === 'ok') {
@@ -262,6 +311,113 @@ export function normalizeUrl(input: string): string | null {
   if (/^https?:\/\//i.test(raw)) return raw
   if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return null
   return `https://${raw}`
+}
+
+/* ── the omnibox: what one line of typing MEANS ──────────────────────────── */
+
+/** Where a query that is not a URL goes. One constant, so the parse and the
+ *  "Search for …" affordance can never disagree about the engine. */
+export const SEARCH_URL = 'https://www.google.com/search?q='
+
+/** What the address bar decided the human meant. A discriminated union rather
+ *  than a nullable string because "this is a search" and "this is a page" are
+ *  different acts and the bar SHOWS which one it is about to take. */
+export type AddressIntent =
+  | { kind: 'empty' }
+  | { kind: 'navigate'; url: string }
+  | { kind: 'search'; url: string; query: string }
+  | { kind: 'refuse'; reason: string }
+
+/** A dotted name: `mail.example`, `a.b.co.uk`, a trailing root dot allowed. */
+const DOTTED = /^[a-z0-9-]+(\.[a-z0-9-]+)+\.?$/i
+/** A dotted quad. Written without a bounded quantifier on purpose — see the
+ *  repo's grep rule; `\d\d?\d?` costs nothing and reads the same. */
+const IPV4 = /^\d\d?\d?(\.\d\d?\d?){3}$/
+/** The hosts where `https://` is the WRONG default — a dev server on loopback
+ *  has no certificate, and every real browser sends these to `http://`. */
+const LOOPBACK = /^(localhost|127\.\d\d?\d?\.\d\d?\d?\.\d\d?\d?|0\.0\.0\.0)$/i
+/** `[::1]`, `[fe80::1]:8080` — bracketed, so the port split below is safe. */
+const IPV6 = /^\[[0-9a-f:.]+\]$/i
+
+function searched(query: string): AddressIntent {
+  return { kind: 'search', url: `${SEARCH_URL}${encodeURIComponent(query)}`, query }
+}
+
+/**
+ * One line of typing → one act.
+ *
+ * The order is the order every browser uses, and each step is a defect that was
+ * reproduced in the old box:
+ *
+ *   1. empty → nothing happens (it used to mint nothing and close the form).
+ *   2. `http(s)://…` → go there verbatim.
+ *   3. whitespace, or a leading `?` → SEARCH. `how to bake bread` used to
+ *      become `https://how to bake bread`, which the server answered with a 400
+ *      and the human read as "this browser is broken".
+ *   4. a scheme that is not http(s) (`javascript:`, `file:`, `mailto:`) →
+ *      refused IN PLACE, with a reason, instead of being handed to the server.
+ *   5. a host — dotted name, IPv4/IPv6 literal, or `localhost`, each with an
+ *      optional `:port` and path → schemed and opened. Loopback gets `http`,
+ *      everything else `https`.
+ *   6. anything else (`github`, `q3 numbers`) → SEARCH.
+ */
+export function parseAddress(input: string): AddressIntent {
+  const raw = input.trim()
+  if (!raw) return { kind: 'empty' }
+  if (/^https?:\/\//i.test(raw)) return { kind: 'navigate', url: raw }
+  // A leading `?` is the explicit "search for this" prefix; anything with a
+  // space in it cannot be a host, whatever else it looks like.
+  if (raw.startsWith('?')) return searched(raw.slice(1).trim() || raw)
+  if (/\s/.test(raw)) return searched(raw)
+
+  // The authority is everything before the first path / query / fragment mark.
+  const authority = raw.split(/[/?#]/)[0]
+  let host = authority
+  let port = ''
+  const cut = authority.startsWith('[')
+    ? authority.indexOf(':', authority.indexOf(']'))
+    : authority.indexOf(':')
+  if (cut >= 0) {
+    host = authority.slice(0, cut)
+    port = authority.slice(cut + 1)
+  }
+  // A colon whose right-hand side is not a port is a SCHEME. `javascript:` and
+  // `file:` are refused here rather than at the server, because the server's
+  // 400 arrives as a red toast that never names the scheme.
+  if (cut >= 0 && !/^\d+$/.test(port)) {
+    return {
+      kind: 'refuse',
+      reason: `Only http and https pages open here — ${host}: can't.`,
+    }
+  }
+  if (LOOPBACK.test(host) || IPV6.test(host)) return { kind: 'navigate', url: `http://${raw}` }
+  if (IPV4.test(host)) return { kind: 'navigate', url: `http://${raw}` }
+  // `3.5` and `1.2.3.4.5` are dotted but are not hosts — a browser searches for
+  // them, and so does this.
+  if (/^[\d.]+$/.test(host)) return searched(raw)
+  if (DOTTED.test(host)) return { kind: 'navigate', url: `https://${raw}` }
+  return searched(raw)
+}
+
+/**
+ * The URL as the bar SHOWS it while it is idle: `https://` hidden, `www.`
+ * trimmed, a bare `/` path dropped.
+ *
+ * `http://` is deliberately NOT hidden — hiding the one scheme that is not
+ * secure is the phishing-friendly half of scheme-trimming, and this workspace
+ * lends its tabs to agents. Anything that does not parse is echoed unchanged:
+ * a half-typed address still has to render.
+ */
+export function displayUrl(url: string): string {
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return url
+    const host = u.host.replace(/^www\./i, '')
+    const rest = `${u.pathname === '/' ? '' : u.pathname}${u.search}${u.hash}`
+    return `${u.protocol === 'https:' ? '' : 'http://'}${host}${rest}`
+  } catch {
+    return url
+  }
 }
 
 /** How a grantee reads to a human. The keyspace is the connector store's,
