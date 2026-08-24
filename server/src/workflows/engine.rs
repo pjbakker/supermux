@@ -847,9 +847,75 @@ pub async fn cancel(state: &AppState, run_id: i64) -> Result<(), AppError> {
     Ok(())
 }
 
-/// The crash reaper — implemented in T2.5.
+/// The crash reaper (§3.6).
+///
+/// Watchers are in-memory tokio tasks. A restart mid-step loses the watcher, and
+/// today the schedule's `done_action` simply never fired — silently. In a chain
+/// that failure mode is worse: the run sits `running` forever and §3.2 rule 2
+/// blocks the workflow from ever firing again.
+///
+/// So a run whose heartbeat has outlived its current step's own timeout (plus a
+/// minute of grace) is turned into an honest `interrupted`: visible in the run
+/// log, pushed once, and — because the run is no longer `running` — self-healing
+/// on the next cadence. Runs on every tick AND once at boot, which is precisely
+/// when the watchers were lost.
 pub async fn reap(state: &AppState) {
-    let _ = state;
+    let now = Utc::now().timestamp();
+    let stale = match db::workflows::stale_running(&state.pool, now).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "workflows: stale-run sweep failed");
+            return;
+        }
+    };
+    for run in stale {
+        let steps = db::workflows::steps_for(&state.pool, &run.workflow_id).await.unwrap_or_default();
+        let n = steps.len().max(1);
+        let step_runs = db::workflows::step_runs_for(&state.pool, run.id).await.unwrap_or_default();
+        let open = step_runs.iter().rev().find(|s| s.finished_at.is_none());
+        let position = open.map(|s| s.position).unwrap_or(run.current_step);
+        let title = db::workflows::get(&state.pool, &run.workflow_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|w| w.title)
+            .unwrap_or_else(|| run.workflow_id.clone());
+        let note = format!("'{title}' was interrupted at step {} of {n}", position + 1);
+
+        if let Some(o) = open {
+            let _ = db::workflows::close_step_run(
+                &state.pool,
+                o.id,
+                "interrupted",
+                "interrupted",
+                "the server restarted while this step was in flight",
+            )
+            .await;
+        }
+        let _ = db::workflows::close_run(&state.pool, run.id, "interrupted", &note).await;
+        release_run(run.id);
+        unregister_waker(run.id);
+
+        let company_id = db::workflows::get(&state.pool, &run.workflow_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|w| w.company_id);
+        let _ = state.sse_tx.send(SseEvent::for_company(
+            "alerts",
+            json!({
+                "level": "error",
+                "source": "workflows",
+                "workflow": run.workflow_id,
+                "run_id": run.id,
+                "status": "interrupted",
+                "detail": note,
+            }),
+            company_id,
+        ));
+        push_failure(state, &title, note.clone()).await;
+        tracing::info!(run_id = run.id, workflow = %run.workflow_id, "reaped a stale workflow run");
+    }
 }
 
 /// Fire a STEP's own `on_complete`, if it has one. The engine never formats a
