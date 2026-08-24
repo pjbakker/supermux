@@ -426,8 +426,8 @@ const fn human_label(cat: NotifCategory) -> &'static str {
         NotifCategory::AgentWaiting => "Agent needs you",
         NotifCategory::AgentFinished => "Agent finished",
         NotifCategory::AgentStopped => "Agent stopped",
-        NotifCategory::ScheduleError => "Scheduled task errored",
-        NotifCategory::ScheduleFinished => "Scheduled task finished",
+        NotifCategory::ScheduleError => "Workflow errored",
+        NotifCategory::ScheduleFinished => "Workflow finished",
         NotifCategory::AgentError => "Agent hit an error",
     }
 }

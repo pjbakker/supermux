@@ -30,7 +30,6 @@ pub mod notify;
 pub mod prefs;
 pub mod public;
 pub mod push;
-pub mod scheduler;
 pub mod scope;
 pub mod sessions;
 pub mod sse;

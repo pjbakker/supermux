@@ -22,7 +22,6 @@ pub mod human_users;
 pub mod prefs;
 pub mod push;
 pub mod runtime_state;
-pub mod schedules;
 pub mod sessions;
 pub mod skills;
 pub mod steering;

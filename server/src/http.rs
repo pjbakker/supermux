@@ -157,7 +157,7 @@ pub fn router(state: AppState) -> Router {
 /// .merge(sessions::router_for(state.clone()))
 /// .merge(board::router_for(state.clone()))
 /// .merge(files::router_for().with_state(state.clone()))
-/// .merge(scheduler::router_for(state.clone()))
+/// .merge(workflows::router_for(state.clone()))
 /// .merge(agents::router_for(state.clone()))
 /// ```
 fn protected_router(state: AppState) -> Router {

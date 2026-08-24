@@ -1255,21 +1255,20 @@ mod tests {
         assert_eq!(out[1].1, "look at it");
     }
 
-    /// The one const two systems agree on. It moved modules in T2.2; if the
-    /// string had moved WITH it, every `<supermux-schedule>` line already on
-    /// disk would stop rendering. (This assertion dies with `scheduler/` in
-    /// Phase 4, having done its job.)
+    /// The one const two systems agreed on. It moved modules in T2.2 and the
+    /// module it moved OUT of is gone as of Phase 4A — so the assertion that
+    /// used to compare the two now compares against the bytes themselves,
+    /// written out literally. Every `<supermux-schedule>` line already on disk
+    /// stops rendering if these change, and there is no longer a second
+    /// implementation to catch it.
     #[test]
-    fn the_wrapper_tag_and_footer_sentinel_are_byte_identical_to_the_legacy_ones() {
-        assert_eq!(SCHEDULE_TAG, crate::scheduler::runner::SCHEDULE_TAG);
-        assert_eq!(
-            CONFIRM_FOOTER_SENTINEL,
-            crate::scheduler::runner::CONFIRM_FOOTER_SENTINEL
-        );
+    fn the_wrapper_tag_and_footer_sentinel_are_frozen_bytes() {
+        assert_eq!(SCHEDULE_TAG, "supermux-schedule");
+        assert_eq!(CONFIRM_FOOTER_SENTINEL, "— — —");
         // …and the wrapper the engine writes is the wrapper the runner wrote.
         assert_eq!(
             wrap_schedule("SCHED-1", "t", "body"),
-            crate::scheduler::runner::wrap_schedule("SCHED-1", "t", "body")
+            "<supermux-schedule id=\"SCHED-1\" title=\"t\">\nbody\n</supermux-schedule>"
         );
     }
 

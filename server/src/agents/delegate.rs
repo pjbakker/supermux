@@ -68,7 +68,7 @@ pub const HUMAN_TAG: &str = "supermux-human";
 /// The schedule wrapper's tag, named here only so [`wrapper_markup`] can refuse
 /// it too: a delegated prompt that opens a `<supermux-schedule>` would let one
 /// session forge a scheduled fire in another's transcript just as easily.
-const SCHEDULE_TAG: &str = crate::scheduler::runner::SCHEDULE_TAG;
+const SCHEDULE_TAG: &str = crate::workflows::engine::SCHEDULE_TAG;
 
 /// Whether `s` contains markup that would let it forge — or break out of — one
 /// of supermux's own transcript wrappers.
@@ -151,7 +151,7 @@ pub fn wrap_human(
         return Err("prompt may not contain supermux wrapper markup");
     }
     let company = company_id.map(|c| c.to_string()).unwrap_or_default();
-    let name = crate::scheduler::runner::escape_attr(name);
+    let name = crate::workflows::engine::escape_attr(name);
     Ok(format!(
         "<{HUMAN_TAG} user=\"{user_id}\" name=\"{name}\" company=\"{company}\">\n{prompt}\n</{HUMAN_TAG}>"
     ))

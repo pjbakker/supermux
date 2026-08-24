@@ -24,7 +24,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::agents::delegate::{DELEGATION_TAG, HUMAN_TAG};
-use crate::scheduler::runner::{unescape_attr, CONFIRM_FOOTER_SENTINEL, SCHEDULE_TAG};
+use crate::workflows::engine::{unescape_attr, CONFIRM_FOOTER_SENTINEL, SCHEDULE_TAG};
 use crate::db;
 use crate::error::AppError;
 use crate::state::AppState;
@@ -2000,7 +2000,7 @@ please prepare the next stacked branch
         // `wrap_schedule` escapes the title (a schedule title is free text the
         // owner typed); recall decodes it, so the divider names the schedule the
         // way it is named in the scheduler, not `Ship &quot;it&quot;`.
-        let body = crate::scheduler::runner::wrap_schedule(
+        let body = crate::workflows::engine::wrap_schedule(
             "s2",
             "Ship \"it\" <now> & later",
             "do the thing",
