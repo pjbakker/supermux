@@ -37,6 +37,7 @@ import {
   MAX_VIEWPORT_DPR,
   TakeoverSocket,
   driveDpr,
+  measuredViewport,
   viewportPayload,
   type SocketLike,
 } from '../../src/lib/browser/takeover-socket'
@@ -196,6 +197,31 @@ describe('the Viewport message', () => {
     expect(driveDpr(false, 3)).toBe(1)
     expect(driveDpr(false, 1)).toBe(1)
     expect(driveDpr(true, Number.NaN)).toBe(1)
+  })
+
+  test('the box is MEASURED from the element every time — a settle corrects a collapsed height', () => {
+    // The iOS-PWA black-band root cause: the takeover box's height is fed by the
+    // app-shell `100dvh` flex chain, which resolves SHORT on a cold launch and
+    // settles to full only after a viewport resize. The panel re-reads the box
+    // on every settle through this helper, so the negotiated height tracks the
+    // element rather than a value captured at attach.
+    const opts = { driving: false, devicePixelRatio: 2, coarsePointer: true }
+    // Attach: the shell handed us a collapsed height.
+    const collapsed = measuredViewport({ clientWidth: 390, clientHeight: 512 }, opts)
+    expect(collapsed).toEqual({ width: 390, height: 512, dpr: 1, mobile: true })
+    // Settle: same element, the `100dvh` chain now full — a DIFFERENT box, so
+    // the socket (tested below) re-sends it and the server lays the page out at
+    // the height the human is actually looking at. No black band.
+    const settled = measuredViewport({ clientWidth: 390, clientHeight: 800 }, opts)
+    expect(settled).toEqual({ width: 390, height: 800, dpr: 1, mobile: true })
+    // Driving asks for the viewer's real pixels; the coarse-pointer answer is the
+    // mobile flag, verbatim (a narrow desktop window stays a desktop).
+    expect(
+      measuredViewport(
+        { clientWidth: 390, clientHeight: 800 },
+        { driving: true, devicePixelRatio: 3, coarsePointer: false },
+      ),
+    ).toEqual({ width: 390, height: 800, dpr: MAX_VIEWPORT_DPR, mobile: false })
   })
 
   test('the socket sends it once per box, and re-sends it after a reconnect', () => {

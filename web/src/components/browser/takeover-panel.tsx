@@ -90,7 +90,7 @@ import {
 import {
   EMPTY_SNAPSHOT,
   TakeoverSocket,
-  driveDpr,
+  measuredViewport,
   modifiersFor,
   signInOps,
   subjectName,
@@ -484,15 +484,19 @@ export function TakeoverPanel({
       const box = boxRef.current
       const sock = socketRef.current
       if (!box || !sock) return
-      sock.viewport({
-        width: box.clientWidth,
-        height: box.clientHeight,
-        dpr: driveDpr(driving, window.devicePixelRatio || 1),
-        // A COARSE POINTER, not a narrow window: a 390px browser window on a
-        // laptop is a narrow desktop, and telling a site it is a phone there
-        // would hand a mouse touch-sized buttons.
-        mobile: !!window.matchMedia?.('(pointer: coarse)').matches,
-      })
+      // Re-MEASURED here, every time — the box's height is fed by the app-shell
+      // `100dvh` flex chain, which on an iOS PWA cold launch briefly resolves
+      // SHORT (globals.css:742, use-keyboard-viewport.ts:168) and settles to the
+      // full height only after a viewport resize. Reading `boxRef` at fire time
+      // (not closing over a stale size) is what lets a settle correct a height
+      // that was collapsed at attach.
+      sock.viewport(
+        measuredViewport(box, {
+          driving,
+          devicePixelRatio: window.devicePixelRatio || 1,
+          coarsePointer: !!window.matchMedia?.('(pointer: coarse)').matches,
+        }),
+      )
     }, 120)
   }, [driving])
   React.useEffect(
@@ -502,29 +506,64 @@ export function TakeoverPanel({
     [],
   )
   // Taking the wheel re-negotiates: same box, sharper pixels.
+  //
+  // Plus a short burst of delayed re-measures after attach/wheel-change: the iOS
+  // PWA `100dvh` height can settle from short to full WITHOUT firing a resize the
+  // observer catches, and a box that is already stable-tall emits no further
+  // event at all — so a one-shot negotiate at attach can ship a collapsed height
+  // that then never gets corrected. Re-measuring at a few fixed delays reaches
+  // the settled box regardless; the socket de-dups an unchanged box, so once the
+  // height is stable these cost nothing on the wire.
   React.useEffect(() => {
     negotiate()
+    const timers = [250, 700, 1500].map((ms) => setTimeout(negotiate, ms))
+    return () => timers.forEach(clearTimeout)
   }, [negotiate])
 
-  // Repaint from the frame we ALREADY hold when the box resizes — a rotation, a
-  // split-pane drag, an iOS URL-bar collapse. `blit` sizes the backing store, so
-  // without this the canvas keeps the previous box's dimensions and the browser
-  // stretches it; on a static page no further frame ever arrives to fix it.
+  // Repaint from the frame we ALREADY hold, and re-negotiate, whenever the box
+  // SETTLES — a rotation, a split-pane drag, an iOS URL-bar collapse, and the
+  // one this exists to catch: the iOS-PWA `100dvh` cold-launch height settling
+  // from short to full. `blit` sizes the backing store, so without the repaint
+  // the canvas keeps the previous box's dimensions and the browser stretches it;
+  // on a static page NO further frame arrives on its own to fix it — the
+  // re-negotiate is what makes the server push a fresh still at the settled box.
   React.useEffect(() => {
     const box = boxRef.current
     const canvas = canvasRef.current
-    if (!box || !canvas || typeof ResizeObserver === 'undefined') return
-    const ro = new ResizeObserver(() => {
+    if (!box || !canvas) return
+    // One settle handler for every signal. Debounced inside `negotiate`, and the
+    // socket de-dups an unchanged box — so firing it generously is free.
+    const settle = () => {
       const painted = paintedRef.current
       if (painted) blit(canvas, box, painted.image)
-      // The box moved, so the box we told the SERVER about is stale — the page
-      // is now being laid out for a viewport that no longer exists. Debounced,
-      // because each negotiation costs chrome a metrics override, a screencast
-      // restart and a full still, and a rotation fires this observer four times.
+      // The box may have moved, so the box we told the SERVER about is stale —
+      // the page is now being laid out for a viewport that no longer exists.
       negotiate()
-    })
-    ro.observe(box)
-    return () => ro.disconnect()
+    }
+    // The box's OWN size change (rotation, split-pane). The primary signal.
+    const ro =
+      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(settle)
+    ro?.observe(box)
+    // The VIEWPORT settling. On iOS PWA the shell's `100dvh` flex chain resolves
+    // short on cold launch and only settles after a viewport resize event —
+    // which fires on `window`/`visualViewport` even in the window where the box's
+    // ResizeObserver has been torn down for a `negotiate` identity change (the
+    // wheel changing hands). Belt to the ResizeObserver's braces: whichever sees
+    // the settle first re-negotiates, the other de-dups.
+    const vv = typeof window !== 'undefined' ? window.visualViewport : undefined
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', settle)
+      window.addEventListener('orientationchange', settle)
+    }
+    vv?.addEventListener('resize', settle)
+    return () => {
+      ro?.disconnect()
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('resize', settle)
+        window.removeEventListener('orientationchange', settle)
+      }
+      vv?.removeEventListener('resize', settle)
+    }
     // Re-installed when the wheel changes hands, because `negotiate` closes
     // over `driving` (the drive profile asks for sharper pixels). That happens
     // twice a session and never mid-gesture, so it costs nothing.

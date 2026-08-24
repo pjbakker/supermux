@@ -314,6 +314,43 @@ export function driveDpr(driving: boolean, devicePixelRatio: number): number {
     : 1
 }
 
+/** The subset of an element the box measurement reads. `clientWidth`/`Height`
+ *  are the CONTENT box in integer CSS px — the exact space the canvas fills and
+ *  the space `fitFrame`/`toPagePoint` map against, so the page is laid out at
+ *  the box the human is actually looking at and every tap lands true. */
+export interface MeasurableBox {
+  clientWidth: number
+  clientHeight: number
+}
+
+/**
+ * The viewport to negotiate for a measured canvas box — the ONE place the box's
+ * pixels become a `ClientMsg::Viewport`.
+ *
+ * Pulled out of the panel's effect so it is pure and pinned: the box the client
+ * MEASURES has to be the box the server LAYS OUT and the box the client MAPS
+ * clicks against, or a page renders for one height and taps resolve against
+ * another. Re-run it on every settle (rotation, split-pane, and — the iOS PWA
+ * case — the `100dvh` cold-launch height settling from short to full): the box
+ * is re-read HERE, so a height that was transiently collapsed at attach is
+ * corrected the instant the layout viewport settles, and the socket's own
+ * de-dup drops it when nothing actually moved.
+ */
+export function measuredViewport(
+  box: MeasurableBox,
+  opts: { driving: boolean; devicePixelRatio: number; coarsePointer: boolean },
+): ViewportBox {
+  return {
+    width: box.clientWidth,
+    height: box.clientHeight,
+    dpr: driveDpr(opts.driving, opts.devicePixelRatio),
+    // A COARSE POINTER, not a narrow window: a 390px browser window on a laptop
+    // is a narrow desktop, and telling a site it is a phone there would hand a
+    // mouse touch-sized buttons.
+    mobile: opts.coarsePointer,
+  }
+}
+
 export class TakeoverSocket {
   private ws: SocketLike | null = null
   private authed = false
