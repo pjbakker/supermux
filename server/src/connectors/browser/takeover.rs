@@ -78,7 +78,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use super::context::{AckPolicy, AgentContext, NavState, ScreencastOptions};
+use super::context::{capture_mismatch, AckPolicy, AgentContext, NavState, ScreencastOptions};
 use super::lock::{Actor, DriveMode, HandOff};
 use crate::state::AppState;
 use crate::ws::{
@@ -106,6 +106,20 @@ const MAX_TEXT_BYTES: usize = 8 * 1024;
 /// viewport. Larger than any plausible page viewport; the real clamp arrives
 /// with frame #1, a few ms in.
 const COORD_CEILING: f64 = 100_000.0;
+
+/// The floor between two capture repairs. One is enough in practice (measured:
+/// the frame right after it is the right shape), so this only exists so a page
+/// that somehow never comes back cannot turn a 60 fps cast into 60 screenshots
+/// and 120 `Emulation` round trips a second.
+const CAPTURE_REPAIR_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many repairs in a row may fail to produce a correctly-sized frame before
+/// this socket stops trying. A repair costs two `Emulation` calls and a
+/// screenshot, so a page that somehow never comes back must not be able to bill
+/// the browser for one of those every [`CAPTURE_REPAIR_COOLDOWN`] forever. The
+/// counter clears the moment a frame arrives at the right box, so a page that
+/// drifts once per navigation never approaches it.
+const CAPTURE_REPAIR_TRIES: u32 = 3;
 
 /// The WS sub-router. Merged at the TOP level of [`crate::http::router`] (next
 /// to [`crate::ws::router_for`]), **not** into the bearer-protected `/api`
@@ -1357,6 +1371,10 @@ async fn drive(
     // The newest ack token, kept so DROPPED frames can still be acked — an
     // unacked frame permanently stalls chrome's 2-slot in-flight window.
     let mut last_ack: Option<Value> = None;
+    // When we last put a drifted capture back, and how many tries in a row have
+    // not stuck — see the frame arm below.
+    let mut repaired_at: Option<Instant> = None;
+    let mut repairs: u32 = 0;
 
     let mut last_inbound = Instant::now();
     let mut ping = tokio::time::interval(PING_EVERY);
@@ -1649,6 +1667,56 @@ async fn drive(
                         }
                         if let Some(ack) = &f.ack {
                             let _ = ctx.ack_frame(ack);
+                        }
+                        // ── **the black band** ─────────────────────────────
+                        //
+                        // A main-frame commit drops the emulated size off the
+                        // CAPTURE while leaving it on the document, so a page
+                        // laid out at 390×700 starts arriving as a 1366×757
+                        // window frame with the mobile page in its corner —
+                        // which `fitFrame` letterboxes into a short band at the
+                        // top of a tall viewport with the box's background
+                        // under it. Nothing announces the drop, so the frame's
+                        // own `deviceWidth/deviceHeight` is the error signal:
+                        // it disagrees with the box we told chrome to lay the
+                        // page out at, and that disagreement is the bug.
+                        //
+                        // Detected HERE rather than in the screencast pump
+                        // because only this side can do the second half: a
+                        // resize on a static page emits no frame of its own
+                        // (gotcha #1), so an article would keep the band until
+                        // the human scrolled it — which is exactly what the bug
+                        // looked like. The still is what makes the repair
+                        // visible.
+                        if !capture_mismatch(Some(&f.metadata), ctx.viewport_css()) {
+                            // Back at the box we set: whatever we did worked, so
+                            // the next drift gets a full budget again.
+                            repairs = 0;
+                        } else if repairs < CAPTURE_REPAIR_TRIES
+                            && repaired_at.is_none_or(|at| at.elapsed() >= CAPTURE_REPAIR_COOLDOWN)
+                        {
+                            repaired_at = Some(Instant::now());
+                            repairs += 1;
+                            if let Err(e) = ctx.repair_capture().await {
+                                debug!(session = %session, error = %e, "browser takeover: capture repair");
+                            } else {
+                                let (w, h) = ctx.viewport_css();
+                                // The frame above already moved the input clamp
+                                // to the WINDOW's box; put it back, or every
+                                // click between here and the next good frame
+                                // lands scaled wrong.
+                                viewport = Viewport { width: f64::from(w), height: f64::from(h) };
+                                let meta = seed_metadata(w, h);
+                                if let Ok(still) = ctx.screenshot().await {
+                                    if socket
+                                        .send(ServerMsg::Frame { data: &still, metadata: &meta }.to_frame())
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Outcome::SendFailed;
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(RecvError::Lagged(n)) => {

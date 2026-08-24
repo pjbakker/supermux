@@ -41,7 +41,7 @@
 //! [`Actor::Human`] always passes. Read-only helpers are ungated — observing
 //! the page is never a conflict.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -529,6 +529,44 @@ fn is_main_frame(params: &Value, key: &str, main: Option<&str>) -> bool {
     }
 }
 
+/// **Does this frame's capture box disagree with the override we set?**
+///
+/// `metadata.deviceWidth/deviceHeight` is the box chrome captured in, and it is
+/// supposed to be the box [`DeviceMetrics`] asked for. When a navigation drops
+/// the override off the capture surface it comes back as the real window
+/// instead, and the takeover canvas letterboxes that wide frame into a tall box
+/// — the page in a short band at the top, background under it.
+///
+/// Pure, and deliberately conservative: metadata WITHOUT a usable box (a seed
+/// still is a `Page.captureScreenshot` and carries none) is not evidence of
+/// anything, so it is never a mismatch.
+pub fn capture_mismatch(metadata: Option<&Value>, want: (u32, u32)) -> bool {
+    let Some(meta) = metadata else {
+        return false;
+    };
+    let px = |key: &str| meta.get(key).and_then(Value::as_f64).map(|v| v.round() as u32);
+    let (Some(w), Some(h)) = (px("deviceWidth"), px("deviceHeight")) else {
+        return false;
+    };
+    if w == 0 || h == 0 {
+        return false;
+    }
+    (w, h) != want
+}
+
+/// **Is this `Page.frameNavigated` a MAIN-frame commit?**
+///
+/// Pure, and split out so the address bar's "is this my url" rule is one
+/// testable thing. A frame with a `parentId` is an iframe and its url is not
+/// the page's; a payload with no `frame` at all is not a commit we can reason
+/// about. Both are "no".
+fn main_frame_committed(params: &Value) -> bool {
+    match params.get("frame") {
+        Some(frame) => frame.get("parentId").is_none(),
+        None => false,
+    }
+}
+
 /// `Runtime.evaluate` on a flat-mode session, value or [`Value::Null`].
 ///
 /// A free function because the pump owns no `&self`: it holds the client and the
@@ -551,6 +589,77 @@ async fn eval_on(client: &CdpClient, session: &str, expression: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// The `Emulation.setDeviceMetricsOverride` payload — **one builder**, shared by
+/// the call that sets the override and the one that restores it after a
+/// navigation, so the two can never drift.
+fn device_metrics_params(width: u32, height: u32, scale: f64, mobile: bool) -> Value {
+    json!({
+        "width": width, "height": height,
+        "deviceScaleFactor": scale, "mobile": mobile,
+    })
+}
+
+/// **The override this target is running with, and the reason it is shared.**
+///
+/// A main-frame navigation silently un-sizes the CAPTURE. Measured against
+/// Chrome 149 (headless=new): after a commit the document keeps its emulated
+/// layout viewport — `innerWidth` is still 390 — but the screencast surface
+/// reverts to the real `--window-size` window, so the very next frame arrives
+/// 1366×757 with the mobile page drawn into its top-left corner. The takeover
+/// canvas letterboxes that wide frame into a tall box and the human sees a
+/// short band of page at the top with the box's background under it.
+///
+/// Nothing announces the drop and re-sending the SAME payload is a chrome
+/// no-op, so it takes a clear-then-set to undo — which is
+/// [`AgentContext::repair_capture`], fired by the takeover relay the moment a
+/// frame's own box disagrees with this one ([`capture_mismatch`]). Kept whole
+/// so that repair can re-issue the override verbatim rather than guess at it.
+#[derive(Debug)]
+struct DeviceMetrics {
+    width: AtomicU32,
+    height: AtomicU32,
+    /// `f64::to_bits` — an atomic float without a mutex around it.
+    scale: AtomicU64,
+    mobile: AtomicBool,
+}
+
+impl DeviceMetrics {
+    fn new(width: u32, height: u32, scale: f64, mobile: bool) -> Self {
+        Self {
+            width: AtomicU32::new(width),
+            height: AtomicU32::new(height),
+            scale: AtomicU64::new(scale.to_bits()),
+            mobile: AtomicBool::new(mobile),
+        }
+    }
+
+    fn store(&self, width: u32, height: u32, scale: f64, mobile: bool) {
+        self.width.store(width, Ordering::Relaxed);
+        self.height.store(height, Ordering::Relaxed);
+        self.scale.store(scale.to_bits(), Ordering::Relaxed);
+        self.mobile.store(mobile, Ordering::Relaxed);
+    }
+
+    /// The CSS-pixel box the page is laid out at.
+    fn css(&self) -> (u32, u32) {
+        (
+            self.width.load(Ordering::Relaxed),
+            self.height.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The payload that re-asserts this override, verbatim.
+    fn cdp_params(&self) -> Value {
+        let (width, height) = self.css();
+        device_metrics_params(
+            width,
+            height,
+            f64::from_bits(self.scale.load(Ordering::Relaxed)),
+            self.mobile.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// A live per-agent browser context.
 pub struct AgentContext {
     /// The lock subject — a session name for scratch, a `tb_…` tab id for a
@@ -564,13 +673,13 @@ pub struct AgentContext {
     cdp_session_id: String,
     client: Arc<CdpClient>,
     lock: DriveLock,
-    /// The CSS-pixel box this target is laid out at — mirrored from every
-    /// `Emulation.setDeviceMetricsOverride` we issue, which is authoritative
-    /// because nothing else in the tree ever sets one. Atomic, not behind the
-    /// screencast mutex, because the takeover seed reads it on a path with
-    /// nothing to await.
-    viewport_w: AtomicU32,
-    viewport_h: AtomicU32,
+    /// The device-metrics override this target is laid out at — mirrored from
+    /// every `Emulation.setDeviceMetricsOverride` we issue, which is
+    /// authoritative because nothing else in the tree ever sets one. Atomic,
+    /// not behind the screencast mutex, because the takeover seed reads it on a
+    /// path with nothing to await. Kept whole (not just the CSS box) because
+    /// [`AgentContext::repair_capture`] has to RE-ISSUE it verbatim.
+    metrics: Arc<DeviceMetrics>,
     /// Live screencast pump, if one is running.
     screencast: Mutex<Option<Screencast>>,
     /// Live nav-state watcher, if one is running (P1-5).
@@ -725,8 +834,7 @@ impl AgentContext {
             cdp_session_id,
             client,
             lock: DriveLock::new(session),
-            viewport_w: AtomicU32::new(width),
-            viewport_h: AtomicU32::new(height),
+            metrics: Arc::new(DeviceMetrics::new(width, height, 1.0, false)),
             screencast: Mutex::new(None),
             nav: Mutex::new(None),
         };
@@ -735,14 +843,8 @@ impl AgentContext {
         me.session_call("Runtime.enable", json!({})).await?;
         // `--window-size` is a browser-wide default; the viewport is per-target
         // (gotcha #11), so pin it here.
-        me.session_call(
-            "Emulation.setDeviceMetricsOverride",
-            json!({
-                "width": width, "height": height,
-                "deviceScaleFactor": 1, "mobile": false,
-            }),
-        )
-        .await?;
+        me.session_call("Emulation.setDeviceMetricsOverride", me.metrics.cdp_params())
+            .await?;
         Ok(me)
     }
 
@@ -1132,14 +1234,13 @@ impl AgentContext {
         };
         self.session_call(
             "Emulation.setDeviceMetricsOverride",
-            json!({
-                "width": width, "height": height,
-                "deviceScaleFactor": scale, "mobile": mobile,
-            }),
+            device_metrics_params(width, height, scale, mobile),
         )
         .await?;
-        self.viewport_w.store(width, Ordering::Relaxed);
-        self.viewport_h.store(height, Ordering::Relaxed);
+        // Stored only once chrome has taken it, so `viewport_css` — and the
+        // repair that re-issues these same values — can never publish a box the
+        // page was refused.
+        self.metrics.store(width, height, scale, mobile);
         Ok(())
     }
 
@@ -1152,10 +1253,33 @@ impl AgentContext {
     /// instead of from whenever the page next repaints — which on a static page
     /// is never.
     pub fn viewport_css(&self) -> (u32, u32) {
-        (
-            self.viewport_w.load(Ordering::Relaxed),
-            self.viewport_h.load(Ordering::Relaxed),
-        )
+        self.metrics.css()
+    }
+
+    /// **Put the CAPTURE back at the box the page is laid out at.**
+    ///
+    /// A main-frame commit drops the emulated size off the capture surface
+    /// while leaving it on the document (see [`DeviceMetrics`]) — the frames
+    /// come back window-shaped with the page drawn into a corner of them, and
+    /// the takeover canvas letterboxes that into a band with background under
+    /// it. Nothing observes the drop, so the caller detects it from a frame
+    /// ([`capture_mismatch`]) and calls this.
+    ///
+    /// **CLEAR, then set.** Chrome ignores a `setDeviceMetricsOverride` whose
+    /// payload equals the override it already believes it is running, and that
+    /// is exactly the state the drop leaves behind: the emulation is still
+    /// "on" with our numbers, only the capture forgot. Re-sending the same
+    /// payload is then a no-op — measured — and the band stays. Clearing first
+    /// makes the set a real change.
+    ///
+    /// Ungated: this is a restoration of an override an actor already passed
+    /// the lock to set, not a new claim on the page.
+    pub async fn repair_capture(&self) -> Result<()> {
+        self.session_call("Emulation.clearDeviceMetricsOverride", json!({}))
+            .await?;
+        self.session_call("Emulation.setDeviceMetricsOverride", self.metrics.cdp_params())
+            .await?;
+        Ok(())
     }
 
     // ── screencast (phase 2 consumes this) ──────────────────────────────────
@@ -1512,11 +1636,12 @@ async fn nav_pump(
                 let mut publish = false;
                 match ev.method.as_str() {
                     "Page.frameNavigated" if ours => {
-                        let frame = ev.params.get("frame").cloned().unwrap_or(json!({}));
-                        // A SUBFRAME navigation is not the address bar.
-                        if frame.get("parentId").is_some() {
+                        // A SUBFRAME navigation is neither the address bar nor
+                        // a new capture surface.
+                        if !main_frame_committed(&ev.params) {
                             continue;
                         }
+                        let frame = ev.params.get("frame").cloned().unwrap_or(json!({}));
                         main_frame = frame.get("id").and_then(Value::as_str).map(str::to_string);
                         let url = str_of(frame.get("url"));
                         if !url.is_empty() {
@@ -1895,6 +2020,83 @@ mod tests {
         state.loading = true;
         publish_nav(&tx, &state);
         assert!(rx.has_changed().unwrap(), "a real change must");
+    }
+
+    /// **The black-band regression** (`fitFrame` letterboxing a 1366×757 frame
+    /// into a 390×700 box). A main-frame commit un-sizes the capture, so
+    /// [`AgentContext::repair_capture`] re-asserts the override — and it may
+    /// only ever re-assert the box we actually set, byte for byte, or the
+    /// repair becomes a second source of truth that drifts from the first.
+    #[test]
+    fn the_restore_payload_is_the_set_payload() {
+        let m = DeviceMetrics::new(1366, 900, 1.0, false);
+        assert_eq!(m.cdp_params(), device_metrics_params(1366, 900, 1.0, false));
+        assert_eq!(m.css(), (1366, 900));
+
+        // A phone takes the wheel: the restore has to follow, or the first
+        // navigation puts the desktop capture back.
+        m.store(390, 700, 2.0, true);
+        assert_eq!(m.css(), (390, 700));
+        let p = m.cdp_params();
+        assert_eq!(p["width"], json!(390));
+        assert_eq!(p["height"], json!(700));
+        assert_eq!(p["deviceScaleFactor"], json!(2.0));
+        assert_eq!(p["mobile"], json!(true));
+        assert_eq!(p, device_metrics_params(390, 700, 2.0, true));
+    }
+
+    /// **The signal the repair runs off.** A frame captured at a box that is
+    /// not the box we laid the page out at IS the black band, one frame before
+    /// a human can see it — so this predicate is the whole detector, and its
+    /// false-positive cases matter: a seed still carries no metadata at all and
+    /// must never be read as drift, or every attach would trigger a repair.
+    #[test]
+    fn a_frame_captured_at_the_wrong_box_is_the_black_band() {
+        let want = (390, 700);
+        assert!(!capture_mismatch(
+            Some(&json!({ "deviceWidth": 390, "deviceHeight": 700 })),
+            want
+        ));
+        // The measured failure: the document is still 390 wide but the capture
+        // came back as the real window.
+        assert!(capture_mismatch(
+            Some(&json!({ "deviceWidth": 1366, "deviceHeight": 757 })),
+            want
+        ));
+        // Height alone is enough — that is the axis the letterbox eats.
+        assert!(capture_mismatch(
+            Some(&json!({ "deviceWidth": 390, "deviceHeight": 757 })),
+            want
+        ));
+        // CDP sends these as floats.
+        assert!(!capture_mismatch(
+            Some(&json!({ "deviceWidth": 390.0, "deviceHeight": 700.0 })),
+            want
+        ));
+        // No metadata, no claim: a `Page.captureScreenshot` still carries none,
+        // and a zero box is chrome saying nothing rather than saying zero.
+        assert!(!capture_mismatch(None, want));
+        assert!(!capture_mismatch(Some(&json!({})), want));
+        assert!(!capture_mismatch(
+            Some(&json!({ "deviceWidth": 0, "deviceHeight": 0 })),
+            want
+        ));
+    }
+
+    /// Only the MAIN frame's commit moves the address bar; a subframe's url is
+    /// not the page's.
+    #[test]
+    fn only_a_main_frame_commit_moves_the_address_bar() {
+        assert!(main_frame_committed(
+            &json!({ "frame": { "id": "F1", "url": "https://nos.nl/" } })
+        ));
+        assert!(
+            !main_frame_committed(
+                &json!({ "frame": { "id": "F2", "parentId": "F1", "url": "https://ads.test/" } })
+            ),
+            "an iframe is not the page"
+        );
+        assert!(!main_frame_committed(&json!({})), "no frame, no commit");
     }
 
     #[test]
