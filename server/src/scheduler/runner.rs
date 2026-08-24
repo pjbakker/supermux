@@ -187,7 +187,7 @@ async fn execute(state: &AppState, sched: &Schedule) -> JobOutcome {
 /// `kind='shell'` — `bash -c <command>` with a 600s ceiling.
 async fn execute_shell(sched: &Schedule) -> JobOutcome {
     let result = tokio::time::timeout(
-        parser::SHELL_TIMEOUT,
+        super::SHELL_TIMEOUT,
         tokio::process::Command::new("/bin/bash")
             .arg("-c")
             .arg(&sched.command)

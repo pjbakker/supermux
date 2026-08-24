@@ -24,7 +24,6 @@
 //! an ambient property of the machine running it.
 
 use std::str::FromStr;
-use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, FixedOffset, Local, Utc};
 use cron::Schedule as CronSchedule;
@@ -402,9 +401,6 @@ fn day_to_std(name: &str) -> Option<u32> {
         _ => return None,
     })
 }
-
-/// 600s ceiling for shell jobs (re-exported for the runner).
-pub const SHELL_TIMEOUT: StdDuration = StdDuration::from_secs(600);
 
 #[cfg(test)]
 mod tests {

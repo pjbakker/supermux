@@ -12,7 +12,6 @@
 //! sub-router; `http::router` merges it under the shared bearer-auth layer.
 
 pub mod hook;
-pub mod parser;
 pub mod runner;
 pub mod watch;
 
@@ -33,6 +32,15 @@ use crate::error::AppError;
 use crate::state::{AppState, SseEvent};
 
 use runner::Trigger;
+
+/// The cadence grammar now lives in [`crate::workflows::parser`] (Workflows v1,
+/// T2.1). Re-exported here so the legacy scheduler — deleted wholesale in
+/// Phase 4 — keeps compiling against `super::parser` until then.
+pub use crate::workflows::parser;
+
+/// 600s ceiling for shell jobs. Lived on `parser` until the parser moved to
+/// `workflows/`; it dies with `execute_shell` in Phase 4.
+pub const SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The scheduler tick interval (explicit 10s).
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
