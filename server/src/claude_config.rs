@@ -658,6 +658,12 @@ mod tests {
         async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
             self.inner.rename(from, to).await
         }
+        async fn mkdir(&self, path: &Path) -> Result<()> {
+            self.inner.mkdir(path).await
+        }
+        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy(from, to).await
+        }
         async fn exists(&self, path: &Path) -> Result<bool> {
             if self.break_exists {
                 anyhow::bail!("ssh: connection closed");
