@@ -481,6 +481,17 @@ function readOptions(lines: readonly string[]): OptionRow[] {
   return rows
 }
 
+/** Does this row carry a DESCRIPTION rather than a wrapped label?
+ *
+ *  The `WRAP_COL` discriminator, as one predicate: a label line that stopped
+ *  well short of CC's wrap column did not wrap, so an indented line under it is
+ *  the option's own description and may be lifted off the chip. Read by the
+ *  `question` family and — since the owner's unmapped-question report — by
+ *  `unknown` too. */
+function described(r: OptionRow): boolean {
+  return !r.wrapped && r.folds.length > 0
+}
+
 /** The rule Claude Code draws UNDER an AskUserQuestion's own options, separating
  *  them from the out-of-box affordance (`5. Chat about this`) below it.
  *
@@ -931,12 +942,37 @@ function readDialog(
   const caret = kept.find((r) => r.caret)
   const sighting: DialogSighting = {
     family,
-    options: kept.map((r) => (family === 'question' ? r.label : r.text)),
+    options: kept.map((r) =>
+      family === 'question' || (family === 'unknown' && described(r)) ? r.label : r.text,
+    ),
     caretIndex: caret ? caret.index : null,
   }
   if (family !== 'unknown') {
     const question = readQuestion(block, family)
     if (question) sighting.question = question
+  }
+  if (family === 'unknown') {
+    // AN UNMAPPED DIALOG SPLITS ITS DESCRIPTIONS TOO (owner report, chat showed
+    // an AskUserQuestion as an illegible pile of chips).
+    //
+    // Finding 8 — chips reading `Apple A crisp and refreshing fruit` — was fixed
+    // for the `question` family alone, and a build whose header chip this app
+    // cannot sight falls through to `unknown`, which still published the FOLDED
+    // row. Those strings are two sentences long, they wrap to three or four
+    // lines inside a 34px pill, and the overflow lands on the row below it.
+    //
+    // The same discriminator applies, unchanged: a label line that stopped well
+    // short of CC's wrap column did not wrap, so the indented line under it is a
+    // DESCRIPTION and may be lifted out. A row that did reach the wrap column
+    // keeps its folded text, because there the continuation is the rest of the
+    // sentence and dropping it would change what the option says.
+    //
+    // Nothing acts on these strings: an `unknown` sighting has no registry entry
+    // (`dialogCardView` draws every control inert) and it can never be a
+    // continuity anchor (`DialogContinuity['family']` excludes it), so this
+    // changes what is READ and nothing that is pressed.
+    const descriptions = kept.map((r) => (described(r) ? r.folds.join(' ') : undefined))
+    if (descriptions.some((d) => d !== undefined)) sighting.descriptions = descriptions
   }
   if (family === 'question') {
     const header = HEADER_CHIP_RE.exec(lines[chip])
@@ -944,9 +980,7 @@ function readDialog(
     const headline = readHeadline(lines, chip, kept[0].line)
     if (headline) sighting.question = headline
     // A description only where the label line proves it did not wrap.
-    sighting.descriptions = kept.map((r) =>
-      !r.wrapped && r.folds.length ? r.folds.join(' ') : undefined,
-    )
+    sighting.descriptions = kept.map((r) => (described(r) ? r.folds.join(' ') : undefined))
     const free = kept.findIndex((r) => FREE_TEXT_ROW_RE.test(r.label))
     if (free >= 0) sighting.freeTextIndex = free
   } else if (family === 'startup') {
