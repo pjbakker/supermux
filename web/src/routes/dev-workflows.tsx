@@ -30,6 +30,8 @@ import { WorkflowsView } from '@/components/workflows/workflows-view'
 import { ComposerBody, draftFromTemplate } from '@/components/workflows/workflow-composer'
 import { ConnectorHintPicker } from '@/components/workflows/connector-hint-picker'
 import { RunTimeline } from '@/components/workflows/run-timeline'
+import { exprToRecurrence, isCadenceExpr, isCronExpr } from '@/components/workflows/cadence'
+import { WorkflowError } from '@/lib/api/workflows'
 import type { ProgressMap } from '@/hooks/use-workflows'
 import type { ConnectorCard, SessionConnector } from '@/lib/api/connectors'
 import type {
@@ -214,42 +216,77 @@ const BOTS = [
   { name: 'inbox', display_name: 'Inbox', status: 'idle' },
 ]
 
-/** The preview endpoint, offline.
+/**
+ * The preview endpoint, offline.
  *
- *  It walks the real cadence rather than adding a fixed number of days: a bench
- *  whose "Every Monday" preview lands on a Tuesday teaches a reviewer to
- *  distrust the preview, which is the one thing on this surface that has to be
- *  believed. */
+ * It walks the REAL cadence, through the same `exprToRecurrence` the composer's
+ * builder uses, rather than adding a fixed number of days: a bench whose "Every
+ * Monday" preview lands on a Tuesday — or whose "9:30pm" lands at 9am — teaches
+ * a reviewer to distrust the one thing on this surface that has to be believed.
+ *
+ * And it REFUSES what the server would refuse. A stub that answers everything is
+ * how "whenever i feel like it" got a next-fire time on a review screenshot; a
+ * bench has to be at least as strict as production or it launders bugs into
+ * evidence.
+ */
 const previewFn = async (expression: string) => {
-  const e = expression.toLowerCase()
-  const hourly = /every\s+\d*\s*h/.test(e)
-  const weekday = e.includes('weekday')
-  const dayIdx = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].findIndex((d) =>
-    new RegExp(`\\b${d}`).test(e),
-  )
-  const hour = Number(/at\s+(\d{1,2})/.exec(e)?.[1] ?? 9)
+  const e = expression.trim().toLowerCase()
+  if (!isCadenceExpr(e)) throw new WorkflowError(`I can’t read “${expression}” as a time.`, 400)
+
   const out: string[] = []
-  const d = new Date()
-  d.setSeconds(0, 0)
-  if (hourly) {
-    d.setMinutes(0)
-    for (let i = 1; i <= 5; i += 1) {
-      const n = new Date(d)
-      n.setHours(d.getHours() + i)
-      out.push(n.toISOString())
+  const push = (d: Date) => out.push(new Date(d).toISOString())
+
+  // A 5-field cron: honour MIN/HOUR and a simple day-of-week field, which is
+  // every cron anybody actually types into this box. Gated on `isCronExpr`, NOT
+  // on the field count — "weekly on mon at 17:00" is also five tokens, and
+  // counting them is what sent it down this branch and produced midnight.
+  const fields = e.split(/\s+/)
+  if (isCronExpr(e)) {
+    const min = Number(fields[0]) || 0
+    const hour = Number(fields[1]) || 0
+    const dows = expandDow(fields[4])
+    const cursor = new Date()
+    cursor.setHours(hour, min, 0, 0)
+    while (out.length < 5) {
+      cursor.setDate(cursor.getDate() + 1)
+      if (dows && !dows.has(cursor.getDay())) continue
+      push(cursor)
     }
     return { next_runs: out }
   }
-  d.setHours(hour, 0, 0, 0)
-  let cursor = new Date(d)
+
+  const r = exprToRecurrence(e)
+  const [h, m] = r.time.split(':').map(Number)
+  if (r.frequency === 'interval') {
+    const unitMs = r.intervalUnit === 'h' ? 3_600_000 : r.intervalUnit === 'd' ? 86_400_000 : 60_000
+    const base = Date.now()
+    for (let i = 1; i <= 5; i += 1) push(new Date(base + i * r.intervalN * unitMs))
+    return { next_runs: out }
+  }
+  const wantDay = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(r.day)
+  const cursor = new Date()
+  cursor.setHours(h ?? 9, m ?? 0, 0, 0)
   while (out.length < 5) {
-    cursor = new Date(cursor.getTime() + 86_400_000)
+    cursor.setDate(cursor.getDate() + 1)
     const dow = cursor.getDay()
-    if (weekday && (dow === 0 || dow === 6)) continue
-    if (dayIdx >= 0 && dow !== dayIdx) continue
-    out.push(cursor.toISOString())
+    if (r.frequency === 'weekdays' && (dow === 0 || dow === 6)) continue
+    if (r.frequency === 'weekly' && dow !== wantDay) continue
+    if (r.frequency === 'monthly' && cursor.getDate() !== r.dom) continue
+    push(cursor)
   }
   return { next_runs: out }
+}
+
+/** `*` → every day; `1-5` / `1,3` → that set, in std cron numbering. */
+function expandDow(field: string): Set<number> | null {
+  if (!field || field === '*') return null
+  const days = new Set<number>()
+  for (const seg of field.split(',')) {
+    const [a, b] = seg.split('-').map(Number)
+    if (Number.isNaN(a)) return null
+    for (let d = a; d <= (Number.isNaN(b) ? a : b); d += 1) days.add(d % 7)
+  }
+  return days.size ? days : null
 }
 
 function Panel({
@@ -268,7 +305,11 @@ function Panel({
       <h2 className="text-[13px] font-medium text-foreground">{label}</h2>
       <div
         data-vr={label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}
-        style={{ height, ...(width ? { width, maxWidth: '100%' } : {}) }}
+        // `min(…, 100vw)`, not `max-width: 100%`: the column above is
+        // content-sized, so a percentage resolves against the panel's own 390px
+        // and a 375px viewport reports a 16px overflow the product does not
+        // have. A bench that invents an overflow is as bad as one that hides it.
+        style={{ height, ...(width ? { width: `min(${width}px, 100vw)` } : {}) }}
         className="overflow-hidden rounded-2xl border border-border"
       >
         {children}

@@ -28,7 +28,9 @@ import { CalendarClock, Check, ChevronDown, Hand, Repeat, Sparkles } from 'lucid
 
 import { cn } from '@/lib/utils'
 import { springs } from '@/lib/springs'
-import { workflowsApi, type TriggerKind } from '@/lib/api/workflows'
+import { type TriggerKind } from '@/lib/api/workflows'
+
+import { CADENCE_IDLE, type CadenceCheck } from './use-cadence-preview'
 
 import {
   EMPTY_RECURRENCE,
@@ -48,8 +50,14 @@ import {
 
 export interface TriggerValue {
   kind: TriggerKind
-  /** The expression in the SERVER's grammar, or '' for `manual`. */
+  /** The expression in the SERVER's grammar. `''` means "there isn't one" —
+   *  either the mode is `manual`, or what the user typed does not parse. */
   expr: string
+  /** What the user actually TYPED. Kept in the draft rather than in this
+   *  component's own state so the footer can tell "nothing entered yet" from
+   *  "entered something I couldn't read" — two different sentences, and the
+   *  second one is the honest half of this control. */
+  text?: string
 }
 
 const MODES: { kind: TriggerKind; label: string; icon: typeof Hand; hint: string }[] = [
@@ -66,8 +74,10 @@ const MODES: { kind: TriggerKind; label: string; icon: typeof Hand; hint: string
 export interface TriggerPickerProps {
   value: TriggerValue
   onChange: (next: TriggerValue) => void
-  /** Injected offline (the dev bench). Defaults to the real preview endpoint. */
-  previewFn?: (expression: string) => Promise<{ next_runs: string[] }>
+  /** The SERVER's verdict on `value.expr`, owned by the composer (which also
+   *  needs it to decide whether Save may be pressed). Presentational here on
+   *  purpose: one check, one debounce, one source of truth. */
+  check?: CadenceCheck
   /** Offline bench: start with the structured composer already revealed. */
   initialBuilder?: boolean
 }
@@ -75,18 +85,14 @@ export interface TriggerPickerProps {
 export function TriggerPicker({
   value,
   onChange,
-  previewFn = workflowsApi.preview,
+  check = CADENCE_IDLE,
   initialBuilder = false,
 }: TriggerPickerProps) {
   const reduce = useReducedMotion()
-  // What the user typed, which is NOT what is sent: the field keeps the raw
-  // text so a half-typed "every m" does not become "every 1m" under the caret.
-  const [text, setText] = React.useState(value.expr)
-  const [lastExpr, setLastExpr] = React.useState(value.expr)
-  if (value.expr !== lastExpr) {
-    setLastExpr(value.expr)
-    setText(value.expr)
-  }
+  // What the user typed lives in the DRAFT, not here: a half-typed "every m"
+  // must not become "every 1m" under the caret, and the footer has to be able
+  // to say "I couldn't read that" about text this component no longer owns.
+  const text = value.text ?? value.expr
   const [builder, setBuilder] = React.useState(initialBuilder)
   const [draft, setDraft] = React.useState<RecurrenceDraft>(() =>
     value.expr ? exprToRecurrence(value.expr) : { ...EMPTY_RECURRENCE },
@@ -94,29 +100,28 @@ export function TriggerPicker({
   const [showAll, setShowAll] = React.useState(false)
 
   const typed = text.trim()
-  const normalized = value.kind === 'recurring' ? normalizeCadence(typed) : value.expr
-  const preview = usePreview(value.kind === 'manual' ? null : normalized, previewFn)
+  const normalized = value.expr || null
+  // The check is the SERVER's. `normalized` only decides what gets sent.
+  const confirmed = check.status === 'ok'
 
   const setExpr = (expr: string | null, raw?: string) => {
-    if (raw !== undefined) setText(raw)
-    onChange({ kind: value.kind, expr: expr ?? '' })
+    onChange({ kind: value.kind, expr: expr ?? '', text: raw ?? expr ?? '' })
   }
 
   const pickMode = (kind: TriggerKind) => {
     if (kind === value.kind) return
     if (kind === 'manual') {
-      onChange({ kind, expr: '' })
+      onChange({ kind, expr: '', text: '' })
       return
     }
     if (kind === 'recurring') {
       // Coming back to Repeating restores the last cadence rather than an empty
       // field — the expression stays on the row server-side for exactly this.
       const expr = normalizeCadence(text) ?? QUICK_CADENCES[0].expr
-      setText(expr)
-      onChange({ kind, expr })
+      onChange({ kind, expr, text: expr })
       return
     }
-    onChange({ kind, expr: value.kind === 'once' ? value.expr : '' })
+    onChange({ kind, expr: value.kind === 'once' ? value.expr : '', text: '' })
   }
 
   return (
@@ -142,10 +147,11 @@ export function TriggerPicker({
               aria-checked={on}
               onClick={() => pickMode(m.kind)}
               className={cn(
-                // At 320px three labelled chips do not fit WITH glyphs, and a
-                // truncated "Repeati" is worse than no icon at all — so the
-                // icon is what gives way, never the word.
-                'relative flex h-9 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-full px-2 text-[13px] font-medium transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-[360px]:gap-1 max-[360px]:px-1 max-[360px]:text-[12.5px]',
+                // Three labelled chips do not fit WITH glyphs below 390px —
+                // measured, not guessed: 375 (iPhone SE) clips "When I say",
+                // 390 does not. A truncated "Repeati" is worse than no icon, so
+                // the icon is what gives way, never the word.
+                'relative flex h-9 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-full px-2 text-[13px] font-medium transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-[389px]:gap-1 max-[389px]:px-1 max-[389px]:text-[12.5px]',
                 on ? 'text-background' : 'text-muted-foreground hover:text-foreground',
               )}
             >
@@ -157,7 +163,7 @@ export function TriggerPicker({
                 />
               )}
               <span className="relative z-10 flex items-center gap-1.5 truncate">
-                <m.icon className="size-3.5 shrink-0 max-[360px]:hidden" aria-hidden="true" />
+                <m.icon className="size-3.5 shrink-0 max-[389px]:hidden" aria-hidden="true" />
                 {m.label}
               </span>
             </button>
@@ -180,7 +186,7 @@ export function TriggerPicker({
           )}
 
           {value.kind === 'once' && (
-            <OnceBody expr={value.expr} onExpr={(e) => setExpr(e)} />
+            <OnceBody expr={value.expr} onExpr={(e) => setExpr(e)} check={check} />
           )}
 
           {value.kind === 'recurring' && (
@@ -195,7 +201,11 @@ export function TriggerPicker({
                   autoCapitalize="none"
                   className="h-11 w-full rounded-lg border border-input bg-transparent pl-3 pr-9 text-base text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
                 />
-                {normalized && (
+                {/* The check is a PROMISE that this schedule is real, so it
+                    waits for the server to say so. It used to appear the moment
+                    a local regex matched, which is how "whenever i feel like
+                    it" got one. */}
+                {confirmed && (
                   <Check
                     className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-emerald-500"
                     aria-hidden="true"
@@ -226,7 +236,7 @@ export function TriggerPicker({
               <CadenceReadback
                 expr={normalized}
                 typed={typed}
-                preview={preview}
+                check={check}
                 showAll={showAll}
                 onShowAll={() => setShowAll((v) => !v)}
               />
@@ -274,68 +284,16 @@ export function TriggerPicker({
 
 // ── the reassurance line ──────────────────────────────────────────────────────
 
-interface PreviewState {
-  runs: string[]
-  loading: boolean
-  error: string | null
-}
-
-/** Ask the server what this expression actually means, debounced.
- *
- *  The server is the only thing that knows: it owns the grammar, the host's
- *  timezone and the DST walk. Rendering a next-fire computed in the browser
- *  would be a second implementation of a calendar, and it would be wrong twice
- *  a year. */
-function usePreview(
-  expr: string | null,
-  previewFn: (expression: string) => Promise<{ next_runs: string[] }>,
-): PreviewState {
-  // The snapshot remembers WHICH expression it answers. That is what lets the
-  // "loading" and "cleared" states be derived during render instead of written
-  // by the effect — and it is also what stops the previous cadence's fire times
-  // sitting under a newly typed one for the length of the debounce, which would
-  // be the most misleading 300ms on the page.
-  const [snap, setSnap] = React.useState<{ expr: string; runs: string[]; error: string | null }>({
-    expr: '',
-    runs: [],
-    error: null,
-  })
-  React.useEffect(() => {
-    if (!expr) return
-    let live = true
-    const t = setTimeout(() => {
-      previewFn(expr)
-        .then((r) => {
-          if (live) setSnap({ expr, runs: r.next_runs ?? [], error: null })
-        })
-        .catch((e: Error) => {
-          if (live) setSnap({ expr, runs: [], error: e.message })
-        })
-    }, 320)
-    return () => {
-      live = false
-      clearTimeout(t)
-    }
-  }, [expr, previewFn])
-
-  const fresh = !!expr && snap.expr === expr
-  return {
-    runs: fresh ? snap.runs : [],
-    loading: !!expr && !fresh,
-    error: fresh ? snap.error : null,
-  }
-}
-
 function CadenceReadback({
   expr,
   typed,
-  preview,
+  check,
   showAll,
   onShowAll,
 }: {
   expr: string | null
   typed: string
-  preview: PreviewState
+  check: CadenceCheck
   showAll: boolean
   onShowAll: () => void
 }) {
@@ -346,30 +304,54 @@ function CadenceReadback({
       </p>
     )
   }
+  // Nothing local matched: say so, name two things that DO work, and stop.
+  // No English render, no check, no fire times — there is nothing to render
+  // them from.
   if (!expr) {
     return (
       <p className="text-[12.5px] text-amber-600 dark:text-amber-500">
-        I don’t know that one yet. Try “every weekday at 9am” or “daily at 18:00”.
+        Couldn’t understand that — try “every weekday at 9am” or “daily at 18:00”.
       </p>
+    )
+  }
+  // It parsed locally, but the SERVER refused it. Its sentence, not ours.
+  if (check.status === 'rejected') {
+    return (
+      <div className="flex flex-col gap-0.5">
+        <p className="text-[12.5px] text-amber-600 dark:text-amber-500">
+          {check.error ?? 'That isn’t a schedule I can run.'}
+        </p>
+        <p className="text-[11.5px] text-muted-foreground">
+          Try “every weekday at 9am”, “mondays at 17:00”, or a 5-field cron.
+        </p>
+      </div>
     )
   }
   return (
     <div className="flex flex-col gap-1">
       <p className="text-[13px] font-medium text-foreground">{describeSchedule(expr)}</p>
-      {preview.error ? (
-        <p className="text-[12px] text-amber-600 dark:text-amber-500">{preview.error}</p>
-      ) : preview.runs.length > 0 ? (
+      {check.status === 'checking' && (
+        <p className="text-[12px] text-muted-foreground">Working out when…</p>
+      )}
+      {check.status === 'unverified' && (
+        // Our outage, not their mistake — so it reads as a missing confirmation
+        // rather than as an error, and it does not block Save.
+        <p className="text-[12px] text-muted-foreground">
+          Can’t reach the server to confirm the times. Saving still works.
+        </p>
+      )}
+      {check.status === 'ok' && (
         <>
           <p className="text-[12px] text-muted-foreground">
-            Next: {formatFull(preview.runs[0])}
-            {preview.runs.length > 1 && (
+            Next: {formatFull(check.runs[0])}
+            {check.runs.length > 1 && (
               <button
                 type="button"
                 onClick={onShowAll}
                 aria-expanded={showAll}
                 className="ml-1.5 inline-flex items-center gap-0.5 text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
-                +{preview.runs.length - 1} more
+                +{check.runs.length - 1} more
                 <ChevronDown
                   className={cn('size-3 transition-transform duration-150', showAll && 'rotate-180')}
                   aria-hidden="true"
@@ -379,7 +361,7 @@ function CadenceReadback({
           </p>
           {showAll && (
             <ul className="flex flex-col gap-0.5 pl-0.5">
-              {preview.runs.slice(1).map((r) => (
+              {check.runs.slice(1).map((r) => (
                 <li key={r} className="text-[12px] tabular-nums text-muted-foreground">
                   {formatFull(r)}
                 </li>
@@ -387,10 +369,6 @@ function CadenceReadback({
             </ul>
           )}
         </>
-      ) : (
-        <p className="text-[12px] text-muted-foreground">
-          {preview.loading ? 'Working out when…' : ' '}
-        </p>
       )}
     </div>
   )
@@ -401,7 +379,15 @@ function CadenceReadback({
 /** `in <N>m` is the grammar the parser has for a one-shot; a datetime picker is
  *  the question a person can answer. The conversion happens here, and the
  *  readback is what it will actually do. */
-function OnceBody({ expr, onExpr }: { expr: string; onExpr: (expr: string | null) => void }) {
+function OnceBody({
+  expr,
+  onExpr,
+  check,
+}: {
+  expr: string
+  onExpr: (expr: string | null) => void
+  check: CadenceCheck
+}) {
   const [when, setWhen] = React.useState(() => defaultOnce())
   const [err, setErr] = React.useState<string | null>(null)
 
@@ -430,10 +416,19 @@ function OnceBody({ expr, onExpr }: { expr: string; onExpr: (expr: string | null
       />
       {err ? (
         <p className="text-[12.5px] text-amber-600 dark:text-amber-500">{err}</p>
-      ) : (
-        <p className="text-[12.5px] text-muted-foreground">
-          Runs once, then stops. It stays here afterwards, so you can run it again.
+      ) : check.status === 'rejected' ? (
+        <p className="text-[12.5px] text-amber-600 dark:text-amber-500">
+          {check.error ?? 'That isn’t a time I can run.'}
         </p>
+      ) : (
+        <>
+          {check.status === 'ok' && (
+            <p className="text-[12.5px] text-foreground">Runs {formatFull(check.runs[0])}.</p>
+          )}
+          <p className="text-[12.5px] text-muted-foreground">
+            Runs once, then stops. It stays here afterwards, so you can run it again.
+          </p>
+        </>
       )}
     </div>
   )

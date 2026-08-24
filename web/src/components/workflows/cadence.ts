@@ -292,7 +292,9 @@ export function describeSchedule(expr: string | null | undefined): string {
     return tm ? `Every ${day} at ${prettyTime(tm[0], tm[1])}` : `Every ${day}`
   }
 
-  if (e.split(/\s+/).length === 5) return 'Custom schedule'
+  // A REAL cron, not "five words". Before this was `split(/\s+/).length === 5`,
+  // which made "whenever i feel like it" a custom schedule.
+  if (isCronExpr(e)) return 'Custom schedule'
 
   return expr!.trim()
 }
@@ -435,16 +437,92 @@ function dayToken(word: string): string | null {
 /** A bare clock time: `9`, `9am`, `9:30`, `9:30pm`, `21:00`. */
 const RE_CLOCK = /^\d{1,2}(:\d{2})?(am|pm)?$/
 
-/** Does this already parse under the server grammar? Mirrors parser.rs's own
- *  order of attempts, so "already valid" here means "valid there". */
+/**
+ * Does this parse under the server grammar?
+ *
+ * Mirrors `parser.rs`'s own order of attempts AND its own strictness, which is
+ * the part that was missing: a regex that matches the SHAPE of an expression
+ * says nothing about whether the parser can read the time inside it. Every arm
+ * below now validates its payload — the unit, the day name, the day-of-month
+ * range, the clock — because "every weekday at potato" matching `RE_WEEKDAY`
+ * is not the same thing as it being a schedule.
+ *
+ * The server stays the authority. This only has to be tight enough that
+ * nothing which is obviously not a cadence can ever wear the green check.
+ */
 export function isCadenceExpr(expr: string): boolean {
   const e = expr.trim().toLowerCase()
   if (!e) return false
-  if (RE_IN.test(e) || RE_EVERY_N.test(e) || RE_EVERY_ALIAS.test(e)) return true
-  if (RE_WEEKDAY.test(e) || RE_DAILY.test(e) || RE_WEEKLY.test(e) || RE_MONTHLY.test(e)) return true
-  const day = RE_EVERY_DAY.exec(e)
-  if (day && dayToken(day[1])) return true
-  return e.split(/\s+/).length === 5
+
+  let c = RE_IN.exec(e)
+  if (c) return !!unitToken(c[2])
+  c = RE_EVERY_N.exec(e)
+  if (c) return !!unitToken(c[2]) && Number(c[1]) > 0
+  if (RE_EVERY_ALIAS.test(e)) return true
+
+  c = RE_WEEKDAY.exec(e)
+  if (c) return readTime(c[1]) !== null
+  c = RE_DAILY.exec(e)
+  if (c) return readTime(c[1]) !== null
+  c = RE_WEEKLY.exec(e)
+  if (c) return !!dayToken(c[1]) && readTime(c[2]) !== null
+  c = RE_MONTHLY.exec(e)
+  if (c) {
+    const dom = Number(c[1])
+    return dom >= 1 && dom <= 28 && readTime(c[2]) !== null
+  }
+  c = RE_EVERY_DAY.exec(e)
+  if (c && dayToken(c[1])) return readTime(c[2]) !== null
+
+  return isCronExpr(e)
+}
+
+/** Month and day NAMES the `cron` crate maps natively (parser.rs passes them
+ *  through `translate_dow` untouched). */
+const CRON_MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const CRON_DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']
+
+/** One cron field: `*`, `a`, `a-b`, any of those with `/step`, comma-joined. */
+function cronField(field: string, lo: number, hi: number, names: string[]): boolean {
+  if (!field) return false
+  return field.split(',').every((seg) => {
+    if (!seg) return false
+    const [base, step, ...rest] = seg.split('/')
+    if (rest.length) return false
+    if (step !== undefined && !/^[1-9]\d*$/.test(step)) return false
+    if (base === '*') return true
+    const token = (t: string): boolean => {
+      if (!t) return false
+      if (names.includes(t)) return true
+      if (!/^\d{1,2}$/.test(t)) return false
+      const n = Number(t)
+      return n >= lo && n <= hi
+    }
+    const [a, b, ...more] = base.split('-')
+    if (more.length) return false
+    return b === undefined ? token(a) : token(a) && token(b)
+  })
+}
+
+/**
+ * A REAL 5-field cron — `MIN HOUR DOM MON DOW`, each field validated against
+ * its own range.
+ *
+ * THE BUG THIS EXISTS TO CLOSE: the previous test was
+ * `expr.split(/\s+/).length === 5`, i.e. "any five words". "whenever i feel
+ * like it" is five words, so it validated, rendered as "Custom schedule", wore
+ * the green check and got a next-fire time. Word count is not a grammar.
+ */
+export function isCronExpr(raw: string): boolean {
+  const fields = raw.trim().toLowerCase().split(/\s+/)
+  if (fields.length !== 5) return false
+  return (
+    cronField(fields[0], 0, 59, []) &&
+    cronField(fields[1], 0, 23, []) &&
+    cronField(fields[2], 1, 31, []) &&
+    cronField(fields[3], 1, 12, CRON_MONTHS) &&
+    cronField(fields[4], 0, 7, CRON_DAYS)
+  )
 }
 
 /** Strip the words that carry no cadence meaning — "run", "please", "at" when

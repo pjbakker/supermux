@@ -46,6 +46,12 @@ import {
 } from '@/hooks/use-workflows'
 
 import { CompletionActionRow, completionProblem } from './completion-action-row'
+import {
+  CADENCE_IDLE,
+  cadenceProblem,
+  useCadencePreview,
+  type CadenceCheck,
+} from './use-cadence-preview'
 import { ConnectorHintPicker } from './connector-hint-picker'
 import { StepCard, newStep, type StepDraft } from './step-card'
 import { TriggerPicker, type TriggerValue } from './trigger-picker'
@@ -72,7 +78,7 @@ export function emptyDraft(session = ''): ComposerDraft {
   return {
     title: '',
     session,
-    trigger: { kind: 'recurring', expr: 'every weekday at 9:00' },
+    trigger: { kind: 'recurring', expr: 'every weekday at 9:00', text: 'every weekday at 9:00' },
     steps: [newStep()],
     onComplete: { kind: 'notify' },
   }
@@ -85,7 +91,7 @@ export function draftFromTemplate(key: string, session = ''): ComposerDraft {
   return {
     title: t.title,
     session,
-    trigger: { kind: 'recurring', expr: t.schedule_expr },
+    trigger: { kind: 'recurring', expr: t.schedule_expr, text: t.schedule_expr },
     steps: t.steps.map((s) => newStep({ title: s.title, text: s.prompt, connectors: s.connectors ?? [] })),
     onComplete: t.on_complete,
   }
@@ -100,6 +106,7 @@ export function draftFromWorkflow(payload: WorkflowDetailPayload): ComposerDraft
     trigger: {
       kind: (w.trigger_kind as TriggerValue['kind']) ?? 'manual',
       expr: w.schedule_expr ?? '',
+      text: w.schedule_expr ?? '',
     },
     steps: (payload.steps ?? []).map((s) =>
       newStep({
@@ -127,13 +134,28 @@ export function draftProblem(
   draft: ComposerDraft,
   uploading = false,
   uploadingName?: string,
+  check: CadenceCheck = CADENCE_IDLE,
 ): string | null {
   if (!draft.session.trim()) return 'Pick which bot runs this'
   const empty = draft.steps.findIndex((s) => !s.text.trim())
   if (empty >= 0) return `Step ${empty + 1} has no prompt`
   if (draft.steps.length === 0) return 'Add at least one step'
-  if (draft.trigger.kind !== 'manual' && !draft.trigger.expr.trim()) {
-    return draft.trigger.kind === 'once' ? 'Pick when it should run' : 'Say how often it runs'
+  if (draft.trigger.kind !== 'manual') {
+    if (!draft.trigger.expr.trim()) {
+      // Two different failures, two different sentences. "Say how often it
+      // runs" is right for an empty field and WRONG for a field holding
+      // "whenever i feel like it" — that user answered the question, they just
+      // were not understood, and telling them to answer it again is the kind of
+      // form that makes people give up.
+      if (draft.trigger.kind === 'once') return 'Pick when it should run'
+      return draft.trigger.text?.trim()
+        ? 'Couldn’t understand that — try “every weekday at 9am”'
+        : 'Say how often it runs'
+    }
+    // It parsed locally; the SERVER still has to confirm it before Save can
+    // promise anything.
+    const cadence = cadenceProblem(check)
+    if (cadence) return cadence
   }
   const completion = completionProblem(draft.onComplete)
   if (completion) return completion
@@ -232,8 +254,15 @@ export function ComposerBody({
   const replaceSteps = useReplaceSteps()
   const run = useRunWorkflow()
 
+  // ONE check, one debounce, one source of truth: the composer owns it because
+  // it is the thing that has to decide whether Save may be pressed, and the
+  // picker only renders it.
+  const check = useCadencePreview(
+    draft.trigger.kind === 'manual' ? null : draft.trigger.expr || null,
+    previewFn,
+  )
   const anyUploading = Object.values(uploading).some(Boolean)
-  const problem = draftProblem(draft, anyUploading)
+  const problem = draftProblem(draft, anyUploading, undefined, check)
   const set = (patchDraft: Partial<ComposerDraft>) => setDraft((d) => ({ ...d, ...patchDraft }))
 
   const setStep = (key: string, next: StepDraft) =>
@@ -328,10 +357,16 @@ export function ComposerBody({
         <span className="min-w-0 flex-1 truncate text-[13px] text-muted-foreground">
           {id ? 'Edit workflow' : 'New workflow'}
         </span>
+        {/* Disabled in step with the footer's Save, never on its own: the two
+            are the same action, and one of them refusing while the other looks
+            ready is the interface disagreeing with itself. The pinned footer is
+            always on screen, so this is never a disabled button with no
+            explanation — the explanation is two lines below it. */}
         <button
           type="button"
           onClick={() => void save(false)}
-          disabled={saving}
+          disabled={saving || !!problem}
+          aria-describedby="composer-validity"
           className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-full bg-primary px-4 text-[13px] font-medium text-primary-foreground transition-transform duration-100 active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
         >
           {saving && <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />}
@@ -371,11 +406,7 @@ export function ComposerBody({
         </section>
 
         {/* WHEN — the point of the whole surface */}
-        <TriggerPicker
-          value={draft.trigger}
-          onChange={(trigger) => set({ trigger })}
-          previewFn={previewFn}
-        />
+        <TriggerPicker value={draft.trigger} onChange={(trigger) => set({ trigger })} check={check} />
 
         {/* WHAT */}
         <section className="flex flex-col gap-2">
@@ -441,6 +472,7 @@ export function ComposerBody({
             that has to NAME the problem. */}
         <div className="mx-auto flex w-full max-w-[720px] flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-2">
           <p
+            id="composer-validity"
             role="status"
             aria-live="polite"
             className={cn(
