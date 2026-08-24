@@ -1,12 +1,30 @@
-//! One agent's **isolated browser context** — its own cookie jar, its own
-//! `localStorage`, its own page, and its own [`DriveLock`].
+//! **One page, driven by an agent or a human** — its cookie jar, its
+//! `localStorage`, its target, and its [`DriveLock`].
 //!
-//! # Isolation
+//! # Two jars, one page primitive (shared-browser v1 §2.3)
 //!
-//! A context is a CDP `BrowserContext` (`Target.createBrowserContext`), the
-//! same primitive an incognito window uses. The spike verified cookie *and*
-//! `localStorage` isolation between two of them, and verified that disposing
-//! one leaves its siblings responsive — so per-agent teardown is safe.
+//! Everything below the identity line is shared; only *which* jar the page
+//! lands in differs, and that is exactly one field:
+//!
+//! * **Agent scratch** ([`AgentContext::create`], `browser_context_id =
+//!   Some(_)`). A CDP `BrowserContext` (`Target.createBrowserContext`), the same
+//!   primitive an incognito window uses. The spike verified cookie *and*
+//!   `localStorage` isolation between two of them, and verified that disposing
+//!   one leaves its siblings responsive — so per-agent teardown is safe. This
+//!   path is **byte-for-byte today's behaviour** and keeps every guarantee it
+//!   has: an incognito-equivalent context does not persist to the profile dir,
+//!   so scratch stays isolated even while sharing a durable `--user-data-dir`.
+//! * **Workspace tab** ([`AgentContext::create_in_default_context`],
+//!   `browser_context_id = None`). `Target.createTarget` with **no**
+//!   `browserContextId` lands in the browser's DEFAULT context, whose cookies /
+//!   `localStorage` / IndexedDB Chrome persists into
+//!   `<user-data-dir>/Default/…`. **The profile IS the jar** — there is nothing
+//!   to create and, decisively, nothing to dispose (see
+//!   [`AgentContext::close`]).
+//!
+//! Every page-driving method below is identical for both and is deliberately
+//! left untouched by v1 — in particular the screencast pump's ack accounting,
+//! which is subtle and must not be re-derived.
 //!
 //! # Flat-mode sessions
 //!
@@ -182,8 +200,13 @@ impl KeyPress {
 
 /// A live per-agent browser context.
 pub struct AgentContext {
+    /// The lock subject — a session name for scratch, a `tb_…` tab id for a
+    /// workspace tab.
     session: String,
-    browser_context_id: String,
+    /// `Some(_)` ⇒ an isolated (incognito-equivalent) context we own and must
+    /// dispose. `None` ⇒ the browser's DEFAULT context: the persistent profile,
+    /// which is shared by every workspace tab and must NEVER be disposed.
+    browser_context_id: Option<String>,
     target_id: String,
     cdp_session_id: String,
     client: Arc<CdpClient>,
@@ -235,7 +258,15 @@ impl AgentContext {
             })?
             .to_string();
 
-        match Self::finish_create(client.clone(), session, &browser_context_id, width, height).await
+        match Self::finish_create(
+            client.clone(),
+            session,
+            Some(browser_context_id.as_str()),
+            width,
+            height,
+            "about:blank",
+        )
+        .await
         {
             Ok(me) => Ok(me),
             Err(e) => {
@@ -250,24 +281,50 @@ impl AgentContext {
         }
     }
 
+    /// **Open a page in the browser's DEFAULT (persistent) context** — the
+    /// workspace path (v1 §2.3 R2 / §4.1).
+    ///
+    /// The one structural difference from [`create`](Self::create): it does
+    /// **not** call `Target.createBrowserContext` at all. A `createTarget` with
+    /// no `browserContextId` lands in the default context, which is the durable
+    /// profile on disk, which is the human's cookie jar. That is the entire
+    /// mechanism by which a login survives a tab close, an idle reap, a Chrome
+    /// crash and a `systemctl restart`.
+    ///
+    /// `subject` is the lock subject (a tab id here, not a session name), and
+    /// `url` is where the page opens — a rehydrating tab reopens at its stored
+    /// URL rather than at `about:blank`.
+    pub async fn create_in_default_context(
+        client: Arc<CdpClient>,
+        subject: &str,
+        width: u32,
+        height: u32,
+        url: &str,
+    ) -> Result<Self> {
+        // No createBrowserContext, and therefore nothing to dispose if
+        // `finish_create` fails halfway — its own `closeTarget` on the way out
+        // is not needed either, because a failed createTarget leaves no target.
+        Self::finish_create(client, subject, None, width, height, url).await
+    }
+
     async fn finish_create(
         client: Arc<CdpClient>,
         session: &str,
-        browser_context_id: &str,
+        browser_context_id: Option<&str>,
         width: u32,
         height: u32,
+        url: &str,
     ) -> Result<Self> {
-        let target = client
-            .call(
-                "Target.createTarget",
-                json!({
-                    "url": "about:blank",
-                    "browserContextId": browser_context_id,
-                    "width": width,
-                    "height": height,
-                }),
-            )
-            .await?;
+        let mut params = json!({
+            "url": url,
+            "width": width,
+            "height": height,
+        });
+        // Present ⇒ isolated context. ABSENT ⇒ the default, persistent one.
+        if let Some(bcid) = browser_context_id {
+            params["browserContextId"] = json!(bcid);
+        }
+        let target = client.call("Target.createTarget", params).await?;
         let target_id = target["targetId"]
             .as_str()
             .ok_or_else(|| BrowserError::Protocol {
@@ -293,7 +350,7 @@ impl AgentContext {
 
         let me = Self {
             session: session.to_string(),
-            browser_context_id: browser_context_id.to_string(),
+            browser_context_id: browser_context_id.map(str::to_string),
             target_id,
             cdp_session_id,
             client,
@@ -322,9 +379,17 @@ impl AgentContext {
     pub fn session(&self) -> &str {
         &self.session
     }
-    /// The CDP `browserContextId` (the isolation boundary).
-    pub fn browser_context_id(&self) -> &str {
-        &self.browser_context_id
+    /// The CDP `browserContextId` (the isolation boundary), or `None` for a page
+    /// in the DEFAULT persistent context — a workspace tab, whose jar is the
+    /// profile on disk.
+    pub fn browser_context_id(&self) -> Option<&str> {
+        self.browser_context_id.as_deref()
+    }
+
+    /// Is this page in the persistent (default) context? True for a workspace
+    /// tab, false for an agent-scratch context.
+    pub fn is_persistent(&self) -> bool {
+        self.browser_context_id.is_none()
     }
     /// The CDP `targetId` of this context's page.
     pub fn target_id(&self) -> &str {
@@ -744,11 +809,18 @@ impl AgentContext {
         {
             debug!(session = %self.session, error = %e, "browser: closeTarget");
         }
+        // **Only a scratch context is disposed.** Disposing the DEFAULT context
+        // would be a protocol error at best and would nuke every other workspace
+        // tab — and the profile's cookies with them — at worst (v1 §2.3 R5). A
+        // workspace tab closes with `closeTarget` and nothing else.
+        let Some(bcid) = self.browser_context_id.as_deref() else {
+            return;
+        };
         if let Err(e) = self
             .client
             .call(
                 "Target.disposeBrowserContext",
-                json!({ "browserContextId": self.browser_context_id }),
+                json!({ "browserContextId": bcid }),
             )
             .await
         {

@@ -127,10 +127,15 @@ pub enum Actor {
     Human,
 }
 
-/// The per-context drive-lock state machine.
+/// The per-SUBJECT drive-lock state machine.
+///
+/// The subject is whatever this lock is scoped to. v1 keeps the logic 1:1 and
+/// only changes the cardinality: a scratch context is locked by its **session
+/// name**, a workspace tab by its **tab id**, so one lock per tab means a human
+/// driving tab A never blocks a granted agent on tab B.
 #[derive(Debug)]
 pub struct DriveLock {
-    session: String,
+    subject: String,
     tx: watch::Sender<DriveMode>,
     /// How the LAST takeover ended ([`HandOff`], or `HANDOFF_PENDING` while one
     /// is live / before the first). Separate from the watch value on purpose:
@@ -141,18 +146,18 @@ pub struct DriveLock {
 
 impl DriveLock {
     /// A fresh lock, resting in [`DriveMode::AgentDriving`].
-    pub fn new(session: impl Into<String>) -> Self {
+    pub fn new(subject: impl Into<String>) -> Self {
         let (tx, _rx) = watch::channel(DriveMode::AgentDriving);
         Self {
-            session: session.into(),
+            subject: subject.into(),
             tx,
             handoff: AtomicU8::new(HANDOFF_PENDING),
         }
     }
 
-    /// The session this lock guards.
-    pub fn session(&self) -> &str {
-        &self.session
+    /// The subject this lock guards — a session name (scratch) or a tab id.
+    pub fn subject(&self) -> &str {
+        &self.subject
     }
 
     /// Current mode. Lock-free read.
@@ -209,7 +214,7 @@ impl DriveLock {
         match self.mode() {
             DriveMode::AgentDriving => Ok(()),
             DriveMode::HumanDriving => Err(BrowserError::HumanDriving {
-                session: self.session.clone(),
+                subject: self.subject.clone(),
             }),
         }
     }
@@ -238,7 +243,7 @@ impl DriveLock {
         match deadline.await {
             Ok(inner) => inner,
             Err(_) => Err(BrowserError::TakeoverWait {
-                session: self.session.clone(),
+                subject: self.subject.clone(),
             }),
         }
     }
@@ -272,7 +277,7 @@ mod tests {
 
         let err = lock.ensure_agent().expect_err("agent must be refused");
         match err {
-            BrowserError::HumanDriving { session } => assert_eq!(session, "alice"),
+            BrowserError::HumanDriving { subject } => assert_eq!(subject, "alice"),
             other => panic!("wrong error: {other:?}"),
         }
 
