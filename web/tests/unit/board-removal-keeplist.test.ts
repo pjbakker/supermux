@@ -237,12 +237,13 @@ describe('and the PAGE is really gone', () => {
     expect(layout).not.toContain("to: '/board'")
     expect(layout).not.toContain('SquareKanban')
     const navBlock = layout.slice(layout.indexOf('const NAV'), layout.indexOf('/** Tiny notification dot'))
-    // The array is FIVE entries — the base four (Overview / Focus / Files /
-    // Settings) plus the `grokOnly` Connector-store doorway (`/store`, #22) that
-    // this branch added; each rendered nav still filters by mode. What this guard
-    // fixes is that NO entry is the removed board slot (asserted above); the count
-    // just pins the array size so a board slot cannot quietly return.
-    expect(navBlock.match(/to: '/g)?.length).toBe(5)
+    // The array is SIX entries — the base four (Overview / Focus / Files /
+    // Settings) plus TWO `grokOnly` doorways: the Connector store (`/store`, #22)
+    // and the shared-browser workspace (`/browser`, shared-browser v1 §6.1);
+    // each rendered nav still filters by mode. What this guard fixes is that NO
+    // entry is the removed board slot (asserted above); the count just pins the
+    // array size so a board slot cannot quietly return.
+    expect(navBlock.match(/to: '/g)?.length).toBe(6)
   })
 
   test('the palette lost its four board verbs and its issue rows', () => {
