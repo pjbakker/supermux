@@ -35,6 +35,12 @@ const Settings = lazy(() =>
 const Store = lazy(() =>
   import('@/routes/store').then((m) => ({ default: m.Store })),
 )
+// Workflows — the list, the composer and the run history. Lazy like the store:
+// a headline surface, but not on the cold hero path, and the composer's step
+// tree / cadence grammar should not weigh the entry bundle.
+const Workflows = lazy(() =>
+  import('@/routes/workflows').then((m) => ({ default: m.Workflows })),
+)
 // The phone team-detail surface (Phase 6a). Lazy so the 160 KB entry gate never
 // carries ChatPanel/TeamPanel/MemberPane for a route the roster only reaches on a
 // phone tap (and which redirects to /focus when bot mode is off).
@@ -258,13 +264,23 @@ export default function App() {
                     and /hosts use. */}
                 <Route path="/board" element={<Navigate to="/" replace />} />
                 <Route path="/files/:name?" element={<Files />} />
-                {/* Scheduler moved into Settings → Schedules (B1 T8: a route
-                    whose 5-column table did not earn a primary-nav slot).
-                    Redirect old bookmarks / deep links to the Settings anchor
-                    so no link breaks — the exact pattern /hosts uses below. */}
+                {/* Schedules became Workflows. Both old doorways — the
+                    standalone `/scheduler` route and the Settings anchor B1
+                    folded it into — land on the new list, so no bookmark and no
+                    deep link breaks. A redirect rather than a 404 is the same
+                    courtesy /hosts and /board already get. The Settings
+                    ANCHOR (`/settings#schedules`) is a hash, which no path
+                    route can match; the section it scrolls to is deleted with
+                    the rest of the scheduler UI in 4B, and the command palette
+                    entry that used to point there now points here. */}
+                <Route path="/scheduler" element={<Navigate to="/workflows" replace />} />
                 <Route
-                  path="/scheduler"
-                  element={<Navigate to="/settings#schedules" replace />}
+                  path="/workflows"
+                  element={
+                    <Suspense fallback={null}>
+                      <Workflows />
+                    </Suspense>
+                  }
                 />
                 {/* Hosts moved into Settings → Remote hosts. Redirect old
                     bookmarks / deep links to the Settings anchor so no link

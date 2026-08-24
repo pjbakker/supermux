@@ -7,6 +7,7 @@ import {
   Search,
   Settings as SettingsIcon,
   Terminal,
+  Workflow,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -92,6 +93,12 @@ const NAV: NavItem[] = [
   // a first-class Grok destination on the rail and the phone nav (Plug glyph,
   // the same mark the command palette already uses for it). Base app unchanged.
   { to: '/store', label: 'Connectors', icon: Plug, grokOnly: true },
+  // Workflows — a bot, an ordered list of prompts, and one trigger (#—). Sits
+  // immediately AFTER Connectors because that is the order the two are learned
+  // in: you give a bot its tools, then you give it a job. `grokOnly` like the
+  // store, so the BASE rail stays four items and no `--nav-n` / tab-count /
+  // Liquid-Pill geometry is respec'd; under grok the phone bar goes 4 → 5.
+  { to: '/workflows', label: 'Workflows', icon: Workflow, grokOnly: true },
   { to: '/files', label: 'Files', icon: FolderClosed },
   // Hosts registry AND the scheduler both moved into Settings (rare-use config
   // doesn't need a primary-nav slot). `/hosts` → /settings#hosts and

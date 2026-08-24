@@ -331,9 +331,9 @@ export function CommandPalette() {
       go('/store', 'Connectors', 'connector store mcp integrations add tools plugins connect catalog', Plug),
       go('/settings', 'Settings', 'preferences config options update theme', SettingsIcon),
       go(
-        '/settings#schedules',
-        'Schedules',
-        'scheduler cron recurring timer prompt later',
+        '/workflows',
+        'Workflows',
+        'scheduler cron recurring timer prompt later workflow steps chain schedule automation',
         CalendarClock,
       ),
       go('/settings#hosts', 'Remote hosts', 'ssh host remote machine registry', ServerCog),
