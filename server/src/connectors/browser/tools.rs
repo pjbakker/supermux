@@ -176,6 +176,17 @@ async fn tool_handler(
         }
     };
     let result = result.map_err(browser_err)?;
+
+    // 5. **The landing check.** Where the page ended up, not just where the call
+    //    pointed it — see `enforce_landing_origin`. Runs on the RESULT, so the
+    //    URL it judges is the very one the payload was read from; there is no
+    //    window in which the page could move between the check and the read.
+    let result = match &target {
+        Target::Workspace(tab, origins) => {
+            enforce_landing_origin(&state, &body.session, tab, origins, &body.tool, result).await?
+        }
+        Target::Scratch(_) => result,
+    };
     Ok(Json(json!({ "ok": true, "result": result })))
 }
 
@@ -187,7 +198,14 @@ async fn tool_handler(
 /// a [`Target::Workspace`] carries.
 enum Target {
     Scratch(Arc<AgentContext>),
-    Workspace(Arc<Tab>),
+    /// A workspace tab plus **the allowlist as the DB has it right now**.
+    ///
+    /// Read from the row on every call rather than from the live `Tab`'s cached
+    /// meta on purpose: a human who narrows a tab's allowlist must have that
+    /// take effect on the very next agent call, not whenever the tab happens to
+    /// be rehydrated. A stale in-memory allowlist is a permission that outlives
+    /// its revocation.
+    Workspace(Arc<Tab>, Vec<String>),
 }
 
 impl Target {
@@ -195,7 +213,7 @@ impl Target {
     fn page(&self) -> &AgentContext {
         match self {
             Self::Scratch(ctx) => ctx,
-            Self::Workspace(tab) => tab.page(),
+            Self::Workspace(tab, _) => tab.page(),
         }
     }
 
@@ -203,7 +221,7 @@ impl Target {
     fn tab_id(&self) -> Option<&str> {
         match self {
             Self::Scratch(_) => None,
-            Self::Workspace(tab) => Some(tab.id()),
+            Self::Workspace(tab, _) => Some(tab.id()),
         }
     }
 }
@@ -251,11 +269,12 @@ async fn resolve_tab(state: &AppState, session: &str, tab_id: &str) -> Result<Ta
         }));
     }
 
+    let origins = db_tabs::origins_of(&row);
     let meta = TabMeta {
         title: row.title.clone(),
         url: row.url.clone(),
         pinned: row.pinned != 0,
-        origins: db_tabs::origins_of(&row),
+        origins: origins.clone(),
         login_state: row.login_state.clone(),
     };
     let tab = state
@@ -263,6 +282,12 @@ async fn resolve_tab(state: &AppState, session: &str, tab_id: &str) -> Result<Ta
         .ensure_tab(tab_id, meta)
         .await
         .map_err(browser_err)?;
+    // `ensure_tab` hands back the ALREADY-LIVE tab unchanged when there is one,
+    // so its cached meta can be older than the row. Push the row's answer back
+    // in: a human who just narrowed the allowlist, or cleared `needs_login`,
+    // must be reflected on this call and not on some later rehydrate.
+    tab.set_origins(origins.clone()).await;
+    tab.set_login_state(row.login_state.clone()).await;
     // Freshness for the workspace UI's "last used" ordering.
     let _ = db_tabs::update(
         pool,
@@ -273,7 +298,7 @@ async fn resolve_tab(state: &AppState, session: &str, tab_id: &str) -> Result<Ta
         },
     )
     .await;
-    Ok(Target::Workspace(tab))
+    Ok(Target::Workspace(tab, origins))
 }
 
 /// Does this session hold an ENABLED `shared-browser` grant (its own or `*`)?
@@ -497,17 +522,137 @@ fn handback_result(handoff: Option<HandOff>, url: &str, reason: &str) -> Value {
     }
 }
 
+/// **Where the page ACTUALLY is, after the verb ran** (§8.4, the landing half).
+///
+/// # The hole this closes
+///
+/// The destination check in [`navigate`] only sees URLs an agent *asked* for.
+/// But a workspace tab moves on its own: a `browser_click` on a link, a
+/// `location.replace`, an OAuth bounce. So a bot legitimately granted
+/// `tb_mail` (allowlist `mail.example.com`) could click a link, land anywhere,
+/// and read it — and on a SHARED profile "anywhere" includes every other service
+/// the human is signed into in the same jar. That is a cross-tab privilege
+/// escalation dressed as a normal read.
+///
+/// # The choice: hard-refuse the READS, report the rest
+///
+/// * `read` / `screenshot` / `navigate` — **refused** with
+///   [`BrowserError::OriginNotAllowed`] (403). These are the verbs that move
+///   content off the page and into the agent, and the module's whole posture is
+///   that on an authenticated tab *reading is the exfiltration*. The payload is
+///   dropped, not trimmed: half of an off-allowlist page is still off-allowlist.
+/// * `click` / `request_human_takeover` — **not refused**, because the page has
+///   already moved and refusing after the fact protects nothing. They come back
+///   stamped `off_allowlist` with the host, so the agent knows the tab drifted
+///   and the next read is going to be refused.
+///
+/// # Why this does not break real logins
+///
+/// A human's sign-in never passes through here. Human navigation happens over
+/// the takeover socket as [`Actor::Human`], which this endpoint does not gate at
+/// all — so an SSO chain hopping through `login.microsoftonline.com`,
+/// `accounts.google.com` and back is untouched, and the human can add any host
+/// the tab legitimately uses to its allowlist while they set it up. What IS
+/// refused is an *agent* reading an identity provider's page, which it should
+/// never be doing: the honest move there is `request_human_takeover`, and that
+/// verb keeps working. The refusal names the host precisely so the agent can say
+/// which one the human would need to allow.
+///
+/// Every drift is audited under its own action (`browser.off_allowlist`), so tab
+/// activity review catches a tab that keeps wandering even when the read that
+/// followed was refused.
+async fn enforce_landing_origin(
+    state: &AppState,
+    session: &str,
+    tab: &Arc<Tab>,
+    origins: &[String],
+    tool: &str,
+    result: Value,
+) -> Result<Value, AppError> {
+    let landed = result.get("url").and_then(Value::as_str).unwrap_or_default();
+    let Some(host) = landing_drift(landed, origins) else {
+        return Ok(result);
+    };
+
+    let (url_note, _) = clip(landed, 500);
+    crate::db::audit::log(
+        &state.pool,
+        &format!("agent:{session}"),
+        "browser.off_allowlist",
+        &format!("tab:{}", tab.id()),
+        json!({ "tool": tool, "host": host, "url": url_note, "allowed": origins }),
+    )
+    .await
+    .ok();
+
+    if drift_refuses(tool) {
+        Err(browser_err(BrowserError::OriginNotAllowed {
+            tab: tab.id().to_string(),
+            host,
+        }))
+    } else {
+        // The page already moved; say so instead of pretending it did not.
+        {
+            let mut result = result;
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("off_allowlist".into(), json!(true));
+                obj.insert("off_allowlist_host".into(), json!(host));
+                obj.insert(
+                    "warning".into(),
+                    json!(
+                        "This tab is now on a host outside its allowlist. Reading or \
+                         screenshotting it will be refused. Ask the human to allow this host on \
+                         the tab, or navigate back."
+                    ),
+                );
+            }
+            Ok(result)
+        }
+    }
+}
+
+/// **Has the page drifted off the tab's allowlist?** `Some(host)` when it has —
+/// the host to refuse on and to audit; `None` when the landing is fine.
+///
+/// Split out from [`enforce_landing_origin`] so the decision is testable without
+/// a browser, because this is the predicate that decides whether authenticated
+/// content leaves the server.
+///
+/// * `about:blank` / no URL ⇒ fine. The empty page has no host and no content.
+/// * A scheme `host_of` cannot parse (`data:`, `file:`, `javascript:`) ⇒ **drift**.
+///   A URL with no host can never satisfy a host allowlist; waving it through
+///   because the check "does not apply" is how allowlists get bypassed.
+fn landing_drift(landed: &str, origins: &[String]) -> Option<String> {
+    if landed.is_empty() || landed == "about:blank" {
+        return None;
+    }
+    let host = host_of(landed).unwrap_or_default();
+    if !host.is_empty() && db_tabs::host_allowed(origins, &host) {
+        return None;
+    }
+    Some(host)
+}
+
+/// Does a drift REFUSE this verb, or merely annotate it?
+///
+/// Refuse the verbs that carry page content back to the agent; annotate the ones
+/// where the page has already moved and refusing protects nothing. A verb this
+/// function has never heard of is refused — a new content verb must not be able
+/// to slip past the allowlist by being new.
+fn drift_refuses(tool: &str) -> bool {
+    !matches!(tool, "click" | "request_human_takeover")
+}
+
 // ── the tools ────────────────────────────────────────────────────────────────
 
 /// **Navigation, origin-scoped on a workspace tab** (§8.4).
 ///
-/// A tab authenticated to `bank.example` and handed to an agent is a
-/// cookie-bearing HTTP client; `navigate` + `read` against an attacker-chosen
-/// host is a plausible exfil chain. So an AGENT may only navigate a tab to a host
-/// on that tab's allowlist. The human is never blocked (they navigate by driving,
-/// not through this endpoint), and in-page navigation by the site itself —
-/// redirects, SPA routing, every SSO hop — is not blocked, because it cannot be
-/// and blocking it would break the logins this feature exists to keep.
+/// This is only HALF the scope check — the destination half. The other half is
+/// [`enforce_landing_origin`], which re-checks where the page ACTUALLY IS before
+/// any content leaves the server. Guarding only the destination was a real hole:
+/// a click on an inbox link, or a page's own JS redirect, moves the tab
+/// off-allowlist without ever calling this function, and the next `read` would
+/// have returned whatever was then loaded.
 ///
 /// A scratch context has no allowlist and is unchanged.
 async fn navigate(target: &Target, args: &Value) -> Result<Value, BrowserError> {
@@ -517,13 +662,12 @@ async fn navigate(target: &Target, args: &Value) -> Result<Value, BrowserError> 
         method: "navigate".into(),
         message: "missing `url`".into(),
     })?;
-    if let Target::Workspace(tab) = target {
+    if let Target::Workspace(tab, origins) = target {
         let host = host_of(url).ok_or_else(|| BrowserError::OriginNotAllowed {
             tab: tab.id().to_string(),
             host: String::new(),
         })?;
-        let origins = tab.origins().await;
-        if !db_tabs::host_allowed(&origins, &host) {
+        if !db_tabs::host_allowed(origins, &host) {
             return Err(BrowserError::OriginNotAllowed {
                 tab: tab.id().to_string(),
                 host,
@@ -936,6 +1080,58 @@ mod tests {
         ] {
             assert_eq!(host_of(hostile), None, "{hostile} must not yield a host");
         }
+    }
+
+    /// **The landing check's decision table**, without a browser.
+    ///
+    /// This is the predicate that decides whether authenticated page content
+    /// leaves the server, so every branch is pinned here.
+    #[test]
+    fn a_page_that_drifts_off_the_allowlist_is_detected_and_the_read_verbs_refuse() {
+        let origins = vec!["mail.example.com".to_string(), ".corp.example".to_string()];
+
+        // On-allowlist landings are fine, exact and suffix alike.
+        assert_eq!(landing_drift("https://mail.example.com/inbox", &origins), None);
+        assert_eq!(landing_drift("https://sso.corp.example/x", &origins), None);
+        // The empty page has no host and no content.
+        assert_eq!(landing_drift("about:blank", &origins), None);
+        assert_eq!(landing_drift("", &origins), None);
+
+        // THE HOLE: the tab moved to a host nobody allowed. `navigate` never saw
+        // this URL — a click or the page's own JS put it there.
+        assert_eq!(
+            landing_drift("https://evil.test/collect", &origins),
+            Some("evil.test".to_string())
+        );
+        // A near-miss host must not pass a suffix check.
+        assert_eq!(
+            landing_drift("https://notmail.example.com/", &origins),
+            Some("notmail.example.com".to_string())
+        );
+        // A scheme with NO host cannot satisfy a host allowlist. Fail closed —
+        // "the check does not apply" must never read as "allowed".
+        for hostless in [
+            "data:text/html,<h1>hi",
+            "file:///etc/passwd",
+            "javascript:1",
+        ] {
+            assert_eq!(
+                landing_drift(hostless, &origins),
+                Some(String::new()),
+                "{hostless} must count as drift"
+            );
+        }
+
+        // The content verbs refuse; the verbs whose page already moved annotate.
+        for refused in ["read", "screenshot", "navigate"] {
+            assert!(drift_refuses(refused), "{refused} must refuse on drift");
+        }
+        for annotated in ["click", "request_human_takeover"] {
+            assert!(!drift_refuses(annotated), "{annotated} must not refuse");
+        }
+        // A verb nobody has taught this function about is refused: a NEW content
+        // verb must not bypass the allowlist by being new.
+        assert!(drift_refuses("some_future_read_verb"));
     }
 
     /// **T7 — the confused-deputy guard.** A session with the connector grant but
@@ -1493,15 +1689,29 @@ mod tests {
         // real loopback origins instead — `127.0.0.1` is allowed, `localhost` is
         // the same server under a DIFFERENT host, which is exactly the shape of
         // the same-site-attacker case the allowlist exists for.
-        let (url, server) = {
+        // Two paths on ONE server: `/` is an ordinary page, `/go` is a page that
+        // takes itself off-allowlist the moment it loads — the site-driven half
+        // of the exploit, which `navigate`'s destination check cannot see.
+        let (url, server, port) = {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            let port = addr.port();
             let handle = tokio::spawn(async move {
                 loop {
                     let Ok((mut sock, _)) = listener.accept().await else { return };
                     tokio::spawn(async move {
-                        use tokio::io::AsyncWriteExt;
-                        let body = "<title>allowed</title><body>on-allowlist</body>";
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 1024];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let body = if req.contains("GET /go") {
+                            format!(
+                                "<title>drift</title><body>redirecting<script>\
+                                 location.replace('http://localhost:{port}/');</script></body>"
+                            )
+                        } else {
+                            "<title>allowed</title><body>on-allowlist</body>".to_string()
+                        };
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
@@ -1512,9 +1722,10 @@ mod tests {
                     });
                 }
             });
-            (format!("http://127.0.0.1:{}/", addr.port()), handle)
+            (format!("http://127.0.0.1:{port}/"), handle, port)
         };
         let off_host = url.replace("127.0.0.1", "localhost");
+        let drift_url = format!("http://127.0.0.1:{port}/go");
 
         crate::db::browser_tabs::create(
             &state.pool,
@@ -1579,6 +1790,87 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
+
+        // ── THE LANDING HALF ────────────────────────────────────────────────
+        // Navigate to an ON-allowlist URL whose PAGE then takes the tab
+        // off-allowlist. `navigate` approved the destination and never sees
+        // where the tab ends up; before the landing check, the read below
+        // happily returned the off-allowlist page.
+        let (st, _) = call(
+            &state,
+            "alice",
+            "tok-alice",
+            "navigate",
+            json!({ "tab": "tb_originscope1", "url": drift_url }),
+        )
+        .await;
+        // Either the redirect landed inside `navigate` (403, the landing check
+        // firing on navigate itself) or it landed just after (200). Both are
+        // correct; what must NOT be possible is reading the result.
+        assert!(
+            st == StatusCode::OK || st == StatusCode::FORBIDDEN,
+            "unexpected navigate status {st}"
+        );
+
+        let mut refused = None;
+        for _ in 0..40 {
+            let (st, v) = call(
+                &state,
+                "alice",
+                "tok-alice",
+                "read",
+                json!({ "tab": "tb_originscope1" }),
+            )
+            .await;
+            if st == StatusCode::FORBIDDEN {
+                refused = Some(v);
+                break;
+            }
+            // Still on the redirecting page — it must at least not be the
+            // off-allowlist one already.
+            assert!(
+                !v["result"]["url"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("localhost"),
+                "an off-allowlist page was READ — the landing check did not fire: {v}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let refused = refused.expect("the drifted tab must eventually refuse a read");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("localhost"),
+            "the refusal names the host the human would have to allow: {refused}"
+        );
+
+        // A screenshot of the same drifted page is refused for the same reason —
+        // a picture of an off-allowlist page is the same exfiltration as its text.
+        let (st, _) = call(
+            &state,
+            "alice",
+            "tok-alice",
+            "screenshot",
+            json!({ "tab": "tb_originscope1" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "screenshot must refuse too");
+
+        // The drift is on the record even though every read was refused, so a
+        // tab that keeps wandering is visible in its activity trail.
+        let drifts: Vec<String> = sqlx::query_scalar(
+            "SELECT action FROM audit_log WHERE target = ? ORDER BY id",
+        )
+        .bind("tab:tb_originscope1")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+        assert!(
+            drifts.iter().any(|a| a == "browser.off_allowlist"),
+            "an off-allowlist landing must write its own audit entry: {drifts:?}"
+        );
 
         state.browser.shutdown().await;
         server.abort();

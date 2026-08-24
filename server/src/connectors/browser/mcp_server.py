@@ -151,7 +151,9 @@ READ_TOOL = {
     "description": (
         "Read the shared browser's current page as text: the whole body, or one "
         "element's text when `selector` is given. Also returns the URL and "
-        "title. Reading is always allowed, even while the human drives."
+        "title. Reading is NOT free: it is refused while the human is driving "
+        "(their login form is not yours to read), and on a shared tab it is "
+        "refused if the page has drifted to a host outside that tab's allowlist."
     ),
     "inputSchema": {
         "type": "object",
