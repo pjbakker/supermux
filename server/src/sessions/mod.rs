@@ -1461,17 +1461,17 @@ pub async fn duplicate(
             }
         }
     }
-    // T6.2 — the schedules come too, DISABLED. Before B5 no child row was
-    // cloned at all, so "duplicate this agent" silently dropped its jobs. They
-    // arrive disabled because a copy that immediately starts firing cron jobs
-    // is a surprise, and the framing is "a bot is its own template", not "its
-    // own daemon" — the UI says so at the call site.
-    match db::schedules::copy_for_session(&state.pool, src, new_name).await {
+    // T6.2 — the workflows come too, WITH THEIR STEPS, DISABLED. Before B5 no
+    // child row was cloned at all, so "duplicate this agent" silently dropped
+    // its jobs. They arrive disabled because a copy that immediately starts
+    // firing is a surprise, and the framing is "a bot is its own template", not
+    // "its own daemon" — the UI says so at the call site.
+    match db::workflows::copy_for_session(&state.pool, src, new_name).await {
         Ok(0) => {}
-        Ok(n) => tracing::info!(src = %src, new = %new_name, schedules = n, "duplicate: copied schedules (disabled)"),
-        // Best-effort: a session without its schedules is still a usable copy,
+        Ok(n) => tracing::info!(src = %src, new = %new_name, workflows = n, "duplicate: copied workflows (disabled)"),
+        // Best-effort: a session without its workflows is still a usable copy,
         // and failing the whole duplicate over them would be worse.
-        Err(e) => tracing::warn!(src = %src, error = %e, "duplicate: could not copy schedules"),
+        Err(e) => tracing::warn!(src = %src, error = %e, "duplicate: could not copy workflows"),
     }
     let hook_token = gen_hook_token();
     db::sessions::ensure_runtime(&state.pool, new_name, &hook_token).await?;
@@ -2288,7 +2288,7 @@ async fn seen_handler(
 
 /// `POST /api/sessions/{name}/restart` — atomic stop→start (rung 2).
 ///
-/// Preserves the conversation, worktree and schedules; destroys the live pty.
+/// Preserves the conversation, worktree and workflows; destroys the live pty.
 /// Exists because two clients composed this differently, and because a composed
 /// stop+start leaves a window in which the auto-healer can race the user.
 async fn restart_handler(
@@ -2319,7 +2319,7 @@ async fn recover_handler(
 
 /// `POST /api/sessions/{name}/reset` — a fresh runtime (rung 3).
 ///
-/// Preserves the worktree, schedules and config; destroys the conversation and
+/// Preserves the worktree, workflows and config; destroys the conversation and
 /// scrollback. Refuses a RUNNING session with a 409 rather than resetting under
 /// a live pty — see `lifecycle::reset` for why that split-brain is worse than
 /// the refusal.

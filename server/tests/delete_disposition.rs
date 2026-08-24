@@ -2,19 +2,23 @@
 //!
 //! §15.3 asks for "delete honesty: enumerate what is/isn't removed". The audit
 //! found the enumeration was not just missing from the UI — one row of it was
-//! WRONG in the code. `schedules.session` is a bare `TEXT NOT NULL` with no FK
-//! (`0003_schedules.sql:7`), so deleting or purging a session left its
-//! schedules pointing at a name that no longer resolves. Every tick then failed
-//! its existence check, recorded an error run, **and pushed a notification to
-//! the user's phone** (`runner.rs`) — forever, for a session they deleted.
+//! WRONG in the code. `workflows.session` is a bare `TEXT NOT NULL` with no FK
+//! (`0038_workflows.sql`, deliberately — spec §2.4), so deleting or purging a
+//! session left its jobs pointing at a name that no longer resolves. Every tick
+//! then failed its existence check, recorded an error run, **and pushed a
+//! notification to the user's phone** — forever, for a session they deleted.
 //!
-//! The disposition chosen (T7.1): the schedules are **soft-deleted**
+//! The disposition chosen (T7.1): the workflows are **soft-deleted**
 //! (`deleted = now`), not hard-deleted. The tick loop filters `deleted IS NULL`
-//! so firing stops immediately, while `schedule_runs` — which FK-CASCADEs off
-//! `schedules(id)` and would be destroyed by a hard DELETE — keeps its history.
-//! "The schedule stops and won't run again. Past runs stay in the log." is
-//! already the copy on the manual delete-schedule path; this makes the implicit
-//! path behave the same way.
+//! so firing stops immediately, while `workflow_runs` — which FK-CASCADEs off
+//! `workflows(id)` and would be destroyed by a hard DELETE — keeps its history.
+//! "The workflow stops and won't run again. Past runs stay in the log." is
+//! already the copy on the manual delete path; this makes the implicit path
+//! behave the same way.
+//!
+//! Workflows v1 note: `workflows.session` being unkeyed is now a WRITTEN-DOWN
+//! choice with four named cascades (rename / delete / duplicate / archive), and
+//! three of the four are asserted here.
 //!
 //! R3's mitigation: this file is the disposition table *as a test*, so a future
 //! change to either handler that forgets the copy fails CI rather than turning
@@ -23,7 +27,7 @@
 use std::path::PathBuf;
 
 use supermux_server::config::{Config, ProviderDefaults, TlsConfig, WsConfig};
-use supermux_server::db::schedules::Schedule;
+use supermux_server::db::workflows::{StepInput, Workflow};
 use supermux_server::state::AppState;
 use supermux_server::{db, sessions};
 
@@ -78,66 +82,55 @@ fn new_session(name: &str, dir: &std::path::Path) -> db::sessions::NewSession {
     }
 }
 
-fn tmux_schedule(id: &str, session: &str) -> Schedule {
+fn workflow(id: &str, session: &str) -> Workflow {
     let now = chrono::Utc::now().timestamp();
-    Schedule {
+    Workflow {
         id: id.to_string(),
         title: "orphan candidate".to_string(),
         session: session.to_string(),
-        command: String::new(),
-        prompt: "ping".to_string(),
-        kind: "tmux".to_string(),
-        boot_dir: String::new(),
-        boot_provider: String::new(),
-        boot_worktree: 0,
-        sched_type: "recurring".to_string(),
-        recurrence: Some("every 1 minute".to_string()),
-        run_at: None,
-        next_run: Some(
-            (chrono::Utc::now() + chrono::Duration::minutes(1))
-                .to_rfc3339(),
-        ),
-        last_run: None,
+        company_id: None,
         enabled: 1,
-        run_count: 0,
+        trigger_kind: "recurring".to_string(),
         schedule_expr: Some("every 1 minute".to_string()),
-        watch: 0,
-        watch_timeout: 0,
-        done_pattern: None,
-        done_action: "notify".to_string(),
-        confirm_finish: 0,
-        bypass_permissions: 0,
+        next_run: Some((chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339()),
+        last_run: None,
+        run_count: 0,
+        on_complete: r#"{"kind":"notify"}"#.to_string(),
         created: now,
         updated: now,
         deleted: None,
     }
 }
 
-/// T7.1 — the orphan fix, stated as an invariant: **no schedule survives its
+fn step(prompt: &str) -> StepInput {
+    StepInput { prompt: prompt.to_string(), ..Default::default() }
+}
+
+/// T7.1 — the orphan fix, stated as an invariant: **no workflow survives its
 /// session**. This is the failing test the fix was written against.
 #[tokio::test]
-async fn no_schedule_survives_its_session_delete() {
+async fn no_workflow_survives_its_session_delete() {
     let (state, dir) = new_state().await;
     db::sessions::create(&state.pool, &new_session("doomed", &dir))
         .await
         .unwrap();
-    db::schedules::insert(&state.pool, &tmux_schedule("s-doomed", "doomed"))
+    db::workflows::insert(&state.pool, &workflow("s-doomed", "doomed"))
         .await
         .unwrap();
 
     // Precondition: the tick loop can see it.
-    let due = db::schedules::enabled_with_next(&state.pool).await.unwrap();
+    let due = db::workflows::enabled_with_next(&state.pool).await.unwrap();
     assert!(
         due.iter().any(|s| s.id == "s-doomed"),
-        "precondition: the schedule is live to the tick loop"
+        "precondition: the workflow is live to the tick loop"
     );
 
     db::sessions::delete(&state.pool, "doomed").await.unwrap();
 
-    let due = db::schedules::enabled_with_next(&state.pool).await.unwrap();
+    let due = db::workflows::enabled_with_next(&state.pool).await.unwrap();
     assert!(
         !due.iter().any(|s| s.id == "s-doomed"),
-        "the deleted session's schedule is still firing — every tick errors and \
+        "the deleted session's workflow is still firing — every tick errors and \
          pushes to the user's phone"
     );
 }
@@ -207,12 +200,12 @@ async fn delete_broadcasts_a_sessions_removal_delta() {
 /// hard delete (the Archived sheet's "Delete forever"), so this is the one that
 /// actually happens in the wild.
 #[tokio::test]
-async fn no_schedule_survives_its_session_purge() {
+async fn no_workflow_survives_its_session_purge() {
     let (state, dir) = new_state().await;
     db::sessions::create(&state.pool, &new_session("purged", &dir))
         .await
         .unwrap();
-    db::schedules::insert(&state.pool, &tmux_schedule("s-purged", "purged"))
+    db::workflows::insert(&state.pool, &workflow("s-purged", "purged"))
         .await
         .unwrap();
     db::sessions::set_archived(&state.pool, "purged", true)
@@ -221,31 +214,32 @@ async fn no_schedule_survives_its_session_purge() {
 
     sessions::purge(&state, "purged").await.expect("purge");
 
-    let due = db::schedules::enabled_with_next(&state.pool).await.unwrap();
+    let due = db::workflows::enabled_with_next(&state.pool).await.unwrap();
     assert!(
         !due.iter().any(|s| s.id == "s-purged"),
-        "the purged session's schedule is still firing"
+        "the purged session's workflow is still firing"
     );
 }
 
 /// The disposition is a SOFT delete, and that distinction is load-bearing:
-/// `schedule_runs` FK-CASCADEs off `schedules(id)`, so hard-deleting the
-/// schedule would take the run ledger with it. "Past runs stay in the log" is
-/// the promise the manual delete-schedule path already makes; the implicit path
+/// `workflow_runs` FK-CASCADEs off `workflows(id)`, so hard-deleting the
+/// workflow would take the run ledger with it. "Past runs stay in the log" is
+/// the promise the manual delete path already makes; the implicit path
 /// keeps it too.
 #[tokio::test]
-async fn the_schedules_run_history_survives_the_disposition() {
+async fn deleting_a_session_soft_deletes_its_workflows_and_keeps_the_run_log() {
     let (state, dir) = new_state().await;
     db::sessions::create(&state.pool, &new_session("historic", &dir))
         .await
         .unwrap();
-    db::schedules::insert(&state.pool, &tmux_schedule("s-historic", "historic"))
+    db::workflows::insert(&state.pool, &workflow("s-historic", "historic"))
         .await
         .unwrap();
-    db::schedules::insert_run(
+    db::workflows::insert_run(
         &state.pool,
         "s-historic",
         chrono::Utc::now().timestamp(),
+        "tick",
         "ok",
         "sent to historic",
     )
@@ -254,7 +248,7 @@ async fn the_schedules_run_history_survives_the_disposition() {
 
     db::sessions::delete(&state.pool, "historic").await.unwrap();
 
-    let runs = db::schedules::runs_for(&state.pool, "s-historic", 10)
+    let runs = db::workflows::runs_for(&state.pool, "s-historic", 10)
         .await
         .unwrap();
     assert_eq!(
@@ -266,17 +260,17 @@ async fn the_schedules_run_history_survives_the_disposition() {
 }
 
 /// Archive is the reversible verb — it is the "undo window" §15.3 asks for,
-/// it just was never named as one. It must NOT dispose of the schedules: T5's
+/// it just was never named as one. It must NOT dispose of the workflows: T5's
 /// contract is that they are *paused* (a pure function of `sessions.archived`)
 /// and resume on unarchive. This test is what stops T7's fix from being
 /// implemented one layer too high and quietly destroying them.
 #[tokio::test]
-async fn archive_preserves_the_schedules_it_only_pauses_them() {
+async fn archive_preserves_the_workflows_it_only_pauses_them() {
     let (state, dir) = new_state().await;
     db::sessions::create(&state.pool, &new_session("resting", &dir))
         .await
         .unwrap();
-    db::schedules::insert(&state.pool, &tmux_schedule("s-resting", "resting"))
+    db::workflows::insert(&state.pool, &workflow("s-resting", "resting"))
         .await
         .unwrap();
 
@@ -284,16 +278,16 @@ async fn archive_preserves_the_schedules_it_only_pauses_them() {
         .await
         .unwrap();
 
-    let sched = db::schedules::get(&state.pool, "s-resting")
+    let sched = db::workflows::get(&state.pool, "s-resting")
         .await
         .unwrap()
-        .expect("archive must not delete the schedule — it is reversible");
+        .expect("archive must not delete the workflow — it is reversible");
     assert!(sched.deleted.is_none(), "archive is not a disposition");
     assert_eq!(sched.enabled, 1, "the row is untouched; the pause is dynamic");
 }
 
 /// Purge refuses a live session (409) and an absent one (404) BEFORE anything
-/// destructive runs — so a failed purge disposes of nothing, schedules
+/// destructive runs — so a failed purge disposes of nothing, workflows
 /// included. Guards the ordering, not just the outcome.
 #[tokio::test]
 async fn a_refused_purge_disposes_of_nothing() {
@@ -301,7 +295,7 @@ async fn a_refused_purge_disposes_of_nothing() {
     db::sessions::create(&state.pool, &new_session("live", &dir))
         .await
         .unwrap();
-    db::schedules::insert(&state.pool, &tmux_schedule("s-live", "live"))
+    db::workflows::insert(&state.pool, &workflow("s-live", "live"))
         .await
         .unwrap();
 
@@ -309,10 +303,10 @@ async fn a_refused_purge_disposes_of_nothing() {
     sessions::purge(&state, "live")
         .await
         .expect_err("purge must refuse a live session");
-    let due = db::schedules::enabled_with_next(&state.pool).await.unwrap();
+    let due = db::workflows::enabled_with_next(&state.pool).await.unwrap();
     assert!(
         due.iter().any(|s| s.id == "s-live"),
-        "a refused purge must not have disposed of the schedule"
+        "a refused purge must not have disposed of the workflow"
     );
     assert!(db::sessions::exists(&state.pool, "live").await.unwrap());
 
@@ -320,4 +314,93 @@ async fn a_refused_purge_disposes_of_nothing() {
     sessions::purge(&state, "no-such-session")
         .await
         .expect_err("purge of an unknown session is a 404");
+}
+
+/// **Rename** — the second of the four cascades (spec §2.4). `workflows.session`
+/// is unkeyed TEXT, so deferred-FK does not reach it: without the explicit
+/// `UPDATE workflows SET session = ?` in `db::sessions::rename`, renaming a bot
+/// orphans every job it owns — pointed at a slug that no longer resolves.
+#[tokio::test]
+async fn renaming_a_session_repoints_its_workflows() {
+    let (state, dir) = new_state().await;
+    db::sessions::create(&state.pool, &new_session("scout", &dir))
+        .await
+        .unwrap();
+    db::workflows::insert(&state.pool, &workflow("wf-renamed", "scout"))
+        .await
+        .unwrap();
+
+    db::sessions::rename(&state.pool, "scout", "recon").await.unwrap();
+
+    let wf = db::workflows::get(&state.pool, "wf-renamed")
+        .await
+        .unwrap()
+        .expect("a rename must not lose the workflow");
+    assert_eq!(wf.session, "recon", "the workflow follows its bot's new name");
+    assert!(
+        db::workflows::list_for_session(&state.pool, "scout").await.unwrap().is_empty(),
+        "nothing is left pointing at the old slug — that is what orphans a job"
+    );
+}
+
+/// **Duplicate** — the third cascade. A copy that arrived with the trigger but
+/// an empty body would be exactly the bug `copy_for_session`'s doc-comment was
+/// written to prevent, one level down: today's function copies zero children.
+///
+/// This exercises the two db calls `sessions::duplicate` makes back-to-back
+/// (`db::sessions::duplicate` then `db::workflows::copy_for_session`), which is
+/// the whole of the cascade — the rest of that handler is pty and detector work.
+#[tokio::test]
+async fn duplicating_a_session_copies_workflows_and_their_steps_disabled_with_reset_counters() {
+    let (state, dir) = new_state().await;
+    db::sessions::create(&state.pool, &new_session("template", &dir))
+        .await
+        .unwrap();
+
+    let mut src = workflow("wf-template", "template");
+    src.run_count = 7;
+    src.last_run = Some("2026-08-01T09:00:00+00:00".to_string());
+    db::workflows::insert(&state.pool, &src).await.unwrap();
+    let src_steps = db::workflows::replace_steps(
+        &state.pool,
+        "wf-template",
+        &[step("one"), step("two"), step("three")],
+    )
+    .await
+    .unwrap();
+
+    db::sessions::duplicate(&state.pool, "template", "template-copy").await.unwrap();
+    let copied = db::workflows::copy_for_session(&state.pool, "template", "template-copy")
+        .await
+        .unwrap();
+    assert_eq!(copied, 1);
+
+    let copies = db::workflows::list_for_session(&state.pool, "template-copy").await.unwrap();
+    assert_eq!(copies.len(), 1);
+    let copy = &copies[0];
+    assert_ne!(copy.id, "wf-template", "the copy is its own row, with its own fire-key space");
+    assert!(copy.id.starts_with("WF-"));
+    assert_eq!(copy.title, "orphan candidate");
+    assert_eq!(copy.enabled, 0, "a copy that starts firing on its own is a surprise");
+    assert_eq!(copy.run_count, 0, "inheriting the original's ledger would make the copy's log a lie");
+    assert_eq!(copy.next_run, None);
+    assert_eq!(copy.last_run, None);
+
+    // The steps come too — same order, same bodies, NEW ids.
+    let copy_steps = db::workflows::steps_for(&state.pool, &copy.id).await.unwrap();
+    assert_eq!(copy_steps.len(), 3, "a workflow IS its ordered steps; a copy without them is broken");
+    assert_eq!(copy_steps.iter().map(|s| s.position).collect::<Vec<_>>(), vec![0, 1, 2]);
+    assert_eq!(
+        copy_steps.iter().map(|s| s.prompt.as_str()).collect::<Vec<_>>(),
+        vec!["one", "two", "three"]
+    );
+    for s in &copy_steps {
+        assert!(s.id.starts_with("WS-"));
+        assert!(!src_steps.iter().any(|o| o.id == s.id), "the copy's steps are its own");
+    }
+
+    // And the original is untouched.
+    let original = db::workflows::get(&state.pool, "wf-template").await.unwrap().unwrap();
+    assert_eq!(original.enabled, 1);
+    assert_eq!(original.run_count, 7);
 }

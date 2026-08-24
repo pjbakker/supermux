@@ -2622,8 +2622,8 @@ pub async fn unarchive(state: &AppState, name: &str) -> Result<(), AppError> {
 //   | rung           | preserves                          | destroys                    |
 //   |----------------|------------------------------------|-----------------------------|
 //   | Recover holder | scrollback                         | nothing else                |
-//   | Restart        | conversation, worktree, schedules  | live pty + in-memory buffer |
-//   | Reset          | worktree, schedules, config        | conversation + scrollback   |
+//   | Restart        | conversation, worktree, workflows  | live pty + in-memory buffer |
+//   | Reset          | worktree, workflows, config        | conversation + scrollback   |
 //
 // `BRAND.md` §6h carries the same three sentences the UI shows.
 
@@ -2635,7 +2635,7 @@ pub async fn unarchive(state: &AppState, name: &str) -> Result<(), AppError> {
 /// and a heal landing in that gap races the user's own restart.
 ///
 /// Preserves the conversation (Claude resumes it), the worktree and the
-/// schedules. Destroys the live pty and whatever scrollback lived only in it.
+/// workflows. Destroys the live pty and whatever scrollback lived only in it.
 pub async fn restart(state: &AppState, name: &str) -> Result<StartResult, AppError> {
     if !db::sessions::exists_active(&state.pool, name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
@@ -2672,7 +2672,7 @@ pub async fn recover_holder(state: &AppState, name: &str) -> Result<super::auto_
 /// Rung 3 — **Reset**: a fresh runtime for a session whose state is wedged.
 ///
 /// Preserves everything the user thinks of as THEIRS — the working directory,
-/// the worktree, the branch, the schedules, the config, the session's identity
+/// the worktree, the branch, the workflows, the config, the session's identity
 /// and name. Destroys the conversation link, the scrollback and the activity
 /// state.
 ///
