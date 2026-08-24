@@ -23,7 +23,11 @@ import { describe, expect, test } from 'bun:test'
 import { companyForPath, type Company } from '@/lib/companies'
 import { mapWithLimit, type Settled } from '@/lib/concurrency'
 import { duplicateName, summarizeBulk } from '@/lib/files-bulk'
-import { filesLiveActions, parseFilesFrame } from '@/hooks/use-files'
+import {
+  applyFilesFrame,
+  filesLiveActions,
+  parseFilesFrame,
+} from '@/hooks/use-files'
 
 function company(over: Partial<Company> & { id: number }): Company {
   return {
@@ -324,5 +328,88 @@ describe('filesLiveActions — what one frame invalidates', () => {
       dirty: false,
     })
     expect(a.invalidate).toEqual([])
+  })
+})
+
+// ── the whole SSE hop, against a stub query client ────────────────────────────
+
+describe('applyFilesFrame — one frame, end to end', () => {
+  const ACME: Company = company({ id: 1, slug: 'acme', root_dir: '/srv/acme' })
+  const GLOBEX: Company = company({ id: 2, slug: 'globex', root_dir: '/srv/globex' })
+
+  function stub() {
+    const invalidated: (readonly unknown[])[] = []
+    const recorded: { key: string; path: string }[] = []
+    const stale: string[] = []
+    return {
+      invalidated,
+      recorded,
+      stale,
+      sinks: {
+        invalidate: (k: readonly unknown[]) => void invalidated.push(k),
+        record: (key: string, a: { path: string }) =>
+          void recorded.push({ key, path: a.path }),
+        markStale: (p: string) => void stale.push(p),
+      },
+    }
+  }
+
+  test('the frame is filed under the company that OWNS THE PATH', () => {
+    const s = stub()
+    applyFilesFrame(
+      { op: 'write', path: '/srv/globex/x.md', dir: '/srv/globex', from: null, session: 'bo' },
+      { dirPath: DIR, openPath: null, dirty: false },
+      [ACME, GLOBEX],
+      s.sinks,
+      123,
+    )
+    // Stamped by PATH, never by the emitting session's company — an owner-run
+    // HQ bot can write into any company's folder.
+    expect(s.recorded).toEqual([{ key: '2', path: '/srv/globex/x.md' }])
+    // …and a frame for a directory we are not looking at invalidates nothing.
+    expect(s.invalidated).toEqual([])
+  })
+
+  test('an HQ path (under no company root) is filed under "hq"', () => {
+    const s = stub()
+    applyFilesFrame(
+      { op: 'write', path: '/home/me/notes.md', dir: '/home/me', from: null, session: null },
+      { dirPath: null, openPath: null, dirty: false },
+      [ACME, GLOBEX],
+      s.sinks,
+      1,
+    )
+    expect(s.recorded[0]!.key).toBe('hq')
+  })
+
+  test('the OPEN directory is invalidated, and a clean open file refetched', () => {
+    const s = stub()
+    applyFilesFrame(
+      { op: 'write', path: OPEN, dir: DIR, from: null, session: 'bo' },
+      { dirPath: DIR, openPath: OPEN, dirty: false },
+      [ACME],
+      s.sinks,
+      1,
+    )
+    expect(s.invalidated).toEqual([
+      ['files', 'ls', DIR],
+      ['files', 'file', OPEN],
+    ])
+    expect(s.stale).toEqual([])
+  })
+
+  test('A DIRTY DRAFT IS NEVER REFETCHED OVER — it is reported instead', () => {
+    const s = stub()
+    applyFilesFrame(
+      { op: 'write', path: OPEN, dir: DIR, from: null, session: 'bo' },
+      { dirPath: DIR, openPath: OPEN, dirty: true },
+      [ACME],
+      s.sinks,
+      1,
+    )
+    expect(s.invalidated).toEqual([['files', 'ls', DIR]])
+    expect(s.stale).toEqual([OPEN])
+    // The activity line still updates: the bot's write is real either way.
+    expect(s.recorded[0]!.key).toBe('1')
   })
 })

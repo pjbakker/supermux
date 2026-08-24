@@ -34,6 +34,7 @@ import { useSse, type SseEventType } from '@/hooks/use-sse'
 import {
   activityKey,
   useFilesActivityStore,
+  type FilesActivity,
 } from '@/stores/files-activity-store'
 
 /** The home-directory sentinel the backend expands to $HOME. */
@@ -264,6 +265,47 @@ export function filesLiveActions(
   return { invalidate, staleOpenFile: touchesOpenFile && ctx.dirty }
 }
 
+/** Where one frame's consequences go. An interface rather than the query client
+ *  itself so `applyFilesFrame` below is drivable by a stub — the whole point of
+ *  extracting it. */
+export interface FilesLiveSinks {
+  invalidate: (key: readonly unknown[]) => void
+  record: (key: string, activity: FilesActivity) => void
+  /** The open file changed under a DIRTY draft: nothing was refetched, and the
+   *  caller is expected to surface that rather than resolve it. */
+  markStale: (path: string) => void
+}
+
+/**
+ * Apply ONE frame. This is the entire behaviour of `useFilesLive` minus the
+ * React plumbing — extracted so the wiring is testable without a DOM, an
+ * `EventSource` or a real query client (this repo's tests pin logic and SSR
+ * structure; live event delivery is Playwright's job).
+ *
+ * Order matters in exactly one way: the activity line is recorded for EVERY
+ * frame, including frames for directories nobody is looking at. That is the
+ * point of the landing — it is how you find out a bot is busy in a space you
+ * left. The invalidations are scoped to what is actually on screen.
+ */
+export function applyFilesFrame(
+  frame: FilesFrame,
+  ctx: FilesLiveContext,
+  companies: readonly Company[],
+  sinks: FilesLiveSinks,
+  at: number,
+): void {
+  const owner = companyForPath(frame.path, companies)
+  sinks.record(activityKey(owner ? owner.id : null), {
+    at,
+    path: frame.path,
+    op: frame.op,
+    session: frame.session,
+  })
+  const { invalidate, staleOpenFile } = filesLiveActions(frame, ctx)
+  for (const key of invalidate) sinks.invalidate(key)
+  if (staleOpenFile && ctx.openPath) sinks.markStale(ctx.openPath)
+}
+
 /** Lexical parent of an absolute path. Used ONLY for a rename's `from` (the
  *  server gives us `dir` for the destination); a lexical split is right here
  *  because both sides came from the same server-canonicalized string. */
@@ -312,26 +354,17 @@ export function useFilesLive(
         if (type !== 'files') return
         const frame = parseFilesFrame(payload)
         if (!frame) return
-
-        // The landing line, for EVERY frame — including ones for directories
-        // we are not looking at. That is the point: the grid is how you find
-        // out a bot is busy in a space you left.
-        const owner = companyForPath(frame.path, companiesRef.current)
-        record(activityKey(owner ? owner.id : null), {
-          at: Date.now(),
-          path: frame.path,
-          op: frame.op,
-          session: frame.session,
-        })
-
-        const { invalidate, staleOpenFile } = filesLiveActions(
+        applyFilesFrame(
           frame,
           ctxRef.current,
+          companiesRef.current,
+          {
+            invalidate: (key) => void qc.invalidateQueries({ queryKey: key }),
+            record,
+            markStale: setStaleOpen,
+          },
+          Date.now(),
         )
-        for (const key of invalidate) {
-          void qc.invalidateQueries({ queryKey: key })
-        }
-        if (staleOpenFile) setStaleOpen(ctxRef.current.openPath)
       },
       // A wake from a backgrounded tab: everything we missed while the
       // EventSource was suspended is one listing refresh away.
