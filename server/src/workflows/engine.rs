@@ -847,6 +847,11 @@ pub async fn cancel(state: &AppState, run_id: i64) -> Result<(), AppError> {
     Ok(())
 }
 
+/// The crash reaper — implemented in T2.5.
+pub async fn reap(state: &AppState) {
+    let _ = state;
+}
+
 /// Fire a STEP's own `on_complete`, if it has one. The engine never formats a
 /// message here: it hands `complete::fire` a typed enum and nothing else, which
 /// is the seam that keeps `done_action: command:<text>` from growing back.

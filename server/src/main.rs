@@ -7,7 +7,7 @@
 //! `lib.rs` so the binary and integration tests share them.
 
 use supermux_server::{
-    agents, bot_memory, config, connectors, db, external_edit, http, scheduler, sessions, state,
+    agents, bot_memory, config, connectors, db, external_edit, http, sessions, state,
     teams, workflows,
 };
 
@@ -162,8 +162,8 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "workflows: port reconciliation failed"),
     }
 
-    // Background tasks. The scheduler tick runs here.
-    scheduler::spawn(state.clone());
+    // Background tasks. The workflows tick (and its crash reaper) run here.
+    workflows::spawn(state.clone());
     // Resume per-session status detection on boot (cold-start init).
     sessions::auto_actions::spawn_all(&state).await;
     // Resume per-session steering delivery on boot.
