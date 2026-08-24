@@ -7,7 +7,7 @@
 // and invalidates on both. There is no interval here, ever, and no second
 // connection: reconnect / backoff / staleness are all `useSse`'s.
 
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import {
   useMutation,
   useQuery,
@@ -187,4 +187,106 @@ export function useWorkflowsStream() {
   const onResync = useCallback(() => invalidateWorkflows(qc), [qc])
   const handlers = useMemo(() => ({ onEvent, onResync }), [onEvent, onResync])
   useSse(handlers)
+}
+
+// ── live progress (what makes the rail move) ──────────────────────────────────
+
+/** Where one workflow's in-flight run has got to. Assembled from the SSE frames
+ *  alone — a run's step-by-step position exists nowhere else without polling a
+ *  ledger the list has no reason to fetch. */
+export interface WorkflowProgress {
+  runId: number
+  /** 1-based, matching the frame. */
+  step: number
+  steps: number
+  running: boolean
+  /** `ok` | `error` | `timeout` | `interrupted` | `cancelled`, once the run has
+   *  finished and the `alerts` frame said which. Null while running. */
+  status: string | null
+}
+
+export type ProgressMap = Readonly<Record<string, WorkflowProgress>>
+
+/**
+ * Fold one SSE frame into the progress map. PURE, so the state machine is
+ * testable without a stream.
+ *
+ * The two channels arrive in a fixed order and carry different halves of the
+ * truth: `alerts` names the terminal STATUS, the `workflows` `run-finished`
+ * frame only says it ended. So a `run-finished` never clobbers a status an
+ * alert already set — otherwise a failed run would flash red and settle grey.
+ */
+export function applyProgressFrame(
+  map: ProgressMap,
+  type: SseEventType | string,
+  payload: unknown,
+): ProgressMap {
+  const p = (payload ?? {}) as Record<string, unknown>
+  const id = typeof p.workflow === 'string' ? p.workflow : null
+  if (!id) return map
+  const prev = map[id]
+  const num = (v: unknown, fallback: number) => (typeof v === 'number' ? v : fallback)
+
+  if (type === 'alerts') {
+    const source = p.source ?? (p.payload as { source?: string } | undefined)?.source
+    if (source !== 'workflows' && source !== 'workflow') return map
+    return {
+      ...map,
+      [id]: {
+        runId: num(p.run_id, prev?.runId ?? 0),
+        step: num(p.step, prev?.step ?? 0),
+        steps: num(p.steps, prev?.steps ?? 0),
+        running: false,
+        status: typeof p.status === 'string' ? p.status : (prev?.status ?? null),
+      },
+    }
+  }
+  if (type !== 'workflows') return map
+
+  const change = typeof p.change === 'string' ? p.change : ''
+  if (change === 'run-started' || change === 'step') {
+    return {
+      ...map,
+      [id]: {
+        runId: num(p.run_id, prev?.runId ?? 0),
+        step: num(p.step, prev?.step ?? 0),
+        steps: num(p.steps, prev?.steps ?? 0),
+        running: true,
+        status: null,
+      },
+    }
+  }
+  if (change === 'run-finished' || change === 'cancelled') {
+    return {
+      ...map,
+      [id]: {
+        runId: num(p.run_id, prev?.runId ?? 0),
+        step: num(p.step, prev?.step ?? 0),
+        steps: num(p.steps, prev?.steps ?? 0),
+        running: false,
+        // `cancelled` is its own answer; anything else waits for the alert
+        // rather than inventing a verdict the server did not give.
+        status: change === 'cancelled' ? 'cancelled' : (prev?.status ?? null),
+      },
+    }
+  }
+  if (change === 'deleted') {
+    const { [id]: _gone, ...rest } = map
+    return rest
+  }
+  return map
+}
+
+/**
+ * The live position of every running workflow, folded out of the shared SSE
+ * stream. Mount alongside `useWorkflowsStream` on any surface drawing a rail.
+ */
+export function useWorkflowProgress(): ProgressMap {
+  const [map, setMap] = useState<ProgressMap>({})
+  const onEvent = useCallback((type: SseEventType, payload: unknown) => {
+    setMap((m) => applyProgressFrame(m, type, payload))
+  }, [])
+  const handlers = useMemo(() => ({ onEvent }), [onEvent])
+  useSse(handlers)
+  return map
 }
