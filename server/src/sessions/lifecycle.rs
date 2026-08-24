@@ -25,6 +25,7 @@ use crate::files::transport::{FileTransport, LocalFileTransport, SshFileTranspor
 use crate::state::{AppState, SseEvent};
 
 use super::runtime::SessionRuntime;
+use super::pty_state;
 use super::status::{self, Mode};
 use super::tmux::Tmux;
 use super::transport::HostId;
@@ -799,8 +800,9 @@ fn agent_busy(capture: &str) -> bool {
     capture.to_lowercase().contains("esc to interrupt")
 }
 
-/// May [`send_harness_text`] type `text`+Enter into the pty showing this CURRENT
-/// capture? The SEND-path twin of [`classify_ready_tick`]'s ready arm.
+/// WHY [`send_harness_text`] may NOT type `text`+Enter into the pty showing this
+/// CURRENT capture — or `None` when it may. The SEND-path twin of
+/// [`classify_ready_tick`]'s ready arm.
 ///
 /// [`wake_for_send`] already refuses a FIRST send whose wake lands on a boot
 /// modal (`start().ready == false`), but an ALREADY-AWAKE retry (`woke == false`)
@@ -830,18 +832,151 @@ fn agent_busy(capture: &str) -> bool {
 ///   * the live-composer / busy-footer glyphs are searched ONLY in the
 ///     bottom-anchored [`current_screen_tail`] — an agent glyph higher than that
 ///     is stale scrollback, not the screen we are about to type into.
-fn pty_ready_for_send(capture: &str) -> bool {
-    if at_resume_picker(capture) || at_trust_dialog(capture) {
-        return false;
+///
+/// Wave-8 scoped the POSITIVE evidence to the bottom 10 rows and left the
+/// refusal as the residue: anything with no agent glyph down there was reported
+/// as "parked at a prompt that is not the agent's … it is likely sitting on a
+/// resume picker or a folder-trust dialog". For a tall Claude-owned dialog that
+/// sentence is false in both halves. An AskUserQuestion draws its `❯` selection
+/// caret ABOVE four option rows, each with a description line, plus a rule, the
+/// out-of-box row and the footer — on the live 2.1.233 capture
+/// (`tests/fixtures/pty/ask-user-question.txt`) the caret sits at row 29 of 39,
+/// one row out of range. So the owner's session, sitting on a perfectly ordinary
+/// question, refused every message and pointed at two dialogs that were not on
+/// screen. The classification was positional: the SAME dialog with two options
+/// and no descriptions keeps its caret inside the window and sends fine.
+///
+/// So the blocking set is EXPLICIT now, and each member names itself:
+///   * the `--resume` session picker (Claude or Codex), and
+///   * a startup GATE — `trust` / `apikey` / `onboarding` / `hooks-review`,
+///     read by [`pty_state::startup_wedge`], the same reader the status detector
+///     already trusts to say a session is waiting on a human.
+/// Those are the screens where a keystroke really cannot be verified: nothing
+/// about them belongs to the agent, and Enter means something native.
+///
+/// A CLAUDE-OWNED DIALOG IS THE AGENT AT THE WHEEL. The permission menu was
+/// always admitted ("answering one is unchanged"); a question, a plan approval
+/// and a paused modal are the same thing one option list longer, and which side
+/// of a 10-row window their caret lands on is not a fact about who owns the pty.
+/// The evidence for them is bottom-anchored BY CONSTRUCTION — CC prints the
+/// dialog's key legend on the last line of the screen — so it needs no window
+/// widening and cannot be satisfied by stale scrollback the way an old `❯`
+/// could ([`agent_dialog_visible`]).
+///
+/// Everything the wave-8 guard was built for still refuses, and the residual
+/// case now says the honest thing: no agent evidence on the CURRENT screen.
+///
+/// WHAT ADMITTING A DIALOG DOES, stated plainly because it is the trade-off:
+/// a `send_text` + Enter into an open dialog is answered BY the dialog — the
+/// paste is dropped and the Enter picks the caret's row (a0 §3, and the same
+/// fact `web/src/components/chat/use-composer.ts` states). That is already true
+/// of the permission menu this guard has always admitted on purpose, and the
+/// CHAT surface refuses in front of it for every sighted dialog family
+/// (`sendGate`: `if (lens?.dialog) return { send: false … }`), which is the
+/// layer that knows what the card above the composer can do. This guard's job
+/// is narrower: keep a message out of a screen that is NOT the agent's. Making
+/// it also arbitrate which of the agent's own dialogs may be typed into — by
+/// counting rows — is what produced a 409 that named two dialogs that were not
+/// on screen.
+fn send_block(capture: &str) -> Option<SendBlock> {
+    if at_resume_picker(capture) {
+        return Some(SendBlock::ResumePicker);
+    }
+    // The gate readers run over the WHOLE capture: their identifying title sits
+    // at the TOP of the screen (and `pty_state` keeps its own tail window), so a
+    // bottom-only look would miss it and admit the selection cursor under it.
+    if at_trust_dialog(capture) {
+        return Some(SendBlock::Gate("trust"));
+    }
+    if let Some(wedge) = pty_state::startup_wedge(capture) {
+        return Some(SendBlock::Gate(wedge));
     }
     let screen = current_screen_tail(capture);
-    agent_ui_visible(&screen) || agent_busy(&screen) || codex_ready(&screen)
+    if agent_ui_visible(&screen)
+        || agent_busy(&screen)
+        || codex_ready(&screen)
+        || agent_dialog_visible(&screen)
+    {
+        return None;
+    }
+    Some(SendBlock::NoAgent)
+}
+
+/// Why a send was refused — one variant per screen, because the sentence the
+/// caller reads has to name the thing that is actually in the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendBlock {
+    /// The `--resume` session picker (Claude or Codex).
+    ResumePicker,
+    /// A named startup gate (`pty_state`'s wedge token).
+    Gate(&'static str),
+    /// Nothing on the CURRENT screen says an agent owns it — a bare shell the
+    /// agent exited to, or a screen this server cannot read as one.
+    NoAgent,
+}
+
+impl SendBlock {
+    /// The refusal, in one sentence: what is on screen, that nothing was
+    /// delivered, and the one thing that ends the situation.
+    fn sentence(self, name: &str) -> String {
+        match self {
+            SendBlock::ResumePicker => format!(
+                "session '{name}' is sitting on its resume picker — the message was NOT delivered. \
+                 Open the terminal and pick a conversation (or Reset the session), then resend.",
+            ),
+            SendBlock::Gate(wedge) => format!(
+                "session '{name}' is sitting on {} — a startup gate the agent has not passed yet, \
+                 so the message was NOT delivered. Open the terminal and answer it (or Reset the \
+                 session), then resend.",
+                gate_clause(wedge),
+            ),
+            SendBlock::NoAgent => format!(
+                "session '{name}' shows no agent prompt on its current screen — it has probably \
+                 exited to a shell, so the message was NOT delivered. Open the terminal to see \
+                 what it is showing (or Reset the session), then resend.",
+            ),
+        }
+    }
+}
+
+/// A wedge token as the reader meets it on screen. An unknown token names itself
+/// rather than being smoothed into "a startup gate" twice over — a sentence that
+/// says a word the user can search for beats one that says nothing.
+fn gate_clause(wedge: &str) -> String {
+    match wedge {
+        "trust" => "its folder-trust dialog".to_string(),
+        "apikey" => "its API-key gate".to_string(),
+        "onboarding" => "Claude Code's first-run setup".to_string(),
+        "hooks-review" => "Codex's hooks-review gate".to_string(),
+        other => format!("its `{other}` startup gate"),
+    }
+}
+
+/// Is an agent DIALOG the current screen — a permission prompt, an
+/// AskUserQuestion, a plan approval, a paused modal?
+///
+/// The key legend Claude Code and Codex print UNDER a dialog's option list, and
+/// it is the last printed line of the screen every time, which is what makes it
+/// safe to read in the bottom-anchored window that stale scrollback cannot
+/// reach. This is the evidence that survives a caret pushed out of range by a
+/// long option list — the wave-8 regression this fixes.
+///
+/// Read on the CURRENT SCREEN ONLY (never the whole capture): an answered
+/// dialog's footer scrolled up into the history is not what is being typed into.
+/// The full-screen boot modals are rejected BEFORE this is consulted, so a
+/// picker's own `Enter to select` can never be read as an agent dialog.
+fn agent_dialog_visible(screen: &str) -> bool {
+    let c = screen.to_lowercase();
+    c.contains("esc to cancel")
+        || c.contains("enter to select")
+        || c.contains("enter to confirm")
+        || c.contains("tab to amend")
 }
 
 /// True once a READY, EMPTY Codex composer is visible. Codex draws `›` (U+203A),
 /// not Claude's `❯`, so [`agent_ui_visible`] is blind to it and the send guard
 /// wrongly 409'd every send/delegate to an awake, idle Codex (FIX 2). ORed into
-/// [`pty_ready_for_send`] AFTER the picker/trust rejections, so a real Codex
+/// [`send_block`] AFTER the picker/trust rejections, so a real Codex
 /// resume-picker or folder-trust dialog is still refused first. Keyed (via
 /// `status`) on the "Ask Codex to do anything" placeholder and/or the composer
 /// model footer — signals a picker/trust dialog never shows — and NEVER on a
@@ -2164,13 +2299,14 @@ pub async fn send_harness_text(
         }
         match rt.capture_plain(status::CAPTURE_LINES).await {
             Ok(raw) => {
-                if !pty_ready_for_send(&status::prepare_capture(&raw)) {
-                    return Err(AppError::Conflict(format!(
-                        "session '{name}' is parked at a prompt that is not the agent's — the \
-                         message was NOT delivered. Open the terminal: it is likely sitting on a \
-                         resume picker or a folder-trust dialog. Dismiss it (or Reset the session), \
-                         then resend.",
-                    )));
+                // THE REFUSAL NAMES WHAT IS ACTUALLY IN THE WAY (owner report).
+                // It used to say "parked at a prompt that is not the agent's …
+                // likely sitting on a resume picker or a folder-trust dialog"
+                // for every screen that failed the guard — including a Claude
+                // question, which is neither, and which is now admitted. See
+                // `send_block`.
+                if let Some(block) = send_block(&status::prepare_capture(&raw)) {
+                    return Err(AppError::Conflict(block.sentence(name)));
                 }
             }
             // FAIL CLOSED. A send guard that cannot read the current screen must
@@ -2952,6 +3088,13 @@ mod agent_ready_heuristics_tests {
     //! detection is unit-tested directly (no real tmux needed).
     use super::*;
 
+    /// The send guard as a yes/no — the shape the wave-7/8 tests were written
+    /// against, kept so each of them reads as one assertion. `None` from
+    /// [`send_block`] IS "ready": every refusal is one of its variants.
+    fn pty_ready_for_send(capture: &str) -> bool {
+        send_block(capture).is_none()
+    }
+
     #[test]
     fn detects_claude_trust_dialog() {
         // Verbatim shape of Claude's first-run workspace-trust prompt.
@@ -3115,6 +3258,72 @@ mod agent_ready_heuristics_tests {
             pty_ready_for_send("✻ Thinking… (esc to interrupt · 12s · ↑ 2.1k tokens)"),
             "a send while the agent is mid-turn is a queue, not a swallow",
         );
+    }
+
+    /// THE OWNER'S WEDGE: a live AskUserQuestion refused every message, and the
+    /// 409 named two dialogs that were not on screen.
+    ///
+    /// The whole capture is the real one (CC 2.1.233, `tests/fixtures/pty/
+    /// ask-user-question.txt`), through the same `prepare_capture` the send path
+    /// runs. Its `❯` selection caret sits at row 29 of 39 — above four option
+    /// rows, each with a description line, plus the rule, the out-of-box row and
+    /// the footer — so wave-8's bottom-10 window missed it and the guard fell to
+    /// its residual refusal. The dialog's own key legend IS on the last line,
+    /// which is the evidence that cannot be stale, and which is what admits it
+    /// now.
+    #[test]
+    fn a_send_while_claude_asks_a_question_is_not_refused_as_a_boot_modal() {
+        let capture = status::prepare_capture(include_str!(
+            "../../tests/fixtures/pty/ask-user-question.txt"
+        ));
+        assert_eq!(
+            send_block(&capture),
+            None,
+            "an AskUserQuestion is the agent at the wheel, exactly like the permission menu \
+             beside it — a caret pushed out of a 10-row window is not a fact about who owns \
+             the pty",
+        );
+        // The answered twin — the same session one keystroke later — was never
+        // refused and must not start being.
+        let answered = status::prepare_capture(include_str!(
+            "../../tests/fixtures/pty/ask-user-question-answered.txt"
+        ));
+        assert_eq!(send_block(&answered), None);
+    }
+
+    /// The blocking set is EXPLICIT, and every member says its own name. Before
+    /// this, ANY screen that failed the positive check was reported as "parked at
+    /// a prompt that is not the agent's … likely sitting on a resume picker or a
+    /// folder-trust dialog" — false for a question, false for a bare shell, and
+    /// un-actionable in both cases.
+    #[test]
+    fn a_refused_send_names_the_screen_that_is_actually_in_the_way() {
+        let picker = "Resume a conversation\n❯ 1. Fix the parser  2h ago\n  2. Older chat";
+        assert_eq!(send_block(picker), Some(SendBlock::ResumePicker));
+        assert!(
+            send_block(picker).unwrap().sentence("ipc").contains("resume picker"),
+            "the sentence names the picker, and nothing else",
+        );
+
+        let trust = "Quick safety check: do you trust the files in this folder?\n❯ 1. Yes";
+        assert_eq!(send_block(trust), Some(SendBlock::Gate("trust")));
+        assert!(send_block(trust).unwrap().sentence("ipc").contains("folder-trust"));
+
+        // Codex's hooks-review gate: refused before this change too, but only as
+        // the residue of finding no agent glyph. Now it is refused BY NAME.
+        let hooks = status::prepare_capture(include_str!(
+            "../../tests/fixtures/pty/codex-hooks-review.txt"
+        ));
+        assert_eq!(send_block(&hooks), Some(SendBlock::Gate("hooks-review")));
+        assert!(send_block(&hooks).unwrap().sentence("ipc").contains("hooks-review"));
+
+        // The bare shell keeps its own sentence — it is not a modal, and telling
+        // the user to dismiss one would send them looking for a screen that is
+        // not there.
+        let bare = send_block("user@host project % \n").unwrap();
+        assert_eq!(bare, SendBlock::NoAgent);
+        assert!(bare.sentence("ipc").contains("no agent prompt"));
+        assert!(!bare.sentence("ipc").contains("resume picker"));
     }
 
     /// CURRENT-SCREEN scoping (wave-8, codex pass 3). A capture whose VIEWPORT is
