@@ -39,6 +39,12 @@ const Files = lazy(() =>
 const Settings = lazy(() =>
   import('@/routes/settings').then((m) => ({ default: m.Settings })),
 )
+// The shared-browser WORKSPACE (/browser) — lazy for the same reason the store
+// is, plus one of its own: it pulls in the takeover canvas + socket, which no
+// other route needs.
+const BrowserWorkspaceRoute = lazy(() =>
+  import('@/routes/browser').then((m) => ({ default: m.BrowserRoute })),
+)
 // The connector store — lazy like Settings: a headline surface, but not on the
 // cold hero path, and its catalog/card tree should not weigh the entry bundle.
 const Store = lazy(() =>
@@ -155,6 +161,11 @@ const DevSelectionProbe = import.meta.env.DEV
 // app is completely unaffected.
 const DevBrowserTakeover = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-browser-takeover'))
+  : null
+// Shared-browser WORKSPACE bench — the tab rail + the per-tab grant sheet +
+// the viewport, on fixture tabs, offline. The page the /browser shots come from.
+const DevBrowserWorkspace = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-browser-workspace'))
   : null
 // Connector-store bench — the grid + bot-scoped sheet + inline connect-card, in
 // both themes and the [data-grok] skin, offline. The page the store shots come
@@ -367,6 +378,14 @@ export default function App() {
                     </Suspense>
                   }
                 />
+                <Route
+                  path="/browser"
+                  element={
+                    <Suspense fallback={null}>
+                      <BrowserWorkspaceRoute />
+                    </Suspense>
+                  }
+                />
                 {/* Phase 6a — the phone team-detail surface. Two arms (team /
                     team+member); the component redirects to /focus/<lead> when
                     bot mode is off, so the base app never renders it. Inside
@@ -400,6 +419,16 @@ export default function App() {
                   Without the param it renders a BARE <Outlet/> — zero extra DOM,
                   so every existing bench is byte-identical. */}
               <Route element={import.meta.env.DEV ? <DevSkin /> : <Outlet />}>
+              {DevBrowserWorkspace && (
+                <Route
+                  path="/dev/browser-workspace"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevBrowserWorkspace />
+                    </Suspense>
+                  }
+                />
+              )}
               {DevStore && (
                 <Route
                   path="/dev/store"

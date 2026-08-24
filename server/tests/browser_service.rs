@@ -13,11 +13,27 @@
 //! `--test-threads=1` on purpose: each test spawns its own browser (~600 MB
 //! RSS with a few contexts), and the leak test scans the *global* process table.
 //!
+//! # Two modes, two opposite guarantees
+//!
+//! Shared-browser v1 added a persistent workspace mode beside the original
+//! per-agent scratch mode, and the two want **opposite** things from a profile:
+//!
+//! * **Agent scratch** — nothing survives. Both isolation tests below are still
+//!   true and still desirable, so they are **re-scoped, not deleted**: they name
+//!   `scratch` explicitly and select `ProfileMode::Ephemeral` explicitly, so
+//!   nobody can read them as a global invariant they stopped being.
+//! * **Workspace tab** — the login survives *everything*. That is the mirror
+//!   image, and it is one test:
+//!   [`a_login_survives_a_chrome_restart_on_the_durable_profile`].
+//!
 //! Coverage:
-//! 1. [`lifecycle_leaves_no_orphan_process_or_profile_dir`] — THE critical one.
-//! 2. [`two_contexts_are_cookie_and_localstorage_isolated`]
-//! 2b. [`a_recycled_session_name_never_inherits_the_previous_cookie_jar`] — what
-//!     disposing the context on session end buys beyond the leak fix.
+//! 1. [`lifecycle_leaves_no_orphan_process_or_profile_dir`] — THE critical one
+//!    (explicitly `Ephemeral`: an ephemeral profile is still removed).
+//! 2. [`two_scratch_contexts_are_cookie_and_localstorage_isolated`]
+//! 2b. [`a_recycled_session_name_never_inherits_the_previous_scratch_cookie_jar`]
+//!     — what disposing the context on session end buys beyond the leak fix.
+//! 2c. [`a_login_survives_a_chrome_restart_on_the_durable_profile`] — the mirror.
+//! 2d. [`a_durable_profile_survives_shutdown_without_leaking_a_process`]
 //! 3. [`click_and_insert_text_mutate_the_page`]
 //! 4. [`human_takeover_refuses_agent_input_until_released`]
 //! 5. [`dropping_the_service_without_shutdown_still_kills_the_tree`] — the Drop backstop.
@@ -27,18 +43,41 @@ use std::time::Duration;
 
 use supermux_server::connectors::browser::context::ScreencastOptions;
 use supermux_server::connectors::browser::error::BrowserError;
+use supermux_server::connectors::browser::launch::ProfileMode;
 use supermux_server::connectors::browser::lock::{Actor, DriveMode, HandOff};
+use supermux_server::connectors::browser::tab::TabMeta;
 use supermux_server::connectors::browser::{dispose_on_teardown, BrowserConfig, BrowserService};
 
 // ── harness ─────────────────────────────────────────────────────────────────
 
 /// A service configured for tests: idle reaping off (the tests own teardown),
 /// small viewport, tiny context cap so the guard is cheap to exercise.
+///
+/// **`ProfileMode::Ephemeral` is explicit and load-bearing.** The service now
+/// defaults to the durable workspace profile; the leak test and the isolation
+/// tests below are *about* the throwaway one, and selecting it here is what keeps
+/// them asserting exactly what they have always asserted.
 fn test_service() -> std::sync::Arc<BrowserService> {
     BrowserService::new(BrowserConfig {
         width: 800,
         height: 600,
         max_contexts: 4,
+        max_tabs: 4,
+        profile: ProfileMode::Ephemeral,
+        idle_timeout: Duration::ZERO,
+        ..BrowserConfig::default()
+    })
+}
+
+/// A service on a **durable** profile at `dir` — the workspace shape. Two of
+/// these on the same `dir` (sequentially) is the persistence test.
+fn durable_service(dir: &Path) -> std::sync::Arc<BrowserService> {
+    BrowserService::new(BrowserConfig {
+        width: 800,
+        height: 600,
+        max_contexts: 4,
+        max_tabs: 4,
+        profile: ProfileMode::Durable(dir.to_path_buf()),
         idle_timeout: Duration::ZERO,
         ..BrowserConfig::default()
     })
@@ -258,11 +297,16 @@ async fn lifecycle_leaves_no_orphan_process_or_profile_dir() {
     assert!(procs_mentioning(&needle).is_empty());
 }
 
-// ── 2. per-agent context isolation ──────────────────────────────────────────
+// ── 2. per-agent SCRATCH context isolation ──────────────────────────────────
+//
+// Re-scoped, body unchanged. This is the guarantee agent scratch mode keeps, and
+// the reason an ungranted agent's browser is exactly as isolated as it ever was
+// — even though the chrome it runs in may be holding the human's durable profile
+// open at the same time (an incognito-equivalent context does not persist).
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the pinned chrome-headless-shell"]
-async fn two_contexts_are_cookie_and_localstorage_isolated() {
+async fn two_scratch_contexts_are_cookie_and_localstorage_isolated() {
     if !chrome_present() {
         return;
     }
@@ -347,9 +391,14 @@ async fn two_contexts_are_cookie_and_localstorage_isolated() {
 /// This drives the real teardown helper (the one the `SessionEnd` hook,
 /// `lifecycle::stop`, delete/archive and rename all call), not `close_context`
 /// directly, so it fails if that helper stops disposing.
+///
+/// **Scoped to scratch.** The same helper must NOT reach a workspace tab — a
+/// session ending closing a tab a human pinned and logged into is the anti-goal
+/// of the feature — which is why it calls `close_scratch` and cannot see the tab
+/// map at all.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the pinned chrome-headless-shell"]
-async fn a_recycled_session_name_never_inherits_the_previous_cookie_jar() {
+async fn a_recycled_session_name_never_inherits_the_previous_scratch_cookie_jar() {
     if !chrome_present() {
         return;
     }
@@ -368,7 +417,10 @@ async fn a_recycled_session_name_never_inherits_the_previous_cookie_jar() {
         serde_json::json!("sid=THE-FIRST-BOT"),
         "occupant #1 really is logged in"
     );
-    let first_id = first.browser_context_id().to_string();
+    let first_id = first
+        .browser_context_id()
+        .expect("a scratch context owns a browserContextId")
+        .to_string();
 
     // ── its session ends ────────────────────────────────────────────────────
     dispose_on_teardown(&svc, "scraper")
@@ -385,7 +437,7 @@ async fn a_recycled_session_name_never_inherits_the_previous_cookie_jar() {
     let second = svc.context_for("scraper").await.expect("second occupant");
     assert_ne!(
         second.browser_context_id(),
-        first_id,
+        Some(first_id.as_str()),
         "there was nothing left to inherit, so this is a NEW browser context"
     );
     second.navigate(Actor::Agent, &url).await.expect("nav 2");
@@ -407,6 +459,205 @@ async fn a_recycled_session_name_never_inherits_the_previous_cookie_jar() {
     );
 
     svc.shutdown().await;
+    server.abort();
+}
+
+// ── 2c. THE MIRROR: a login survives a restart on the durable profile ───────
+
+/// **The single assertion the feature lives or dies on.**
+///
+/// The exact mirror image of the two isolation tests above: where a scratch
+/// context must LOSE everything, a workspace tab must KEEP everything. A cookie
+/// and a `localStorage` key written in one Chrome process are read back after
+/// that process is gone and a **brand-new** `BrowserService` has opened the same
+/// durable profile — which is what a `systemctl restart supermux`, an idle reap
+/// and a Chrome crash all look like from the tab's point of view.
+///
+/// Note the cookie is written with an explicit `max-age`. A *session* cookie
+/// (no expiry) is deliberately NOT asserted here: Chrome only restores those when
+/// it believes it is resuming a session, which an automation launch on a
+/// `--user-data-dir` is not — measured, spec §7.1a. Pretending otherwise would
+/// make this test lie about exactly the case the honest `needs_login` state
+/// exists for.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the pinned chrome"]
+async fn a_login_survives_a_chrome_restart_on_the_durable_profile() {
+    if !chrome_present() {
+        return;
+    }
+    let (url, server) = serve_page(PAGE).await;
+    let profile = std::env::temp_dir().join(format!("supermux-durable-{}", uuid::Uuid::new_v4()));
+    let tab_id = "tb_persistencetest0001";
+    let meta = TabMeta {
+        url: url.clone(),
+        ..TabMeta::default()
+    };
+
+    // ── run #1: the human signs in ──────────────────────────────────────────
+    let svc = durable_service(&profile);
+    let tab = svc.ensure_tab(tab_id, meta.clone()).await.expect("open tab");
+    assert!(
+        tab.page().is_persistent(),
+        "a workspace tab must live in the DEFAULT context — that context IS the jar"
+    );
+    assert_eq!(
+        tab.page().browser_context_id(),
+        None,
+        "the workspace path must never call Target.createBrowserContext"
+    );
+    tab.page()
+        .navigate(Actor::Agent, &url)
+        .await
+        .expect("nav run 1");
+    tab.page()
+        .evaluate(
+            "document.cookie='sid=THE-HUMAN;path=/;max-age=86400'; \
+             localStorage.setItem('sid','THE-HUMAN'); 1",
+        )
+        .await
+        .expect("sign in");
+    assert_eq!(
+        tab.page().evaluate("document.cookie").await.expect("jar 1"),
+        serde_json::json!("sid=THE-HUMAN"),
+        "the human really is signed in"
+    );
+
+    let pid = svc.chrome_pid().await.expect("a live chrome");
+    svc.shutdown().await;
+
+    // The process is gone; the JAR IS NOT. This is the one line that separates
+    // this test from the ephemeral leak test, which asserts the exact opposite.
+    assert!(
+        procs_in_group(pid).is_empty(),
+        "a durable profile must not weaken process leak-safety by one line"
+    );
+    assert!(
+        profile.exists(),
+        "remove_profile() must be a no-op for a durable profile"
+    );
+    drop(svc);
+
+    // ── run #2: a BRAND-NEW service on the same profile ─────────────────────
+    let svc2 = durable_service(&profile);
+    let tab2 = svc2
+        .ensure_tab(tab_id, meta.clone())
+        .await
+        .expect("rehydrate tab");
+    assert_ne!(
+        svc2.chrome_pid().await.expect("a second chrome"),
+        pid,
+        "this really is a second browser process"
+    );
+    tab2.page()
+        .navigate(Actor::Agent, &url)
+        .await
+        .expect("nav run 2");
+    let jar = tab2
+        .page()
+        .evaluate("document.cookie")
+        .await
+        .expect("jar 2");
+    let ls = tab2
+        .page()
+        .evaluate("localStorage.getItem('sid')")
+        .await
+        .expect("ls 2");
+    eprintln!("[durable] after restart: cookie={jar} ls={ls}");
+    assert_eq!(
+        jar,
+        serde_json::json!("sid=THE-HUMAN"),
+        "the cookie must survive a full Chrome + service restart"
+    );
+    assert_eq!(
+        ls,
+        serde_json::json!("THE-HUMAN"),
+        "localStorage must survive a full Chrome + service restart"
+    );
+
+    svc2.shutdown().await;
+    let _ = std::fs::remove_dir_all(&profile);
+    server.abort();
+}
+
+// ── 2d. dehydration is lossless, and tabs have independent locks ────────────
+
+/// R4 + R5 + the per-tab lock, in one browser.
+///
+/// * Dehydrating a tab closes its target and persists nothing else — the row and
+///   the cookies stay, so the rehydrated tab still knows who it is.
+/// * `Tab::close` must never dispose a browser context: if it did, dehydrating
+///   tab A would take tab B (and the whole jar) with it. Tab B answering after
+///   A's dehydration is that assertion.
+/// * A human on tab A must not block an agent on tab B — the cardinality change
+///   the session-keyed lock could not express.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the pinned chrome"]
+async fn dehydrating_one_tab_leaves_its_siblings_and_the_jar_intact() {
+    if !chrome_present() {
+        return;
+    }
+    let (url, server) = serve_page(PAGE).await;
+    let profile = std::env::temp_dir().join(format!("supermux-durable-{}", uuid::Uuid::new_v4()));
+    let svc = durable_service(&profile);
+    let meta = TabMeta {
+        url: url.clone(),
+        ..TabMeta::default()
+    };
+
+    let a = svc.ensure_tab("tb_aaaa0001", meta.clone()).await.expect("tab a");
+    let b = svc.ensure_tab("tb_bbbb0002", meta.clone()).await.expect("tab b");
+    assert_eq!(svc.tab_count().await, 2);
+    a.page().navigate(Actor::Agent, &url).await.expect("nav a");
+    b.page().navigate(Actor::Agent, &url).await.expect("nav b");
+    a.page()
+        .evaluate("document.cookie='shared=YES;path=/;max-age=3600'; 1")
+        .await
+        .expect("write a");
+
+    // Same DEFAULT context ⇒ tab B sees the cookie tab A set. That is the
+    // POINT: one jar, shared by every workspace tab.
+    let seen_by_b = b.page().evaluate("document.cookie").await.expect("jar b");
+    assert_eq!(
+        seen_by_b,
+        serde_json::json!("shared=YES"),
+        "workspace tabs share ONE jar — the human's profile"
+    );
+
+    // Independent locks: a human on A does not stop an agent on B.
+    a.lock().request_human_takeover();
+    assert!(
+        a.page().navigate(Actor::Agent, &url).await.is_err(),
+        "the agent must be refused on the tab a human took over"
+    );
+    b.page()
+        .navigate(Actor::Agent, &url)
+        .await
+        .expect("tab B must be unaffected by a human on tab A");
+    a.lock().release_to_agent(HandOff::Explicit);
+
+    // Dehydrate A. B must still answer — proof that closing a tab did NOT
+    // dispose the shared context.
+    assert!(svc.dehydrate_tab("tb_aaaa0001").await.expect("dehydrate"));
+    assert_eq!(svc.tab_count().await, 1);
+    assert_eq!(svc.live_tabs().await, vec!["tb_bbbb0002"]);
+    let b_after = b.page().evaluate("document.cookie").await.expect("jar b after");
+    assert_eq!(
+        b_after,
+        serde_json::json!("shared=YES"),
+        "dehydrating one tab must not touch its siblings or the jar"
+    );
+
+    // Rehydrating A finds the jar exactly where it left it.
+    let a2 = svc.ensure_tab("tb_aaaa0001", meta).await.expect("rehydrate a");
+    a2.page().navigate(Actor::Agent, &url).await.expect("nav a2");
+    assert_eq!(
+        a2.page().evaluate("document.cookie").await.expect("jar a2"),
+        serde_json::json!("shared=YES"),
+        "a rehydrated tab is signed in exactly as it was"
+    );
+
+    svc.shutdown().await;
+    let _ = std::fs::remove_dir_all(&profile);
     server.abort();
 }
 
@@ -539,7 +790,7 @@ async fn human_takeover_refuses_agent_input_until_released() {
         .expect_err("agent input must be refused under HUMAN_DRIVING");
     eprintln!("[lock] agent refused with: {err}");
     assert!(
-        matches!(&err, BrowserError::HumanDriving { session } if session == "shared"),
+        matches!(&err, BrowserError::HumanDriving { subject } if subject == "shared"),
         "got {err:?}"
     );
     for refused in [

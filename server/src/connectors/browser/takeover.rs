@@ -112,7 +112,14 @@ const COORD_CEILING: f64 = 100_000.0;
 /// router — see the module docs on auth.
 pub fn router_for(state: AppState) -> Router {
     Router::new()
+        // Scratch: the in-chat takeover of ONE agent's own context. **Retained
+        // unchanged** — `TakeoverCard` is still the interruption affordance, and
+        // an in-chat ask means the human is coming to drive, so this route keeps
+        // grabbing the wheel on attach.
         .route("/ws/browser/{session}/takeover", get(handle_takeover_ws))
+        // Workspace: the human's persistent tab. Same relay, same frames, same
+        // closed input command set — different subject, and **watch-first**.
+        .route("/ws/browser/tab/{tab_id}", get(handle_tab_takeover_ws))
         .with_state(state)
 }
 
@@ -129,17 +136,43 @@ async fn handle_takeover_ws(
     ws.on_upgrade(move |socket| takeover_socket(socket, session, state, origin_ok))
 }
 
+/// Upgrade handler for a **workspace tab**.
+async fn handle_tab_takeover_ws(
+    ws: WebSocketUpgrade,
+    Path(tab_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let origin_ok = origin_allowed(&state, &headers);
+    ws.on_upgrade(move |socket| tab_takeover_socket(socket, tab_id, state, origin_ok))
+}
+
 // ── one viewer at a time ────────────────────────────────────────────────────
 
-/// Sessions with a live takeover socket.
+/// Subjects with a live takeover socket, **namespaced**: `session:<name>` for a
+/// scratch context, `tab:<id>` for a workspace tab.
 ///
-/// A second viewer would be actively harmful, not merely redundant: it would
-/// double-ack every frame, and — worse — *its* disconnect would
-/// `release_to_agent` while the first human is still driving, handing the wheel
-/// back mid-gesture. So the second socket is refused with 1013 (retryable).
+/// The namespace is load-bearing, not cosmetic: without it a session and a tab
+/// that happened to share a string would fight over one slot, and (worse) one's
+/// disconnect would release the other's wheel.
+///
+/// A second viewer on the SAME subject would be actively harmful, not merely
+/// redundant: it would double-ack every frame, and — worse — *its* disconnect
+/// would `release_to_agent` while the first human is still driving, handing the
+/// wheel back mid-gesture. So the second socket is refused with 1013 (retryable).
 fn viewers() -> &'static Mutex<HashSet<String>> {
     static VIEWERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     VIEWERS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// The viewer-slot key for a scratch session.
+fn session_key(session: &str) -> String {
+    format!("session:{session}")
+}
+
+/// The viewer-slot key for a workspace tab.
+fn tab_key(tab_id: &str) -> String {
+    format!("tab:{tab_id}")
 }
 
 /// **Is a human actually looking at this session's page right now?**
@@ -152,19 +185,28 @@ pub fn is_attached(session: &str) -> bool {
     viewers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(session)
+        .contains(&session_key(session))
 }
 
-/// RAII claim on a session's single viewer slot.
+/// [`is_attached`] for a workspace tab.
+pub fn is_tab_attached(tab_id: &str) -> bool {
+    viewers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&tab_key(tab_id))
+}
+
+/// RAII claim on one subject's single viewer slot.
 struct ViewerSlot(String);
 
 impl ViewerSlot {
-    fn claim(session: &str) -> Option<Self> {
+    /// `key` is already namespaced — [`session_key`] or [`tab_key`].
+    fn claim(key: &str) -> Option<Self> {
         let mut set = viewers().lock().unwrap_or_else(|e| e.into_inner());
-        if !set.insert(session.to_string()) {
+        if !set.insert(key.to_string()) {
             return None;
         }
-        Some(Self(session.to_string()))
+        Some(Self(key.to_string()))
     }
 }
 
@@ -543,13 +585,15 @@ async fn takeover_socket(
         return;
     };
 
-    // 3. One viewer per session (see `ViewerSlot`).
-    let Some(_slot) = ViewerSlot::claim(&session) else {
+    // 3. One viewer per subject (see `ViewerSlot`).
+    let Some(_slot) = ViewerSlot::claim(&session_key(&session)) else {
         close(&mut socket, close_code::AGAIN, REASON_ALREADY_ATTACHED).await;
         return;
     };
 
-    // 4. **Grab the wheel.** This is the agent pause — see the module docs.
+    // 4. **Grab the wheel.** This is the agent pause — see the module docs. The
+    //    session route grabs on attach because an in-chat takeover ask means the
+    //    human is coming to drive; the TAB route deliberately does not (§6.4).
     let previous = ctx.lock().request_human_takeover();
     info!(session = %session, %previous, "browser takeover: attached");
 
@@ -571,6 +615,78 @@ async fn takeover_socket(
     // see `tools::handback_result`.
     ctx.lock().release_to_agent(HandOff::Disconnected);
     info!(session = %session, ?outcome, "browser takeover: detached, released to AGENT");
+}
+
+/// **The workspace-tab relay.** Same wire, same closed input command set, same
+/// first-frame auth — three differences, all deliberate:
+///
+/// 1. **Subject.** The lock, the viewer slot and the log field are the TAB, so a
+///    human on tab A does not touch tab B.
+/// 2. **Watch-first** (§6.4). It does NOT call `request_human_takeover` on
+///    attach. The relay already refuses to forward any input while the human does
+///    not hold the wheel, and `DriveLock::gate` lets `Actor::Human` start the
+///    screencast regardless — so the human sees live frames and drives nothing
+///    until they press Drive (a `take_over` frame). Without this, *merely looking
+///    at a tab* would silently block every granted agent on it: the workspace
+///    surface would hit that footgun constantly, where an in-chat takeover card
+///    never does.
+/// 3. **Hand-back on exit is conditional.** Releasing a wheel we never took would
+///    be a lie to a parked agent, so the release only fires if this socket
+///    actually took it.
+async fn tab_takeover_socket(
+    mut socket: WebSocket,
+    tab_id: String,
+    state: AppState,
+    origin_ok: bool,
+) {
+    if !origin_ok {
+        close(&mut socket, close_code::POLICY, "origin not allowed").await;
+        return;
+    }
+    let authed = match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
+        Ok(Some(Ok(Message::Text(t)))) => verify_auth_frame(&state, t.as_str()),
+        _ => false,
+    };
+    if !authed {
+        close(&mut socket, close_code::POLICY, "auth required").await;
+        return;
+    }
+    // The same shape gate `valid_name` is to a session name, before the id is
+    // used as a map key or reaches a log line.
+    if !crate::db::browser_tabs::valid_tab_id(&tab_id) {
+        close(&mut socket, close_code::POLICY, "bad name").await;
+        return;
+    }
+    if socket.send(ServerMsg::AuthOk.to_frame()).await.is_err() {
+        return;
+    }
+
+    // The tab must ALREADY be live: a takeover takes over something. We do not
+    // rehydrate here — that would let an unauthorised surface spawn chrome, and
+    // it would present a freshly-opened page as if it were what was there.
+    let Some(tab) = state.browser.tab(&tab_id).await else {
+        close(&mut socket, CLOSE_NO_CONTEXT, REASON_NO_CONTEXT).await;
+        return;
+    };
+    let Some(_slot) = ViewerSlot::claim(&tab_key(&tab_id)) else {
+        close(&mut socket, close_code::AGAIN, REASON_ALREADY_ATTACHED).await;
+        return;
+    };
+    info!(tab = %tab_id, mode = %tab.mode(), "browser takeover: attached to tab (watching)");
+
+    let ctx = tab.page().clone();
+    let outcome = drive(&mut socket, &tab_id, &ctx).await;
+
+    if let Err(e) = ctx.stop_screencast(Actor::Human).await {
+        debug!(tab = %tab_id, error = %e, "browser takeover: stopScreencast");
+    }
+    // Only release what we actually took. A watcher who never pressed Drive has
+    // no wheel to hand back, and claiming otherwise would wake a parked agent
+    // with a hand-off that never happened.
+    if human_may_drive(ctx.mode()) {
+        ctx.lock().release_to_agent(HandOff::Disconnected);
+    }
+    info!(tab = %tab_id, ?outcome, "browser takeover: tab detached");
 }
 
 /// Why the socket loop ended. Logged, not sent — by the time we know, the
@@ -977,7 +1093,12 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
             std::path::Path::new(&format!("/proc/{pid}")).exists()
         }
 
-        let svc = BrowserService::new(BrowserConfig::default());
+        // Explicitly ephemeral: this test's teardown assertion is the scratch
+        // one (the profile dir is removed), not the workspace one.
+        let svc = BrowserService::new(BrowserConfig {
+            profile: crate::connectors::browser::launch::ProfileMode::Ephemeral,
+            ..BrowserConfig::default()
+        });
         let ctx = svc.context_for("takeover").await.expect("context");
         let pid = svc.chrome_pid().await.expect("a chrome pid");
         let udd = svc.user_data_dir().await.expect("a user-data-dir");

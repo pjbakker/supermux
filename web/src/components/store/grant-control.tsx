@@ -16,9 +16,19 @@ import { ALL_AGENTS, companyGrantKey } from '@/lib/api/connectors'
 import { useConnectorActions } from '@/stores/connectors-store'
 import { useUI } from '@/stores/ui-store'
 import { useCompanies } from '@/hooks/use-companies'
+import type { Company } from '@/lib/api'
 import { CompanyMark } from '@/components/roster/company-mark'
 
 export type GrantScope = 'bot' | 'company' | 'all' | null
+
+/** Grant/revoke overrides, so ONE control can lend a connector *or* a workspace
+ *  browser tab (shared-browser v1 §6.5). Absent ⇒ today's behaviour, byte for
+ *  byte: `useConnectorActions()` against `connectorId`. Present ⇒ the same three
+ *  tiers, the same honesty rule, a different resource underneath. */
+export interface GrantApi {
+  grant: (target: string) => Promise<void>
+  revoke: (target: string) => Promise<void>
+}
 
 export function GrantControl({
   connectorId,
@@ -28,6 +38,10 @@ export function GrantControl({
   onRevoked,
   compact,
   accountRef,
+  resourceLabel,
+  api,
+  companyOverride,
+  allowAll = true,
 }: {
   connectorId: string
   /** The bot this control grants to. `null` = library view (only All agents). */
@@ -42,6 +56,20 @@ export function GrantControl({
    *  the account's KEPT secret (the plain grant can't — the client never sees a
    *  secret_ref). Absent everywhere else, so the legacy behaviour is unchanged. */
   accountRef?: string | null
+  /** What is being lent, for the shared-grant line ("this tab"). Defaults to the
+   *  connector wording. */
+  resourceLabel?: string
+  /** Lend something that is NOT a connector (a browser tab). See [[GrantApi]]. */
+  api?: GrantApi
+  /** Which company the "This company" tier targets, when the RESOURCE has an
+   *  owning company of its own. `undefined` (the default, and every connector
+   *  call site) keeps today's behaviour: the currently-active UI company.
+   *  `null` means the resource is HQ-owned, so there is no company tier at all
+   *  — never the globally-active one, which the server would refuse. */
+  companyOverride?: Company | null
+  /** Offer the all-agents tier. `false` where `*` cannot be a legal target — a
+   *  company-owned resource, since `*` resolves to NO company server-side. */
+  allowAll?: boolean
 }) {
   const actions = useConnectorActions()
   const [busy, setBusy] = React.useState<'bot' | 'company' | 'all' | 'revoke' | null>(null)
@@ -51,8 +79,11 @@ export function GrantControl({
   // tier is hidden — a grant to "this company" has no referent there.
   const activeCompany = useUI((s) => s.activeCompany)
   const { companies } = useCompanies()
-  const company =
+  const inferred =
     activeCompany !== null ? companies.find((c) => c.id === activeCompany) ?? null : null
+  // A resource that OWNS a company overrides the roster scope entirely: the
+  // grant has to land in the resource's company or the server refuses it.
+  const company = companyOverride !== undefined ? companyOverride : inferred
   const companyTarget = company ? companyGrantKey(company.id) : null
 
   const grantTo = async (which: 'bot' | 'company' | 'all') => {
@@ -64,6 +95,13 @@ export function GrantControl({
     try {
       // Account-aware grant rides `reconnect` (server reuses the account's kept
       // secret); the legacy grant is used only when no account is in scope.
+      // The override owns the whole write when present — no connector call is
+      // made at all, so a tab grant can never touch `session_connectors`.
+      if (api) {
+        await api.grant(target)
+        onGranted?.(target, false)
+        return
+      }
       const restart = accountRef
         ? await actions.reconnect(connectorId, accountRef, target)
         : await actions.grant(connectorId, target)
@@ -80,7 +118,8 @@ export function GrantControl({
     if (!target) return
     setBusy('revoke')
     try {
-      await actions.revoke(connectorId, target)
+      if (api) await api.revoke(target)
+      else await actions.revoke(connectorId, target)
       onRevoked?.(target)
     } finally {
       setBusy(null)
@@ -123,13 +162,15 @@ export function GrantControl({
             mark={<CompanyMark slug={company.slug} name={company.display_name} size={16} />}
           />
         )}
-        <ScopeButton
-          selected={scope === 'all'}
-          disabled={busy !== null}
-          busy={busy === 'all'}
-          onClick={() => grantTo('all')}
-          label="All agents"
-        />
+        {allowAll && (
+          <ScopeButton
+            selected={scope === 'all'}
+            disabled={busy !== null}
+            busy={busy === 'all'}
+            onClick={() => grantTo('all')}
+            label="All agents"
+          />
+        )}
       </div>
 
       {scope !== null && (
@@ -137,7 +178,9 @@ export function GrantControl({
           {sharedGrant && botName ? (
             <span>
               Shared via <span className="font-medium text-foreground">{sharedVia}</span> — revoke it
-              from the store to remove it everywhere.
+              {resourceLabel
+                ? ' from that scope to remove it everywhere.'
+                : ' from the store to remove it everywhere.'}
             </span>
           ) : (
             <button

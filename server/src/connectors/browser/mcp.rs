@@ -59,12 +59,29 @@ stroke='%230284c7' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='ro
 <circle cx='8.6' cy='6.5' r='.7' fill='%230284c7' stroke='none'/>\
 <path d='M8 13.5h8M8 16.5h5'/></svg>";
 
-/// The five tools the server exposes (the card's tool list + count).
+/// The tool an agent calls FIRST: which shared tabs may it use at all.
+pub const LIST_TABS_TOOL: &str = "browser_list_tabs";
+
+/// The six tools the server exposes (the card's tool list + count).
+///
+/// Every page verb takes an optional `tab`. **Omitted** ⇒ the agent's own
+/// throwaway browser, exactly as before. **Given** ⇒ one of the human's shared,
+/// already-signed-in tabs — which requires a per-tab grant, checked before the
+/// call reaches a page (`tools.rs`), reads included.
+///
+/// This list must stay in lockstep with `mcp_server.py`'s `TOOLS` and with
+/// `web/src/components/store/catalog.ts`.
 pub fn tool_decls() -> Vec<ToolDecl> {
     vec![
         ToolDecl {
+            name: LIST_TABS_TOOL.into(),
+            description: "See which shared tabs you're allowed to use, and whether each is still                 signed in. Call this first."
+                .into(),
+        },
+        ToolDecl {
             name: "browser_navigate".into(),
-            description: "Open a URL in the shared browser and wait for it to load.".into(),
+            description: "Open a URL and wait for it to load — in your own browser, or in a                 shared tab you've been granted (`tab`)."
+                .into(),
         },
         ToolDecl {
             name: "browser_click".into(),
@@ -141,8 +158,9 @@ pub fn manifest(server_path: &str) -> Manifest {
         kind: KIND_BUILTIN_BROWSER.into(),
         display_name: "Shared Browser".into(),
         icon: ICON.into(),
-        description: "One real Chrome, shared between you and your agents. A granted bot browses \
-            in its own isolated context — cookies and logins survive between turns — and when it \
+        description: "One real Chrome you log into once. Pin the tabs that matter, and lend \
+            individual tabs to named agents — an agent granted a tab reuses your signed-in \
+            session; an agent granted none gets its own throwaway browser instead. When a bot \
             hits a login, a 2FA prompt or a CAPTCHA it asks you to take the wheel: the live page \
             opens on your phone, you finish the step, and the agent picks up where you left it. \
             No credentials to store; nothing to sign in to."
@@ -201,9 +219,10 @@ mod tests {
         assert_eq!(m.kind, KIND_BUILTIN_BROWSER);
         assert_eq!(m.display_name, "Shared Browser");
         assert_eq!(m.categories, vec!["browser".to_string()], "shows under the Browser chip");
-        assert_eq!(m.tools.len(), 5, "five tools on the card");
+        assert_eq!(m.tools.len(), 6, "six tools on the card");
         let names: Vec<&str> = m.tools.iter().map(|t| t.name.as_str()).collect();
         for want in [
+            LIST_TABS_TOOL,
             "browser_navigate",
             "browser_click",
             "browser_read",
@@ -255,11 +274,11 @@ mod tests {
     }
 
     /// FUNCTIONAL: spawn the real server and drive it over MCP stdio the way
-    /// Claude Code does — `initialize`, `tools/list` — and assert the five tools
+    /// Claude Code does — `initialize`, `tools/list` — and assert the six tools
     /// are really advertised by a live process, with the interaction marker on
     /// the takeover tool. Skipped when `python3` is absent.
     #[test]
-    fn live_server_advertises_the_five_tools_with_the_takeover_marker() {
+    fn live_server_advertises_the_six_tools_with_the_takeover_marker() {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
 
@@ -302,7 +321,27 @@ mod tests {
 
         let list = roundtrip(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
         let tools = list["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
+        // The three-file mirror (§5.3): whatever the live process advertises is
+        // exactly what the card declares. A drift here is a bot calling a tool
+        // the store never showed the human.
+        let live: std::collections::BTreeSet<String> = tools
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        let declared: std::collections::BTreeSet<String> =
+            tool_decls().into_iter().map(|t| t.name).collect();
+        assert_eq!(live, declared, "mcp_server.py TOOLS vs tool_decls()");
+        // Every page verb takes the optional `tab`; list_tabs takes nothing.
+        for t in tools.iter() {
+            let name = t["name"].as_str().unwrap_or_default();
+            let has_tab = t["inputSchema"]["properties"]["tab"].is_object();
+            assert_eq!(
+                has_tab,
+                name != LIST_TABS_TOOL,
+                "{name} tab-argument declaration"
+            );
+        }
         let takeover = tools
             .iter()
             .find(|t| t["name"] == json!(TAKEOVER_TOOL))

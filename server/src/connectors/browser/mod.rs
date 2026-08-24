@@ -1,23 +1,45 @@
-//! **Shared-Browser connector — phase 1: the browser service.**
+//! **Shared-Browser connector — the browser service.**
 //!
-//! A single long-lived `chrome-headless-shell`, owned by the Rust server, with
-//! one **isolated CDP browser context per agent session** and an
-//! **AGENT ⇄ HUMAN drive lock** per context.
+//! One long-lived Chromium, owned by the Rust server, running **two modes at
+//! once** over one process and one CDP socket:
 //!
 //! ```text
-//!   BrowserService  ── lazily spawns ──▶  chrome-headless-shell  (one process)
-//!        │                                        │
-//!        │  one browser WebSocket (CdpClient)  ───┘
+//!   BrowserService ── lazily spawns ──▶ chromium --headless=new   (ONE process,
+//!        │                                    │                    ONE durable
+//!        │  one browser WebSocket (CdpClient) ┘                    --user-data-dir)
 //!        │
-//!        ├─ contexts["alice"] → AgentContext { browserContextId, target, DriveLock }
-//!        └─ contexts["bob"]   → AgentContext { browserContextId, target, DriveLock }
+//!        ├─ tabs["tb_9f…"]  → Tab { durable id, target, DriveLock, grants }   WORKSPACE
+//!        ├─ tabs["tb_4c…"]  → Tab { … }        ↑ all in the DEFAULT context —
+//!        │                                       the profile on disk IS the jar
+//!        ├─ scratch["alice"] → AgentContext { browserContextId, target, lock } AGENT
+//!        └─ scratch["bob"]   → AgentContext { … }   ↑ incognito-equivalent, dies
+//!                                                     with the session
 //! ```
+//!
+//! # The two modes, and the one argument that chooses between them
+//!
+//! * **Agent scratch** — today's behaviour, byte for byte. A tool call with no
+//!   `tab` argument gets its own isolated context that is destroyed with the
+//!   session. Every isolation guarantee it ever had still holds: an
+//!   incognito-equivalent context does not persist, even on a durable profile.
+//! * **Workspace tab** — the human logs in once; tabs persist and pin; an agent
+//!   that is **explicitly granted a tab** reuses that authenticated tab. A tool
+//!   call naming a `tab` takes this path, and only after
+//!   [`tools::has_tab_grant`] says yes — reads and screenshots included, because
+//!   on a logged-in page reading IS the exfiltration.
+//!
+//! # A tab is durable; its target is not
+//!
+//! `tb_<uuid>` is minted once and stored in `browser_tabs`. The CDP `targetId`
+//! underneath changes on every rehydrate. The idle reaper therefore
+//! **dehydrates** rather than evicts (persist url/title → `closeTarget` → keep
+//! the row), and because the profile is on disk, the next access relaunches
+//! Chrome, reopens the stored URL, and the login is simply there.
 //!
 //! # Phase boundaries
 //!
-//! * **Phase 1 (here).** The process manager, the CDP client, the per-agent
-//!   context registry, the drive lock, leak safety. No HTTP routes, no MCP
-//!   tools — nothing outside this module calls it yet.
+//! * **Phase 1 (here).** The process manager, the CDP client, the registries,
+//!   the drive lock, leak safety.
 //! * **Phase 2 (shipped, [`takeover`]).** The takeover UI's data plane: a WS
 //!   relay that publishes [`context::ScreencastFrame`]s to an authenticated
 //!   client and feeds its taps back as [`lock::Actor::Human`] input. It does
@@ -63,6 +85,12 @@ pub mod tools;
 /// Phase 2: the human takeover WebSocket — screencast out, input in, gated by
 /// the drive lock.
 pub mod takeover;
+/// Shared-browser v1: the persistent workspace **tab** — the unit a human pins
+/// and an agent is granted.
+pub mod tab;
+/// Shared-browser v1: the HUMAN's bearer-gated tab CRUD + per-tab grant API.
+/// Deliberately a different door from [`tools`], which is the agent's.
+pub mod api;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -75,15 +103,27 @@ use tracing::{info, warn};
 use cdp::CdpClient;
 use context::AgentContext;
 use error::{BrowserError, Result};
-use launch::ChromeProcess;
+use launch::{ChromeProcess, ProfileMode};
 use lock::{DriveMode, HandOff};
+use tab::{Tab, TabId, TabMeta};
+
+use crate::db::browser_tabs as db_tabs;
 
 pub use error::BrowserError as Error;
 
-/// Cap on live contexts. Each context is a page + its renderer; the spike
-/// measured ~592 MB RSS for browser + 3 contexts, and one 60 fps screencast
-/// already costs ~68 % of a core, so this is a resource guard, not a policy.
+/// Cap on live **scratch** contexts. Each context is a page + its renderer; the
+/// spike measured ~592 MB RSS for browser + 3 contexts, and one 60 fps
+/// screencast already costs ~68 % of a core, so this is a resource guard, not a
+/// policy.
 const DEFAULT_MAX_CONTEXTS: usize = 8;
+
+/// Cap on **live** workspace tabs. 8 is far too low for a workspace, and this is
+/// a LIVENESS ceiling, not a persistence one: `browser_tabs` rows are unbounded
+/// by this number, and a dehydrated tab costs a row, not ~100 MB of RSS. Full
+/// Chromium idles at ~844 MB, so 16 live tabs is ~2.5 GB — affordable on the
+/// deploy box, and precisely why the idle reaper (which dehydrates rather than
+/// pinning chrome alive forever) stays.
+const DEFAULT_MAX_TABS: usize = 16;
 
 /// Shut the browser down after this long with **zero** contexts.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -102,8 +142,14 @@ const BROWSER_CLOSE_BUDGET: Duration = Duration::from_secs(2);
 /// browser must never be able to hold up a session Stop/delete.
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
 
-/// Env override: max simultaneous per-agent contexts.
+/// Env override: max simultaneous per-agent **scratch** contexts. Deliberately
+/// the same variable it always was — scratch mode's tuning is unchanged.
 pub const ENV_MAX_CONTEXTS: &str = "SUPERMUX_BROWSER_MAX_CONTEXTS";
+/// Env override: max simultaneous LIVE workspace tabs.
+pub const ENV_MAX_TABS: &str = "SUPERMUX_BROWSER_MAX_TABS";
+/// Env override: the durable profile directory (an operator escape hatch — e.g.
+/// putting the credential store on a different volume).
+pub const ENV_PROFILE_DIR: &str = "SUPERMUX_BROWSER_PROFILE_DIR";
 /// Env override: idle minutes before the shell is reaped (`0` disables).
 pub const ENV_IDLE_MINUTES: &str = "SUPERMUX_BROWSER_IDLE_MINUTES";
 
@@ -114,13 +160,59 @@ pub struct BrowserConfig {
     pub executable: PathBuf,
     /// `LD_LIBRARY_PATH` for the child (extracted chrome libs on a no-sudo box).
     pub ld_library_path: Option<String>,
-    /// Default per-context viewport.
+    /// Default per-page viewport (also the browser `--window-size`). Raised from
+    /// 1024×768 for v1: a workspace wants a saner login viewport, and 1366×900 is
+    /// a less unusual fingerprint besides.
     pub width: u32,
     pub height: u32,
-    /// Hard cap on live contexts.
+    /// Hard cap on live scratch contexts.
     pub max_contexts: usize,
+    /// Hard cap on live workspace tabs.
+    pub max_tabs: usize,
+    /// **Where the cookie jar lives.** `Durable` is the workspace default; the
+    /// leak test and the two isolation tests select `Ephemeral` explicitly, which
+    /// is what keeps them asserting exactly what they always asserted.
+    pub profile: ProfileMode,
     /// Idle-reap threshold; `Duration::ZERO` disables reaping.
     pub idle_timeout: Duration,
+}
+
+/// The durable profile's default location: `<data_dir>/browser/profile`.
+///
+/// `data_dir` resolves to `$SUPERMUX_DATA_DIR` → `$HOME/.supermux`, which the
+/// systemd unit sets explicitly to the service user's real home — deliberately
+/// outside the repo checkout and outside the unit's `WorkingDirectory` churn, so
+/// the profile survives `deploy-self.sh` AND the in-app updater (which only
+/// replaces `<data_dir>/bin/` and writes `<data_dir>/archives/`) for free.
+///
+/// **It is a credential store.** Mode 0700, excluded from any backup or
+/// support-bundle sweep, and logged by PATH only — never by contents (§8.5).
+pub fn default_profile_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os(ENV_PROFILE_DIR) {
+        return PathBuf::from(p);
+    }
+    let base = std::env::var_os("SUPERMUX_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".supermux")
+        });
+    base.join("browser").join("profile")
+}
+
+/// The profile dir for an ALREADY-RESOLVED data dir.
+///
+/// [`default_profile_dir`] re-reads the environment, which is right for a
+/// standalone `BrowserConfig::default()` and **wrong** for the running server:
+/// `config.data_dir` is the resolved answer (env → `config.toml` → `$HOME`), and
+/// a test harness with its own temp data dir must land its profile there rather
+/// than in the live one. The explicit [`ENV_PROFILE_DIR`] override still wins.
+pub fn profile_dir_for(data_dir: &std::path::Path) -> PathBuf {
+    if let Some(p) = std::env::var_os(ENV_PROFILE_DIR) {
+        return PathBuf::from(p);
+    }
+    data_dir.join("browser").join("profile")
 }
 
 impl Default for BrowserConfig {
@@ -128,15 +220,25 @@ impl Default for BrowserConfig {
         Self {
             executable: launch::default_executable(),
             ld_library_path: launch::default_ld_library_path(),
-            width: 1024,
-            height: 768,
+            width: 1366,
+            height: 900,
             max_contexts: DEFAULT_MAX_CONTEXTS,
+            max_tabs: DEFAULT_MAX_TABS,
+            profile: ProfileMode::Durable(default_profile_dir()),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 }
 
 impl BrowserConfig {
+    /// [`from_env`](Self::from_env) with the durable profile pinned under an
+    /// already-resolved `data_dir` — what the server actually constructs.
+    pub fn for_data_dir(data_dir: &std::path::Path) -> Self {
+        let mut cfg = Self::from_env();
+        cfg.profile = ProfileMode::Durable(profile_dir_for(data_dir));
+        cfg
+    }
+
     /// [`Default`] with the documented env overrides applied.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
@@ -144,6 +246,13 @@ impl BrowserConfig {
             if let Ok(n) = v.trim().parse::<usize>() {
                 if n > 0 {
                     cfg.max_contexts = n;
+                }
+            }
+        }
+        if let Ok(v) = std::env::var(ENV_MAX_TABS) {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                if n > 0 {
+                    cfg.max_tabs = n;
                 }
             }
         }
@@ -157,11 +266,20 @@ impl BrowserConfig {
 }
 
 /// Everything that exists only while chrome is running.
+///
+/// **Two registries, one browser** (v1 §2.3 R2). The split IS the feature: a
+/// scratch context is keyed on a *session name* and dies with that session; a
+/// workspace tab is keyed on a *durable tab id* and outlives everything,
+/// including this struct.
 struct Running {
     chrome: ChromeProcess,
     client: Arc<CdpClient>,
-    contexts: HashMap<String, Arc<AgentContext>>,
-    /// When the context map last became empty (`None` while non-empty).
+    /// LIVE workspace tabs. A dehydrated tab is absent here and present in
+    /// `browser_tabs` — that asymmetry is the whole persistence design.
+    tabs: HashMap<TabId, Arc<Tab>>,
+    /// Per-session scratch contexts — today's map, renamed, same semantics.
+    scratch: HashMap<String, Arc<AgentContext>>,
+    /// When the registries last became idle (`None` while something is live).
     idle_since: Option<Instant>,
 }
 
@@ -170,6 +288,12 @@ struct Running {
 pub struct BrowserService {
     cfg: BrowserConfig,
     running: Mutex<Option<Running>>,
+    /// The DB handle, attached by [`crate::state::AppState`] right after
+    /// construction. `OnceLock` rather than a constructor argument so
+    /// [`BrowserService::new`] stays the allocation-only call the lazy-start
+    /// invariant depends on, and so every existing test constructs unchanged.
+    /// Absent ⇒ the tab surface is simply unavailable (scratch is untouched).
+    pool: std::sync::OnceLock<sqlx::SqlitePool>,
     /// Guards the one-time spawn of the signal hook + idle reaper. Both are
     /// installed on the first successful chrome launch and never again.
     background: Once,
@@ -191,8 +315,22 @@ impl BrowserService {
         Arc::new(Self {
             cfg,
             running: Mutex::new(None),
+            pool: std::sync::OnceLock::new(),
             background: Once::new(),
         })
+    }
+
+    /// Hand the service its DB pool. Idempotent; a second call is ignored.
+    ///
+    /// Only the **tab** surface needs it (rows, grants, and persisting a tab's
+    /// URL before it is dehydrated). Scratch mode never touches the DB, so a
+    /// service without a pool behaves exactly as it did before v1.
+    pub fn attach_pool(&self, pool: sqlx::SqlitePool) {
+        let _ = self.pool.set(pool);
+    }
+
+    fn pool(&self) -> Option<&sqlx::SqlitePool> {
+        self.pool.get()
     }
 
     /// The effective configuration.
@@ -211,8 +349,9 @@ impl BrowserService {
         self.running.lock().await.as_ref().map(|r| r.chrome.pid())
     }
 
-    /// The running browser's scratch profile dir, if any. Exposed so the leak
-    /// test can assert it is gone after shutdown.
+    /// The running browser's profile dir, if any. Exposed so the leak test can
+    /// assert an EPHEMERAL one is gone after shutdown, and so the persistence
+    /// test can assert a DURABLE one is still there.
     pub async fn user_data_dir(&self) -> Option<PathBuf> {
         self.running
             .lock()
@@ -221,16 +360,49 @@ impl BrowserService {
             .map(|r| r.chrome.user_data_dir().to_path_buf())
     }
 
-    /// Sessions that currently hold a context.
+    /// Sessions that currently hold a scratch context.
     pub async fn sessions(&self) -> Vec<String> {
         match self.running.lock().await.as_ref() {
             Some(r) => {
-                let mut v: Vec<String> = r.contexts.keys().cloned().collect();
+                let mut v: Vec<String> = r.scratch.keys().cloned().collect();
                 v.sort();
                 v
             }
             None => Vec::new(),
         }
+    }
+
+    /// Ids of the workspace tabs that are LIVE right now (a subset of the
+    /// `browser_tabs` rows — the rest are dehydrated).
+    pub async fn live_tabs(&self) -> Vec<String> {
+        match self.running.lock().await.as_ref() {
+            Some(r) => {
+                let mut v: Vec<String> = r.tabs.keys().cloned().collect();
+                v.sort();
+                v
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// How many workspace tabs are live.
+    pub async fn tab_count(&self) -> usize {
+        self.running
+            .lock()
+            .await
+            .as_ref()
+            .map(|r| r.tabs.len())
+            .unwrap_or(0)
+    }
+
+    /// How many persisted tabs currently have **no** live target — the companion
+    /// observable to [`idle_armed`](Self::idle_armed): a reap that "loses" tabs
+    /// would show up here as rows that never come back.
+    pub async fn dehydrated_tab_count(&self) -> usize {
+        let Some(pool) = self.pool() else { return 0 };
+        let rows = db_tabs::list(pool).await.unwrap_or_default();
+        let live = self.live_tabs().await;
+        rows.iter().filter(|r| !live.contains(&r.id)).count()
     }
 
     // ── the registry ────────────────────────────────────────────────────────
@@ -261,10 +433,10 @@ impl BrowserService {
         }
         let running = guard.as_mut().expect("just started");
 
-        if let Some(existing) = running.contexts.get(session) {
+        if let Some(existing) = running.scratch.get(session) {
             return Ok(existing.clone());
         }
-        if running.contexts.len() >= self.cfg.max_contexts {
+        if running.scratch.len() >= self.cfg.max_contexts {
             return Err(BrowserError::TooManyContexts {
                 max: self.cfg.max_contexts,
             });
@@ -281,10 +453,10 @@ impl BrowserService {
         );
         info!(
             session,
-            browser_context = %ctx.browser_context_id(),
-            "browser: context created"
+            browser_context = ?ctx.browser_context_id(),
+            "browser: scratch context created"
         );
-        running.contexts.insert(session.to_string(), ctx.clone());
+        running.scratch.insert(session.to_string(), ctx.clone());
         running.idle_since = None;
         Ok(ctx)
     }
@@ -296,7 +468,7 @@ impl BrowserService {
             .lock()
             .await
             .as_ref()
-            .and_then(|r| r.contexts.get(session).cloned())
+            .and_then(|r| r.scratch.get(session).cloned())
     }
 
     /// How many contexts are live right now. This is the number
@@ -308,39 +480,193 @@ impl BrowserService {
             .lock()
             .await
             .as_ref()
-            .map(|r| r.contexts.len())
+            .map(|r| r.scratch.len())
             .unwrap_or(0)
     }
 
-    /// Is the idle reaper's clock armed (zero contexts, waiting to time out)?
+    /// Is the idle reaper's clock armed (nothing live, waiting to time out)?
     /// The reaper can only fire while this is true, so it is the observable
     /// behind "the reaper is not defeated".
+    ///
+    /// **Unchanged in meaning, widened in scope:** a live workspace tab now also
+    /// disarms it. A tab is not *lost* by a reap — it is dehydrated (R4) — but a
+    /// tab someone is actually driving must not have chrome pulled out from
+    /// under it, so it counts as activity while it is live.
     pub async fn idle_armed(&self) -> bool {
         self.running
             .lock()
             .await
             .as_ref()
-            .map(|r| r.idle_since.is_some() && r.contexts.is_empty())
+            .map(|r| r.idle_since.is_some() && r.scratch.is_empty() && r.tabs.is_empty())
             .unwrap_or(false)
     }
 
-    /// Close one session's context and dispose it browser-side. Disposing one
-    /// context provably leaves its siblings responsive.
-    pub async fn close_context(&self, session: &str) -> Result<()> {
+    /// Close one session's **scratch** context and dispose it browser-side.
+    /// Disposing one context provably leaves its siblings responsive.
+    ///
+    /// It can no longer reach the tab map — that is R3 in one method: a session
+    /// ending must never close a workspace tab, pinned or not.
+    pub async fn close_scratch(&self, session: &str) -> Result<()> {
         let mut guard = self.running.lock().await;
         let Some(running) = guard.as_mut() else {
             return Err(BrowserError::NoSuchContext(session.to_string()));
         };
-        let Some(ctx) = running.contexts.remove(session) else {
+        let Some(ctx) = running.scratch.remove(session) else {
             return Err(BrowserError::NoSuchContext(session.to_string()));
         };
-        if running.contexts.is_empty() {
+        if running.scratch.is_empty() && running.tabs.is_empty() {
             running.idle_since = Some(Instant::now());
         }
         drop(guard);
         ctx.close().await;
-        info!(session, "browser: context closed");
+        info!(session, "browser: scratch context closed");
         Ok(())
+    }
+
+    /// The pre-v1 name for [`close_scratch`](Self::close_scratch). Kept because
+    /// every caller of it always meant "scratch" — the rename is a clarification,
+    /// not a behaviour change.
+    pub async fn close_context(&self, session: &str) -> Result<()> {
+        self.close_scratch(session).await
+    }
+
+    // ── the workspace tab registry (shared-browser v1) ──────────────────────
+
+    /// A LIVE tab, without creating one and **without starting chrome**.
+    ///
+    /// Deliberately non-spawning, exactly like [`context`](Self::context): the
+    /// takeover socket takes over something that already exists, and an
+    /// unauthorised surface must never be able to spawn a browser.
+    pub async fn tab(&self, tab_id: &str) -> Option<Arc<Tab>> {
+        self.running
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|r| r.tabs.get(tab_id).cloned())
+    }
+
+    /// **Get or rehydrate** a workspace tab, starting chrome on first use.
+    ///
+    /// Idempotent: a second call for the same id returns the same `Arc`. A tab
+    /// that was dehydrated (or lost to a crash / a restart) is re-opened at
+    /// `meta.url` in the DEFAULT context — the profile is on disk, so the cookies
+    /// are simply there and the login comes back with the page.
+    ///
+    /// Lazy start is preserved: nothing here runs until somebody with a grant
+    /// actually asks for a tab.
+    pub async fn ensure_tab(self: &Arc<Self>, tab_id: &str, meta: TabMeta) -> Result<Arc<Tab>> {
+        if !db_tabs::valid_tab_id(tab_id) {
+            return Err(BrowserError::NoSuchTab(tab_id.to_string()));
+        }
+        let mut guard = self.running.lock().await;
+
+        // Relaunch if a previous chrome died under us (same policy as scratch).
+        if let Some(r) = guard.as_ref() {
+            if r.client.is_closed() || !r.chrome.is_alive() {
+                warn!("browser: chrome died; relaunching on demand");
+                if let Some(dead) = guard.take() {
+                    dead.chrome.shutdown().await;
+                }
+            }
+        }
+        if guard.is_none() {
+            *guard = Some(self.start_locked().await?);
+        }
+        let running = guard.as_mut().expect("just started");
+
+        if let Some(existing) = running.tabs.get(tab_id) {
+            running.idle_since = None;
+            return Ok(existing.clone());
+        }
+        if running.tabs.len() >= self.cfg.max_tabs {
+            return Err(BrowserError::TooManyTabs {
+                max: self.cfg.max_tabs,
+            });
+        }
+
+        let url = if meta.url.trim().is_empty() {
+            "about:blank"
+        } else {
+            meta.url.as_str()
+        };
+        // The lock subject is the TAB id, not a session name — one lock per tab.
+        let page = Arc::new(
+            AgentContext::create_in_default_context(
+                running.client.clone(),
+                tab_id,
+                self.cfg.width,
+                self.cfg.height,
+                url,
+            )
+            .await?,
+        );
+        let tab = Arc::new(Tab::new(tab_id.to_string(), page, meta));
+        info!(
+            tab = tab_id,
+            target = %tab.page().target_id(),
+            "browser: workspace tab live"
+        );
+        running.tabs.insert(tab_id.to_string(), tab.clone());
+        running.idle_since = None;
+        Ok(tab)
+    }
+
+    /// **Dehydrate** a tab: persist where it was, close its target, forget it.
+    /// The `browser_tabs` row — and the profile's cookies — are untouched, so
+    /// the next [`ensure_tab`](Self::ensure_tab) restores it losslessly.
+    ///
+    /// `Ok(false)` when the tab was not live (already dehydrated); that is a
+    /// normal state, not an error.
+    pub async fn dehydrate_tab(&self, tab_id: &str) -> Result<bool> {
+        let taken = {
+            let mut guard = self.running.lock().await;
+            let Some(running) = guard.as_mut() else {
+                return Ok(false);
+            };
+            let taken = running.tabs.remove(tab_id);
+            if running.scratch.is_empty() && running.tabs.is_empty() {
+                running.idle_since = Some(Instant::now());
+            }
+            taken
+        };
+        let Some(tab) = taken else { return Ok(false) };
+        self.persist_location(&tab).await;
+        tab.close().await;
+        info!(tab = tab_id, "browser: tab dehydrated (row + cookies kept)");
+        Ok(true)
+    }
+
+    /// Read the page's real URL/title and write them through to `browser_tabs`,
+    /// so a rehydrate reopens where the human actually was.
+    async fn persist_location(&self, tab: &Arc<Tab>) {
+        let url = tab.page().current_url().await.unwrap_or_default();
+        let title = tab
+            .page()
+            .evaluate("document.title")
+            .await
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        if url.is_empty() {
+            return;
+        }
+        tab.set_location(url.clone(), title.clone()).await;
+        let Some(pool) = self.pool() else { return };
+        let patch = db_tabs::TabPatch {
+            url: Some(url),
+            title: Some(title),
+            ..Default::default()
+        };
+        if let Err(e) = db_tabs::update(pool, tab.id(), &patch).await {
+            warn!(tab = tab.id(), error = %e, "browser: could not persist tab location");
+        }
+    }
+
+    /// Dehydrate every live tab (the reaper's first step, and the shutdown path's).
+    async fn dehydrate_all_tabs(&self) {
+        for id in self.live_tabs().await {
+            let _ = self.dehydrate_tab(&id).await;
+        }
     }
 
     // ── the AGENT/HUMAN lock, service-level ─────────────────────────────────
@@ -371,12 +697,44 @@ impl BrowserService {
         Ok(previous)
     }
 
-    /// Current drive mode for a session's context.
+    /// Current drive mode for a session's scratch context.
     pub async fn mode(&self, session: &str) -> Result<DriveMode> {
         self.context(session)
             .await
             .map(|c| c.mode())
             .ok_or_else(|| BrowserError::NoSuchContext(session.to_string()))
+    }
+
+    /// **The human grabs the wheel on one TAB.** Tab-scoped sibling of
+    /// [`request_human_takeover`](Self::request_human_takeover); the
+    /// session-scoped one stays for scratch.
+    pub async fn request_human_takeover_tab(&self, tab_id: &str) -> Result<DriveMode> {
+        let tab = self
+            .tab(tab_id)
+            .await
+            .ok_or_else(|| BrowserError::NoSuchTab(tab_id.to_string()))?;
+        let previous = tab.lock().request_human_takeover();
+        info!(tab = tab_id, %previous, "browser: HUMAN takeover (tab)");
+        Ok(previous)
+    }
+
+    /// The wheel goes back to the agent on one tab.
+    pub async fn release_tab_to_agent(&self, tab_id: &str, handoff: HandOff) -> Result<DriveMode> {
+        let tab = self
+            .tab(tab_id)
+            .await
+            .ok_or_else(|| BrowserError::NoSuchTab(tab_id.to_string()))?;
+        let previous = tab.lock().release_to_agent(handoff);
+        info!(tab = tab_id, %previous, "browser: tab released to AGENT");
+        Ok(previous)
+    }
+
+    /// Current drive mode for one tab.
+    pub async fn tab_mode(&self, tab_id: &str) -> Result<DriveMode> {
+        self.tab(tab_id)
+            .await
+            .map(|t| t.mode())
+            .ok_or_else(|| BrowserError::NoSuchTab(tab_id.to_string()))
     }
 
     // ── lifecycle ───────────────────────────────────────────────────────────
@@ -388,6 +746,7 @@ impl BrowserService {
             self.cfg.ld_library_path.as_deref(),
             self.cfg.width,
             self.cfg.height,
+            &self.cfg.profile,
         )
         .await?;
         // From here `chrome` owns its own teardown: if the CDP connect fails,
@@ -403,10 +762,18 @@ impl BrowserService {
             spawn_idle_reaper(weak, self.cfg.idle_timeout);
         });
 
+        // **Reconcile** (§4.2). A durable profile's session-restore can resurrect
+        // page targets we know nothing about; a live set larger than the set
+        // supermux believes in is how a tab registry silently desyncs. Close any
+        // orphan page target now, while there is provably nothing of ours to hit
+        // (both registries are empty at this point, by construction).
+        reconcile_orphan_targets(&client).await;
+
         Ok(Running {
             chrome,
             client,
-            contexts: HashMap::new(),
+            tabs: HashMap::new(),
+            scratch: HashMap::new(),
             idle_since: Some(Instant::now()),
         })
     }
@@ -422,11 +789,18 @@ impl BrowserService {
         let Some(mut running) = taken else { return };
         let pid = running.chrome.pid();
 
-        // 1. Best-effort per-context disposal, bounded.
-        let contexts: Vec<Arc<AgentContext>> = running.contexts.drain().map(|(_, c)| c).collect();
+        // 1. Best-effort per-context disposal, bounded. Tabs are dropped from
+        //    the registry WITHOUT `disposeBrowserContext` (there is none to
+        //    dispose) — their rows and their cookies are on disk and outlive
+        //    this process entirely, which is the point.
+        let contexts: Vec<Arc<AgentContext>> = running.scratch.drain().map(|(_, c)| c).collect();
+        let tabs: Vec<Arc<Tab>> = running.tabs.drain().map(|(_, t)| t).collect();
         let _ = tokio::time::timeout(CONTEXT_DRAIN_BUDGET, async {
             for ctx in contexts {
                 ctx.close().await;
+            }
+            for tab in tabs {
+                tab.close().await;
             }
         })
         .await;
@@ -462,7 +836,45 @@ impl Drop for BrowserService {
     }
 }
 
-/// **Drop `session`'s browser context because the session is going away.**
+/// Close any page target Chrome brought back on its own.
+///
+/// A durable `--user-data-dir` means Chrome may restore the previous run's tabs.
+/// Those targets are not in our registry, would never be closed, and would count
+/// against nothing — a slow leak of authenticated pages nobody can see. Called
+/// once per launch, before either registry has an entry, so every page target
+/// found here is by definition an orphan.
+///
+/// Best-effort and non-fatal: a browser that will not enumerate its targets is
+/// not a reason to refuse to start.
+async fn reconcile_orphan_targets(client: &Arc<CdpClient>) {
+    let Ok(v) = client.call("Target.getTargets", serde_json::json!({})).await else {
+        return;
+    };
+    let Some(infos) = v.get("targetInfos").and_then(|t| t.as_array()) else {
+        return;
+    };
+    for info in infos {
+        if info.get("type").and_then(|t| t.as_str()) != Some("page") {
+            continue;
+        }
+        let Some(target_id) = info.get("targetId").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        warn!(
+            target = target_id,
+            url = info.get("url").and_then(|u| u.as_str()).unwrap_or(""),
+            "browser: closing a target restored by the durable profile"
+        );
+        let _ = client
+            .call(
+                "Target.closeTarget",
+                serde_json::json!({ "targetId": target_id }),
+            )
+            .await;
+    }
+}
+
+/// **Drop `session`'s SCRATCH browser context because the session is going away.**
 ///
 /// Wired into every session-teardown path (`SessionEnd` hook, `lifecycle::stop`,
 /// delete/archive via `AppState::forget_session`, and rename). Without it a
@@ -480,6 +892,11 @@ impl Drop for BrowserService {
 ///    agent signed into; disposing it on session end is also why a recycled
 ///    session name finds nothing to inherit.
 ///
+/// **It cannot reach a workspace tab** (v1 §2.3 R3). All three leaks above are
+/// about *scratch* contexts; a session ending closing a tab a human pinned and
+/// logged into would be the precise anti-goal of the feature. The one-word
+/// change is the call below: [`BrowserService::close_scratch`].
+///
 /// Fire-and-forget and bounded: teardown must never block on CDP, and a session
 /// that never used the browser is the common case — its `NoSuchContext` is
 /// silent, not an error. Returns the spawned task so a test can await the
@@ -492,7 +909,7 @@ pub fn dispose_on_teardown(
     let browser = browser.clone();
     let session = session.to_string();
     Some(handle.spawn(async move {
-        match tokio::time::timeout(TEARDOWN_BUDGET, browser.close_context(&session)).await {
+        match tokio::time::timeout(TEARDOWN_BUDGET, browser.close_scratch(&session)).await {
             // The common case: this session never opened a browser.
             Ok(Err(BrowserError::NoSuchContext(_))) => {}
             Ok(Err(e)) => warn!(session, error = %e, "browser: teardown disposal failed"),
@@ -537,11 +954,25 @@ fn install_signal_hook(weak: Weak<BrowserService>) {
     });
 }
 
-/// Close the shell after [`BrowserConfig::idle_timeout`] with zero contexts.
+/// Close the browser after [`BrowserConfig::idle_timeout`] with nothing live.
 ///
 /// Lives for the process lifetime (it exits when the service is dropped) and
 /// is a no-op while chrome is not running, so a reaped browser simply
-/// relaunches on the next [`BrowserService::context_for`].
+/// relaunches on the next [`BrowserService::context_for`] /
+/// [`BrowserService::ensure_tab`].
+///
+/// # Dehydration, not eviction (v1 §2.3 R4)
+///
+/// Pinning chrome alive forever to protect tabs would re-introduce the very leak
+/// this reaper exists to close — on a box with a documented chrome-leak history,
+/// and at ~844 MB idle. So the reaper still fires; it just cannot LOSE anything:
+/// every live tab has its URL and title persisted and its target closed, the row
+/// stays, and the cookies stay in the profile on disk. The next access relaunches
+/// chrome, reopens the stored URL, and the login is simply there.
+///
+/// A live tab still *disarms* the clock while it is live (see
+/// [`BrowserService::idle_armed`]) — dehydrating a page a human is looking at
+/// would be correct-but-rude.
 fn spawn_idle_reaper(weak: Weak<BrowserService>, idle_timeout: Duration) {
     if idle_timeout.is_zero() {
         info!("browser: idle reaper disabled");
@@ -556,13 +987,19 @@ fn spawn_idle_reaper(weak: Weak<BrowserService>, idle_timeout: Duration) {
                 match guard.as_ref() {
                     Some(r) => r
                         .idle_since
-                        .map(|t| r.contexts.is_empty() && t.elapsed() >= idle_timeout)
+                        .map(|t| {
+                            r.scratch.is_empty() && r.tabs.is_empty() && t.elapsed() >= idle_timeout
+                        })
                         .unwrap_or(false),
                     None => false,
                 }
             };
             if expired {
                 info!(?idle_timeout, "browser: idle — reaping chrome");
+                // Belt and braces: the clock only arms with an empty tab map, but
+                // a tab that went live in the same tick must be persisted, not
+                // dropped on the floor.
+                svc.dehydrate_all_tabs().await;
                 svc.shutdown().await;
             }
         }
@@ -628,8 +1065,57 @@ mod tests {
     fn defaults_are_conservative() {
         let cfg = BrowserConfig::default();
         assert!(cfg.max_contexts >= 1 && cfg.max_contexts <= 32);
+        assert!(cfg.max_tabs >= cfg.max_contexts, "a workspace needs more room than scratch");
         assert!(cfg.idle_timeout >= Duration::from_secs(60));
-        assert_eq!((cfg.width, cfg.height), (1024, 768));
+        // Raised for v1: a login viewport, and a less unusual fingerprint.
+        assert_eq!((cfg.width, cfg.height), (1366, 900));
+        // The DEFAULT is the persistent workspace jar, living under the data dir
+        // — never the repo checkout, never a worktree, never /tmp.
+        match &cfg.profile {
+            ProfileMode::Durable(dir) => {
+                assert!(dir.ends_with("browser/profile"), "got {}", dir.display());
+                assert!(
+                    !dir.starts_with(std::env::temp_dir()),
+                    "the durable profile must not live in temp: {}",
+                    dir.display()
+                );
+            }
+            other => panic!("the default profile must be Durable, got {other:?}"),
+        }
+    }
+
+    /// A tab id that never passed the shape gate must not reach the registry —
+    /// and must not start a browser on its way to being rejected.
+    #[tokio::test]
+    async fn a_malformed_tab_id_is_refused_without_spawning_anything() {
+        let svc = BrowserService::new(BrowserConfig::default());
+        for bad in ["", "alice", "tb_", "tb_../../etc", "tb_a b"] {
+            let err = svc
+                .ensure_tab(bad, TabMeta::default())
+                .await
+                .expect_err("must be refused");
+            assert!(matches!(err, BrowserError::NoSuchTab(_)), "{bad}: {err:?}");
+        }
+        assert!(!svc.is_running().await, "no chrome may be spawned");
+        assert_eq!(svc.tab_count().await, 0);
+    }
+
+    /// The tab-scoped lock API needs a LIVE tab, exactly as the session-scoped
+    /// one needs a live context — and neither may spawn one to answer.
+    #[tokio::test]
+    async fn the_tab_lock_api_needs_a_live_tab() {
+        let svc = BrowserService::new(BrowserConfig::default());
+        let err = svc
+            .request_human_takeover_tab("tb_nothinghere1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BrowserError::NoSuchTab(_)), "got {err:?}");
+        let err = svc.tab_mode("tb_nothinghere1").await.unwrap_err();
+        assert!(matches!(err, BrowserError::NoSuchTab(_)), "got {err:?}");
+        assert!(svc.tab("tb_nothinghere1").await.is_none());
+        // Dehydrating a tab that is not live is a normal state, not an error.
+        assert!(!svc.dehydrate_tab("tb_nothinghere1").await.unwrap());
+        assert!(!svc.is_running().await);
     }
 
     // ── FINDING 1: the registry's lifetime contract ─────────────────────────
@@ -665,6 +1151,7 @@ mod tests {
 
         let svc = BrowserService::new(BrowserConfig {
             max_contexts: 3,
+            profile: ProfileMode::Ephemeral,
             ..BrowserConfig::default()
         });
 
@@ -727,7 +1214,13 @@ mod tests {
             std::path::Path::new(&format!("/proc/{pid}")).exists()
         }
 
-        let svc = BrowserService::new(BrowserConfig::default());
+        // **Explicitly ephemeral.** This test asserts the profile dir is REMOVED,
+        // which is the scratch guarantee; the default is now the durable
+        // workspace jar, whose whole job is to survive exactly this.
+        let svc = BrowserService::new(BrowserConfig {
+            profile: ProfileMode::Ephemeral,
+            ..BrowserConfig::default()
+        });
         // First context lazily spawns the single shell.
         svc.context_for("alice").await.expect("spawn + context alice");
         assert!(svc.is_running().await, "chrome should be running after context_for");

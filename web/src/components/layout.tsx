@@ -2,6 +2,7 @@ import * as React from 'react'
 import { Outlet, useLocation } from 'react-router-dom'
 import {
   FolderClosed,
+  Globe,
   LayoutGrid,
   Plug,
   Search,
@@ -99,6 +100,12 @@ const NAV: NavItem[] = [
   // store, so the BASE rail stays four items and no `--nav-n` / tab-count /
   // Liquid-Pill geometry is respec'd; under grok the phone bar goes 4 → 5.
   { to: '/workflows', label: 'Workflows', icon: Workflow, grokOnly: true },
+  // Shared browser — the human's persistent, logged-in browser workspace
+  // (shared-browser v1 §6.1). `grokOnly` for the same reason /store is: it is a
+  // Grok-native doorway, and the base app must stay byte-identical (both nav
+  // surfaces filter it out when grok is off, and `--nav-n` / the sliding pill
+  // geometry follow the filtered count automatically).
+  { to: '/browser', label: 'Browser', icon: Globe, grokOnly: true },
   { to: '/files', label: 'Files', icon: FolderClosed },
   // Hosts registry AND the scheduler both moved into Settings (rare-use config
   // doesn't need a primary-nav slot). `/hosts` → /settings#hosts and

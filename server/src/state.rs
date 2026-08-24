@@ -628,6 +628,12 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(pool: SqlitePool, config: Config) -> Self {
+        // Cloned up front: `pool` and `config` are moved into the struct literal
+        // below, and the browser service needs its own DB handle (for the
+        // workspace-tab rows) and the RESOLVED data dir (for the durable profile
+        // — never the raw env, so a test harness lands in its own temp dir).
+        let browser_pool = pool.clone();
+        let browser_cfg = crate::connectors::browser::BrowserConfig::for_data_dir(&config.data_dir);
         let (sse_tx, _rx) = broadcast::channel(SSE_CHANNEL_CAP);
         // Build the pty streamer before `config` is moved into the Arc.
         let pty = Arc::new(PtyStreamer::new(
@@ -695,9 +701,14 @@ impl AppState {
             host_pool,
             updates: crate::updates::UpdatesState::new(),
             // Cheap: a config struct. No process, no I/O — see the field docs.
-            browser: crate::connectors::browser::BrowserService::new(
-                crate::connectors::browser::BrowserConfig::from_env(),
-            ),
+            // The pool is attached (not passed to `new`) so that call stays
+            // allocation-only, which the lazy-start invariant depends on; the
+            // workspace-TAB surface is the only thing that reads it.
+            browser: {
+                let svc = crate::connectors::browser::BrowserService::new(browser_cfg);
+                svc.attach_pool(browser_pool);
+                svc
+            },
             // Runs (or reuses) the once-per-process isolation probe and logs the
             // honest measured level. On THIS box the systemd @system-service
             // filter blocks landlock_*, so the probe measures None and company

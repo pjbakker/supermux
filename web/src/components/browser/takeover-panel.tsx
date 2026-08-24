@@ -50,17 +50,90 @@ import {
   EMPTY_SNAPSHOT,
   TakeoverSocket,
   modifiersFor,
+  subjectName,
   type TakeoverOptions,
   type TakeoverSnapshot,
+  type TakeoverSubject,
 } from '@/lib/browser/takeover-socket'
 
 /** Cap the backing store at 2× — a 3× phone would triple the fill cost of
  *  every frame for a JPEG that is 512px wide to begin with. */
 const MAX_DPR = 2
 
+/**
+ * Paint an already-decoded frame into the canvas at the box's CURRENT size.
+ *
+ * Split out of the decode loop because a RESIZE has to repaint too, and it has
+ * no frame of its own to wait for: a static page emits no screencast frames
+ * (spike gotcha #1), so a canvas whose backing store was sized for the old box
+ * would sit there CSS-stretched — blurry, and letterboxed for the wrong aspect
+ * — for as long as the page holds still. Which, on a signed-in inbox, is
+ * "until something moves".
+ */
+function blit(canvas: HTMLCanvasElement, box: HTMLElement, image: DecodedFrame): void {
+  const cssW = box.clientWidth
+  const cssH = box.clientHeight
+  if (!(cssW > 0) || !(cssH > 0)) return
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR)
+  const w = Math.round(cssW * dpr)
+  const h = Math.round(cssH * dpr)
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w
+    canvas.height = h
+  }
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  const fit = fitFrame({ width: cssW, height: cssH }, frameSize(image))
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, cssW, cssH)
+  ctx.drawImage(image as CanvasImageSource, fit.left, fit.top, fit.width, fit.height)
+}
+
+/** Wipe the canvas. Used when the SUBJECT changes: the canvas element survives
+ *  a subject swap (React reuses the node), so without this the PREVIOUS tab's
+ *  page stays on screen while the new tab's socket dials and its seed still is
+ *  captured — one tab's pixels under another tab's address bar, which is the
+ *  one thing a workspace must never show. */
+function wipe(canvas: HTMLCanvasElement): void {
+  canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+}
+
+/** Free a decoded frame we are done with.
+ *
+ *  `createImageBitmap` allocates OUTSIDE the JS heap and is reclaimed only when
+ *  the GC eventually gets to it, so at 30–60 frames a second an un-closed
+ *  bitmap per frame is real drift on a long watch. An `<img>` fallback has
+ *  nothing to release. */
+function release(frame: DecodedFrame | null | undefined): void {
+  if (frame && 'close' in frame && typeof frame.close === 'function') frame.close()
+}
+
+/** The three wheel verbs, published into a host-owned ref while the socket is
+ *  alive (and nulled on teardown, so a stale handle cannot poke a dead socket).
+ *  A ref rather than a callback argument on purpose: the host calls these from
+ *  its own event handlers, so nothing reads a ref during render. */
+export interface TakeoverControls {
+  takeOver: () => void
+  handBack: () => void
+  resync: () => void
+}
+
+/** What a host-drawn header renders from. Plain values only. */
+export interface TakeoverHeaderState {
+  snapshot: TakeoverSnapshot
+  /** `snapshot.mode === 'human_driving'`, spelled out because it is the ONE
+   *  thing a host must not get wrong. */
+  driving: boolean
+}
+
 export interface TakeoverPanelProps {
-  /** The supermux session whose browser context this is. */
-  session: string
+  /** The supermux session whose SCRATCH browser context this is (the in-chat
+   *  path). Ignored when `subject` is given. */
+  session?: string
+  /** The WORKSPACE subject — a persistent tab, or a session spelled out. The
+   *  route is the only difference: a tab attaches watch-first (`/ws/browser/
+   *  tab/{id}`), a session grabs the wheel on attach. */
+  subject?: TakeoverSubject
   /** Injected for tests/benches; production passes nothing. */
   options?: TakeoverOptions
   /** The panel is hosted inside a surface that ALREADY states who is driving and
@@ -69,10 +142,30 @@ export interface TakeoverPanelProps {
    *  button beside the host's — one state, one control (jury TAKEOVER_PANEL #2).
    *  Standalone (the /dev bench, a future full-page route) keeps both. */
   embedded?: boolean
+  /** Draw the host's OWN header (address bar, Watch/Drive) in place of the
+   *  built-in one, driving this same socket. The workspace route uses it; the
+   *  in-chat card and the bench pass nothing and keep today's header. */
+  renderHeader?: (state: TakeoverHeaderState) => React.ReactNode
+  /** Where to publish [[TakeoverControls]] for a host-drawn header. */
+  controlsRef?: { current: TakeoverControls | null }
   className?: string
 }
 
-export function TakeoverPanel({ session, options, embedded, className }: TakeoverPanelProps) {
+export function TakeoverPanel({
+  session,
+  subject,
+  options,
+  embedded,
+  renderHeader,
+  controlsRef,
+  className,
+}: TakeoverPanelProps) {
+  // Primitives, not the object: a caller passing `subject={{kind:'tab',id}}`
+  // inline would otherwise hand the effect a new identity on every render and
+  // redial the socket sixty times a minute.
+  const kind = subject?.kind ?? 'session'
+  const name = subject ? subjectName(subject) : session ?? ''
+
   const [snap, setSnap] = React.useState<TakeoverSnapshot>(EMPTY_SNAPSHOT)
   const boxRef = React.useRef<HTMLDivElement | null>(null)
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null)
@@ -91,6 +184,10 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
     let alive = true
     let pending: TakeoverFrame | null = null
     let decoding = false
+    // Captured for the cleanup: the canvas node outlives a subject swap (React
+    // reuses it), and reading the ref in a cleanup is exactly what the
+    // exhaustive-deps rule warns about.
+    const mounted = canvasRef.current
 
     const paint = async (): Promise<void> => {
       if (decoding) return
@@ -103,21 +200,14 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
         const canvas = canvasRef.current
         const box = boxRef.current
         if (alive && canvas && box) {
-          const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR)
-          const cssW = box.clientWidth
-          const cssH = box.clientHeight
-          if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
-            canvas.width = Math.round(cssW * dpr)
-            canvas.height = Math.round(cssH * dpr)
-          }
-          const ctx = canvas.getContext('2d')
-          if (ctx) {
-            const fit = fitFrame({ width: cssW, height: cssH }, frameSize(image))
-            ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-            ctx.clearRect(0, 0, cssW, cssH)
-            ctx.drawImage(image as CanvasImageSource, fit.left, fit.top, fit.width, fit.height)
-          }
+          blit(canvas, box, image)
+          // The one we just replaced is now unreachable — close it here rather
+          // than leaving a bitmap per frame to the GC.
+          release(paintedRef.current?.image)
           paintedRef.current = { image, frame: next }
+        } else {
+          // Decoded into a panel that went away mid-decode.
+          release(image)
         }
       } catch {
         /* a frame that will not decode is a frame we skip */
@@ -130,7 +220,7 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
     }
 
     const sock = new TakeoverSocket(
-      session,
+      kind === 'tab' ? { kind: 'tab', id: name } : { kind: 'session', name },
       setSnap,
       (frame) => {
         pending = frame
@@ -139,15 +229,45 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
       options,
     )
     socketRef.current = sock
+    // Publish the wheel verbs over the LOCAL socket, not the ref — they are
+    // born and die with this socket, exactly like the decode loop above.
+    if (controlsRef) {
+      controlsRef.current = {
+        takeOver: () => sock.takeOver(),
+        handBack: () => sock.handBack(),
+        resync: () => sock.resync(),
+      }
+    }
     sock.start()
     return () => {
       alive = false
       pending = null
       sock.stop()
+      if (controlsRef) controlsRef.current = null
       socketRef.current = null
+      // The subject changed (or the panel unmounted): the pixels on the canvas
+      // are the OLD subject's and must not outlive it — see `wipe`.
+      if (mounted) wipe(mounted)
+      release(paintedRef.current?.image)
       paintedRef.current = null
     }
-  }, [session, options])
+  }, [kind, name, options, controlsRef])
+
+  // Repaint from the frame we ALREADY hold when the box resizes — a rotation, a
+  // split-pane drag, an iOS URL-bar collapse. `blit` sizes the backing store, so
+  // without this the canvas keeps the previous box's dimensions and the browser
+  // stretches it; on a static page no further frame ever arrives to fix it.
+  React.useEffect(() => {
+    const box = boxRef.current
+    const canvas = canvasRef.current
+    if (!box || !canvas || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => {
+      const painted = paintedRef.current
+      if (painted) blit(canvas, box, painted.image)
+    })
+    ro.observe(box)
+    return () => ro.disconnect()
+  }, [])
 
   /** A pointer/wheel event's position in PAGE coordinates, or `null` when it
    *  landed on the letterbox (or before the first frame). */
@@ -241,8 +361,12 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
   return (
     <div
       className={cn('flex min-h-0 flex-col overflow-hidden bg-paper text-ink', className)}
-      data-takeover={session}
+      data-takeover={name}
+      data-takeover-kind={kind}
     >
+      {renderHeader ? (
+        renderHeader({ snapshot: snap, driving })
+      ) : (
       <header className="flex items-center gap-2 border-b border-hairline bg-surface px-3 py-2">
         {!embedded && <ModePill mode={snap.mode} state={snap.state} />}
         <span
@@ -271,11 +395,14 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
           </button>
         )}
       </header>
+      )}
 
       <div
         ref={boxRef}
         role="application"
-        aria-label={`Shared browser for ${session}`}
+        aria-label={
+          kind === 'tab' ? 'Shared browser tab' : `Shared browser for ${name}`
+        }
         tabIndex={0}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -291,7 +418,7 @@ export function TakeoverPanel({ session, options, embedded, className }: Takeove
         )}
       >
         <canvas ref={canvasRef} className="block h-full w-full" data-takeover-canvas />
-        <StatusVeil state={snap.state} refused={snap.refused} />
+        <StatusVeil state={snap.state} refused={snap.refused} kind={kind} />
       </div>
     </div>
   )
@@ -334,13 +461,20 @@ function ModePill({
 function StatusVeil({
   state,
   refused,
+  kind,
 }: {
   state: TakeoverSnapshot['state']
   refused: string | null
+  /** A tab's 4404 means something different from a session's: the tab exists and
+   *  its login is on disk, it just is not open right now. Saying "the agent has
+   *  to open one" there would be plain wrong. */
+  kind?: 'session' | 'tab'
 }) {
   const message =
     state === 'no-context'
-      ? 'This session has no open page yet — the agent has to open one before you can take over.'
+      ? kind === 'tab'
+        ? "This tab isn't open right now — it went to sleep, and its sign-in is kept on disk."
+        : 'This session has no open page yet — the agent has to open one before you can take over.'
       : state === 'busy'
         ? 'Someone else is already driving this page.'
         : state === 'offline'

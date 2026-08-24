@@ -35,14 +35,18 @@ pub enum BrowserError {
     #[error("page evaluation threw: {0}")]
     Evaluate(String),
 
-    /// The agent tried to drive a context a human has taken over.
+    /// The agent tried to drive a page a human has taken over.
     /// **This is the lock refusal** — expected, not exceptional.
-    #[error("browser context '{session}' is under HUMAN control; agent input is refused")]
-    HumanDriving { session: String },
+    ///
+    /// `subject` is what the lock is scoped to: a session name for a scratch
+    /// context, a `tb_…` tab id for a workspace tab (one lock per tab, so a
+    /// human on tab A never blocks an agent on tab B).
+    #[error("browser subject '{subject}' is under HUMAN control; agent input is refused")]
+    HumanDriving { subject: String },
 
     /// Waiting for the human to hand control back exceeded the caller's budget.
-    #[error("timed out waiting for human takeover of '{session}' to end")]
-    TakeoverWait { session: String },
+    #[error("timed out waiting for human takeover of '{subject}' to end")]
+    TakeoverWait { subject: String },
 
     /// The per-service context cap would be exceeded.
     #[error("browser context limit reached ({max}); close a session's context first")]
@@ -55,4 +59,38 @@ pub enum BrowserError {
     /// The service has been shut down (idle-reaped or on server exit).
     #[error("browser service is shut down")]
     ShuttingDown,
+
+    // ── shared-browser v1: the workspace-tab surface ────────────────────────
+    //
+    // `NoSuchTab` and `NotGrantedForTab` are BOTH rendered 403 to an agent
+    // caller (see `tools::browser_err`), deliberately: an ungranted bot must not
+    // learn whether a tab id exists. The distinction survives only in the logs
+    // and on the human surface.
+    /// No `browser_tabs` row with this id.
+    #[error("no such browser tab '{0}'")]
+    NoSuchTab(String),
+
+    /// The session holds the connector grant but not a grant on THIS tab.
+    /// **The R2 refusal** — it gates reads and screenshots too, because on an
+    /// authenticated tab reading IS the exfiltration.
+    #[error("session '{session}' has no grant on browser tab '{tab}'")]
+    NotGrantedForTab { session: String, tab: String },
+
+    /// The per-service workspace-tab cap would be exceeded.
+    #[error("browser tab limit reached ({max}); close or unpin a tab first")]
+    TooManyTabs { max: usize },
+
+    /// The tab's login has lapsed. **Honest expiry**: an agent scraping a login
+    /// wall and reporting it as data is worse than an agent that errors.
+    #[error("browser tab '{tab}' needs the human to sign in again")]
+    TabNeedsLogin { tab: String },
+
+    /// An agent tried to navigate a tab off its per-tab origin allowlist. A
+    /// cookie-bearing tab pointed at an attacker-chosen host is an exfil chain.
+    #[error("browser tab '{tab}' is not allowed to visit '{host}'")]
+    OriginNotAllowed { tab: String, host: String },
+
+    /// Another supermux instance already owns the durable profile (§8.6).
+    #[error("the browser profile is already open by another supermux instance (pid {by_pid:?})")]
+    ProfileLocked { by_pid: Option<u32> },
 }
