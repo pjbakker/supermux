@@ -1045,3 +1045,155 @@ async fn text_limit_is_one_megabyte() {
     assert_eq!(body["truncated"], false, "900 KB is inside the 1 MB text limit");
     assert_eq!(body["content"].as_str().unwrap().len(), 900 * 1024);
 }
+
+// ───────────────────── the company-stamped `files` SSE frame ──────────────────
+
+/// R6 — the `files` frame is this app's FIRST company-routed producer, so this
+/// is the first end-to-end proof that `SseEvent::for_company` routing works
+/// against a real subscriber. A frame for a path under company A's root must be
+/// stamped A: unstamped would be a missing update (safe), but a frame stamped
+/// with the WRONG company leaks another company's filenames to a member and
+/// nothing downstream would catch it.
+#[tokio::test]
+async fn files_frame_is_company_stamped_by_path() {
+    use supermux_server::scope::Scope;
+
+    let env = setup().await;
+    let root_a = env.work_dir.join("acme");
+    let root_b = env.work_dir.join("beta");
+    std::fs::create_dir(&root_a).unwrap();
+    std::fs::create_dir(&root_b).unwrap();
+    let a = db::companies::create(&env.state.pool, "acme", "Acme", &root_a.to_string_lossy())
+        .await
+        .expect("company A");
+    let b = db::companies::create(&env.state.pool, "beta", "Beta", &root_b.to_string_lossy())
+        .await
+        .expect("company B");
+
+    let mut rx = env.state.sse_tx.subscribe();
+
+    let target = root_a.join("reports/q3");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/mkdir",
+            &json!({ "path": target.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let frame = rx.try_recv().expect("a files frame was published");
+    assert_eq!(frame.event, "files");
+    assert_eq!(frame.payload["op"], "mkdir");
+    assert_eq!(frame.payload["path"], target.to_string_lossy().into_owned());
+    assert_eq!(
+        frame.payload["dir"],
+        root_a.join("reports").to_string_lossy().into_owned(),
+        "`dir` is computed server-side — the FE never dirname()s"
+    );
+    assert_eq!(frame.company_id, Some(a.id), "stamped with the OWNING company");
+    assert!(Scope::Company(a.id).sees(frame.company_id), "company A sees it");
+    assert!(
+        !Scope::Company(b.id).sees(frame.company_id),
+        "company B must NEVER see company A's filenames"
+    );
+    assert!(Scope::All.sees(frame.company_id), "the owner sees everything");
+}
+
+/// A path under NO company root (HQ) stays unstamped → owner/admin only, because
+/// `Scope::sees(None)` is fail-closed for a scoped human. A missing update is the
+/// safe failure mode.
+#[tokio::test]
+async fn files_frame_outside_any_company_root_is_unstamped() {
+    use supermux_server::scope::Scope;
+
+    let env = setup().await;
+    let root_a = env.work_dir.join("acme");
+    std::fs::create_dir(&root_a).unwrap();
+    let a = db::companies::create(&env.state.pool, "acme", "Acme", &root_a.to_string_lossy())
+        .await
+        .expect("company A");
+
+    let mut rx = env.state.sse_tx.subscribe();
+
+    // `…/acme-corp` is a SIBLING of the company root, not inside it — the
+    // prefix match is `/`-delimited.
+    let target = env.work_dir.join("acme-corp/notes");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/mkdir",
+            &json!({ "path": target.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let frame = rx.try_recv().expect("a files frame was published");
+    assert_eq!(frame.company_id, None, "an HQ path is unstamped");
+    assert!(!Scope::Company(a.id).sees(frame.company_id), "fail-closed for a member");
+    assert!(Scope::All.sees(frame.company_id), "the owner still sees it");
+}
+
+/// Every mutating file handler emits, not just the new verbs.
+#[tokio::test]
+async fn put_delete_and_rename_all_emit_files_frames() {
+    let env = setup().await;
+    let target = env.work_dir.join("live.md");
+
+    let mut rx = env.state.sse_tx.subscribe();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::PUT,
+            "/api/file",
+            &json!({ "path": target.to_string_lossy(), "content": "hi\n" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let f = rx.try_recv().expect("put emits");
+    assert_eq!((f.event.as_str(), &f.payload["op"]), ("files", &json!("put")));
+
+    let moved = env.work_dir.join("live2.md");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": target.to_string_lossy(), "to": moved.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let f = rx.try_recv().expect("rename emits");
+    assert_eq!(f.payload["op"], "rename");
+    assert_eq!(f.payload["path"], moved.to_string_lossy().into_owned());
+    assert_eq!(
+        f.payload["from"],
+        target.to_string_lossy().into_owned(),
+        "rename carries the old path"
+    );
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::DELETE,
+            "/api/fs/delete",
+            &json!({ "path": moved.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let f = rx.try_recv().expect("delete emits");
+    assert_eq!(f.payload["op"], "delete");
+}

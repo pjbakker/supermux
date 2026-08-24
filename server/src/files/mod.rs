@@ -531,6 +531,7 @@ async fn put_file(
     )
     .await
     .ok();
+    emit_files_event(&state, "put", &abs, None, body.session.as_deref()).await;
 
     Ok(Json(json!({ "ok": true, "path": abs.to_string_lossy() })))
 }
@@ -691,6 +692,18 @@ async fn fs_upload(
         } else {
             transport.write(&target, &data).await.map_err(map_transport)?;
         }
+        // The multipart upload had NO audit row until now — it is the one
+        // mutating file handler that wrote nothing to the ledger.
+        db::audit::log(
+            &state.pool,
+            "user",
+            "file.upload",
+            &target.to_string_lossy(),
+            json!({ "bytes": data.len() }),
+        )
+        .await
+        .ok();
+        emit_files_event(&state, "upload", &target, None, session.as_deref()).await;
         saved.push(json!({
             "name": target.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             "size": data.len(),
@@ -729,6 +742,7 @@ async fn fs_delete(
     db::audit::log(&state.pool, "user", "file.delete", &abs.to_string_lossy(), json!({}))
         .await
         .ok();
+    emit_files_event(&state, "delete", &abs, None, body.session.as_deref()).await;
 
     Ok(Json(json!({ "ok": true, "deleted": abs.to_string_lossy() })))
 }
@@ -760,6 +774,7 @@ async fn fs_mkdir(
     db::audit::log(&state.pool, "user", "dir.create", &abs.to_string_lossy(), json!({}))
         .await
         .ok();
+    emit_files_event(&state, "mkdir", &abs, None, body.session.as_deref()).await;
 
     Ok(Json(json!({ "ok": true, "path": abs.to_string_lossy() })))
 }
@@ -822,6 +837,7 @@ async fn fs_rename(
     )
     .await
     .ok();
+    emit_files_event(&state, "rename", &to_abs, Some(&from_abs), body.session.as_deref()).await;
 
     Ok(Json(json!({
         "ok": true,
@@ -883,6 +899,7 @@ async fn fs_copy(
     )
     .await
     .ok();
+    emit_files_event(&state, "copy", &to_abs, Some(&from_abs), body.session.as_deref()).await;
 
     Ok(Json(json!({
         "ok": true,
@@ -903,6 +920,47 @@ fn is_inside(from: &Path, to: &Path) -> bool {
     let f = f.trim_end_matches('/');
     let t = to.to_string_lossy();
     t == f || t.starts_with(&format!("{f}/"))
+}
+
+/// Publish one `files` SSE frame, stamped with the company that OWNS the path.
+///
+/// ```jsonc
+/// // event: files
+/// { "op": "write"|"mkdir"|"rename"|"copy"|"put"|"delete"|"upload",
+///   "path": "/abs/path",        // the DESTINATION for rename/copy
+///   "dir":  "/abs/parent",      // server-computed: the FE must never dirname()
+///   "from": "/abs/old"|null,    // rename only
+///   "session": "researcher"|null }
+/// ```
+///
+/// There is exactly ONE stamping rule and it lives here (§3.2): the company is
+/// derived from the PATH via [`company_for_path`], never from the emitting
+/// session. A path under no company root stays unstamped → `Scope::sees(None)`
+/// is fail-closed, so the frame reaches owner/admin only. That asymmetry is
+/// deliberate: a MISSING update is safe, a WRONGLY stamped one leaks another
+/// company's filenames to a member and nothing downstream would catch it.
+///
+/// `dir` is computed server-side on purpose — the FE would otherwise
+/// re-implement `dirname` for two transports and get remote paths wrong.
+pub(crate) async fn emit_files_event(
+    state: &AppState,
+    op: &str,
+    path: &Path,
+    from: Option<&Path>,
+    session: Option<&str>,
+) {
+    let company = company_for_path(state, path).await;
+    let _ = state.sse_tx.send(crate::state::SseEvent::for_company(
+        "files",
+        json!({
+            "op": op,
+            "path": path.to_string_lossy(),
+            "dir": path.parent().map(|p| p.to_string_lossy().into_owned()),
+            "from": from.map(|p| p.to_string_lossy().into_owned()),
+            "session": session,
+        }),
+        company,
+    ));
 }
 
 /// The company that OWNS this path, by longest `/`-delimited `root_dir` prefix

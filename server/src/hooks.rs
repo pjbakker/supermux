@@ -197,6 +197,12 @@ async fn hook_handler(
     let raw_payload = body.payload.unwrap_or(Value::Null);
     apply_payload(&state, &body.session, &body.event, &raw_payload);
 
+    // A live agent file-write becomes a `files` SSE frame, so a file a bot
+    // wrote seconds ago appears in the Files surface without a reload. Only the
+    // qualifying subset of PostToolUse pays the extra indexed SELECT (every hook
+    // already pays one for `verify_hook_token`).
+    emit_agent_file_write(&state, &body.session, &body.event, &raw_payload).await;
+
     if is_pointer_event(&body.event) {
         let id = raw_payload
             .get("session_id")
@@ -210,6 +216,63 @@ async fn hook_handler(
     state.wake_detector(&body.session);
 
     Ok(Json(json!({ "ok": true })))
+}
+
+/// The tools whose `PostToolUse` payload names a file the agent just wrote.
+const FILE_WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// Publish a `files` SSE frame for an agent's own file write.
+///
+/// The live payload really is `{"tool_name":"Edit","tool_input":{"file_path":
+/// "src/tile.tsx"}}` and the `file_path` is RELATIVE, so it must be joined onto
+/// the session's `dir` before the company prefix-match runs — otherwise
+/// `company_for_path` returns `None` for every agent write and the whole feature
+/// is dead on arrival.
+///
+/// Absolutization here is LEXICAL ONLY — no `canonicalize`, no FS access, no
+/// `safe_path`. We never open the file; we only publish a string, and the
+/// path-derived company stamp is the gate. That keeps the hook inside its
+/// `--max-time 1` budget.
+///
+/// STATED BLIND SPOT: agents also write through `Bash` (`>`, `sed -i`,
+/// `git checkout`, build output). No `PostToolUse` `file_path` exists for those,
+/// so this arm cannot see them; the client's visibility-gated refetch backstop
+/// covers it until the `notify` watcher lands.
+async fn emit_agent_file_write(state: &AppState, session: &str, event: &str, payload: &Value) {
+    if !matches!(event, "post_tool" | "post_tool_use" | "PostToolUse") {
+        return;
+    }
+    let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    if !FILE_WRITE_TOOLS.contains(&tool) {
+        return;
+    }
+    let Some(file_path) = payload
+        .get("tool_input")
+        .and_then(|t| t.get("file_path"))
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+    else {
+        return;
+    };
+    // One indexed SELECT — it hands us the session's `dir` (and is the only way
+    // to absolutize a relative payload path).
+    let Ok(Some(sess)) = db::sessions::get(&state.pool, session).await else {
+        return;
+    };
+    let abs = absolutize_hook_path(file_path, &sess.dir);
+    crate::files::emit_files_event(state, "write", &abs, None, Some(session)).await;
+}
+
+/// Lexically absolutize a hook payload's `file_path` against the session dir.
+/// An already-absolute path is returned untouched; a `~` is expanded the same
+/// way the files layer expands it.
+fn absolutize_hook_path(file_path: &str, dir: &str) -> std::path::PathBuf {
+    let expanded = shellexpand::tilde(file_path).into_owned();
+    let p = std::path::PathBuf::from(&expanded);
+    if p.is_absolute() || dir.is_empty() {
+        return p;
+    }
+    std::path::Path::new(dir).join(p)
 }
 
 /// The two events that reliably carry a MAIN-session conversation id:
@@ -892,6 +955,97 @@ mod tests {
         };
         let pool = crate::db::init(&config).await.expect("init pool");
         (AppState::new(pool, config), dir)
+    }
+
+    #[test]
+    fn absolutize_hook_path_joins_a_relative_payload_path() {
+        // The live payload's `file_path` is RELATIVE — joining it onto the
+        // session dir is what makes the company prefix-match work at all.
+        assert_eq!(
+            absolutize_hook_path("src/tile.tsx", "/srv/acme/app"),
+            std::path::PathBuf::from("/srv/acme/app/src/tile.tsx")
+        );
+        // An absolute payload path is taken as-is.
+        assert_eq!(
+            absolutize_hook_path("/srv/acme/app/x.rs", "/srv/acme/app"),
+            std::path::PathBuf::from("/srv/acme/app/x.rs")
+        );
+        // No session dir → whatever we were handed (never a panic).
+        assert_eq!(
+            absolutize_hook_path("x.rs", ""),
+            std::path::PathBuf::from("x.rs")
+        );
+    }
+
+    /// The hook arm is what makes an AGENT's file write visible live. The frame
+    /// must carry the ABSOLUTIZED path and the company that owns it.
+    #[tokio::test]
+    async fn post_tool_write_emits_a_company_stamped_files_frame() {
+        let (state, dir) = test_state().await;
+        let root = dir.join("acme");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let company =
+            crate::db::companies::create(&state.pool, "acme", "Acme", &root.to_string_lossy())
+                .await
+                .expect("company row");
+        crate::db::sessions::create(
+            &state.pool,
+            &crate::db::sessions::NewSession {
+                name: "researcher".to_string(),
+                display_name: "researcher".to_string(),
+                dir: root.to_string_lossy().to_string(),
+                desc: String::new(),
+                provider: "claude".to_string(),
+                creator: "test".to_string(),
+                flags: String::new(),
+                tags: "[]".to_string(),
+                branch: String::new(),
+                mcp: String::new(),
+                worktree: false,
+                worktree_repo: String::new(),
+                host_id: None,
+                runtime: "native".to_string(),
+                model: String::new(),
+                company_id: Some(company.id),
+            },
+        )
+        .await
+        .expect("session row");
+
+        let mut rx = state.sse_tx.subscribe();
+        let payload = json!({
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "src/tile.tsx" },
+        });
+        emit_agent_file_write(&state, "researcher", "PostToolUse", &payload).await;
+
+        let frame = rx.try_recv().expect("a files frame was published");
+        assert_eq!(frame.event, "files");
+        assert_eq!(frame.payload["op"], "write");
+        assert_eq!(
+            frame.payload["path"],
+            root.join("src/tile.tsx").to_string_lossy().into_owned(),
+            "the relative payload path is joined onto the session dir"
+        );
+        assert_eq!(frame.payload["session"], "researcher");
+        assert_eq!(
+            frame.company_id,
+            Some(company.id),
+            "stamped by PATH with the owning company"
+        );
+
+        // A tool that writes no file publishes nothing.
+        emit_agent_file_write(
+            &state,
+            "researcher",
+            "PostToolUse",
+            &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }),
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "Bash produces no files frame");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// One hook payload, as the raw JSON `apply_payload` takes.
