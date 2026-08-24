@@ -169,6 +169,12 @@ export function BrowserWorkspace({
         <EmptyState onNew={() => setComposing(true)} />
       ) : active.live || forceLive ? (
         <TakeoverPanel
+          // KEYED BY TAB. A tab switch is a different page, so the panel starts
+          // over: a fresh canvas (never the previous tab's pixels under this
+          // tab's address bar) and a fresh snapshot, so the header goes back to
+          // "Connecting…" and Drive is disabled until THIS tab's socket is live
+          // — instead of inheriting the tab we just left.
+          key={active.id}
           subject={{ kind: 'tab', id: active.id }}
           options={panelOptions}
           controlsRef={ctl}

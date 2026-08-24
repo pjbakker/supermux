@@ -60,6 +60,54 @@ import {
  *  every frame for a JPEG that is 512px wide to begin with. */
 const MAX_DPR = 2
 
+/**
+ * Paint an already-decoded frame into the canvas at the box's CURRENT size.
+ *
+ * Split out of the decode loop because a RESIZE has to repaint too, and it has
+ * no frame of its own to wait for: a static page emits no screencast frames
+ * (spike gotcha #1), so a canvas whose backing store was sized for the old box
+ * would sit there CSS-stretched — blurry, and letterboxed for the wrong aspect
+ * — for as long as the page holds still. Which, on a signed-in inbox, is
+ * "until something moves".
+ */
+function blit(canvas: HTMLCanvasElement, box: HTMLElement, image: DecodedFrame): void {
+  const cssW = box.clientWidth
+  const cssH = box.clientHeight
+  if (!(cssW > 0) || !(cssH > 0)) return
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR)
+  const w = Math.round(cssW * dpr)
+  const h = Math.round(cssH * dpr)
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w
+    canvas.height = h
+  }
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  const fit = fitFrame({ width: cssW, height: cssH }, frameSize(image))
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, cssW, cssH)
+  ctx.drawImage(image as CanvasImageSource, fit.left, fit.top, fit.width, fit.height)
+}
+
+/** Wipe the canvas. Used when the SUBJECT changes: the canvas element survives
+ *  a subject swap (React reuses the node), so without this the PREVIOUS tab's
+ *  page stays on screen while the new tab's socket dials and its seed still is
+ *  captured — one tab's pixels under another tab's address bar, which is the
+ *  one thing a workspace must never show. */
+function wipe(canvas: HTMLCanvasElement): void {
+  canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+}
+
+/** Free a decoded frame we are done with.
+ *
+ *  `createImageBitmap` allocates OUTSIDE the JS heap and is reclaimed only when
+ *  the GC eventually gets to it, so at 30–60 frames a second an un-closed
+ *  bitmap per frame is real drift on a long watch. An `<img>` fallback has
+ *  nothing to release. */
+function release(frame: DecodedFrame | null | undefined): void {
+  if (frame && 'close' in frame && typeof frame.close === 'function') frame.close()
+}
+
 /** The three wheel verbs, published into a host-owned ref while the socket is
  *  alive (and nulled on teardown, so a stale handle cannot poke a dead socket).
  *  A ref rather than a callback argument on purpose: the host calls these from
@@ -136,6 +184,10 @@ export function TakeoverPanel({
     let alive = true
     let pending: TakeoverFrame | null = null
     let decoding = false
+    // Captured for the cleanup: the canvas node outlives a subject swap (React
+    // reuses it), and reading the ref in a cleanup is exactly what the
+    // exhaustive-deps rule warns about.
+    const mounted = canvasRef.current
 
     const paint = async (): Promise<void> => {
       if (decoding) return
@@ -148,21 +200,14 @@ export function TakeoverPanel({
         const canvas = canvasRef.current
         const box = boxRef.current
         if (alive && canvas && box) {
-          const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR)
-          const cssW = box.clientWidth
-          const cssH = box.clientHeight
-          if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
-            canvas.width = Math.round(cssW * dpr)
-            canvas.height = Math.round(cssH * dpr)
-          }
-          const ctx = canvas.getContext('2d')
-          if (ctx) {
-            const fit = fitFrame({ width: cssW, height: cssH }, frameSize(image))
-            ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-            ctx.clearRect(0, 0, cssW, cssH)
-            ctx.drawImage(image as CanvasImageSource, fit.left, fit.top, fit.width, fit.height)
-          }
+          blit(canvas, box, image)
+          // The one we just replaced is now unreachable — close it here rather
+          // than leaving a bitmap per frame to the GC.
+          release(paintedRef.current?.image)
           paintedRef.current = { image, frame: next }
+        } else {
+          // Decoded into a panel that went away mid-decode.
+          release(image)
         }
       } catch {
         /* a frame that will not decode is a frame we skip */
@@ -200,9 +245,29 @@ export function TakeoverPanel({
       sock.stop()
       if (controlsRef) controlsRef.current = null
       socketRef.current = null
+      // The subject changed (or the panel unmounted): the pixels on the canvas
+      // are the OLD subject's and must not outlive it — see `wipe`.
+      if (mounted) wipe(mounted)
+      release(paintedRef.current?.image)
       paintedRef.current = null
     }
   }, [kind, name, options, controlsRef])
+
+  // Repaint from the frame we ALREADY hold when the box resizes — a rotation, a
+  // split-pane drag, an iOS URL-bar collapse. `blit` sizes the backing store, so
+  // without this the canvas keeps the previous box's dimensions and the browser
+  // stretches it; on a static page no further frame ever arrives to fix it.
+  React.useEffect(() => {
+    const box = boxRef.current
+    const canvas = canvasRef.current
+    if (!box || !canvas || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => {
+      const painted = paintedRef.current
+      if (painted) blit(canvas, box, painted.image)
+    })
+    ro.observe(box)
+    return () => ro.disconnect()
+  }, [])
 
   /** A pointer/wheel event's position in PAGE coordinates, or `null` when it
    *  landed on the letterbox (or before the first frame). */
