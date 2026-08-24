@@ -164,6 +164,11 @@ describe('a long option grows its pill instead of overlapping the next row', () 
   test('a wrapped label is left-aligned and cannot widen the card', () => {
     expect(out).toContain('text-left')
     expect(out).toContain('max-w-full')
+    // `max-w-full` alone only caps the BOX. A single unbreakable token — a
+    // path, a URL, a commit hash — still overflows it without an
+    // `overflow-wrap`, which is the one case the pill cannot grow its way out
+    // of.
+    expect(out).toContain('break-words')
     expect(out).toContain(LONG)
   })
 })

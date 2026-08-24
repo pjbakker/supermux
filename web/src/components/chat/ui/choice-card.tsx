@@ -234,10 +234,13 @@ function ChoiceButton({
         // 1.45 is 19.4px, plus 6px/6px and the hairline, is 32.4px — under the
         // floor, so a one-line pill is exactly 34px as before, and the radius
         // clamps to height/2 either way. `text-left` because a wrapped label
-        // centred in a pill reads as two fragments, and `max-w-full` so a
-        // single long word cannot widen the card past the row.
+        // centred in a pill reads as two fragments; `max-w-full` + `break-words`
+        // so a single long token — a path, a URL, a hash, none of which carry a
+        // break opportunity — wraps inside the pill instead of widening the card
+        // past the row. `max-w-full` alone only caps the box; without
+        // `overflow-wrap` the text still overflows it.
         'inline-flex min-h-[34px] max-w-full items-center gap-2 rounded-[17px] border-[0.5px] border-hairline px-[15px] py-[6px]',
-        'text-left text-[13.4px] leading-[1.45] tracking-[-0.05px] text-ink sm-t-morph',
+        'break-words text-left text-[13.4px] leading-[1.45] tracking-[-0.05px] text-ink sm-t-morph',
         option.primary ? 'bg-fill-soft-2 font-semibold' : 'bg-transparent font-medium hover:bg-fill-soft',
         // Readable, obviously not pressable, and no hover promise.
         option.disabled && 'cursor-default opacity-45 hover:bg-transparent',

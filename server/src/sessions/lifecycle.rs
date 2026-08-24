@@ -805,86 +805,57 @@ fn agent_busy(capture: &str) -> bool {
 /// [`classify_ready_tick`]'s ready arm.
 ///
 /// [`wake_for_send`] already refuses a FIRST send whose wake lands on a boot
-/// modal (`start().ready == false`), but an ALREADY-AWAKE retry (`woke == false`)
-/// skips the wake entirely — so without this a retry types straight into a
-/// resume picker / trust dialog left open on the pty, records `last_send`, and
-/// reports a message the modal swallowed as delivered (codex #1, wave-7). The
-/// gate is on the CURRENT screen, not on whether we just woke.
+/// modal (`start().ready == false`), but an ALREADY-AWAKE retry (`woke ==
+/// false`) skips the wake entirely — so without this a retry types straight into
+/// a resume picker / trust dialog left open on the pty, records `last_send`, and
+/// reports a message the modal swallowed as delivered (codex #1, wave-7).
 ///
-/// Two screens legitimately receive a send:
-///   * the agent is at the wheel — its own prompt with no boot modal over it
-///     ([`agent_at_the_wheel`], which itself excludes the picker + trust dialog,
-///     and still ADMITS a permission menu so answering one is unchanged); or
-///   * the agent is mid-turn/busy ([`agent_busy`]), where a send is a queue.
-/// Everything else — the resume picker, the trust dialog, a bare shell the agent
-/// exited to — must NOT be typed into.
+/// THE RULE, and it is the whole of it: a send is admitted ONLY on POSITIVE
+/// evidence that the agent is at its TEXT COMPOSER. Not "the screen is not one
+/// of the two modals we know"; not "some interactive footer is visible". A
+/// screen this function cannot positively recognise as a composer REFUSES.
 ///
-/// CURRENT-SCREEN scoping (wave-8, codex pass 3). The readiness/busy glyphs
-/// (`❯`, `esc to interrupt`) must be read off the CURRENT screen, NOT the whole
-/// `capture_plain(30)` blob — that blob is scrollback + viewport, so a screen
-/// that ENDS at a bare shell but still has an OLDER `❯` / `esc to interrupt`
-/// line scrolled up in it would otherwise satisfy the guard and the retry would
-/// be typed into the bare shell. So:
-///   * the two full-screen BOOT MODALS are rejected over the whole capture —
-///     their `❯` is a selection cursor and their identifying TITLE sits at the
-///     TOP of the screen, so a bottom-only look would miss the title and wrongly
-///     admit the cursor; while
-///   * the live-composer / busy-footer glyphs are searched ONLY in the
-///     bottom-anchored [`current_screen_tail`] — an agent glyph higher than that
-///     is stale scrollback, not the screen we are about to type into.
+/// WHY THAT ASYMMETRY IS THE DESIGN. `send_harness_text` ends in `send_text` +
+/// `Enter`, and what that means depends entirely on what is listening:
+///   * at a COMPOSER it is a message — the thing every caller intends;
+///   * at ANY selection screen it is neither. The paste is dropped and the Enter
+///     picks whatever row is highlighted (a0 §3, the same fact
+///     `web/src/components/chat/use-composer.ts` states). The sender's words
+///     vanish and an answer nobody chose is submitted — while the caller is told
+///     it worked. That is worse than a 409 in every direction, and it is not
+///     hypothetical for a foreign program: `[y/N]` under a finger that means
+///     "yes" is a destructive confirmation.
+/// Only the BROWSER has a lens in front of this (`sendGate` refuses on a sighted
+/// dialog). `POST /api/agents/delegate`, `scheduler::runner`, the board
+/// dispatcher and the steering loop all funnel through here with no lens at all,
+/// so this guard is the only thing standing in front of those keystrokes.
 ///
-/// Wave-8 scoped the POSITIVE evidence to the bottom 10 rows and left the
-/// refusal as the residue: anything with no agent glyph down there was reported
-/// as "parked at a prompt that is not the agent's … it is likely sitting on a
-/// resume picker or a folder-trust dialog". For a tall Claude-owned dialog that
-/// sentence is false in both halves. An AskUserQuestion draws its `❯` selection
-/// caret ABOVE four option rows, each with a description line, plus a rule, the
-/// out-of-box row and the footer — on the live 2.1.233 capture
-/// (`tests/fixtures/pty/ask-user-question.txt`) the caret sits at row 29 of 39,
-/// one row out of range. So the owner's session, sitting on a perfectly ordinary
-/// question, refused every message and pointed at two dialogs that were not on
-/// screen. The classification was positional: the SAME dialog with two options
-/// and no descriptions keeps its caret inside the window and sends fine.
+/// So, in order:
+///   1. the `--resume` session picker (Claude or Codex) — refused over the WHOLE
+///      capture, because its identifying TITLE sits at the top of the screen;
+///   2. a startup GATE — `trust` / `apikey` / `onboarding` / `hooks-review`, read
+///      by [`pty_state::startup_wedge`], the same reader the status detector
+///      already trusts to say a session is waiting on a human. Same whole-capture
+///      reason;
+///   3. ANY SELECTION SCREEN on the current screen ([`selection_screen`]) — the
+///      agent's own question / plan / paused modal / permission menu, a picker
+///      whose title has scrolled out of the capture, or an interactive prompt
+///      from some program the user ran by hand in the same pty. One refusal,
+///      because a keystroke means the same wrong thing in all of them;
+///   4. otherwise: a COMPOSER anchor ([`agent_composer_visible`]), a live Codex
+///      composer ([`codex_ready`]), or a busy turn ([`agent_busy`], where a send
+///      is the queue CC itself offers) — and nothing else admits.
 ///
-/// So the blocking set is EXPLICIT now, and each member names itself:
-///   * the `--resume` session picker (Claude or Codex), and
-///   * a startup GATE — `trust` / `apikey` / `onboarding` / `hooks-review`,
-///     read by [`pty_state::startup_wedge`], the same reader the status detector
-///     already trusts to say a session is waiting on a human.
-/// Those are the screens where a keystroke really cannot be verified: nothing
-/// about them belongs to the agent, and Enter means something native.
-///
-/// A CLAUDE-OWNED DIALOG IS THE AGENT AT THE WHEEL. The permission menu was
-/// always admitted ("answering one is unchanged"); a question, a plan approval
-/// and a paused modal are the same thing one option list longer, and which side
-/// of a 10-row window their caret lands on is not a fact about who owns the pty.
-/// The evidence for them is bottom-anchored BY CONSTRUCTION — CC prints the
-/// dialog's key legend on the last line of the screen — so it needs no window
-/// widening and cannot be satisfied by stale scrollback the way an old `❯`
-/// could ([`agent_dialog_visible`]).
-///
-/// Everything the wave-8 guard was built for still refuses, and the residual
-/// case now says the honest thing: no agent evidence on the CURRENT screen.
-///
-/// WHAT ADMITTING A DIALOG DOES, stated plainly because it is the trade-off:
-/// a `send_text` + Enter into an open dialog is answered BY the dialog — the
-/// paste is dropped and the Enter picks the caret's row (a0 §3, and the same
-/// fact `web/src/components/chat/use-composer.ts` states). That is already true
-/// of the permission menu this guard has always admitted on purpose, and the
-/// CHAT surface refuses in front of it for every sighted dialog family
-/// (`sendGate`: `if (lens?.dialog) return { send: false … }`), which is the
-/// layer that knows what the card above the composer can do. This guard's job
-/// is narrower: keep a message out of a screen that is NOT the agent's. Making
-/// it also arbitrate which of the agent's own dialogs may be typed into — by
-/// counting rows — is what produced a 409 that named two dialogs that were not
-/// on screen.
+/// CURRENT-SCREEN scoping (wave-8, codex pass 3) is kept for every check that
+/// can be: the capture is scrollback + viewport, so a screen that ENDS at a bare
+/// shell but still carries an OLDER `❯` / `esc to interrupt` up in its history
+/// must not satisfy the guard. Steps 1-2 are the deliberate exception (a title
+/// above the fold), and both of them only ever REFUSE — widening a refusal's
+/// window can never open a door.
 fn send_block(capture: &str) -> Option<SendBlock> {
     if at_resume_picker(capture) {
         return Some(SendBlock::ResumePicker);
     }
-    // The gate readers run over the WHOLE capture: their identifying title sits
-    // at the TOP of the screen (and `pty_state` keeps its own tail window), so a
-    // bottom-only look would miss it and admit the selection cursor under it.
     if at_trust_dialog(capture) {
         return Some(SendBlock::Gate("trust"));
     }
@@ -892,11 +863,13 @@ fn send_block(capture: &str) -> Option<SendBlock> {
         return Some(SendBlock::Gate(wedge));
     }
     let screen = current_screen_tail(capture);
-    if agent_ui_visible(&screen)
-        || agent_busy(&screen)
-        || codex_ready(&screen)
-        || agent_dialog_visible(&screen)
-    {
+    // A SELECTION SCREEN REFUSES BEFORE ANYTHING ADMITS, whoever drew it. It is
+    // checked first on purpose: a dialog's own caret is a `❯` too, so a rule
+    // that admitted first would admit every one of them.
+    if selection_screen(&screen) {
+        return Some(SendBlock::Selection);
+    }
+    if agent_composer_visible(&screen) || agent_busy(&screen) || codex_ready(&screen) {
         return None;
     }
     Some(SendBlock::NoAgent)
@@ -906,12 +879,16 @@ fn send_block(capture: &str) -> Option<SendBlock> {
 /// caller reads has to name the thing that is actually in the way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendBlock {
-    /// The `--resume` session picker (Claude or Codex).
+    /// The `--resume` session picker (Claude or Codex), by its title.
     ResumePicker,
     /// A named startup gate (`pty_state`'s wedge token).
     Gate(&'static str),
-    /// Nothing on the CURRENT screen says an agent owns it — a bare shell the
-    /// agent exited to, or a screen this server cannot read as one.
+    /// A screen that is answered with a KEYPRESS, not with text: the agent's own
+    /// question / plan / paused modal / permission menu, a picker recognised by
+    /// its legend rather than its title, or a foreign interactive prompt.
+    Selection,
+    /// Nothing on the CURRENT screen says an agent is at its composer — a bare
+    /// shell the agent exited to, or a screen this server cannot read as one.
     NoAgent,
 }
 
@@ -930,8 +907,14 @@ impl SendBlock {
                  session), then resend.",
                 gate_clause(wedge),
             ),
+            SendBlock::Selection => format!(
+                "session '{name}' is on a prompt that is answered with a keypress, not with text \
+                 — typed words are dropped there and the Enter after them would pick whatever row \
+                 is highlighted, so the message was NOT delivered. Answer it (the card in chat, or \
+                 the terminal), then resend.",
+            ),
             SendBlock::NoAgent => format!(
-                "session '{name}' shows no agent prompt on its current screen — it has probably \
+                "session '{name}' shows no agent composer on its current screen — it has probably \
                  exited to a shell, so the message was NOT delivered. Open the terminal to see \
                  what it is showing (or Reset the session), then resend.",
             ),
@@ -952,25 +935,94 @@ fn gate_clause(wedge: &str) -> String {
     }
 }
 
-/// Is an agent DIALOG the current screen — a permission prompt, an
-/// AskUserQuestion, a plan approval, a paused modal?
+/// Is the current screen answered with a KEYPRESS rather than with text?
 ///
-/// The key legend Claude Code and Codex print UNDER a dialog's option list, and
-/// it is the last printed line of the screen every time, which is what makes it
-/// safe to read in the bottom-anchored window that stale scrollback cannot
-/// reach. This is the evidence that survives a caret pushed out of range by a
-/// long option list — the wave-8 regression this fixes.
+/// Deliberately NOT "is this a Claude dialog". The pty is a terminal a human
+/// also drives by hand, and `npm init`, `gh`, `k9s`, a psql `\d` pager and a
+/// dozen other programs draw selection lists and `[y/N]` confirmations into the
+/// same pane. This function's answer only ever REFUSES a send, so it is written
+/// to be generous: every marker below costs an undeliverable 409 the caller can
+/// act on, and the alternative it prevents is a keystroke landing on a row
+/// nobody chose.
 ///
-/// Read on the CURRENT SCREEN ONLY (never the whole capture): an answered
-/// dialog's footer scrolled up into the history is not what is being typed into.
-/// The full-screen boot modals are rejected BEFORE this is consulted, so a
-/// picker's own `Enter to select` can never be read as an agent dialog.
-fn agent_dialog_visible(screen: &str) -> bool {
+/// Two shapes, both bottom-anchored by construction:
+///   * a CARET ON A NUMBERED ROW (`❯ 1. Yes`) — the selection cursor, which is
+///     the one thing ordinary prose lists never carry (the same tell
+///     `peek-lens.ts`'s `looksModal` uses);
+///   * a KEY LEGEND — the line a TUI prints under its options saying which key
+///     commits. Claude Code and Codex draw `Enter to select` / `Enter to
+///     confirm` / `Esc to cancel` / `Tab to amend`; inquirer-style CLIs draw
+///     `(Use arrow keys)`; a shell confirmation draws `[y/N]`.
+///
+/// THE LEGEND IS ALSO THE BELT ON THE PICKER (step 1's blind spot): a resume
+/// picker whose title has scrolled out of the 30-line capture keeps its footer,
+/// so it is still refused here — one row lower in the ladder, with a sentence
+/// that is true of both.
+///
+/// Read on the CURRENT SCREEN ONLY: an answered dialog's footer scrolled up into
+/// the history is not what is about to be typed into.
+fn selection_screen(screen: &str) -> bool {
+    if screen.lines().any(is_selection_row) {
+        return true;
+    }
     let c = screen.to_lowercase();
-    c.contains("esc to cancel")
-        || c.contains("enter to select")
-        || c.contains("enter to confirm")
-        || c.contains("tab to amend")
+    [
+        "enter to select",
+        "enter to confirm",
+        "esc to cancel",
+        "tab to amend",
+        "use arrow keys",
+        "[y/n]",
+        "(y/n)",
+    ]
+    .iter()
+    .any(|marker| c.contains(marker))
+}
+
+/// `❯ 1. Yes, and don't ask again` — a selection caret sitting ON a numbered
+/// row. The caret alone is the composer's glyph and the number alone is prose,
+/// so it takes both.
+fn is_selection_row(line: &str) -> bool {
+    let rest = match strip_caret(line) {
+        Some(rest) => rest,
+        None => return false,
+    };
+    numbered_row(rest)
+}
+
+/// The line's leading caret glyph removed, or `None` when it does not open with
+/// one. Leading whitespace is the terminal's left margin, not a signal.
+fn strip_caret(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    t.strip_prefix('❯').or_else(|| t.strip_prefix('❱'))
+}
+
+/// `1. Yes` / `12. Something` — the option-row shape, after the caret.
+fn numbered_row(rest: &str) -> bool {
+    let t = rest.trim_start();
+    let digits = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    digits.len() < t.len() && digits.starts_with('.')
+}
+
+/// POSITIVE evidence that the agent is at its TEXT COMPOSER — the one screen
+/// where `send_text` + Enter means "a message".
+///
+/// Two anchors, both Claude Code's own chrome:
+///   * `? for shortcuts`, the hint line CC prints under an idle composer and
+///     under no other screen it draws;
+///   * the composer glyph (`❯` / `❱`) opening a line that is NOT a numbered
+///     option row. That exclusion is the whole difference between this and the
+///     [`agent_ui_visible`] it replaced on the send path: a dialog's selection
+///     cursor is the SAME glyph, which is how a permission menu and an
+///     AskUserQuestion both used to read as "the agent is at the wheel".
+///
+/// [`selection_screen`] has already refused before this is consulted, so a
+/// screen carrying both (a caret row above, a composer below) never reaches
+/// here — deliberately, and in the safe direction.
+fn agent_composer_visible(screen: &str) -> bool {
+    screen
+        .lines()
+        .any(|l| l.contains("? for shortcuts") || strip_caret(l).is_some_and(|r| !numbered_row(r)))
 }
 
 /// True once a READY, EMPTY Codex composer is visible. Codex draws `›` (U+203A),
@@ -3241,15 +3293,31 @@ mod agent_ready_heuristics_tests {
         );
 
         // ADMIT — the agent's own composer prompt with no boot modal over it.
+        // This is the ONLY shape that admits: positive evidence of a text
+        // composer, not the absence of a modal.
         assert!(
             pty_ready_for_send("❯ Try \"fix tests\"\n  ? for shortcuts"),
             "the agent's own idle prompt is the send target",
         );
-        // ADMIT — a permission menu IS the agent waiting on the user; answering it
-        // (typing a choice) must stay unchanged, so this is deliberately typeable.
+        // …and the composer glyph is not enough on its own when it is marking a
+        // ROW rather than opening the composer — the exact confusion that made a
+        // dialog read as "the agent is at the wheel".
         assert!(
-            pty_ready_for_send("Do you want to proceed?\n❯ 1. Yes\n  2. No"),
-            "a permission menu is the agent at the wheel — still typeable (unchanged)",
+            !pty_ready_for_send("Pick one\n❯ 1. Apple\n  2. Banana"),
+            "a selection cursor is the same glyph as the composer's — it must not admit",
+        );
+        // REFUSE — a permission menu. THIS ASSERTION IS REVERSED FROM WAVE-7, on
+        // purpose and after the fact it rested on was checked: this menu is
+        // "typeable" only in the sense that the keystrokes land somewhere. The
+        // paste is dropped and the Enter picks the highlighted row (a0 §3), so a
+        // message sent here is silently destroyed AND an answer nobody chose is
+        // submitted — while the caller is told it was delivered. The browser has
+        // a lens in front of this; `delegate`, the scheduler, the board and the
+        // steering loop do not, and this is the only guard they get.
+        assert_eq!(
+            send_block("Do you want to proceed?\n❯ 1. Yes\n  2. No"),
+            Some(SendBlock::Selection),
+            "a permission menu is answered with a keypress, not with text — refuse",
         );
         // ADMIT — a busy turn: the send is a legitimate QUEUE, and the composer
         // glyph may have scrolled out of a short capture, so `esc to interrupt`
@@ -3260,42 +3328,128 @@ mod agent_ready_heuristics_tests {
         );
     }
 
-    /// THE OWNER'S WEDGE: a live AskUserQuestion refused every message, and the
-    /// 409 named two dialogs that were not on screen.
+    /// THE OWNER'S WEDGE, and what was actually wrong with it: a live
+    /// AskUserQuestion refused every message with a 409 that named two dialogs
+    /// which were not on screen.
     ///
-    /// The whole capture is the real one (CC 2.1.233, `tests/fixtures/pty/
-    /// ask-user-question.txt`), through the same `prepare_capture` the send path
-    /// runs. Its `❯` selection caret sits at row 29 of 39 — above four option
-    /// rows, each with a description line, plus the rule, the out-of-box row and
-    /// the footer — so wave-8's bottom-10 window missed it and the guard fell to
-    /// its residual refusal. The dialog's own key legend IS on the last line,
-    /// which is the evidence that cannot be stale, and which is what admits it
-    /// now.
+    /// The refusal was RIGHT and the sentence was WRONG, and only the sentence
+    /// is fixed. Wave-8 reached it by accident — its bottom-10 window happened
+    /// to miss the `❯` caret, which on the real 2.1.233 capture
+    /// (`tests/fixtures/pty/ask-user-question.txt`) sits at row 29 of 39, above
+    /// four option rows with description lines, the rule, the out-of-box row and
+    /// the footer. The SAME dialog with two options and no descriptions keeps
+    /// its caret in range and was admitted, which is the tell that the reading
+    /// was positional rather than semantic. Now the dialog's own key legend —
+    /// bottom-anchored by construction — refuses it on purpose, and the
+    /// two-option twin refuses with it.
     #[test]
-    fn a_send_while_claude_asks_a_question_is_not_refused_as_a_boot_modal() {
+    fn a_send_while_claude_asks_a_question_is_refused_as_a_selection_not_a_boot_modal() {
         let capture = status::prepare_capture(include_str!(
             "../../tests/fixtures/pty/ask-user-question.txt"
         ));
+        let block = send_block(&capture).expect("a question is answered with a keypress");
         assert_eq!(
-            send_block(&capture),
-            None,
-            "an AskUserQuestion is the agent at the wheel, exactly like the permission menu \
-             beside it — a caret pushed out of a 10-row window is not a fact about who owns \
-             the pty",
+            block,
+            SendBlock::Selection,
+            "an open question must refuse — the paste would be dropped and the Enter would \
+             pick the highlighted row",
         );
-        // The answered twin — the same session one keystroke later — was never
-        // refused and must not start being.
+        // The SENTENCE is the fix: it no longer sends the reader looking for a
+        // resume picker or a folder-trust dialog that is not on screen.
+        let sentence = block.sentence("ipc");
+        assert!(sentence.contains("NOT delivered"), "{sentence}");
+        assert!(!sentence.contains("resume picker"), "{sentence}");
+        assert!(!sentence.contains("folder-trust"), "{sentence}");
+
+        // The SHORT twin — the same dialog, two options, no descriptions — used
+        // to be admitted purely because its caret fell inside the window. It is
+        // the same screen and it refuses the same way now.
+        let short = "Which fruit do you want?\n❯ 1. Apple\n  2. Banana\n\nEnter to select · ↑/↓ to navigate · Esc to cancel";
+        assert_eq!(send_block(short), Some(SendBlock::Selection));
+
+        // The ANSWERED twin — the same session one keystroke later, back at its
+        // composer — must still deliver. This is the half of the owner's report
+        // that IS an un-wedge: an idle agent takes messages.
         let answered = status::prepare_capture(include_str!(
             "../../tests/fixtures/pty/ask-user-question-answered.txt"
         ));
-        assert_eq!(send_block(&answered), None);
+        assert_eq!(
+            send_block(&answered),
+            None,
+            "once the dialog is gone the composer is back, and a message is a message",
+        );
     }
 
-    /// The blocking set is EXPLICIT, and every member says its own name. Before
-    /// this, ANY screen that failed the positive check was reported as "parked at
-    /// a prompt that is not the agent's … likely sitting on a resume picker or a
-    /// folder-trust dialog" — false for a question, false for a bare shell, and
-    /// un-actionable in both cases.
+    /// ADMISSION IS POSITIVE, AND NARROW. Not "no modal was recognised" — that
+    /// is the fail-OPEN reading, and the pty is a terminal a human also drives by
+    /// hand, so an unrecognised screen is at least as likely to be `npm init` as
+    /// it is to be an agent.
+    #[test]
+    fn only_a_recognised_composer_admits_a_send() {
+        // ADMIT: Claude's composer (glyph + its own hint line), Codex's ready
+        // composer, and a busy turn (CC queues typed text during one).
+        for screen in [
+            "❯ Try \"fix tests\"\n  ? for shortcuts",
+            "❯ \n  ⏵⏵ auto mode on\n  ? for shortcuts",
+            "› Ask Codex to do anything\n  gpt-5.6-sol high · /opt/projects/Folderwijzer-codex",
+            "✻ Thinking… (esc to interrupt · 12s · ↑ 2.1k tokens)",
+        ] {
+            assert_eq!(send_block(screen), None, "must admit: {screen:?}");
+        }
+
+        // REFUSE: everything a foreign interactive program draws into the same
+        // pane. None of these is a Claude dialog and none of them may receive a
+        // paste + Enter — `[y/N]` under an Enter is a destructive confirmation,
+        // and `delegate` / the scheduler reach this with no lens in front.
+        for screen in [
+            // inquirer-style list (npm init, create-*, gh)
+            "? Which template? (Use arrow keys)\n❯ 1. minimal\n  2. full",
+            "? Overwrite dist/? (Use arrow keys)\n> Yes\n  No",
+            // a shell confirmation
+            "Delete 42 branches? [y/N] ",
+            // a numbered menu with the caret, no legend at all
+            "❯ 1. production\n  2. staging",
+        ] {
+            assert_eq!(
+                send_block(screen),
+                Some(SendBlock::Selection),
+                "must refuse: {screen:?}",
+            );
+        }
+
+        // REFUSE: an unrecognised screen. The default is closed.
+        assert_eq!(send_block("some program printing along\nno prompt we know"), Some(SendBlock::NoAgent));
+    }
+
+    /// A PICKER WHOSE TITLE HAS SCROLLED OUT still refuses.
+    ///
+    /// `at_resume_picker` reads the whole capture, but the capture is 30 lines:
+    /// a picker with a long conversation list pushes `Resume a conversation` off
+    /// the top, and then the title-based check sees nothing. The legend the
+    /// picker keeps drawing at the bottom is what catches it — one rung lower in
+    /// the ladder, with a sentence that is true of both.
+    #[test]
+    fn a_resume_picker_whose_title_scrolled_out_is_still_refused() {
+        let mut screen = String::new();
+        for i in 0..26 {
+            screen.push_str(&format!("  {}. Fix the parser — {i}h ago\n", i + 3));
+        }
+        screen.push_str("\nEnter to select · Esc to cancel\n");
+        assert!(
+            !screen.contains("Resume a conversation"),
+            "the fixture must NOT carry the title — that is the whole point",
+        );
+        assert_eq!(
+            send_block(&status::prepare_capture(&screen)),
+            Some(SendBlock::Selection),
+            "a picker recognised by its legend rather than its title still refuses",
+        );
+    }
+
+    /// Every refusal says its own name. Before this, ANY screen that failed the
+    /// positive check was reported as "parked at a prompt that is not the
+    /// agent's … likely sitting on a resume picker or a folder-trust dialog" —
+    /// false for a question, false for a bare shell, and un-actionable in both.
     #[test]
     fn a_refused_send_names_the_screen_that_is_actually_in_the_way() {
         let picker = "Resume a conversation\n❯ 1. Fix the parser  2h ago\n  2. Older chat";
@@ -3317,12 +3471,20 @@ mod agent_ready_heuristics_tests {
         assert_eq!(send_block(&hooks), Some(SendBlock::Gate("hooks-review")));
         assert!(send_block(&hooks).unwrap().sentence("ipc").contains("hooks-review"));
 
+        // A selection screen says what it is and what would have happened — a
+        // reader who is told "a keypress, not text" knows why retrying the same
+        // message will not help.
+        let selection = send_block("Pick one\n❯ 1. Apple\n  2. Banana").unwrap();
+        assert_eq!(selection, SendBlock::Selection);
+        assert!(selection.sentence("ipc").contains("keypress"));
+        assert!(!selection.sentence("ipc").contains("resume picker"));
+
         // The bare shell keeps its own sentence — it is not a modal, and telling
         // the user to dismiss one would send them looking for a screen that is
         // not there.
         let bare = send_block("user@host project % \n").unwrap();
         assert_eq!(bare, SendBlock::NoAgent);
-        assert!(bare.sentence("ipc").contains("no agent prompt"));
+        assert!(bare.sentence("ipc").contains("no agent composer"));
         assert!(!bare.sentence("ipc").contains("resume picker"));
     }
 
