@@ -347,3 +347,83 @@ async fn the_idle_edge_and_the_agent_hook_cannot_both_advance_the_same_step() {
     state.pool.close().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// **Regression (the run-key collision).** `workflow_runs.id` is a per-database
+/// AUTOINCREMENT, so the first run of every database is `1` — while the engine's
+/// fire guard and waker map are process-global `static`s. Keyed on the bare run
+/// id, two `AppState`s in one process collide on `1`: the first chain's claim
+/// swallows the second's advance, and the first chain's waker is overwritten by
+/// the second's. Both chains then stall at step 1, forever.
+///
+/// Two independent states, both with run id 1, both must advance.
+#[tokio::test]
+async fn two_chains_in_one_process_do_not_share_a_fire_guard_slot() {
+    let (state_a, dir_a) = new_state().await;
+    let (state_b, dir_b) = new_state().await;
+    live_session(&state_a, "twinA", &dir_a).await;
+    live_session(&state_b, "twinB", &dir_b).await;
+    let wf_a = workflow_with(&state_a, "WF-twin", "twinA", &[step("a one"), step("a two")]).await;
+    let wf_b = workflow_with(&state_b, "WF-twin", "twinB", &[step("b one"), step("b two")]).await;
+
+    let run_a = engine::start(&state_a, wf_a, Trigger::Manual).await.unwrap();
+    let run_b = engine::start(&state_b, wf_b, Trigger::Manual).await.unwrap();
+    // The precondition that made the bug possible — same id, same workflow id,
+    // different databases.
+    assert_eq!(run_a, 1);
+    assert_eq!(run_b, 1);
+
+    until("A step 1 delivered", || async { delivered(&state_a, "twinA", "a one").await }).await;
+    until("B step 1 delivered", || async { delivered(&state_b, "twinB", "b one").await }).await;
+
+    idle_edge(&state_a, "twinA");
+    idle_edge(&state_b, "twinB");
+
+    // Neither chain may be swallowed by the other's claim.
+    until("A step 2 delivered", || async { delivered(&state_a, "twinA", "a two").await }).await;
+    until("B step 2 delivered", || async { delivered(&state_b, "twinB", "b two").await }).await;
+    assert_eq!(step_runs(&state_a, run_a).await.len(), 2);
+    assert_eq!(step_runs(&state_b, run_b).await.len(), 2);
+
+    let _ = sessions::lifecycle::stop(&state_a, "twinA").await;
+    let _ = sessions::lifecycle::stop(&state_b, "twinB").await;
+    state_a.pool.close().await;
+    state_b.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir_a);
+    let _ = std::fs::remove_dir_all(dir_b);
+}
+
+/// The confirm footer hands the agent a run id in PLAINTEXT, in its own pane, so
+/// the id is not a secret. The step-done hook must therefore check that the run
+/// belongs to the session whose hook token authenticated the call — otherwise
+/// any bot could advance any other bot's chain by guessing a small integer.
+#[tokio::test]
+async fn a_step_done_hook_from_another_bot_cannot_advance_the_chain() {
+    let (state, dir) = new_state().await;
+    live_session(&state, "owner", &dir).await;
+    live_session(&state, "stranger", &dir).await;
+    let wf = workflow_with(&state, "WF-owned", "owner", &[step("step one"), step("step two")]).await;
+
+    let run_id = engine::start(&state, wf, Trigger::Manual).await.unwrap();
+    until("step 1 delivered", || async { delivered(&state, "owner", "step one").await }).await;
+
+    // A different bot confirms the same run id.
+    engine::confirm_step_done(&state, run_id, "stranger").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        step_runs(&state, run_id).await.len(),
+        1,
+        "a stranger's hook advanced somebody else's chain"
+    );
+
+    // The owner's confirmation still works.
+    engine::confirm_step_done(&state, run_id, "owner").await;
+    until("step 2 delivered", || async { delivered(&state, "owner", "step two").await }).await;
+    let all = step_runs(&state, run_id).await;
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].signal, "agent-confirmed");
+
+    let _ = sessions::lifecycle::stop(&state, "owner").await;
+    let _ = sessions::lifecycle::stop(&state, "stranger").await;
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -16,11 +16,12 @@
 //! `scheduler::runner::deliveries` and carries every one of its escaping and
 //! defanging tests forward, byte-for-byte.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde_json::json;
 use tokio::sync::{watch, Notify};
 
@@ -360,62 +361,60 @@ impl StepSignal {
     }
 }
 
-/// Per-`(run_id, step)` "this step already advanced" guard.
+/// The in-flight runs of ONE server: the per-`(run, step)` advance claims and
+/// the parked step watchers' wakers.
 ///
-/// Completion can be observed by TWO independent paths — the status→idle edge
-/// and the agent-confirm hook — and the chain must advance exactly once for
-/// each. Same fail-open-on-poisoned-lock rule as the scheduler's `claim_fire`:
-/// a missed dedup is a duplicate ping, never a lost one.
-///
-/// Keyed by RUN, not by workflow: a recurring workflow's *next* run must be able
-/// to fire its step 0 again, so a workflow-scoped guard would wedge the chain
-/// permanently after the first run.
-fn fire_guard() -> &'static Mutex<HashSet<String>> {
-    static G: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    G.get_or_init(|| Mutex::new(HashSet::new()))
+/// **Why this hangs off [`AppState`] rather than being a `static`.** It is
+/// per-server runtime state, exactly like `status_watch` and `session_locks`
+/// next to it — and the only key available for it, `workflow_runs.id`, is a
+/// per-database AUTOINCREMENT, so the first run of every database is `1`. As a
+/// process-global it therefore collided across `AppState`s: one chain's claim
+/// swallowed another's advance and one chain's waker overwrote another's, so
+/// both chains stalled at step 1 forever. Adding the workflow id to the key does
+/// not fix that — two databases can hold the same workflow id — whereas scoping
+/// the whole registry to the server makes the collision unrepresentable.
+#[derive(Default)]
+pub struct RunRegistry {
+    /// "Step `k` of run `r` has already advanced." Completion can be observed by
+    /// TWO independent paths — the status→idle edge and the agent-confirm hook —
+    /// and the chain must advance exactly once for each.
+    ///
+    /// Keyed by RUN, not by workflow: a recurring workflow's *next* run must be
+    /// able to fire its step 0 again, so a workflow-scoped claim would wedge the
+    /// chain permanently after the first run.
+    fired: DashMap<(i64, usize), ()>,
+    /// The parked step watchers. A watcher sits in a `select!`; the agent-confirm
+    /// hook is a different task entirely and needs a handle to reach into it.
+    /// Deliberately in-memory, which is exactly why [`reap`] exists: a restart
+    /// empties this and a run whose waker is gone would sit `running` forever.
+    wakers: DashMap<i64, Arc<Notify>>,
 }
 
-/// Claim the single advance for step `k` of `run_id`. `true` exactly once.
-fn claim_fire(run_id: i64, k: usize) -> bool {
-    match fire_guard().lock() {
-        Ok(mut g) => g.insert(format!("{run_id}:{k}")),
-        Err(_) => true,
+impl RunRegistry {
+    /// Claim the single advance for step `k` of `run_id`. `true` exactly once.
+    fn claim(&self, run_id: i64, k: usize) -> bool {
+        self.fired.insert((run_id, k), ()).is_none()
     }
-}
 
-/// Drop every claim belonging to a finished run, so the guard does not grow for
-/// the life of the process.
-fn release_run(run_id: i64) {
-    if let Ok(mut g) = fire_guard().lock() {
-        let prefix = format!("{run_id}:");
-        g.retain(|k| !k.starts_with(&prefix));
+    /// Drop everything belonging to a finished run, so neither map grows for the
+    /// life of the process.
+    fn release(&self, run_id: i64) {
+        self.fired.retain(|(r, _), _| *r != run_id);
+        self.wakers.remove(&run_id);
     }
-}
 
-/// The in-flight steps' wakers, keyed by run id.
-///
-/// A watcher is parked in a `select!` on the status channel and a timeout; the
-/// agent-confirm hook is a different task entirely and has to reach into that
-/// `select!`. This is the only shared handle between them — and it is
-/// deliberately in-memory, which is exactly why [`reap`] exists: a restart
-/// empties this map, and a run whose waker is gone would otherwise sit
-/// `running` forever.
-fn wakers() -> &'static Mutex<HashMap<i64, Arc<Notify>>> {
-    static W: OnceLock<Mutex<HashMap<i64, Arc<Notify>>>> = OnceLock::new();
-    W.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn register_waker(run_id: i64) -> Arc<Notify> {
-    let n = Arc::new(Notify::new());
-    if let Ok(mut w) = wakers().lock() {
-        w.insert(run_id, n.clone());
+    fn register(&self, run_id: i64) -> Arc<Notify> {
+        let n = Arc::new(Notify::new());
+        self.wakers.insert(run_id, n.clone());
+        n
     }
-    n
-}
 
-fn unregister_waker(run_id: i64) {
-    if let Ok(mut w) = wakers().lock() {
-        w.remove(&run_id);
+    fn unregister(&self, run_id: i64) {
+        self.wakers.remove(&run_id);
+    }
+
+    fn waker(&self, run_id: i64) -> Option<Arc<Notify>> {
+        self.wakers.get(&run_id).map(|w| w.clone())
     }
 }
 
@@ -427,15 +426,33 @@ fn unregister_waker(run_id: i64) {
 /// unknown run id (already finished, or lost to a restart) is a silent no-op —
 /// the reaper is what makes the lost case honest.
 pub async fn confirm_step_done(state: &AppState, run_id: i64, session: &str) {
-    let waker = wakers().lock().ok().and_then(|w| w.get(&run_id).cloned());
-    match waker {
+    // Resolve the run to its workflow — both to build the waker key, and to
+    // CHECK that the run belongs to the session whose hook token authenticated
+    // this call. Without that check any session's token could advance any run;
+    // the footer hands out a run id in plaintext, so the id is not a secret.
+    let Ok(Some(run)) = db::workflows::get_run(&state.pool, run_id).await else {
+        tracing::debug!(run_id, session, "workflow step-done for an unknown run");
+        return;
+    };
+    let owner = db::workflows::get(&state.pool, &run.workflow_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|w| w.session);
+    if owner.as_deref() != Some(session) {
+        tracing::warn!(
+            run_id, session, workflow = %run.workflow_id,
+            "workflow step-done from a session that does not own the run — ignored"
+        );
+        return;
+    }
+    match state.workflow_runs.waker(run_id) {
         Some(n) => {
             tracing::debug!(run_id, session, "workflow step confirmed by the agent");
             n.notify_waiters();
         }
         None => {
             tracing::debug!(run_id, session, "workflow step-done for a run with no live watcher");
-            let _ = state;
         }
     }
 }
@@ -611,7 +628,7 @@ async fn advance(
         let status_tx = state.status_watch_for(&wf.session);
         let status_rx = status_tx.subscribe();
         let baseline = status_rx.borrow().1;
-        let waker = register_waker(run_id);
+        let waker = state.workflow_runs.register(run_id);
 
         // 4. SEND.
         let mut send_error = None;
@@ -625,7 +642,7 @@ async fn advance(
             }
         }
         if let Some(note) = send_error {
-            unregister_waker(run_id);
+            state.workflow_runs.unregister(run_id);
             let _ = db::workflows::close_step_run(
                 &state.pool,
                 step_run,
@@ -640,12 +657,12 @@ async fn advance(
 
         // 5. WATCH.
         let signal = watch_step(run_id, step, status_rx, baseline, waker).await;
-        unregister_waker(run_id);
+        state.workflow_runs.unregister(run_id);
 
         // 6. FIRE GUARD. Belt to the braces of `confirm_step_done` never
         //    advancing the chain itself: whichever path observed completion,
         //    exactly one advance happens per (run, step).
-        if !claim_fire(run_id, k) {
+        if !state.workflow_runs.claim(run_id, k) {
             tracing::debug!(run_id, k, "workflow step already advanced — skipping");
             return;
         }
@@ -758,8 +775,7 @@ async fn finish(
     n: usize,
 ) {
     let _ = db::workflows::close_run(&state.pool, run_id, status, note).await;
-    release_run(run_id);
-    unregister_waker(run_id);
+    state.workflow_runs.release(run_id);
 
     if status == "ok" {
         fire_workflow_complete(state, wf, run_id).await;
@@ -838,10 +854,10 @@ pub async fn cancel(state: &AppState, run_id: i64) -> Result<(), AppError> {
     // nothing — the waker resolves the current step as agent-confirmed, and the
     // claim below is what stops the next step from being delivered.
     for k in 0..super::MAX_STEPS_PER_WORKFLOW {
-        claim_fire(run_id, k);
+        state.workflow_runs.claim(run_id, k);
     }
     db::workflows::close_run(&state.pool, run_id, "cancelled", "cancelled").await?;
-    if let Some(n) = wakers().lock().ok().and_then(|w| w.get(&run_id).cloned()) {
+    if let Some(n) = state.workflow_runs.waker(run_id) {
         n.notify_waiters();
     }
     Ok(())
@@ -893,8 +909,7 @@ pub async fn reap(state: &AppState) {
             .await;
         }
         let _ = db::workflows::close_run(&state.pool, run.id, "interrupted", &note).await;
-        release_run(run.id);
-        unregister_waker(run.id);
+        state.workflow_runs.release(run.id);
 
         let company_id = db::workflows::get(&state.pool, &run.workflow_id)
             .await

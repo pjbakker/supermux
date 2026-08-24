@@ -331,6 +331,11 @@ pub struct AppState {
     /// Memory-only, self-pruned by TTL + cap; a restart simply forgets. See
     /// [`crate::sessions::send_dedup`].
     pub send_dedup: Arc<crate::sessions::send_dedup::SendDedup>,
+    /// The in-flight WORKFLOW runs of this server: per-`(run, step)` advance
+    /// claims and the parked step watchers' wakers. Per-server, not a `static`,
+    /// because its only key (`workflow_runs.id`) is a per-database
+    /// AUTOINCREMENT — see [`crate::workflows::engine::RunRegistry`].
+    pub workflow_runs: Arc<crate::workflows::engine::RunRegistry>,
     /// Per-session status watch channels (the wait-primitive seam).
     /// Empty until the detector drives updates; the map + cleanup ensures
     /// churn never leaks entries.
@@ -664,6 +669,7 @@ impl AppState {
             pending_pushes: Arc::new(DashMap::new()),
             session_locks: Arc::new(DashMap::new()),
             send_dedup: Arc::new(crate::sessions::send_dedup::SendDedup::default()),
+            workflow_runs: Arc::new(crate::workflows::engine::RunRegistry::default()),
             status_watch: Arc::new(DashMap::new()),
             hook_tokens: Arc::new(DashMap::new()),
             pane_conversations: Arc::new(DashMap::new()),
