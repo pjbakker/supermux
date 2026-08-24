@@ -247,6 +247,18 @@ export function mockOptions(
    * clear it.
    */
   nav?: NavState,
+  /**
+   * PHASE 4 — pretend the relay has the DOM verbs.
+   *
+   * `find` and `copy` are the two verbs `takeover.rs` does not implement yet
+   * (see `lib/browser/page-tools.ts` for the four frames they need), so on every
+   * real server today the find bar draws its honest disabled state. That state
+   * is the one that ships, and it MUST be screenshot-able — but so must the one
+   * that ships next, or the shell is never reviewed at all. Passing this emits
+   * the `caps` frame a capable server would, and answers `find` with a real
+   * `find_result`, so both states reach the UI through the real parse.
+   */
+  caps?: { find?: boolean; copy?: boolean },
 ): TakeoverOptions {
   return {
     token: () => 'bench',
@@ -286,6 +298,15 @@ export function mockOptions(
               }),
             })
             sock.onmessage?.({ data: JSON.stringify({ type: 'mode', mode: live }) })
+            if (caps) {
+              sock.onmessage?.({
+                data: JSON.stringify({
+                  type: 'caps',
+                  find: !!caps.find,
+                  copy: !!caps.copy,
+                }),
+              })
+            }
             sock.onmessage?.({
               data: JSON.stringify({
                 type: 'frame',
@@ -320,6 +341,20 @@ export function mockOptions(
           if (msg.type === 'reload') pushNav({ loading: true })
           if (msg.type === 'stop') pushNav({ loading: false })
           if (msg.type === 'dialog') pushNav({ dialog: null })
+          // A capable relay answers a find. The count is a stable fiction so
+          // the capture does not move between runs; the PATH it travels — frame
+          // → `parseFindResult` → the bar's label — is the real one.
+          if (msg.type === 'find' && caps?.find) {
+            const query = String((msg as { query?: string }).query ?? '')
+            sock.onmessage?.({
+              data: JSON.stringify({
+                type: 'find_result',
+                query,
+                index: query ? 2 : 0,
+                total: query ? 7 : 0,
+              }),
+            })
+          }
           if (msg.type === 'hand_back' || msg.type === 'take_over') {
             live = msg.type === 'hand_back' ? 'agent_driving' : 'human_driving'
             sock.onmessage?.({ data: JSON.stringify({ type: 'mode', mode: live }) })

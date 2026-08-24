@@ -365,6 +365,28 @@ pub enum ClientMsg {
         prompt_text: Option<String>,
     },
 
+    // ── the DOM verbs (P4) ──────────────────────────────────────────────
+    //
+    // The two verbs that need the page's TEXT rather than its pixels, plus the
+    // cleanup for the first. CONTROL frames like the navigation ones: `to_cdp`
+    // returns `None` for all three and `drive` runs them itself, because
+    // neither is an `Input.*` dispatch — a find walks the DOM and a copy reads
+    // the selection out of it.
+    /// Find-in-page. `forward` is the direction of the step (`false` is what a
+    /// shift-Enter means), `case_sensitive` the bar's `Aa` toggle.
+    Find {
+        query: String,
+        #[serde(default = "yes")]
+        forward: bool,
+        #[serde(default)]
+        case_sensitive: bool,
+    },
+    /// The find bar closed: drop the highlight and the server-side cursor, so a
+    /// relay does not leave somebody's page selected behind a bar that is gone.
+    FindClose,
+    /// Read the page's current SELECTION as text, for the client's clipboard.
+    Copy,
+
     /// Client-initiated liveness ping.
     Ping,
 }
@@ -405,6 +427,34 @@ pub enum ServerMsg<'a> {
     /// to a scheme the human door refuses (`file:`/`data:` inside a profile that
     /// IS the human's cookie jar is a local read, not navigation).
     Refused { reason: &'a str },
+
+    // ── the DOM verbs' answers (P4) ─────────────────────────────────────────
+    /// **What this relay can do beyond pixels**, sent once per socket right
+    /// after the seed.
+    ///
+    /// THE IMPORTANT ONE. Its absence is what an older relay looks like, and
+    /// the client reads a missing frame as "cannot" rather than "not yet"
+    /// (`page-tools.ts`: every flag defaults FALSE) — so this frame is the only
+    /// thing that lights the find bar and the copy-selection control up, and a
+    /// server that stops answering `find` must stop sending it.
+    Caps { find: bool, copy: bool },
+    /// Where a find landed: the query the server actually searched for, and the
+    /// position in its own result set.
+    ///
+    /// `index` is 1-BASED, the way every find bar in the world counts, and `0`
+    /// means "no current hit" — the only honest answer for `total: 0`. The
+    /// `query` echo is load-bearing: the client shows `…` until the server has
+    /// answered for the query it is *currently* showing, so a result for a
+    /// stale keystroke can never be painted as this one's count.
+    FindResult {
+        query: &'a str,
+        index: u32,
+        total: u32,
+    },
+    /// The page's selection, as text — the answer to [`ClientMsg::Copy`].
+    /// Capped at [`MAX_COPY_BYTES`]: a select-all on a long page is megabytes,
+    /// and a clipboard is not a file transfer.
+    Copied { text: &'a str },
 }
 
 impl ServerMsg<'_> {
@@ -418,6 +468,11 @@ impl ServerMsg<'_> {
 /// A client that omits `dpr` is telling us nothing, not telling us zero.
 fn one_dpr() -> f64 {
     1.0
+}
+
+/// A `find` that omits `forward` means the ordinary Enter: search downwards.
+fn yes() -> bool {
+    true
 }
 
 // ── the viewer's box ────────────────────────────────────────────────────────
@@ -692,8 +747,237 @@ pub fn to_cdp(msg: &ClientMsg, viewport: Viewport) -> Option<CdpCall> {
         | ClientMsg::Reload { .. }
         | ClientMsg::Stop
         | ClientMsg::Dialog { .. }
+        // The DOM verbs (P4) are page READS, run through `AgentContext::evaluate`
+        // in `drive`. `Runtime.evaluate` is not in `dispatch_input`'s `Input.*`
+        // allowlist, and must never be.
+        | ClientMsg::Find { .. }
+        | ClientMsg::FindClose
+        | ClientMsg::Copy
         | ClientMsg::Ping => None,
     }
+}
+
+// ── the DOM verbs (P4): find-in-page and copy-out ───────────────────────────
+//
+// Everything else this socket relays is pixels and input events. These two are
+// not: a find needs the page's TEXT and a copy needs its SELECTION, and neither
+// exists in the JPEG we are painting. Both therefore run as
+// `Runtime.evaluate` in the page's own world — the one CDP surface that can see
+// the DOM — and both are expressed as PURE script builders here, so the whole
+// contract (the escaping, the caps, the counting) is testable without a chrome.
+//
+// **Why an injected routine and not `DOM.performSearch`.** `performSearch`
+// counts NODES that match, including matches inside attributes and raw HTML,
+// and answering `3/7` from it would be a count of something the human cannot
+// see. The walk below counts *visible text occurrences*, which is what a find
+// bar's `3/7` claims to mean, and it produces the current hit's Range in the
+// same pass — so the count and the thing that gets scrolled to can never
+// disagree.
+
+/// Most matches one find will count. A page with more than this is not one
+/// anybody is stepping through match by match, and an unbounded count is an
+/// unbounded walk of somebody else's DOM.
+pub const FIND_MAX_HITS: usize = 10_000;
+
+/// Longest query we will search for. Far past anything typed into a find bar;
+/// the cap exists so the socket cannot be used as a way to hand chrome an
+/// arbitrarily long string to scan a page with.
+pub const MAX_QUERY_BYTES: usize = 4 * 1024;
+
+/// Longest selection the page hands back, in JS string length…
+pub const MAX_COPY_CHARS: usize = 256 * 1024;
+/// …and the byte cap on the frame we put on the wire. Two caps, because the
+/// first keeps megabytes from crossing the CDP socket at all and the second is
+/// what actually bounds the frame.
+pub const MAX_COPY_BYTES: usize = 512 * 1024;
+
+/// The body of the find routine. Prefixed at call time with `Q`/`FWD`/`CS`/`CAP`
+/// (see [`find_script`]); kept as its own constant so the Rust around it needs
+/// no brace escaping.
+///
+/// It counts, selects and scrolls in one pass:
+///  1. a `TreeWalker` over the text nodes that are actually laid out
+///     (`getClientRects().length`, memoised per element — a `display:none` menu
+///     is not a match a human can be scrolled to), skipping the non-content
+///     tags;
+///  2. every occurrence of the needle inside each node, up to `CAP`;
+///  3. the cursor, kept on `window.__supermuxFind` and keyed by query+case, so
+///     Enter steps and wraps instead of re-finding the first hit. A new query
+///     starts at the first match (or the last, going backwards);
+///  4. a `Range` over the current hit, put in the page's own selection (that IS
+///     the highlight, and it is what makes `copy` after a find do the obvious
+///     thing) and scrolled into the middle of its scroll container.
+const FIND_BODY: &str = r##"
+const SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1, HEAD: 1, TITLE: 1, IFRAME: 1 };
+const needle = CS ? Q : Q.toLowerCase();
+const root = document.body || document.documentElement;
+const sel = window.getSelection();
+if (!needle || !root) { window.__supermuxFind = null; return { index: 0, total: 0 }; }
+const seen = new WeakMap();
+const shown = (el) => {
+  if (!el) return false;
+  let v = seen.get(el);
+  if (v === undefined) { v = !!(el.getClientRects && el.getClientRects().length); seen.set(el, v); }
+  return v;
+};
+const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+  acceptNode(n) {
+    const p = n.parentElement;
+    if (!p || SKIP[p.tagName] || !n.nodeValue) return NodeFilter.FILTER_REJECT;
+    return shown(p) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+  }
+});
+const hits = [];
+outer: for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+  const hay = CS ? n.nodeValue : n.nodeValue.toLowerCase();
+  for (let from = 0; ; ) {
+    const at = hay.indexOf(needle, from);
+    if (at < 0) break;
+    hits.push([n, at]);
+    if (hits.length >= CAP) break outer;
+    from = at + needle.length;
+  }
+}
+const total = hits.length;
+if (!total) {
+  window.__supermuxFind = null;
+  if (sel) sel.removeAllRanges();
+  return { index: 0, total: 0 };
+}
+const key = (CS ? 'S:' : 'i:') + Q;
+const st = window.__supermuxFind;
+const idx = (st && st.key === key && typeof st.index === 'number')
+  ? ((st.index + (FWD ? 1 : -1)) % total + total) % total
+  : (FWD ? 0 : total - 1);
+const node = hits[idx][0], at = hits[idx][1];
+const range = document.createRange();
+range.setStart(node, at);
+range.setEnd(node, Math.min(at + needle.length, node.nodeValue.length));
+if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+const el = node.parentElement;
+if (el && el.scrollIntoView) {
+  try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { el.scrollIntoView(); }
+}
+window.__supermuxFind = { key: key, index: idx };
+return { index: idx + 1, total: total };
+"##;
+
+/// Build one find. The query is embedded as a JSON string literal, so a needle
+/// containing quotes, backslashes or newlines is a *needle*, not a syntax error
+/// or an injection.
+pub fn find_script(query: &str, forward: bool, case_sensitive: bool) -> String {
+    let q = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string());
+    let mut js = String::with_capacity(FIND_BODY.len() + q.len() + 96);
+    js.push_str("(() => { const Q = ");
+    js.push_str(&q);
+    js.push_str(", FWD = ");
+    js.push_str(if forward { "true" } else { "false" });
+    js.push_str(", CS = ");
+    js.push_str(if case_sensitive { "true" } else { "false" });
+    js.push_str(", CAP = ");
+    js.push_str(&FIND_MAX_HITS.to_string());
+    js.push_str(";");
+    js.push_str(FIND_BODY);
+    js.push_str("})()");
+    js
+}
+
+/// Undo everything [`find_script`] leaves behind: the cursor and the selection
+/// that IS the highlight.
+///
+/// The counterpart of `DOM.discardSearchResults` for a search we ran ourselves.
+/// It only ever removes state this relay created, which is why the socket runs
+/// it UNGATED — a human who loses the wheel mid-find must still be able to close
+/// the bar without leaving the page highlighted behind it.
+pub fn find_clear_script() -> &'static str {
+    "(() => { try { const s = window.getSelection(); if (s) s.removeAllRanges(); } \
+catch (e) {} window.__supermuxFind = null; return true; })()"
+}
+
+/// Read the page's selection, capped in the page so the megabytes never cross
+/// the CDP socket in the first place.
+pub fn copy_script() -> String {
+    let cap = MAX_COPY_CHARS.to_string();
+    let mut js = String::with_capacity(160 + cap.len() * 2);
+    js.push_str("(() => { try { const s = window.getSelection(); const t = s ? s.toString() : ''; return t.length > ");
+    js.push_str(&cap);
+    js.push_str(" ? t.slice(0, ");
+    js.push_str(&cap);
+    js.push_str(") : t; } catch (e) { return ''; } })()");
+    js
+}
+
+/// `{index,total}` out of whatever the page returned.
+///
+/// Total, like every parse on this wire: a garbled or missing value is `0`, and
+/// `index` can never exceed `total` — a client that trusted `4/3` would paint a
+/// count that cannot be true.
+pub fn find_counts(value: &Value) -> (u32, u32) {
+    let read = |key: &str| -> u32 {
+        value
+            .get(key)
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .map(|n| n.min(f64::from(u32::MAX)) as u32)
+            .unwrap_or(0)
+    };
+    let total = read("total");
+    (read("index").min(total), total)
+}
+
+/// What a takeover socket is attached to — the scratch session or a workspace
+/// tab — in the two spellings the relay needs: the name that goes in the log
+/// line and the seed frame, and the audit ledger's `target`.
+#[derive(Debug, Clone, Copy)]
+pub enum Subject<'a> {
+    Session(&'a str),
+    Tab(&'a str),
+}
+
+impl Subject<'_> {
+    /// The session name or the tab id.
+    pub fn name(&self) -> &str {
+        match self {
+            Subject::Session(s) | Subject::Tab(s) => s,
+        }
+    }
+
+    /// The audit ledger's target column. `tab:<id>` is what every other browser
+    /// write already uses (`api.rs`), so a copy shows up in the same trail as
+    /// the navigations and the grants on that tab; a scratch context has no tab
+    /// row, so it is audited under its session.
+    pub fn audit_target(&self) -> String {
+        match self {
+            Subject::Session(s) => format!("session:{s}"),
+            Subject::Tab(t) => format!("tab:{t}"),
+        }
+    }
+}
+
+/// Record a copy-out.
+///
+/// **Spawned and best-effort**: an audit write must never stall the frame relay,
+/// and a failed one must never swallow the copy the human asked for.
+///
+/// **Never the text.** Only its size — `db::audit`'s secret-hygiene rule, and
+/// the right call anyway: the fact worth keeping is that a signed-in page's
+/// content left the browser, not what it said. Skipped entirely for an empty
+/// selection, which is a button press, not a read.
+fn spawn_copy_audit(state: &AppState, target: String, chars: usize, bytes: usize, clipped: bool) {
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::db::audit::log(
+            &pool,
+            "user",
+            "browser.copy",
+            &target,
+            json!({ "chars": chars, "bytes": bytes, "clipped": clipped }),
+        )
+        .await
+        {
+            warn!(subject = %target, error = %e, "browser takeover: copy audit write failed");
+        }
+    });
 }
 
 /// **The relay's own gate.** `Actor::Human` is never refused by the lock — that
@@ -822,7 +1106,7 @@ async fn takeover_socket(
     let previous = ctx.lock().request_human_takeover();
     info!(session = %session, %previous, "browser takeover: attached");
 
-    let outcome = drive(&mut socket, &session, &ctx).await;
+    let outcome = drive(&mut socket, Subject::Session(&session), &ctx, &state).await;
 
     // 5. Teardown, unconditional. `stop_screencast` first so chrome stops
     //    encoding for a socket that is gone, then the wheel goes back to the
@@ -922,7 +1206,7 @@ async fn tab_takeover_socket(
     info!(tab = %tab_id, mode = %tab.mode(), "browser takeover: attached to tab (watching)");
 
     let ctx = tab.page().clone();
-    let outcome = drive(&mut socket, &tab_id, &ctx).await;
+    let outcome = drive(&mut socket, Subject::Tab(&tab_id), &ctx, &state).await;
 
     if let Err(e) = ctx.stop_screencast(Actor::Human).await {
         debug!(tab = %tab_id, error = %e, "browser takeover: stopScreencast");
@@ -947,7 +1231,16 @@ enum Outcome {
     StartFailed,
 }
 
-async fn drive(socket: &mut WebSocket, session: &str, ctx: &Arc<AgentContext>) -> Outcome {
+async fn drive(
+    socket: &mut WebSocket,
+    subject: Subject<'_>,
+    ctx: &Arc<AgentContext>,
+    state: &AppState,
+) -> Outcome {
+    // The name that goes in the seed frame and every log line here; the audit
+    // ledger's spelling of the same thing is `subject.audit_target()`, and only
+    // the copy path needs it.
+    let session = subject.name();
     // Seed: the target line, a still frame, and the current mode. The still is
     // load-bearing — a static page produces NO screencast frames (gotcha #1),
     // so without it a client attaching to an idle page sees a blank canvas.
@@ -992,6 +1285,26 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &Arc<AgentContext>) -
     }
     if socket
         .send(ServerMsg::Mode { mode: ctx.mode() }.to_frame())
+        .await
+        .is_err()
+    {
+        return Outcome::SendFailed;
+    }
+
+    // **What this relay can do beyond pixels** (P4), once per socket. Without
+    // it the client cannot tell "this server does not do find" from "it has not
+    // answered yet", and it defaults to CANNOT — so this single frame is what
+    // turns the find bar and the copy-selection control from disabled shells
+    // into live ones. Sent after the seed rather than before it so the very
+    // first frame a client sees is still the `target` it sizes its canvas from.
+    if socket
+        .send(
+            ServerMsg::Caps {
+                find: true,
+                copy: true,
+            }
+            .to_frame(),
+        )
         .await
         .is_err()
     {
@@ -1194,6 +1507,96 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &Arc<AgentContext>) -
                             // way to dismiss one is a watcher of a frozen page.
                             ClientMsg::Dialog { accept, prompt_text } => {
                                 spawn_nav(ctx, session, NavCmd::Dialog { accept, prompt_text });
+                                continue;
+                            }
+                            // ── the DOM verbs (P4) ─────────────────────────
+                            //
+                            // GATED, unlike the navigation controls above, and
+                            // deliberately: those move an address bar the human
+                            // owns, while these two touch the PAGE's own state.
+                            // A find replaces the selection and scrolls
+                            // somebody's document; a copy reads the content of a
+                            // signed-in surface out of the browser. Both are
+                            // human actions on a page an agent may be working,
+                            // so both wait for the wheel — and the refusal is
+                            // spoken, not silent, because a find bar with no
+                            // answer spins forever.
+                            ClientMsg::Find { query, forward, case_sensitive } => {
+                                if !human_may_drive(ctx.mode()) {
+                                    let no = ServerMsg::Refused { reason: "agent is driving" };
+                                    if socket.send(no.to_frame()).await.is_err() {
+                                        return Outcome::SendFailed;
+                                    }
+                                    continue;
+                                }
+                                // An over-long needle is answered "no matches"
+                                // WITHOUT walking the page: a 4 KiB string is a
+                                // paste accident, not a search, and the answer
+                                // it would get is the one we give.
+                                let (index, total) = if query.is_empty() || query.len() > MAX_QUERY_BYTES {
+                                    (0, 0)
+                                } else {
+                                    match ctx.evaluate(&find_script(&query, forward, case_sensitive)).await {
+                                        Ok(v) => find_counts(&v),
+                                        Err(e) => {
+                                            debug!(subject = %session, error = %e, "browser takeover: find");
+                                            (0, 0)
+                                        }
+                                    }
+                                };
+                                // ALWAYS answer, even for a failed evaluate. The
+                                // bar shows `…` until the server has spoken for
+                                // THIS query, so a dropped answer is a spinner
+                                // that never stops — the exact failure the caps
+                                // frame exists to prevent.
+                                let out = ServerMsg::FindResult { query: &query, index, total };
+                                if socket.send(out.to_frame()).await.is_err() {
+                                    return Outcome::SendFailed;
+                                }
+                                continue;
+                            }
+                            // UNGATED, on purpose: it only ever REMOVES what our
+                            // own find put on the page. Refusing it because the
+                            // wheel moved mid-search would leave a highlight
+                            // behind a bar that is gone.
+                            ClientMsg::FindClose => {
+                                if let Err(e) = ctx.evaluate(find_clear_script()).await {
+                                    debug!(subject = %session, error = %e, "browser takeover: find_close");
+                                }
+                                continue;
+                            }
+                            ClientMsg::Copy => {
+                                if !human_may_drive(ctx.mode()) {
+                                    let no = ServerMsg::Refused { reason: "agent is driving" };
+                                    if socket.send(no.to_frame()).await.is_err() {
+                                        return Outcome::SendFailed;
+                                    }
+                                    continue;
+                                }
+                                // An in-page READ, nothing else: the server never
+                                // fetches the selection's target, it asks the page
+                                // what is selected. An empty answer is honest and
+                                // the client handles it.
+                                let text = match ctx.evaluate(&copy_script()).await {
+                                    Ok(v) => v.as_str().unwrap_or_default().to_string(),
+                                    Err(e) => {
+                                        debug!(subject = %session, error = %e, "browser takeover: copy");
+                                        String::new()
+                                    }
+                                };
+                                let out = clip(&text, MAX_COPY_BYTES);
+                                if !out.is_empty() {
+                                    spawn_copy_audit(
+                                        state,
+                                        subject.audit_target(),
+                                        out.chars().count(),
+                                        out.len(),
+                                        out.len() < text.len(),
+                                    );
+                                }
+                                if socket.send(ServerMsg::Copied { text: out }.to_frame()).await.is_err() {
+                                    return Outcome::SendFailed;
+                                }
                                 continue;
                             }
                             ClientMsg::Auth { .. } | ClientMsg::Ping => continue,
@@ -1634,6 +2037,150 @@ mod tests {
         );
     }
 
+    // ── the DOM verbs (P4) ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_dom_verbs_parse_exactly_as_the_client_spells_them() {
+        // Byte-for-byte the payloads `web/src/lib/browser/page-tools.ts` builds
+        // (`findPayload` / `findClosePayload` / `copyPayload`). The day either
+        // side renames a field, this fails instead of the frame being silently
+        // dropped as garbled.
+        let ClientMsg::Find { query, forward, case_sensitive } =
+            parse(r#"{"type":"find","query":"needle","forward":true,"case_sensitive":false}"#)
+        else {
+            panic!("not a find");
+        };
+        assert_eq!((query.as_str(), forward, case_sensitive), ("needle", true, false));
+
+        let ClientMsg::Find { forward, case_sensitive, .. } =
+            parse(r#"{"type":"find","query":"n","forward":false,"case_sensitive":true}"#)
+        else {
+            panic!("not a find");
+        };
+        assert!(!forward, "shift-Enter searches backwards");
+        assert!(case_sensitive);
+
+        // A hand-written frame that omits the flags means the ordinary Enter.
+        let ClientMsg::Find { forward, case_sensitive, .. } = parse(r#"{"type":"find","query":"n"}"#)
+        else {
+            panic!("not a find");
+        };
+        assert!(forward, "a missing direction is DOWN, not up");
+        assert!(!case_sensitive, "a missing Aa toggle is off");
+
+        assert!(matches!(parse(r#"{"type":"find_close"}"#), ClientMsg::FindClose));
+        assert!(matches!(parse(r#"{"type":"copy"}"#), ClientMsg::Copy));
+    }
+
+    #[test]
+    fn the_dom_verbs_are_control_frames_and_never_reach_dispatch_input() {
+        // `dispatch_input`'s allowlist is `Input.*`. Find and copy run through
+        // `Runtime.evaluate` in `drive`, so `to_cdp` must refuse to translate
+        // them at all — a `Runtime.*` leaking into the input path would be a
+        // hole in that allowlist.
+        for raw in [
+            r#"{"type":"find","query":"x","forward":true,"case_sensitive":false}"#,
+            r#"{"type":"find_close"}"#,
+            r#"{"type":"copy"}"#,
+        ] {
+            assert!(
+                to_cdp(&parse(raw), Viewport::default()).is_none(),
+                "{raw} must be handled by drive(), not forwarded as input"
+            );
+        }
+    }
+
+    #[test]
+    fn the_phase_four_frames_are_the_shapes_the_client_parses() {
+        // `page-tools.ts::parseCaps` / `parseFindResult`, and the `copied` arm
+        // of `takeover-socket.ts::receive`.
+        let caps = serde_json::to_string(&ServerMsg::Caps { find: true, copy: true }).unwrap();
+        assert_eq!(caps, r#"{"type":"caps","find":true,"copy":true}"#);
+
+        let found = serde_json::to_string(&ServerMsg::FindResult {
+            query: "needle",
+            index: 2,
+            total: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            found,
+            r#"{"type":"find_result","query":"needle","index":2,"total":7}"#,
+        );
+
+        // No matches: 1-based counting makes `0` the only honest current hit.
+        let none = serde_json::to_string(&ServerMsg::FindResult { query: "zz", index: 0, total: 0 })
+            .unwrap();
+        assert_eq!(none, r#"{"type":"find_result","query":"zz","index":0,"total":0}"#);
+
+        let copied = serde_json::to_string(&ServerMsg::Copied { text: "hi \"there\"" }).unwrap();
+        assert_eq!(copied, r#"{"type":"copied","text":"hi \"there\""}"#);
+    }
+
+    #[test]
+    fn find_counts_never_claim_a_hit_past_the_total() {
+        assert_eq!(find_counts(&json!({ "index": 3, "total": 9 })), (3, 9));
+        assert_eq!(find_counts(&json!({ "index": 0, "total": 0 })), (0, 0));
+        // A page that answered nonsense (or nothing) degrades to "no matches"
+        // rather than to a count the bar would paint as fact.
+        assert_eq!(find_counts(&json!({})), (0, 0));
+        assert_eq!(find_counts(&Value::Null), (0, 0));
+        assert_eq!(find_counts(&json!({ "index": -4, "total": -1 })), (0, 0));
+        assert_eq!(
+            find_counts(&json!({ "index": 12, "total": 3 })),
+            (3, 3),
+            "4/3 is a count that cannot be true",
+        );
+    }
+
+    #[test]
+    fn the_find_script_embeds_its_needle_as_a_json_literal() {
+        // A needle full of quotes and backslashes is a NEEDLE, not a syntax
+        // error and not an injection into the page's world.
+        let js = find_script("he said \"hi\\\" and left\n", true, false);
+        assert!(
+            js.contains(r#"const Q = "he said \"hi\\\" and left\n""#),
+            "the query must be a JSON string literal: {js}"
+        );
+        assert!(js.contains("FWD = true") && js.contains("CS = false"));
+        assert!(js.contains(&format!("CAP = {FIND_MAX_HITS}")), "the walk is bounded");
+        assert!(js.starts_with("(() => {") && js.ends_with("})()"));
+
+        let back = find_script("x", false, true);
+        assert!(back.contains("FWD = false") && back.contains("CS = true"));
+    }
+
+    #[test]
+    fn the_copy_script_caps_the_selection_inside_the_page() {
+        let js = copy_script();
+        assert!(js.contains("window.getSelection()"), "{js}");
+        assert!(
+            js.contains(&format!("t.slice(0, {MAX_COPY_CHARS})")),
+            "megabytes must never cross the CDP socket: {js}"
+        );
+        // And the frame itself is byte-capped on top of that.
+        let long = "x".repeat(MAX_COPY_BYTES + 512);
+        assert_eq!(clip(&long, MAX_COPY_BYTES).len(), MAX_COPY_BYTES);
+    }
+
+    #[test]
+    fn find_close_only_undoes_our_own_search() {
+        let js = find_clear_script();
+        assert!(js.contains("removeAllRanges"), "the highlight IS the selection");
+        assert!(js.contains("window.__supermuxFind = null"), "and the cursor goes too");
+    }
+
+    #[test]
+    fn a_copy_is_audited_under_the_ledgers_own_spelling() {
+        // `tab:<id>` is what every other browser write uses (`api.rs`), so a
+        // copy lands in the same trail as the navigations and grants on that
+        // tab; a scratch context has no tab row to hang off.
+        assert_eq!(Subject::Tab("tb_abc").audit_target(), "tab:tb_abc");
+        assert_eq!(Subject::Session("kim").audit_target(), "session:kim");
+        assert_eq!(Subject::Tab("tb_abc").name(), "tb_abc");
+        assert_eq!(Subject::Session("kim").name(), "kim");
+    }
+
     #[test]
     fn server_frames_are_the_shapes_the_client_parses() {
         let auth = serde_json::to_string(&ServerMsg::AuthOk).unwrap();
@@ -1847,6 +2394,90 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
         }
         assert!(!pid_alive(pid), "LEAK: chrome pid {pid} still alive");
         assert!(!udd.exists(), "LEAK: user-data-dir {udd:?} survived");
+    }
+
+    /// A page whose matches are countable BY EYE: three visible `needle`s (one
+    /// of them upper-case), one inside a `display:none` block and one inside a
+    /// `<script>` — neither of which a human can be scrolled to, so neither may
+    /// be counted.
+    fn find_page() -> String {
+        let html = "<style>body{margin:0;font:16px sans-serif}.hide{display:none}</style>\
+<p>needle one</p><p>a NEEDLE upper</p><p>third needle here</p>\
+<p class=hide>needle hidden</p><script>window.junk=1;/*needle*/</script>";
+        format!("data:text/html,{}", html.replace(' ', "%20"))
+    }
+
+    /// REAL-CHROME phase-4 end-to-end: the find actually counts what a human
+    /// sees, the cursor steps and wraps, the current hit becomes the page's
+    /// selection (which is both the highlight AND what `copy` reads), and
+    /// `find_close` leaves nothing behind.
+    #[tokio::test]
+    #[ignore = "spawns a real chrome-headless-shell; run with --ignored on a box that has the pinned binary"]
+    async fn real_chrome_find_counts_visible_text_and_copy_reads_the_selection() {
+        use super::super::{BrowserConfig, BrowserService};
+
+        let svc = BrowserService::new(BrowserConfig {
+            profile: crate::connectors::browser::launch::ProfileMode::Ephemeral,
+            ..BrowserConfig::default()
+        });
+        let ctx = svc.context_for("findcopy").await.expect("context");
+        ctx.navigate(Actor::Agent, &find_page())
+            .await
+            .expect("navigate");
+
+        let run = |js: String| {
+            let ctx = ctx.clone();
+            async move { ctx.evaluate(&js).await.expect("evaluate") }
+        };
+
+        // ── 1. the count is what a human can SEE ────────────────────────────
+        let first = run(find_script("needle", true, false)).await;
+        assert_eq!(
+            find_counts(&first),
+            (1, 3),
+            "the hidden and the scripted match are not matches a human is scrolled to: {first}"
+        );
+
+        // ── 2. Enter steps, and wraps ───────────────────────────────────────
+        assert_eq!(find_counts(&run(find_script("needle", true, false)).await), (2, 3));
+        assert_eq!(find_counts(&run(find_script("needle", true, false)).await), (3, 3));
+        assert_eq!(
+            find_counts(&run(find_script("needle", true, false)).await),
+            (1, 3),
+            "the cursor must wrap, not stick at the end"
+        );
+        // …and shift-Enter steps back over the wrap.
+        assert_eq!(find_counts(&run(find_script("needle", false, false)).await), (3, 3));
+
+        // ── 3. the Aa toggle ────────────────────────────────────────────────
+        let cased = run(find_script("NEEDLE", true, true)).await;
+        assert_eq!(find_counts(&cased), (1, 1), "case-sensitive: {cased}");
+
+        // ── 4. the current hit IS the selection, so copy reads it ───────────
+        let copied = run(copy_script()).await;
+        assert_eq!(
+            copied,
+            json!("NEEDLE"),
+            "the find's highlight is the page's own selection"
+        );
+
+        // ── 5. a miss clears, honestly ──────────────────────────────────────
+        let miss = run(find_script("haystack", true, false)).await;
+        assert_eq!(find_counts(&miss), (0, 0));
+        assert_eq!(run(copy_script()).await, json!(""), "a miss drops the highlight");
+
+        // ── 6. and closing the bar leaves nothing behind ────────────────────
+        run(find_script("needle", true, false)).await;
+        assert_eq!(run(copy_script()).await, json!("needle"));
+        ctx.evaluate(find_clear_script()).await.expect("clear");
+        assert_eq!(run(copy_script()).await, json!(""));
+        assert_eq!(
+            ctx.evaluate("window.__supermuxFind === null").await.unwrap(),
+            json!(true),
+            "the cursor must not survive the bar"
+        );
+
+        svc.shutdown().await;
     }
 
     // ── P0-2: rehydrate-on-attach, and the line it is NOT drawn on ──────────
@@ -2340,6 +2971,26 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
         assert!(
             seed.contains(&format!("127.0.0.1:{port}")),
             "the rehydrated page is the tab's own stored URL: {seed}"
+        );
+        // **The caps frame** (P4), which must arrive with the seed and AFTER the
+        // target — the client sizes its canvas off `target` and reads a missing
+        // `caps` as "this server cannot do find or copy".
+        let mut caps = None;
+        for _ in 0..6 {
+            match next_event(&mut ws).await {
+                Some(Ok(text)) => {
+                    if text.starts_with(r#"{"type":"caps""#) {
+                        caps = Some(text);
+                        break;
+                    }
+                }
+                other => panic!("socket ended before the caps frame: {other:?}"),
+            }
+        }
+        assert_eq!(
+            caps.as_deref(),
+            Some(r#"{"type":"caps","find":true,"copy":true}"#),
+            "without this frame the find bar and copy-selection stay disabled"
         );
         assert!(
             state.browser.tab(id).await.is_some(),

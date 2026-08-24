@@ -87,6 +87,9 @@ export interface AddressBarProps {
   /** Fired with the RESOLVED destination — a page url, or the search url. The
    *  host never re-parses; there is one parser. */
   onNavigate: (url: string) => void
+  /** PHASE 4 — the caret arrived or left. The chrome uses it to let the field
+   *  grow on desktop (§5.8's focus expand); nobody is required to listen. */
+  onEditing?: (editing: boolean) => void
   /** The open tabs, for the suggestion list. A tab row SWITCHES rather than
    *  navigating — nobody wants a ninth copy of the same inbox. */
   tabs?: BrowserTab[]
@@ -108,6 +111,7 @@ export function AddressBar({
   placeholder = 'Search or type a URL',
   focusKey = 0,
   onNavigate,
+  onEditing,
   tabs,
   onSwitchTab,
   origins,
@@ -164,6 +168,12 @@ export function AddressBar({
   }, [focusKey])
 
   const editing = draft !== null
+  // Reported in an EFFECT, never during render: the listener is a parent's
+  // setState, and calling it inline would be a render-phase update of an
+  // ancestor — React's one hard rule.
+  React.useEffect(() => {
+    onEditing?.(editing)
+  }, [editing, onEditing])
   const value = editing ? draft : displayUrl(url)
   const intent: AddressIntent = editing ? parseAddress(draft) : { kind: 'empty' }
   // The chip's claim is the SERVER's when a socket is attached (it is derived
@@ -338,7 +348,7 @@ export function AddressBar({
           <span
             aria-hidden
             data-address-loading=""
-            className="absolute inset-x-0 bottom-0 h-0.5 animate-pulse bg-primary motion-reduce:animate-none"
+            className="sm-browser-hairline absolute inset-x-0 bottom-0 h-0.5 overflow-hidden"
           />
         )}
       </div>

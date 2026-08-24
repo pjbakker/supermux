@@ -33,6 +33,8 @@
 // does not reflow the row the human is looking at. Reload/Stop, Back, Forward
 // and Resync keep their own cells and grey out while there is no page, for the
 // same reason.
+import * as React from 'react'
+
 import { Aperture, MoreHorizontal, Power, Users } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
@@ -95,6 +97,10 @@ export interface BrowserChromeProps {
   onWatch: () => void
   onDrive: () => void
   onMenu: () => void
+  /** PHASE 4 — the ⋯ beside the omnibox opens the PAGE MENU at a point (find,
+   *  copy link, reload, sharing…). Absent = it opens the sheet directly, which
+   *  is what phases 1-3 did. */
+  onPageMenu?: (at: { x: number; y: number }) => void
   className?: string
 }
 
@@ -120,8 +126,14 @@ export function BrowserChrome({
   onWatch,
   onDrive,
   onMenu,
+  onPageMenu,
   className,
 }: BrowserChromeProps) {
+  /** The omnibox has the caret. On DESKTOP the toolbar yields to it — the field
+   *  grows and the verbs recede — which is the §5.8 "focus expand" on the
+   *  surface that has room for it. On a phone the bar is already `basis-full`,
+   *  so there the same state only softens the row below it. */
+  const [typing, setTyping] = React.useState(false)
   const state = tab ? tabState(tab) : null
   const lent = tab ? activeGrantees(tab).length : 0
   // Two different facts, one hairline: OUR mutation is in flight, or the PAGE
@@ -132,8 +144,9 @@ export function BrowserChrome({
   return (
     <div
       data-browser-chrome=""
+      data-chrome-typing={typing ? '' : undefined}
       className={cn(
-        'flex shrink-0 flex-col gap-1.5 border-b border-border bg-card px-3 py-2',
+        'relative flex shrink-0 flex-col gap-1.5 border-b border-border bg-card px-3 py-2',
         className,
       )}
     >
@@ -153,7 +166,12 @@ export function BrowserChrome({
             `basis-full` on a phone — which is what wraps the verbs onto their
             own row. On ≥md it lets go and the toolbar becomes one line, capped
             so a 1920px window does not stretch one URL across the screen. */}
-        <div className="order-1 flex min-w-0 basis-full items-center gap-2 md:order-2 md:min-w-[16rem] md:max-w-[56rem] md:flex-1 md:basis-auto">
+        <div
+          className={cn(
+            'order-1 flex min-w-0 basis-full items-center gap-2 transition-[max-width] duration-150 ease-out md:order-2 md:min-w-[16rem] md:flex-1 md:basis-auto motion-reduce:transition-none',
+            typing ? 'md:max-w-[72rem]' : 'md:max-w-[56rem]',
+          )}
+        >
           <AddressBar
             url={url}
             live={live}
@@ -167,14 +185,26 @@ export function BrowserChrome({
             lent={tab ? lent : undefined}
             onManage={tab ? onMenu : undefined}
             onNavigate={onNavigate}
+            onEditing={setTyping}
             className="min-w-0 flex-1"
           />
           <button
             type="button"
-            onClick={onMenu}
+            onClick={(e) => {
+              if (!onPageMenu) {
+                onMenu()
+                return
+              }
+              // Anchored under the BUTTON, not at the click point: a keyboard
+              // "click" carries (0,0) and would open the menu in the corner.
+              const r = e.currentTarget.getBoundingClientRect()
+              onPageMenu({ x: r.left, y: r.bottom + 6 })
+            }}
             disabled={!tab}
-            aria-label="Tab settings and sharing"
-            className="relative flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground after:absolute after:-inset-2 after:content-[''] hover:text-foreground disabled:opacity-40"
+            aria-haspopup={onPageMenu ? 'menu' : undefined}
+            aria-label={onPageMenu ? 'Page menu' : 'Tab settings and sharing'}
+            data-chrome-page-menu=""
+            className="relative flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground after:absolute after:-inset-2 after:content-[''] transition-colors hover:bg-secondary hover:text-foreground active:scale-95 disabled:opacity-40 motion-reduce:transition-none motion-reduce:active:scale-100"
           >
             <MoreHorizontal className="size-4" aria-hidden />
           </button>
@@ -262,6 +292,19 @@ export function BrowserChrome({
           the evidence, so it must not be the half that is cut. The same line is
           repeated inside the security chip's panel, which is where somebody
           looking for it will actually go. */}
+      {/* THE LOADING HAIRLINE — 2px along the bottom of the chrome, and the
+          only thing that signals a load. It is deliberately NOT over the page:
+          the page is the thing you are trying to look at. Indeterminate,
+          because a relayed page's progress is not a number anybody has, and a
+          fake percentage would be the one dishonest pixel here. */}
+      {loading && (
+        <span
+          aria-hidden
+          data-chrome-hairline=""
+          className="sm-browser-hairline pointer-events-none absolute inset-x-0 bottom-0 h-0.5 overflow-hidden"
+        />
+      )}
+
       <p
         data-tab-state={state?.tone ?? 'none'}
         className={cn(

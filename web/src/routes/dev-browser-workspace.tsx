@@ -44,6 +44,24 @@
 //                     busy · offline · reconnecting · crashed
 //                   `asleep`/`waking` pick the dehydrated fixture tab, which is
 //                   also the pair that must NOT dial: attaching would rehydrate.
+//
+// PHASE 4 — THE JOY LAYER. A swipe, a pinch and a long-press are things a
+// FINGER does, and a screenshot rig has no fingers. So each of these freezes
+// the state a finger would have produced and hands it to the SAME overlay the
+// real gesture drives — there is no bench-only branch behind any of them.
+//   ?swipe=<edge>[:p]  the edge-swipe peek, mid-gesture: `left` (back) or
+//                      `right` (forward), optional progress 0…1
+//                      (`?swipe=left:1` is the armed "let go and it goes")
+//   ?zoom=<n>          the visual zoom at n× — the reset chip appears with it
+//   ?ripple=1          the 300ms tap confirmation on the canvas
+//   ?menu=<what>       a context menu, open: `tab` (long-press / right-click a
+//                      chip) or `page` (the chrome's ⋯)
+//   ?find=1            the find bar — DISABLED by default, because that is the
+//                      state every server ships today
+//   ?caps=find,copy    …pretend a relay that HAS the DOM verbs, so the enabled
+//                      bar and its live count are screenshot-able too
+//   ?undo=1            close the active tab, so the "Closed · Reopen" bar is up
+//   ?drag=1            a tab chip mid-drag, with the rail reflowed around it
 import * as React from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
@@ -53,6 +71,7 @@ import { BrowserWorkspace } from '@/components/browser/workspace'
 import type { BrowserTab } from '@/lib/api/browser'
 import { EMPTY_NAV, type NavState } from '@/lib/browser/nav-state'
 import type { TakeoverOptions } from '@/lib/browser/takeover-socket'
+import { commitDistance, rubberBand, type EdgePeek } from '@/lib/browser/edge-swipe'
 import type { MockFailure } from './dev-browser-takeover.fixture'
 import { BENCH_BOTS, BENCH_TABS } from './dev-browser-workspace.fixture'
 
@@ -163,6 +182,14 @@ export default function DevBrowserWorkspace() {
   const dialogKind = params.get('dialog') ?? ''
   const chip = params.get('chip') === '1'
   const newtab = params.get('newtab') === '1'
+  const swipe = params.get('swipe') ?? ''
+  const zoomAt = Number(params.get('zoom') ?? '') || 0
+  const ripple = params.get('ripple') === '1'
+  const menu = params.get('menu') ?? ''
+  const find = params.get('find') === '1'
+  const capFlags = params.get('caps') ?? ''
+  const undo = params.get('undo') === '1'
+  const drag = params.get('drag') === '1'
   // A state that only exists on a particular KIND of tab picks that tab, so the
   // flag is one flag: `?state=needs-login` is the signed-out one, `?state=asleep`
   // the dehydrated one.
@@ -180,19 +207,26 @@ export default function DevBrowserWorkspace() {
       // The nav state goes in at the SOCKET, so the address bar, the padlock,
       // the arrows, the rail's icon/spinner and the dialog surface all reach
       // their state through the real `nav_state` frame and the real parse.
+      const caps = capFlags
+        ? {
+            find: capFlags.includes('find'),
+            copy: capFlags.includes('copy'),
+          }
+        : undefined
       setOptions(
         m.mockOptions(
           mode,
           fail,
           SILENT_STATES.includes(state),
           benchNavState(navFlags, dialogKind),
+          caps,
         ),
       )
     })
     return () => {
       alive = false
     }
-  }, [drive, state, navFlags, dialogKind])
+  }, [drive, state, navFlags, dialogKind, capFlags])
 
   return (
     <QueryClientProvider client={BENCH_QC}>
@@ -223,6 +257,13 @@ export default function DevBrowserWorkspace() {
                     chip={chip}
                     newtab={newtab}
                     options={options}
+                    swipe={swipe}
+                    zoomAt={zoomAt}
+                    ripple={ripple}
+                    menu={menu}
+                    find={find}
+                    undo={undo}
+                    drag={drag}
                     contentTheme={dark ? 'dark' : 'light'}
                   />
                 </Frame>
@@ -246,6 +287,13 @@ export default function DevBrowserWorkspace() {
                     chip={chip && onlyDesktop}
                     newtab={newtab}
                     options={options}
+                    swipe={onlyDesktop ? swipe : ''}
+                    zoomAt={onlyDesktop ? zoomAt : 0}
+                    ripple={onlyDesktop ? ripple : false}
+                    menu={onlyDesktop ? menu : ''}
+                    find={find}
+                    undo={onlyDesktop ? undo : false}
+                    drag={onlyDesktop ? drag : false}
                     contentTheme={dark ? 'dark' : 'light'}
                   />
                 </Frame>
@@ -311,6 +359,13 @@ function Bench({
   chip,
   newtab,
   options,
+  swipe,
+  zoomAt,
+  ripple,
+  menu,
+  find,
+  undo,
+  drag,
   contentTheme,
 }: {
   empty: boolean
@@ -324,6 +379,13 @@ function Bench({
   chip: boolean
   newtab: boolean
   options?: TakeoverOptions
+  swipe: string
+  zoomAt: number
+  ripple: boolean
+  menu: string
+  find: boolean
+  undo: boolean
+  drag: boolean
   contentTheme: 'light' | 'dark'
 }) {
   const [tabs, setTabs] = React.useState<BrowserTab[]>(empty ? [] : BENCH_TABS)
@@ -377,6 +439,85 @@ function Bench({
     setter?.call(input, address)
     input.dispatchEvent(new Event('input', { bubbles: true }))
   }, [address])
+
+  // `?find=1` presses the REAL ⌘F, and `?undo=1` presses the REAL close button:
+  // both reach their state through the product's own path, so a bench capture
+  // cannot show a surface the app has no door to.
+  const findArmed = React.useRef(true)
+  React.useEffect(() => {
+    if (!find || !findArmed.current) return
+    findArmed.current = false
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true }),
+    )
+  }, [find])
+
+  // NO CLEANUP-CANCELLED TIMERS IN ANY OF THE THREE DRIVERS BELOW. StrictMode
+  // runs every effect twice in dev: the first pass would arm the latch AND
+  // schedule the work, and its cleanup would then cancel that work before the
+  // second pass declined to re-schedule it. The latch survives the double
+  // invoke; a timer does not. So each of these does its work through a raf
+  // chain that nothing cancels — the same reason `?chip=1` is a bare latch.
+  const undoArmed = React.useRef(true)
+  React.useEffect(() => {
+    if (!undo || !undoArmed.current) return
+    undoArmed.current = false
+    // The first CLOSABLE chip — a pinned tab is favicon-only and has no close
+    // affordance at all, which is what pinning is. The rail collapses it, THEN
+    // the row goes and the "Closed · Reopen" bar arrives: the whole sequence,
+    // not a faked end state.
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>('[data-tab-close]')?.click()
+    })
+  }, [undo])
+
+  // `?menu=tab|page` opens the context menu through the same two doors a human
+  // has: a right-click on the chip, and the chrome's ⋯.
+  const menuArmed = React.useRef(true)
+  React.useEffect(() => {
+    if (!menu || !menuArmed.current) return
+    menuArmed.current = false
+    requestAnimationFrame(() => {
+      if (menu === 'page') {
+        document.querySelector<HTMLElement>('[data-chrome-page-menu]')?.click()
+        return
+      }
+      const id = activeId
+      if (!id) return
+      document
+        .querySelector<HTMLElement>(`[data-tab-chip="${CSS.escape(id)}"]`)
+        ?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+    })
+  }, [menu, activeId])
+
+  // `?drag=1` puts a chip in the air with real PointerEvents, so the rail's own
+  // measure-and-reflow runs — a faked transform would screenshot a layout the
+  // drag code never produced.
+  const dragArmed = React.useRef(true)
+  React.useEffect(() => {
+    if (!drag || !dragArmed.current) return
+    dragArmed.current = false
+    // Two frames: one for the rail to lay out, one for the drag to measure it.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const chips = Array.from(document.querySelectorAll<HTMLElement>('[data-tab-chip]'))
+      const held = chips[2] ?? chips[0]
+      if (!held) return
+      const r = held.getBoundingClientRect()
+      const at = (type: string, x: number) =>
+        held.dispatchEvent(
+          new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            pointerId: 1,
+            pointerType: 'mouse',
+            clientX: x,
+            clientY: r.top + r.height / 2,
+          }),
+        )
+      at('pointerdown', r.left + 20)
+      at('pointermove', r.left + 20 - Math.round(r.width * 0.9))
+    }))
+  }, [drag])
 
   const patch = (id: string, fn: (t: BrowserTab) => BrowserTab) =>
     setTabs((prev) => prev.map((t) => (t.id === id ? fn(t) : t)))
@@ -444,8 +585,36 @@ function Bench({
       forceLive={live && state !== 'asleep' && state !== 'waking'}
       crashed={state === 'crashed'}
       benchKeyboard={kb || undefined}
+      benchGesture={benchGesture(swipe, zoomAt, ripple)}
       contentTheme={contentTheme}
       className="min-h-0 flex-1"
     />
   )
+}
+
+/** `?swipe=`/`?zoom=`/`?ripple=` → the state a finger would have produced.
+ *
+ *  The peek's `offset` is computed by the SAME `rubberBand` the gesture uses,
+ *  from the same commit distance, so what the rig captures is the curve that
+ *  ships — not a plausible-looking number typed into a bench. */
+function benchGesture(
+  swipe: string,
+  zoomAt: number,
+  ripple: boolean,
+): { peek?: EdgePeek; zoom?: number; ripple?: boolean } | undefined {
+  const [edge, at] = swipe.split(':')
+  const progress = Math.min(1, Math.max(0, Number(at ?? '') || 0.62))
+  const peek: EdgePeek | undefined =
+    edge === 'left' || edge === 'right'
+      ? {
+          edge,
+          progress,
+          armed: progress >= 1,
+          // 390px is the mandated baseline and the width the phone frame is,
+          // so the offset the rig sees is the offset a thumb would produce.
+          offset: rubberBand(progress * commitDistance(390), commitDistance(390)),
+        }
+      : undefined
+  if (!peek && !zoomAt && !ripple) return undefined
+  return { peek, zoom: zoomAt || undefined, ripple: ripple || undefined }
 }

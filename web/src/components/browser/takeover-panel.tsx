@@ -66,7 +66,15 @@
    contains exactly one such element. */
 import * as React from 'react'
 
-import { Keyboard, Loader2, Power, RotateCw } from 'lucide-react'
+import {
+  ChevronLeft,
+  ChevronRight,
+  Keyboard,
+  Loader2,
+  Minimize2,
+  Power,
+  RotateCw,
+} from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import {
@@ -87,7 +95,27 @@ import {
   type TakeoverSnapshot,
   type TakeoverSubject,
 } from '@/lib/browser/takeover-socket'
-import { ClickCounter, TouchGesture, type GestureAction } from '@/lib/browser/gestures'
+import {
+  ClickCounter,
+  TAP_MS,
+  TAP_SLOP_PX,
+  TouchGesture,
+  type GestureAction,
+} from '@/lib/browser/gestures'
+import { EdgeSwipe, type EdgePeek } from '@/lib/browser/edge-swipe'
+import {
+  NO_ZOOM,
+  isZoomed,
+  panBy,
+  pinchMid,
+  pinchSpan,
+  pinchTo,
+  toggleZoom,
+  zoomAt,
+  zoomTransform,
+  type PinchStart,
+  type ZoomState,
+} from '@/lib/browser/zoom'
 import { keyboardScrollDelta, trapKeyAction } from '@/lib/browser/keyboard-trap'
 import { viewportState, type ViewportVerb, type ViewportView } from '@/lib/browser/viewport-state'
 import { useKeyboardViewport } from '@/hooks/use-keyboard-viewport'
@@ -171,6 +199,16 @@ export interface TakeoverControls {
   stop: () => void
   /** Answer the modal blocking the page. Dismiss is the safe default. */
   dialog: (accept: boolean, promptText?: string) => void
+  // ── the DOM verbs (phase 4) ────────────────────────────────────────────────
+  // Both return `false` when this relay cannot do them, which is TODAY for
+  // every server: nothing goes on the wire and the caller's UI says why. See
+  // `lib/browser/page-tools.ts` for the exact server work each one needs.
+  /** Search the page's DOM. `false` = the relay has no find. */
+  find: (query: string, opts?: { forward?: boolean; caseSensitive?: boolean }) => boolean
+  /** Drop the server's search state — a closed bar must not leak a search. */
+  findClose: () => void
+  /** Ask for the page's current selection as text. `false` = no copy-out. */
+  copySelection: () => boolean
 }
 
 /** What a host-drawn header renders from. Plain values only. */
@@ -236,6 +274,15 @@ export interface TakeoverPanelProps {
    *  and the Done bar can only be captured by pretending one is up. Pixels of
    *  pretend keyboard; production never passes it. */
   benchKeyboard?: number
+  /** BENCH ONLY — the phase-4 joy layer, frozen mid-gesture.
+   *
+   *  A swipe peek, a pinch and a tap ripple are all things a finger does and a
+   *  screenshot rig has no fingers, so the ONE way to capture them offline is
+   *  to hand the panel the state a finger would have produced. Every field
+   *  drives the SAME overlay the real gesture drives — there is no bench-only
+   *  branch below this prop, which is what stops the bench drifting from the
+   *  product. */
+  benchGesture?: { peek?: EdgePeek; zoom?: number; ripple?: boolean }
   className?: string
 }
 
@@ -254,6 +301,7 @@ export function TakeoverPanel({
   onWake,
   onReload,
   benchKeyboard,
+  benchGesture,
   className,
 }: TakeoverPanelProps) {
   // Primitives, not the object: a caller passing `subject={{kind:'tab',id}}`
@@ -263,6 +311,57 @@ export function TakeoverPanel({
   const name = subject ? subjectName(subject) : session ?? ''
 
   const [snap, setSnap] = React.useState<TakeoverSnapshot>(EMPTY_SNAPSHOT)
+  /** The url the current zoom belongs to. */
+  const zoomUrlRef = React.useRef('')
+
+  // ── VISUAL ZOOM (phase 4) ──────────────────────────────────────────────────
+  // A magnifying glass over the frame we already hold — never a re-layout ask,
+  // so a pinch answers in one frame on a 200ms relay. The state is mirrored
+  // into a ref because every consumer below reads it from an EVENT handler
+  // (a tap, a wheel, a resize), never during render, and a stale closure there
+  // would map a tap through last frame's zoom.
+  const [zoom, setZoom] = React.useState<ZoomState>(NO_ZOOM)
+  const zoomRef = React.useRef<ZoomState>(NO_ZOOM)
+  /** A finger is ON it right now, so the transform must follow the finger with
+   *  no transition at all. Off, and the same transform SETTLES — which is what
+   *  makes a double tap and a released rubber-band read as motion rather than
+   *  as a jump. One flag, both gestures. */
+  const [liveGesture, setLiveGesture] = React.useState(false)
+  const liveTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const applyZoom = React.useCallback((next: ZoomState) => {
+    zoomRef.current = next
+    setZoom(next)
+  }, [])
+  /** Continuous input (a trackpad's ctrl-wheel) has no end event, so its
+   *  live-ness is a trailing timer rather than a gesture boundary. */
+  const zoomLiveFor = React.useCallback((ms: number) => {
+    setLiveGesture(true)
+    if (liveTimer.current) clearTimeout(liveTimer.current)
+    liveTimer.current = setTimeout(() => setLiveGesture(false), ms)
+  }, [])
+  React.useEffect(() => () => {
+    if (liveTimer.current) clearTimeout(liveTimer.current)
+  }, [])
+
+  /**
+   * The socket's snapshot, plus the one thing a NAVIGATION has to reset.
+   *
+   * A NEW PAGE STARTS AT FIT: a zoom is a fact about the picture in front of
+   * you, not about the tab, so carrying 2.5× across a navigation opens the
+   * next page at a random corner of itself. Done HERE — in the socket's own
+   * callback, which is an event — rather than in an effect watching the url,
+   * because an effect would be a second render for a fact this one already has.
+   */
+  const receiveSnap = React.useCallback((next: TakeoverSnapshot) => {
+    if (next.nav.url !== zoomUrlRef.current) {
+      zoomUrlRef.current = next.nav.url
+      zoomRef.current = NO_ZOOM
+      setZoom(NO_ZOOM)
+      setLiveGesture(false)
+    }
+    setSnap(next)
+  }, [])
+
   /** The human pressed Wake on a tab the host still thinks is asleep. Latched
    *  so the dial does not un-happen on the next poll that has not caught up. */
   const [dialled, setDialled] = React.useState(false)
@@ -324,7 +423,7 @@ export function TakeoverPanel({
 
     const sock = new TakeoverSocket(
       kind === 'tab' ? { kind: 'tab', id: name } : { kind: 'session', name },
-      setSnap,
+      receiveSnap,
       (frame) => {
         pending = frame
         void paint()
@@ -346,6 +445,10 @@ export function TakeoverPanel({
         reload: (hard?: boolean) => sock.reload(!!hard),
         stop: () => sock.stopLoading(),
         dialog: (accept: boolean, promptText?: string) => sock.dialog(accept, promptText),
+        find: (query: string, opts?: { forward?: boolean; caseSensitive?: boolean }) =>
+          sock.find(query, opts),
+        findClose: () => sock.findClose(),
+        copySelection: () => sock.copySelection(),
       }
     }
     if (attached) sock.start()
@@ -361,7 +464,7 @@ export function TakeoverPanel({
       release(paintedRef.current?.image)
       paintedRef.current = null
     }
-  }, [kind, name, options, controlsRef, attached])
+  }, [kind, name, options, controlsRef, attached, receiveSnap])
 
   // ── the viewer's box ───────────────────────────────────────────────────────
   // Sent on attach, on every resize, and whenever the wheel changes hands (the
@@ -422,20 +525,45 @@ export function TakeoverPanel({
     // twice a session and never mid-gesture, so it costs nothing.
   }, [negotiate])
 
+  /** The canvas' own box, in CSS px — the space the zoom transform lives in. */
+  const zoomBox = React.useCallback(() => {
+    const rect = boxRef.current?.getBoundingClientRect()
+    return { width: rect?.width ?? 0, height: rect?.height ?? 0 }
+  }, [])
+
+  /** Client coords → the canvas' own box coords, zoom undone.
+   *
+   *  THE ORDER MATTERS AND IT IS EASY TO GET WRONG. The frame is painted at
+   *  `p × scale + offset`, so a tap at `c` was aimed at `(c − offset) / scale`.
+   *  Skip this and every tap on a zoomed page lands somewhere else — which is
+   *  the bug that makes a zoom feel haunted rather than broken. */
+  const unzoomed = React.useCallback((clientX: number, clientY: number) => {
+    const rect = boxRef.current?.getBoundingClientRect()
+    if (!rect) return null
+    const z = zoomRef.current
+    return {
+      x: (clientX - rect.left - z.x) / z.scale,
+      y: (clientY - rect.top - z.y) / z.scale,
+      rect,
+    }
+  }, [])
+
   /** A pointer/wheel event's position in PAGE coordinates, or `null` when it
    *  landed on the letterbox (or before the first frame). */
-  const pagePoint = React.useCallback((clientX: number, clientY: number) => {
-    const box = boxRef.current
-    const painted = paintedRef.current
-    if (!box || !painted) return null
-    const rect = box.getBoundingClientRect()
-    return toPagePoint(
-      { x: clientX - rect.left, y: clientY - rect.top },
-      { width: rect.width, height: rect.height },
-      frameSize(painted.image),
-      painted.frame.metadata,
-    )
-  }, [])
+  const pagePoint = React.useCallback(
+    (clientX: number, clientY: number) => {
+      const painted = paintedRef.current
+      const local = unzoomed(clientX, clientY)
+      if (!painted || !local) return null
+      return toPagePoint(
+        { x: local.x, y: local.y },
+        { width: local.rect.width, height: local.rect.height },
+        frameSize(painted.image),
+        painted.frame.metadata,
+      )
+    },
+    [unzoomed],
+  )
 
 
   // ── the soft keyboard ──────────────────────────────────────────────────────
@@ -463,6 +591,19 @@ export function TakeoverPanel({
     trapRef.current?.focus({ preventScroll: true })
   }, [])
 
+  // THE ONE MOMENT WORTH MARKING. Taking the wheel is the instant a human
+  // becomes responsible for what happens on a page that is signed in to
+  // things, so it gets the app's one browser haptic and a ring that DRAWS in
+  // (the box's `transition-shadow` below) rather than appearing. Hand-back is
+  // deliberately silent: giving something up needs no celebration.
+  const drovePrev = React.useRef(driving)
+  React.useEffect(() => {
+    if (driving && !drovePrev.current) {
+      if (typeof navigator !== 'undefined' && 'vibrate' in navigator) navigator.vibrate?.(10)
+    }
+    drovePrev.current = driving
+  }, [driving])
+
   // Leaving drive puts the keyboard away. A trap that keeps focus after the
   // wheel went back to the agent is a keyboard over a page that is ignoring it.
   React.useEffect(() => {
@@ -487,10 +628,55 @@ export function TakeoverPanel({
   }, [kb.keyboardOpen, driving])
 
   // ── touch ──────────────────────────────────────────────────────────────────
+  //
+  // FOUR GESTURES SHARE ONE FINGER, and the order they are asked in IS the
+  // design (phase 4):
+  //
+  //   1. **two fingers → pinch.** Never anything else, and it cancels whatever
+  //      one finger had started — a pinch that also scrolled the page is the
+  //      classic double-handling bug.
+  //   2. **one finger while zoomed → pan the magnifier.** Nothing reaches the
+  //      page: at 2.5× the human is reading, not clicking, and a page that
+  //      scrolled under a pan would make the zoom unusable.
+  //   3. **one finger from the EDGE → back / forward.** Chrome, not content,
+  //      so it is asked before the page and it works while WATCHING — the
+  //      server handles `back` above the drive gate on purpose, and refusing a
+  //      watcher the gesture while the toolbar button next to it works would be
+  //      incoherent rather than safer.
+  //   4. **anything else → the page**, through the phase-2 recogniser.
+  //
+  // 3 and 4 overlap on purpose: the edge recogniser and the page recogniser
+  // BOTH see the start, and whichever commits first takes it. A finger that
+  // went down at the margin and then straight down the screen is a scroll, and
+  // the page gets it — which is the only way a page stays scrollable along its
+  // own left edge.
   const gestureRef = React.useRef<TouchGesture | null>(null)
   if (gestureRef.current == null) {
     gestureRef.current = new TouchGesture()
   }
+  const edgeRef = React.useRef<EdgeSwipe | null>(null)
+  if (edgeRef.current == null) {
+    edgeRef.current = new EdgeSwipe()
+  }
+  /** The double tap that zooms, counted in BOX coords — the zoom is chrome, so
+   *  it must survive a tap on the letterbox where a page point does not exist. */
+  const zoomTapsRef = React.useRef<ClickCounter | null>(null)
+  if (zoomTapsRef.current == null) {
+    zoomTapsRef.current = new ClickCounter()
+  }
+  const pinchRef = React.useRef<PinchStart | null>(null)
+  const panRef = React.useRef<{ x: number; y: number } | null>(null)
+  const touchStartRef = React.useRef<{ x: number; y: number; at: number } | null>(null)
+  const lastBoxRef = React.useRef<{ x: number; y: number } | null>(null)
+  /** The live peek, for the overlay. `null` = no swipe in progress. */
+  const [peek, setPeek] = React.useState<EdgePeek | null>(null)
+  /** Latched so the "let go and it goes" haptic fires ONCE per crossing. */
+  const armedRef = React.useRef(false)
+  /** The 300ms confirmation at the point a finger landed. On a 200ms relay
+   *  this is the whole difference between "did that register" and confidence,
+   *  and it costs one absolutely-positioned span. */
+  const [ripple, setRipple] = React.useState<{ x: number; y: number; key: number } | null>(null)
+  const rippleKey = React.useRef(0)
 
   /** Relay what the recogniser decided. A tap is a click AND the moment the
    *  keyboard may be wanted, so it is also what focuses the trap. */
@@ -517,31 +703,174 @@ export function TakeoverPanel({
   const touchPoint = (t: { clientX: number; clientY: number }) =>
     pagePoint(t.clientX, t.clientY)
 
+  /** Client → the box's own coords, zoom NOT undone: the edge swipe is about
+   *  the edge of the SCREEN and the ripple is painted over the canvas, so both
+   *  live in the untransformed layer. */
+  const boxPoint = (t: { clientX: number; clientY: number }) => {
+    const rect = boxRef.current?.getBoundingClientRect()
+    if (!rect) return null
+    return { x: t.clientX - rect.left, y: t.clientY - rect.top, width: rect.width }
+  }
+
+  const haptic = () => {
+    if (typeof navigator !== 'undefined' && 'vibrate' in navigator) navigator.vibrate?.(8)
+  }
+
+  const beginPinch = (e: React.TouchEvent<HTMLDivElement>) => {
+    const a = boxPoint(e.touches[0])
+    const b = boxPoint(e.touches[1])
+    if (!a || !b) return
+    // A pinch is not a swipe and not a scroll: whatever one finger had begun
+    // is abandoned, and the page is told the touch it saw is cancelled.
+    edgeRef.current!.cancel()
+    setPeek(null)
+    if (driving) relay(gestureRef.current!.cancel())
+    panRef.current = null
+    setLiveGesture(true)
+    pinchRef.current = {
+      base: zoomRef.current,
+      span: pinchSpan(a, b),
+      mid: pinchMid(a, b),
+    }
+  }
+
   const onTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (!driving) return
+    if (e.touches.length >= 2) {
+      beginPinch(e)
+      return
+    }
+    // The leftover finger of a pinch that has not fully lifted is not a new
+    // gesture — see `onTouchEnd`.
+    if (pinchRef.current) return
     const t = e.touches[0]
     if (!t) return
+    const b = boxPoint(t)
+    if (!b) return
+    lastBoxRef.current = { x: b.x, y: b.y }
+    touchStartRef.current = { x: b.x, y: b.y, at: e.timeStamp }
+    // Zoomed: this finger pans the magnifier and the page never hears about it.
+    if (isZoomed(zoomRef.current)) {
+      panRef.current = { x: t.clientX, y: t.clientY }
+      setLiveGesture(true)
+      return
+    }
+    // The edge recogniser refuses outright when there is no history that way,
+    // so a peek is never an animation that cannot commit.
+    edgeRef.current!.begin(b.x, b.y, e.timeStamp, b.width, {
+      back: snap.nav.canGoBack,
+      forward: snap.nav.canGoForward,
+    })
+    if (!driving) return
     const p = touchPoint(t)
     if (!p) return
     relay(gestureRef.current!.begin(p, e.timeStamp))
   }
 
   const onTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (!driving) return
+    if (pinchRef.current) {
+      if (e.touches.length < 2) return
+      const a = boxPoint(e.touches[0])
+      const b = boxPoint(e.touches[1])
+      if (!a || !b) return
+      applyZoom(pinchTo(pinchRef.current, zoomBox(), a, b))
+      return
+    }
     const t = e.touches[0]
     if (!t) return
+    const pan = panRef.current
+    if (pan) {
+      applyZoom(panBy(zoomRef.current, zoomBox(), t.clientX - pan.x, t.clientY - pan.y))
+      panRef.current = { x: t.clientX, y: t.clientY }
+      return
+    }
+    const b = boxPoint(t)
+    if (b) lastBoxRef.current = { x: b.x, y: b.y }
+    const swipe = b ? edgeRef.current!.move(b.x, b.y, e.timeStamp) : null
+    if (swipe) {
+      if (swipe.armed && !armedRef.current) {
+        armedRef.current = true
+        haptic()
+      }
+      if (!swipe.armed) armedRef.current = false
+      setLiveGesture(true)
+      setPeek(swipe)
+      // The page must not ALSO see this finger — one gesture, one owner.
+      if (driving) relay(gestureRef.current!.cancel())
+      return
+    }
+    if (edgeRef.current!.owns) return
+    if (!driving) return
     const p = touchPoint(t)
     if (!p) return
     relay(gestureRef.current!.move(p, e.timeStamp))
   }
 
   const onTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (!driving) return
+    if (pinchRef.current) {
+      // Held until EVERY finger is up: the one left behind by a pinch is not
+      // the start of a pan, and treating it as one is how a zoom drifts on
+      // release.
+      if (e.touches.length === 0) {
+        pinchRef.current = null
+        setLiveGesture(false)
+      }
+      return
+    }
+    if (panRef.current) {
+      panRef.current = null
+      setLiveGesture(false)
+      return
+    }
     const t = e.changedTouches[0]
-    relay(gestureRef.current!.end(t ? touchPoint(t) : null, e.timeStamp))
+    const b = t ? boxPoint(t) : null
+    if (b) lastBoxRef.current = { x: b.x, y: b.y }
+    const verdict = edgeRef.current!.end()
+    setPeek(null)
+    setLiveGesture(false)
+    armedRef.current = false
+    if (verdict) {
+      if (verdict.commit) {
+        haptic()
+        if (verdict.edge === 'left') socketRef.current?.back()
+        else socketRef.current?.forward()
+      }
+      // The finger belonged to the swipe; the page was never told it existed.
+      if (driving) gestureRef.current!.cancel()
+      touchStartRef.current = null
+      return
+    }
+    // DOUBLE TAP → ZOOM, and it beats relaying a page double-click.
+    // On a phone a word is selected by long-press, not by two taps, so two taps
+    // mean zoom the way they do in every mobile browser. The FIRST tap has
+    // already been relayed as a click, which is also what Safari does.
+    const start = touchStartRef.current
+    const spot = lastBoxRef.current
+    touchStartRef.current = null
+    let zoomedNow = false
+    if (start && spot && e.timeStamp - start.at <= TAP_MS) {
+      if (Math.hypot(spot.x - start.x, spot.y - start.y) <= TAP_SLOP_PX) {
+        if (zoomTapsRef.current!.next(spot, e.timeStamp) >= 2) {
+          applyZoom(toggleZoom(zoomRef.current, zoomBox(), spot))
+          zoomedNow = true
+        } else if (driving) {
+          rippleKey.current += 1
+          setRipple({ x: spot.x, y: spot.y, key: rippleKey.current })
+        }
+      }
+    }
+    if (!driving) return
+    const out = gestureRef.current!.end(t ? touchPoint(t) : null, e.timeStamp)
+    if (!zoomedNow) relay(out)
   }
 
   const onTouchCancel = () => {
+    edgeRef.current!.cancel()
+    pinchRef.current = null
+    panRef.current = null
+    touchStartRef.current = null
+    setPeek(null)
+    setLiveGesture(false)
+    armedRef.current = false
     relay(gestureRef.current!.cancel())
   }
 
@@ -552,6 +881,30 @@ export function TakeoverPanel({
     const box = boxRef.current
     if (!box) return
     const onWheel = (e: WheelEvent) => {
+      // A TRACKPAD PINCH arrives as a ctrl-wheel — that is how every engine
+      // reports it, and it is the desktop half of the pinch below. Handled
+      // before the drive gate because zoom is local chrome: a human WATCHING an
+      // agent must be able to lean in and read.
+      if (e.ctrlKey || e.metaKey) {
+        const rect = boxRef.current?.getBoundingClientRect()
+        if (!rect) return
+        e.preventDefault()
+        const anchor = { x: e.clientX - rect.left, y: e.clientY - rect.top }
+        const cur = zoomRef.current
+        // The 0.01 factor is the conventional one: a trackpad's ctrl-wheel
+        // deltas are small and continuous, a mouse wheel's are ±100, and this
+        // makes one notch a sane step without making the trackpad frantic.
+        zoomLiveFor(140)
+        applyZoom(
+          zoomAt(
+            cur,
+            { width: rect.width, height: rect.height },
+            anchor,
+            cur.scale * (1 - e.deltaY * 0.01),
+          ),
+        )
+        return
+      }
       if (!driving) return
       const p = pagePoint(e.clientX, e.clientY)
       if (!p) return
@@ -560,7 +913,7 @@ export function TakeoverPanel({
     }
     box.addEventListener('wheel', onWheel, { passive: false })
     return () => box.removeEventListener('wheel', onWheel)
-  }, [driving, pagePoint])
+  }, [driving, pagePoint, applyZoom, zoomLiveFor])
 
   // ── mouse (desktop) ────────────────────────────────────────────────────────
   // Pointer events fire for TOUCH too, and a finger that produced both a
@@ -757,6 +1110,27 @@ export function TakeoverPanel({
     }
   }
 
+  // The bench freezes a gesture rather than adding a second code path: every
+  // overlay below reads THESE, and a real finger and `?swipe=` reach them the
+  // same way.
+  const peekNow = peek ?? benchGesture?.peek ?? null
+  const zoomNow =
+    benchGesture?.zoom && benchGesture.zoom > 1
+      ? { scale: benchGesture.zoom, x: 0, y: 0 }
+      : zoom
+  // The bench's ripple is FROZEN mid-animation rather than replayed: a 300ms
+  // one-shot has finished before a screenshot rig can reach it, and a capture
+  // of `opacity: 0` is a capture of nothing.
+  const benchRipple = !ripple && !!benchGesture?.ripple
+  const rippleNow = ripple ?? (benchRipple ? { x: 160, y: 220, key: 0 } : null)
+  // The peek's parallax is a THIRD of the finger's travel: the page yielding,
+  // not the page leaving — it is not going anywhere until the gesture commits.
+  const parallax = peekNow ? peekNow.offset * 0.35 * (peekNow.edge === 'left' ? 1 : -1) : 0
+  const zoomPart = zoomTransform(zoomNow)
+  const canvasTransform = parallax
+    ? `translateX(${parallax.toFixed(1)}px)${zoomPart === 'none' ? '' : ` ${zoomPart}`}`
+    : zoomPart
+
   return (
     <div
       className={cn('flex min-h-0 flex-col overflow-hidden bg-paper text-ink', className)}
@@ -824,7 +1198,11 @@ export function TakeoverPanel({
         // rather than scrolling out from under the thumb.
         style={lift ? { marginBottom: lift } : undefined}
         className={cn(
-          'relative min-h-0 flex-1 touch-none select-none outline-none',
+          // `overflow-hidden` is load-bearing since phase 4: a zoomed canvas is
+          // a `scale()`d element, which paints OUTSIDE its own box unless it is
+          // clipped — at 2.5× the page would spill past the viewport and over
+          // whatever is under it.
+          'relative min-h-0 flex-1 overflow-hidden touch-none select-none outline-none',
           // `touch-none` stops the BROWSER panning (we recognise the gesture
           // ourselves); `overscroll-contain` stops a fling at the page's top
           // from pulling supermux itself down to refresh.
@@ -833,20 +1211,84 @@ export function TakeoverPanel({
           driving ? 'cursor-default' : 'cursor-not-allowed',
           // The one moment worth marking: a ring that says "you are IN the
           // page", so nobody types a password into a surface that is watching.
+          // It DRAWS in over 150ms — see the haptic above.
+          'transition-shadow duration-150 ease-out motion-reduce:transition-none',
           driving && 'ring-2 ring-inset ring-primary',
         )}
       >
         {/* Dimmed while the state says the picture is not a claim about now —
             the honest half of "keep the last frame": it stays readable, and it
-            stops looking live. */}
+            stops looking live.
+
+            THE TRANSFORM IS THE WHOLE JOY LAYER, IN ONE STRING. The zoom is a
+            local magnifying glass (`zoom.ts`) and the peek is the swipe's
+            parallax; both are `transform`, so both are composited and neither
+            costs a repaint of a JPEG. The transition is 0 WHILE A FINGER IS ON
+            IT (the picture must track the finger, not chase it) and settles
+            when it lets go — which is what turns a double tap into motion and
+            a released rubber-band into a spring-back. */}
         <canvas
           ref={canvasRef}
+          style={{
+            transform: canvasTransform,
+            transformOrigin: '0 0',
+            transitionProperty: canvasTransform === 'none' && !peekNow ? 'none' : 'transform',
+            transitionDuration: liveGesture ? '0ms' : '240ms',
+            transitionTimingFunction: 'cubic-bezier(0.2, 0, 0, 1)',
+          }}
           className={cn(
-            'block h-full w-full',
+            'block h-full w-full will-change-transform motion-reduce:!transition-none',
             view.dim && view.cover !== 'screen' && 'opacity-50',
           )}
           data-takeover-canvas
+          data-takeover-zoom={zoomNow.scale > 1 ? zoomNow.scale.toFixed(2) : undefined}
         />
+
+        {/* THE PEEK. We do not have the previous page's pixels, so we do not
+            draw them: what slides in is a chevron and a shadow, which says
+            "back" without claiming to be the page you are going to. */}
+        {peekNow && <EdgePeekOverlay peek={peekNow} />}
+
+        {/* The 300ms confirmation at the point the finger landed. Local, so it
+            is instant on a relay that is not. */}
+        {rippleNow && (
+          <span
+            key={rippleNow.key}
+            aria-hidden
+            data-takeover-ripple=""
+            style={
+              benchRipple
+                ? {
+                    left: rippleNow.x,
+                    top: rippleNow.y,
+                    animationDelay: '-0.12s',
+                    animationPlayState: 'paused',
+                  }
+                : { left: rippleNow.x, top: rippleNow.y }
+            }
+            className="sm-browser-ripple pointer-events-none absolute size-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary/50 ring-2 ring-primary/60"
+            onAnimationEnd={() => setRipple(null)}
+          />
+        )}
+
+        {/* Zoomed is a MODE, and a mode with no way out is a trap. One tap,
+            thumb-reachable, and it says the level so the softness is explained
+            rather than mysterious. */}
+        {isZoomed(zoomNow) && (
+          <button
+            type="button"
+            data-takeover-zoom-reset=""
+            onClick={() => {
+              setLiveGesture(false)
+              applyZoom(NO_ZOOM)
+            }}
+            style={{ bottom: 'max(12px, env(safe-area-inset-bottom))' }}
+            className="absolute left-1/2 z-20 inline-flex min-h-11 -translate-x-1/2 items-center gap-1.5 rounded-full border border-hairline bg-surface/95 px-4 text-[12.5px] font-medium text-ink shadow-lg backdrop-blur transition-colors hover:bg-fill-soft motion-reduce:transition-none"
+          >
+            <Minimize2 className="size-3.5" aria-hidden />
+            {zoomNow.scale.toFixed(1)}× · Fit
+          </button>
+        )}
 
         {/* THE KEYBOARD TRAP. A real, focusable input — the only thing on a
             phone that raises a keyboard — kept visually out of the way rather
@@ -899,6 +1341,66 @@ export function TakeoverPanel({
         )}
         {keyboardUp && <KeyboardDoneBar onDone={() => trapRef.current?.blur()} />}
         <StatusVeil refused={snap.refused} />
+      </div>
+    </div>
+  )
+}
+
+/**
+ * THE EDGE-SWIPE PEEK — a chevron, a shadow, and nothing that pretends.
+ *
+ * A native back-swipe slides the PREVIOUS page in under your thumb. We have one
+ * page's pixels, so drawing a second page would be inventing it — and this
+ * browser is signed in to things, which makes an invented page the worst kind
+ * of lie there is. What slides in instead is chrome: a scrim that deepens with
+ * the drag, a circle that fills, and an arrow that goes solid at the moment
+ * letting go would commit. Three signals, all of them true.
+ *
+ * `progress` is the arithmetic from `edge-swipe.ts`, saturating at the commit
+ * point; `armed` is that same threshold as a boolean, so the visual "let go"
+ * and the actual "let go" can never disagree.
+ */
+function EdgePeekOverlay({ peek }: { peek: EdgePeek }) {
+  const left = peek.edge === 'left'
+  const Arrow = left ? ChevronLeft : ChevronRight
+  const size = 40 + peek.progress * 16
+  return (
+    <div
+      aria-hidden
+      data-takeover-peek={peek.edge}
+      data-takeover-peek-armed={peek.armed ? '' : undefined}
+      className="pointer-events-none absolute inset-0 z-10 overflow-hidden"
+    >
+      {/* The scrim comes from the edge the finger is on, so the direction is
+          legible before the arrow is read.
+
+          `currentColor`, NOT `hsl(var(--ink))`: this theme's tokens are whole
+          colours (`#000000`), not HSL channel triples, so `hsl(var(--ink))` is
+          an invalid colour and the entire gradient falls back to `none` —
+          silently, with no error anywhere. Inheriting the ink colour off the
+          class below gets the same value and cannot rot that way. */}
+      <div
+        data-side={left ? 'left' : 'right'}
+        style={{
+          opacity: 0.05 + peek.progress * 0.22,
+          [left ? 'left' : 'right']: 0,
+          backgroundImage: `linear-gradient(to ${left ? 'right' : 'left'}, currentColor, transparent 60%)`,
+        }}
+        className="absolute inset-y-0 w-1/2 text-ink"
+      />
+      <div
+        style={{
+          [left ? 'left' : 'right']: Math.max(8, peek.offset * 0.6 - size / 2),
+          width: size,
+          height: size,
+          opacity: 0.35 + peek.progress * 0.65,
+        }}
+        className="absolute top-1/2 flex -translate-y-1/2 items-center justify-center rounded-full border border-hairline bg-surface/95 shadow-xl backdrop-blur"
+      >
+        <Arrow
+          style={{ transform: `scale(${(0.8 + peek.progress * 0.3).toFixed(2)})` }}
+          className={peek.armed ? 'size-5 text-primary' : 'size-5 text-ink-2'}
+        />
       </div>
     </div>
   )

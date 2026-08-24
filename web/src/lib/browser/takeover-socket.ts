@@ -31,6 +31,17 @@ import { authToken, wsUrl } from '@/env'
 
 import type { FrameMetadata, TakeoverFrame } from './frame-map'
 import { EMPTY_NAV, parseNavState, type NavState } from './nav-state'
+import {
+  NO_CAPS,
+  NO_FIND,
+  copyPayload,
+  findClosePayload,
+  findPayload,
+  parseCaps,
+  parseFindResult,
+  type FindResult,
+  type PageCaps,
+} from './page-tools'
 
 /** The slice of `WebSocket` this module uses — so a test can be a socket. */
 export interface SocketLike {
@@ -92,6 +103,17 @@ export interface TakeoverSnapshot {
   /** The last input the server dropped, and why — cleared on the next accepted
    *  gesture so a stale banner cannot outlive its cause. */
   refused: string | null
+  /**
+   * **What this relay can do beyond pixels** (phase 4). Find-in-page and
+   * copy-out need the page's DOM, which the server does not expose yet — so
+   * every flag is FALSE until a `caps` frame says otherwise, and the UI shells
+   * for both disable themselves with the reason written on them rather than
+   * putting a frame on the wire that would be silently dropped. See
+   * `page-tools.ts` for the exact server work each one needs.
+   */
+  caps: PageCaps
+  /** The live find, as the server counts it. [[NO_FIND]] until one answers. */
+  find: FindResult
 }
 
 export const EMPTY_SNAPSHOT: TakeoverSnapshot = {
@@ -100,6 +122,8 @@ export const EMPTY_SNAPSHOT: TakeoverSnapshot = {
   url: '',
   nav: EMPTY_NAV,
   refused: null,
+  caps: NO_CAPS,
+  find: NO_FIND,
 }
 
 export interface TakeoverOptions {
@@ -111,6 +135,11 @@ export interface TakeoverOptions {
   /** Injected for tests; defaults to `env.ts`. */
   token?: () => string
   baseUrl?: () => string
+  /** The page's selection, when a capable server answers a `copy`. A callback
+   *  rather than a snapshot field: clipboard text is a one-shot event, and
+   *  parking it in state would leave a signed-in page's content sitting in a
+   *  React tree long after the copy. */
+  onCopied?: (text: string) => void
 }
 
 /**
@@ -499,6 +528,43 @@ export class TakeoverSocket {
     })
   }
 
+  // ── the DOM verbs (phase 4) — gated, because the server cannot do them yet ──
+  //
+  // FAIL CLOSED, AND LOUDLY IN THE UI RATHER THAN SILENTLY ON THE WIRE. An
+  // un-capable relay drops an unknown frame on the floor, so a find bar that
+  // sent one anyway would spin against a server that will never answer. The
+  // capability comes from a `caps` frame the server does not send yet, which
+  // means today these three are always no-ops and every surface that offers
+  // them says so. The moment `takeover.rs` grows the arms in `page-tools.ts`'s
+  // header, this client needs no edit at all.
+
+  /** Can this relay search the page's DOM and read its selection? */
+  caps(): PageCaps {
+    return this.snap.caps
+  }
+
+  /** Search the page. No-op (and `false`) when the server cannot. */
+  find(query: string, opts: { forward?: boolean; caseSensitive?: boolean } = {}): boolean {
+    if (!this.snap.caps.find || !query) return false
+    this.send(findPayload(query, opts))
+    return true
+  }
+
+  /** Drop the server's search state — closing the bar must not leak a search
+   *  per keystroke into the relay. */
+  findClose(): void {
+    if (!this.snap.caps.find) return
+    this.patch({ find: NO_FIND })
+    this.send(findClosePayload())
+  }
+
+  /** Ask for the page's current selection as text. */
+  copySelection(): boolean {
+    if (!this.snap.caps.copy) return false
+    this.send(copyPayload())
+    return true
+  }
+
   // ── inbound ───────────────────────────────────────────────────────────────
 
   private receive(raw: unknown): void {
@@ -532,6 +598,19 @@ export class TakeoverSocket {
         // seed, so every consumer of `snapshot.url` — the omnibox, the strip,
         // the security chip — follows a page that navigates itself.
         this.patch({ nav, url: nav.url || this.snap.url })
+        return
+      }
+      case 'caps':
+        // Sent once after `auth_ok` by a server that has the DOM verbs. Absent
+        // = [[NO_CAPS]], which is why the default is false rather than unknown.
+        this.patch({ caps: parseCaps(msg) })
+        return
+      case 'find_result':
+        this.patch({ find: parseFindResult(msg) })
+        return
+      case 'copied': {
+        const text = typeof msg.text === 'string' ? msg.text : ''
+        this.opts.onCopied?.(text)
         return
       }
       case 'mode':
