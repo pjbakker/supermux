@@ -23,6 +23,20 @@
 //                   keyboard trap, the drive-profile negotiation
 //   ?kb=<px>        pretend a soft keyboard that tall is up (the rig has none):
 //                   the viewport lifts above it and the Done bar appears
+//   ?nav=<flags>    PHASE 3 — the nav-state feed, faked (comma-separated):
+//                     back      · there is history behind  → Back lights up
+//                     forward   · …and ahead               → Forward lights up
+//                     loading   · a load is in flight      → Reload becomes
+//                                 Stop, the chip spins, the hairline shimmers
+//                     insecure  · an http page             → "Not secure"
+//                     icon      · the page has a favicon   → the real icon
+//                                 replaces the letter tile in the rail
+//   ?dialog=<kind>  PHASE 3 — the page opened a modal: alert | confirm |
+//                   prompt | beforeunload. Drawn OVER the viewport.
+//   ?chip=1         open the security chip's panel (origins + the nudge)
+//   ?newtab=1       the NEW-TAB page — what `+` lands on, with pinned tiles
+//   ?address=<txt>  ALSO drives the omnibox suggestion list: `?address=mail`
+//                   shows "Go to …" plus the matching open tabs
 //   ?state=<name>   PHASE 2 — force one viewport state, each with its own fake
 //                   socket (a real close code, not a faked state), so all of
 //                   them are screenshot-able offline:
@@ -37,6 +51,7 @@ import { ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { BrowserWorkspace } from '@/components/browser/workspace'
 import type { BrowserTab } from '@/lib/api/browser'
+import { EMPTY_NAV, type NavState } from '@/lib/browser/nav-state'
 import type { TakeoverOptions } from '@/lib/browser/takeover-socket'
 import type { MockFailure } from './dev-browser-takeover.fixture'
 import { BENCH_BOTS, BENCH_TABS } from './dev-browser-workspace.fixture'
@@ -69,6 +84,55 @@ const SOCKET_FAILURE: Partial<Record<ViewportBenchState, MockFailure>> = {
 /** States where the socket simply never answers the handshake. */
 const SILENT_STATES: ViewportBenchState[] = ['connecting', 'waking']
 
+/** A real 16px favicon with no network behind it: one inline SVG as a `data:`
+ *  URI, which is the same shape the server relays (it reads the icon INSIDE the
+ *  page and hands over base64). Lets the rail's icon path be screenshot offline
+ *  without the bench inventing a second one. */
+const BENCH_FAVICON =
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">' +
+      '<rect width="16" height="16" rx="3" fill="#2563eb"/>' +
+      '<path d="M3 5h10v6H3z" fill="none" stroke="#fff" stroke-width="1.4"/>' +
+      '<path d="M3 5l5 4 5-4" fill="none" stroke="#fff" stroke-width="1.4"/>' +
+      '</svg>',
+  )
+
+/** `?nav=` → the nav-state feed the socket would have pushed. Fake state, real
+ *  component: the chrome, the rail and the padlock all read this through the
+ *  exact prop the live feed writes. */
+function benchNavState(flags: string, dialogKind: string): NavState | undefined {
+  const on = flags
+    .split(',')
+    .map((f) => f.trim())
+    .filter(Boolean)
+  if (on.length === 0 && !dialogKind) return undefined
+  const insecure = on.includes('insecure')
+  const url = insecure ? 'http://docs.internal/handbook' : 'https://mail.acme.example/inbox'
+  return {
+    ...EMPTY_NAV,
+    url,
+    title: insecure ? 'Handbook' : 'Inbox (3) — Acme Mail',
+    favicon: on.includes('icon') ? BENCH_FAVICON : null,
+    loading: on.includes('loading'),
+    canGoBack: on.includes('back'),
+    canGoForward: on.includes('forward'),
+    secure: !insecure,
+    dialog: dialogKind
+      ? {
+          kind: dialogKind,
+          message:
+            dialogKind === 'prompt'
+              ? 'What should we call this export?'
+              : dialogKind === 'beforeunload'
+                ? ''
+                : "This export will overwrite last week's file. Continue?",
+          default_prompt: dialogKind === 'prompt' ? 'settlement-q3' : '',
+        }
+      : null,
+  }
+}
+
 /** States that only exist on a particular kind of tab. */
 const STATE_TAB: Partial<Record<ViewportBenchState, string>> = {
   'needs-login': 'tb_bank',
@@ -95,6 +159,10 @@ export default function DevBrowserWorkspace() {
   const drive = params.get('drive') === '1'
   const kb = Number(params.get('kb') ?? '') || 0
   const state = (params.get('state') ?? '') as ViewportBenchState
+  const navFlags = params.get('nav') ?? ''
+  const dialogKind = params.get('dialog') ?? ''
+  const chip = params.get('chip') === '1'
+  const newtab = params.get('newtab') === '1'
   // A state that only exists on a particular KIND of tab picks that tab, so the
   // flag is one flag: `?state=needs-login` is the signed-out one, `?state=asleep`
   // the dehydrated one.
@@ -109,12 +177,22 @@ export default function DevBrowserWorkspace() {
       if (!alive) return
       const mode = drive ? 'human_driving' : 'agent_driving'
       const fail = SOCKET_FAILURE[state]
-      setOptions(m.mockOptions(mode, fail, SILENT_STATES.includes(state)))
+      // The nav state goes in at the SOCKET, so the address bar, the padlock,
+      // the arrows, the rail's icon/spinner and the dialog surface all reach
+      // their state through the real `nav_state` frame and the real parse.
+      setOptions(
+        m.mockOptions(
+          mode,
+          fail,
+          SILENT_STATES.includes(state),
+          benchNavState(navFlags, dialogKind),
+        ),
+      )
     })
     return () => {
       alive = false
     }
-  }, [drive, state])
+  }, [drive, state, navFlags, dialogKind])
 
   return (
     <QueryClientProvider client={BENCH_QC}>
@@ -142,6 +220,8 @@ export default function DevBrowserWorkspace() {
                     sheet={sheet}
                     state={state}
                     kb={kb}
+                    chip={chip}
+                    newtab={newtab}
                     options={options}
                     contentTheme={dark ? 'dark' : 'light'}
                   />
@@ -163,6 +243,8 @@ export default function DevBrowserWorkspace() {
                     sheet={sheet && onlyDesktop}
                     state={state}
                     kb={kb}
+                    chip={chip && onlyDesktop}
+                    newtab={newtab}
                     options={options}
                     contentTheme={dark ? 'dark' : 'light'}
                   />
@@ -226,6 +308,8 @@ function Bench({
   sheet,
   state,
   kb,
+  chip,
+  newtab,
   options,
   contentTheme,
 }: {
@@ -237,6 +321,8 @@ function Bench({
   sheet: boolean
   state: ViewportBenchState
   kb: number
+  chip: boolean
+  newtab: boolean
   options?: TakeoverOptions
   contentTheme: 'light' | 'dark'
 }) {
@@ -255,6 +341,28 @@ function Bench({
     const chip = document.querySelector<HTMLElement>(`[data-tab-chip="${CSS.escape(id)}"]`)
     chip?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
   }, [sheet, activeId])
+
+  // `?newtab=1` presses the REAL `+`, so the bench lands on the new-tab page by
+  // the same path a human does — the workspace owns that state, and a bench-only
+  // door into it is a door that can drift from the product.
+  React.useEffect(() => {
+    if (!newtab) return
+    document.querySelector<HTMLElement>('[data-tab-new]')?.click()
+  }, [newtab])
+
+  // `?chip=1` opens the security panel the same way: by clicking the chip.
+  //
+  // The latch is not superstition. The chip is a TOGGLE, StrictMode runs every
+  // effect twice in dev, and both runs happen before React flushes the state
+  // update — so the DOM still reads `aria-expanded="false"` on the second pass
+  // and a guard that reads the DOM would click twice and close it again. A ref
+  // survives the double-invoke; the attribute does not.
+  const chipArmed = React.useRef(true)
+  React.useEffect(() => {
+    if (!chip || !chipArmed.current) return
+    chipArmed.current = false
+    document.querySelector<HTMLElement>('[data-security-chip]')?.click()
+  }, [chip])
 
   // `?address=` types into the REAL omnibox rather than adding a bench-only
   // prop: the lead icon, the clear button and the refusal line are all driven
@@ -318,6 +426,14 @@ function Bench({
       }}
       onNavigate={(id, url) => patch(id, (t) => ({ ...t, url, live: true }))}
       onWake={(id) => patch(id, (t) => ({ ...t, live: true }))}
+      // No history behind a fixture, so the REST fallbacks are wired to the one
+      // honest thing they can do offline: nothing, loudly, in the console. The
+      // bench exists to screenshot the CONTROLS, and `?nav=back,forward` is what
+      // makes them lit.
+      onBack={() => undefined}
+      onForward={() => undefined}
+      onReload={() => undefined}
+      onStop={() => undefined}
       onSleep={(id) => patch(id, (t) => ({ ...t, live: false }))}
       onOrigins={(id, origins) => patch(id, (t) => ({ ...t, origins }))}
       busy={busy || state === 'waking'}

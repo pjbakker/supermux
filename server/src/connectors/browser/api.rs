@@ -71,6 +71,13 @@ pub fn router_for(state: AppState) -> Router {
         .route("/api/browser/tabs/{id}/open", post(open_handler))
         .route("/api/browser/tabs/{id}/navigate", post(navigate_handler))
         .route("/api/browser/tabs/{id}/close", post(close_handler))
+        // Back / forward / reload / stop (P1-4). Wake-then-act, exactly like
+        // `navigate`: pressing Back on a sleeping tab is a human using a
+        // browser, which is what the lazy-start invariant waits for.
+        .route("/api/browser/tabs/{id}/back", post(back_handler))
+        .route("/api/browser/tabs/{id}/forward", post(forward_handler))
+        .route("/api/browser/tabs/{id}/reload", post(reload_handler))
+        .route("/api/browser/tabs/{id}/stop", post(stop_handler))
         .route("/api/browser/tabs/{id}/grants", get(grants_handler))
         .route("/api/browser/tabs/{id}/grant", post(grant_handler))
         .route(
@@ -442,6 +449,104 @@ async fn close_handler(
     Ok(Json(out))
 }
 
+/// The shared body of the four navigation-control routes (P1-4).
+///
+/// Each wakes the tab (a human pressing Reload is somebody *using* a browser —
+/// the lazy-start invariant is honoured, not repealed), runs the verb as
+/// [`Actor::Human`], then persists where the page actually landed so the answer
+/// carries the new address rather than the one before the step. The page verbs
+/// themselves already wait, bounded, for the load — see
+/// [`AgentContext::go`](super::context::AgentContext::go).
+///
+/// `moved` is the honest half: `false` means the page did not go anywhere —
+/// Back at the start of the stack — and that is a normal state, not a `4xx`. A
+/// UI must grey the button from `can_go_back` on the nav-state feed, and this
+/// answer is what it reconciles against if it did not.
+async fn nav_control(
+    state: &AppState,
+    id: &str,
+    verb: NavVerb,
+    action: &str,
+) -> Result<Json<Value>, AppError> {
+    let row = load(state, id).await?;
+    let tab = wake_tab(state, &row).await?;
+    let page = tab.page();
+    let moved = match verb {
+        NavVerb::Back => page.go(Actor::Human, -1).await,
+        NavVerb::Forward => page.go(Actor::Human, 1).await,
+        NavVerb::Reload => page.reload(Actor::Human, false).await.map(|()| true),
+        NavVerb::Stop => page.stop(Actor::Human).await.map(|()| true),
+    }
+    .map_err(browser_err)?;
+    // The same write-through `wake_and_go` does. The nav watcher would land it
+    // ~1 s later anyway, but this response claims to know where the tab is, so
+    // it has to actually look.
+    state.browser.persist_location(&tab).await;
+    crate::db::audit::log(
+        &state.pool,
+        "user",
+        action,
+        &format!("tab:{id}"),
+        json!({ "moved": moved }),
+    )
+    .await
+    .ok();
+    let row = load(state, id).await?;
+    let live = state.browser.live_tabs().await;
+    let mut out = tab_json(state, &row, &live).await;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("moved".into(), json!(moved));
+    }
+    Ok(Json(out))
+}
+
+/// Which of the four [`nav_control`] verbs a route means.
+#[derive(Debug, Clone, Copy)]
+enum NavVerb {
+    Back,
+    Forward,
+    Reload,
+    Stop,
+}
+
+/// `POST /api/browser/tabs/{id}/back` — one step back through the page's own
+/// history. `moved:false` ⇒ there was nothing behind it.
+async fn back_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    nav_control(&state, &id, NavVerb::Back, "browser.human_back").await
+}
+
+/// `POST /api/browser/tabs/{id}/forward` — …and one step forward.
+async fn forward_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    nav_control(&state, &id, NavVerb::Forward, "browser.human_forward").await
+}
+
+/// `POST /api/browser/tabs/{id}/reload` — reload the page.
+async fn reload_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    nav_control(&state, &id, NavVerb::Reload, "browser.human_reload").await
+}
+
+/// `POST /api/browser/tabs/{id}/stop` — stop the in-flight load.
+///
+/// Wakes like the others, which reads oddly for "stop" but is the coherent
+/// answer: the tab the human is looking at must exist before anything about it
+/// can be stopped, and on an already-idle page it is a no-op that costs one CDP
+/// round trip.
+async fn stop_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    nav_control(&state, &id, NavVerb::Stop, "browser.human_stop").await
+}
+
 async fn grants_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -737,6 +842,12 @@ mod tests {
                 ("open", json!({})),
                 ("navigate", json!({ "url": "https://example.com/" })),
                 ("close", json!({})),
+                // The P1-4 controls, on the same terms: a missing row is a 404
+                // and nothing about it may start a browser.
+                ("back", json!({})),
+                ("forward", json!({})),
+                ("reload", json!({})),
+                ("stop", json!({})),
             ] {
                 let (st, v) = send(
                     &state,
@@ -971,6 +1082,93 @@ mod tests {
         assert!(v.get("open_error").is_none(), "{v}");
         assert_eq!(v["live"], json!(true), "create+open is one round trip: {v}");
         assert_eq!(v["title"], json!("Second"), "{v}");
+
+        state.browser.shutdown().await;
+        server.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **P1-4's REST door, end to end.** Back / forward / reload really step the
+    /// page's own history, `moved` is honest at the ends of the stack, and each
+    /// answer carries the address the page landed on rather than the one before
+    /// the step.
+    ///
+    /// Also proves the P1-5 write-through *without a viewer*: the row learns the
+    /// URL a tab nobody is watching is actually on.
+    #[tokio::test]
+    #[ignore = "spawns a real chrome; run with --ignored on a box that has the pinned binary"]
+    async fn real_chrome_the_human_can_step_the_history_reload_and_stop() {
+        let (state, dir) = test_state().await;
+        if !state.browser.config().executable.exists() {
+            eprintln!("SKIP: no chrome at {}", state.browser.config().executable.display());
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        let (port, server) = page_server();
+        let one = format!("http://127.0.0.1:{port}/");
+        let two = format!("http://127.0.0.1:{port}/two");
+
+        let (_, tab) = send(&state, "POST", "/api/browser/tabs", json!({ "url": one })).await;
+        let id = tab["id"].as_str().unwrap().to_string();
+        let step = |verb: &str| format!("/api/browser/tabs/{id}/{verb}");
+
+        // Land on page one, then page two: a stack with two entries.
+        let (st, v) = send(&state, "POST", &step("navigate"), json!({ "url": one })).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = send(&state, "POST", &step("navigate"), json!({ "url": two })).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["url"], json!(two), "{v}");
+
+        // ── back ────────────────────────────────────────────────────────────
+        let (st, v) = send(&state, "POST", &step("back"), json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["moved"], json!(true), "{v}");
+        assert_eq!(v["url"], json!(one), "the answer carries where it LANDED: {v}");
+        assert_eq!(v["title"], json!("Landing"), "{v}");
+
+        // ── forward ─────────────────────────────────────────────────────────
+        let (st, v) = send(&state, "POST", &step("forward"), json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["moved"], json!(true), "{v}");
+        assert_eq!(v["url"], json!(two), "{v}");
+
+        // ── forward again: nothing there, and that is not an error ──────────
+        let (st, v) = send(&state, "POST", &step("forward"), json!({})).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the end of the stack is a normal state, not a 4xx: {v}"
+        );
+        assert_eq!(v["moved"], json!(false), "{v}");
+        assert_eq!(v["url"], json!(two), "and the page did not move: {v}");
+
+        // ── reload + stop leave the address where it was ────────────────────
+        for verb in ["reload", "stop"] {
+            let (st, v) = send(&state, "POST", &step(verb), json!({})).await;
+            assert_eq!(st, StatusCode::OK, "{verb}: {v}");
+            assert_eq!(v["moved"], json!(true), "{verb}: {v}");
+            assert_eq!(v["url"], json!(two), "{verb} must not move the page: {v}");
+            assert_eq!(v["live"], json!(true), "{verb}: {v}");
+        }
+
+        // ── the write-through lands with NO viewer and NO REST verb ─────────
+        // Drive the page from underneath the human surface entirely, then wait
+        // for the nav watcher's debounce to commit it to the row.
+        let live = state.browser.tab(&id).await.expect("live");
+        live.page().go(Actor::Human, -1).await.expect("back");
+        let mut landed = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let row = db_tabs::get(&state.pool, &id).await.unwrap().expect("row");
+            if row.url == one {
+                landed = row.url;
+                break;
+            }
+        }
+        assert_eq!(
+            landed, one,
+            "the nav-state write-through must commit the real URL with nobody watching"
+        );
 
         state.browser.shutdown().await;
         server.abort();

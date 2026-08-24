@@ -147,13 +147,15 @@ describe('the chrome is persistent — it reports, it does not vanish', () => {
     expect(asleep).toContain('aria-label="Wake tab"')
     expect(asleep).not.toContain('data-chrome-sleep')
     // Reload keeps its own cell either way (greyed, not gone) so waking a tab
-    // does not reflow the row under the human's thumb.
-    expect(asleep).toContain('data-chrome-reload')
+    // does not reflow the row under the human's thumb. Phase 3 moved that cell
+    // into `NavControls`, beside Back and Forward, where a browser's reload
+    // button has always lived — the cell is the same, its owner changed.
+    expect(asleep).toContain('data-nav-reload="reload"')
 
     const live = chrome({ onSleep: () => {} })
     expect(live).toContain('data-chrome-sleep')
     expect(live).not.toContain('data-chrome-wake')
-    expect(live).toContain('data-chrome-reload')
+    expect(live).toContain('data-nav-reload="reload"')
   })
 
   test('resync is wired at last, and disabled while nothing is live', () => {

@@ -97,11 +97,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Once, Weak};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use cdp::CdpClient;
-use context::AgentContext;
+use context::{AgentContext, NavState};
 use error::{BrowserError, Result};
 use launch::{ChromeProcess, ProfileMode};
 use lock::{DriveMode, HandOff};
@@ -130,6 +131,16 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// How often the idle reaper wakes.
 const REAPER_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the nav-state write-through waits for a page to go QUIET before it
+/// commits a `url`/`title` to `browser_tabs` (P1-5).
+///
+/// The debounce is the point, not a throttle: a redirect chain publishes several
+/// nav states and lands on one, and a per-hop write would leave an interstitial
+/// — often a login wall — sitting in the tab list for anyone who looked in the
+/// wrong second. One second is far longer than a same-host redirect and far
+/// shorter than a human noticing.
+const NAV_WRITE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Budget for closing every context during shutdown. A wedged browser must not
 /// be able to delay the process kill.
@@ -606,9 +617,52 @@ impl BrowserService {
             target = %tab.page().target_id(),
             "browser: workspace tab live"
         );
+        // Every live tab gets the nav-state write-through, viewer or no viewer
+        // (P1-5). An agent driving a tab nobody is watching is exactly the case
+        // the stale-URL bug was worst in.
+        if let Some(writer) = self.spawn_nav_write_through(&tab).await {
+            tab.set_nav_writer(writer);
+        }
         running.tabs.insert(tab_id.to_string(), tab.clone());
         running.idle_since = None;
         Ok(tab)
+    }
+
+    /// Follow a live tab's nav state and write `url`/`title` back to
+    /// `browser_tabs`, debounced by [`NAV_WRITE_DEBOUNCE`].
+    ///
+    /// **This is what kills the stale-URL bug for good.** Before it the row
+    /// learned a page's address exactly twice — at a clean dehydrate, and at a
+    /// human REST verb — so the workspace list showed where a tab *had been*,
+    /// and a crash-recovery rehydrate landed on the page the human left rather
+    /// than the one they were on.
+    ///
+    /// It holds only `Weak` handles: a write-through task must never be the
+    /// reason a tab (or the whole service) stays alive.
+    async fn spawn_nav_write_through(self: &Arc<Self>, tab: &Arc<Tab>) -> Option<JoinHandle<()>> {
+        let mut rx = tab.page().watch_nav().await.ok()?;
+        let service = Arc::downgrade(self);
+        let handle = Arc::downgrade(tab);
+        Some(tokio::spawn(async move {
+            while let Some(state) = settled_nav(&mut rx, NAV_WRITE_DEBOUNCE).await {
+                if !worth_writing(&state) {
+                    continue;
+                }
+                let (Some(service), Some(tab)) = (service.upgrade(), handle.upgrade()) else {
+                    return;
+                };
+                tab.set_location(state.url.clone(), state.title.clone()).await;
+                let Some(pool) = service.pool() else { continue };
+                let patch = db_tabs::TabPatch {
+                    url: Some(state.url),
+                    title: Some(state.title),
+                    ..Default::default()
+                };
+                if let Err(e) = db_tabs::update(pool, tab.id(), &patch).await {
+                    warn!(tab = tab.id(), error = %e, "browser: nav write-through");
+                }
+            }
+        }))
     }
 
     /// **Dehydrate** a tab: persist where it was, close its target, forget it.
@@ -1010,9 +1064,117 @@ fn spawn_idle_reaper(weak: Weak<BrowserService>, idle_timeout: Duration) {
     });
 }
 
+
+/// Wait for a nav feed to go **quiet** for `debounce`, then hand back the state
+/// it landed on. `None` ⇒ the watcher is gone, and so is the page.
+///
+/// Split out of [`BrowserService::spawn_nav_write_through`] so the debounce — the
+/// part with an off-by-one-window failure mode nobody would notice until the tab
+/// list was wrong again — is testable with a plain channel and a paused clock.
+async fn settled_nav(rx: &mut watch::Receiver<NavState>, debounce: Duration) -> Option<NavState> {
+    rx.changed().await.ok()?;
+    loop {
+        match tokio::time::timeout(debounce, rx.changed()).await {
+            // Still moving — restart the quiet window.
+            Ok(Ok(())) => continue,
+            // The watcher is gone.
+            Ok(Err(_)) => return None,
+            // A full window of quiet. This is the landing.
+            Err(_) => break,
+        }
+    }
+    Some(rx.borrow_and_update().clone())
+}
+
+/// Is this settled state worth committing to `browser_tabs`?
+///
+/// `about:blank` is not a location, it is the ABSENCE of one — the same rule
+/// [`BrowserService::persist_location`] applies, and for the same reason:
+/// writing it through erases where the human actually was and makes the next
+/// rehydrate land on a blank page. A state still `loading` is a hop, not a
+/// landing, and the debounce alone cannot tell them apart when a page is slow.
+fn worth_writing(state: &NavState) -> bool {
+    !state.loading && !state.url.is_empty() && state.url != "about:blank"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── P1-5: the write-through debounce ────────────────────────────────────
+
+    fn at(url: &str) -> NavState {
+        NavState {
+            url: url.to_string(),
+            title: format!("title of {url}"),
+            ..NavState::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_write_through_commits_the_landing_not_every_redirect_hop() {
+        // A redirect chain publishes several nav states and lands on one.
+        // Writing each hop would leave an interstitial — very often a login
+        // wall — sitting in the human's tab list for whoever looked in the
+        // wrong second.
+        let (tx, mut rx) = watch::channel(NavState::default());
+        let hops = tokio::spawn(async move {
+            for url in ["https://a.test/", "https://a.test/sso", "https://a.test/app"] {
+                tx.send_replace(at(url));
+                tokio::time::sleep(NAV_WRITE_DEBOUNCE / 2).await;
+            }
+            // Hold the sender so the channel does not close under the reader.
+            tokio::time::sleep(NAV_WRITE_DEBOUNCE * 4).await;
+        });
+
+        let landed = settled_nav(&mut rx, NAV_WRITE_DEBOUNCE)
+            .await
+            .expect("a landing");
+        assert_eq!(landed.url, "https://a.test/app", "only the landing is written");
+        hops.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_page_lands_once_and_then_waits() {
+        let (tx, mut rx) = watch::channel(NavState::default());
+        tx.send_replace(at("https://a.test/one"));
+        let first = settled_nav(&mut rx, NAV_WRITE_DEBOUNCE).await.expect("first");
+        assert_eq!(first.url, "https://a.test/one");
+
+        // No further change ⇒ the writer parks on `changed()` rather than
+        // re-committing the same row every debounce window.
+        let idle = tokio::time::timeout(
+            NAV_WRITE_DEBOUNCE * 5,
+            settled_nav(&mut rx, NAV_WRITE_DEBOUNCE),
+        )
+        .await;
+        assert!(idle.is_err(), "a settled page must not keep writing");
+
+        tx.send_replace(at("https://a.test/two"));
+        let second = settled_nav(&mut rx, NAV_WRITE_DEBOUNCE).await.expect("second");
+        assert_eq!(second.url, "https://a.test/two");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_watcher_ends_the_writer_instead_of_spinning() {
+        let (tx, mut rx) = watch::channel(NavState::default());
+        drop(tx);
+        assert!(settled_nav(&mut rx, NAV_WRITE_DEBOUNCE).await.is_none());
+    }
+
+    #[test]
+    fn a_blank_or_in_flight_page_is_never_written_through() {
+        // `about:blank` is the ABSENCE of a location: writing it through would
+        // erase where the human actually was and make the next rehydrate land
+        // on a blank page — the same rule `persist_location` applies.
+        assert!(!worth_writing(&NavState::default()));
+        assert!(!worth_writing(&at("about:blank")));
+        assert!(!worth_writing(&NavState {
+            loading: true,
+            ..at("https://a.test/half-loaded")
+        }));
+        assert!(worth_writing(&at("https://a.test/")));
+    }
 
     #[tokio::test]
     async fn new_spawns_nothing() {

@@ -47,11 +47,12 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use super::cdp::CdpClient;
+use super::cdp::{CdpClient, CdpEvent};
 use super::error::{BrowserError, Result};
 use super::lock::{Actor, DriveLock, DriveMode};
 
@@ -77,6 +78,68 @@ pub const MAX_DEVICE_SCALE: f64 = 2.0;
 /// quality budget on motion, and it is the same trade the 512-cap made in the
 /// other direction.
 const DRIVE_EVERY_NTH: u32 = 4;
+
+/// How long after the last navigation signal a page counts as **settled** and
+/// the expensive reads (history, title, favicon) are worth issuing. Short enough
+/// that the address bar feels immediate; long enough that a redirect chain is
+/// read once at its landing instead of once per hop.
+const NAV_SETTLE: Duration = Duration::from_millis(300);
+
+/// Deadline on the watcher's own CDP reads. Deliberately far below
+/// [`DEFAULT_CALL_TIMEOUT`](super::cdp::DEFAULT_CALL_TIMEOUT): a wedged page must
+/// stall its own address bar for a few seconds, never wedge the pump that is the
+/// only thing still telling the human what is going on.
+const NAV_READ_BUDGET: Duration = Duration::from_secs(5);
+
+/// Ceiling on a favicon data URI. Chrome will hand back whatever the site ships;
+/// the address bar renders it at 16 px and this rides a JSON WebSocket frame, so
+/// anything larger is dropped rather than relayed.
+const MAX_FAVICON_BYTES: usize = 96 * 1024;
+
+/// Events that mean **the page moved**, for the bounded wait after a history
+/// step. `Page.loadEventFired` is the strong signal, but a back/forward restored
+/// from Chrome's back-forward cache never fires it — the document was never
+/// re-parsed — and announces itself with `frameNavigated` instead. Waiting only
+/// on `load` would therefore block every bfcache "back" for the whole budget.
+const HISTORY_DONE: [&str; 3] = [
+    "Page.loadEventFired",
+    "Page.frameNavigated",
+    "Page.navigatedWithinDocument",
+];
+
+/// Read the page's icon **inside the page**, as a `data:` URI, or `null`.
+///
+/// Deliberately not fetched server-side. A signed-in site's icon is very often
+/// behind the same cookie the profile holds, so a server-side `GET` would (a)
+/// leave the profile's jar and come back 403, and (b) put the server's own IP on
+/// a URL the human's page chose. In-page it is one `fetch` with the page's own
+/// credentials, and every failure mode — CSP, CORS, 404, a non-image body — is
+/// caught and degrades to `null` rather than to an error the human sees.
+const FAVICON_JS: &str = r#"(async () => {
+  try {
+    const abs = (h) => { try { return new URL(h, location.href).href } catch (e) { return null } };
+    const links = Array.from(document.querySelectorAll('link[rel~="icon"]'));
+    const size = (l) => {
+      const m = (l.getAttribute('sizes') || '').match(/\d+/);
+      if (m) return parseInt(m[0], 10);
+      return (l.getAttribute('type') || '') === 'image/svg+xml' ? 1000 : 1;
+    };
+    links.sort((a, b) => size(b) - size(a));
+    const href = (links[0] && abs(links[0].getAttribute('href'))) || abs('/favicon.ico');
+    if (!href || !/^https?:/i.test(href)) return null;
+    const r = await fetch(href, { credentials: 'include', cache: 'force-cache' });
+    if (!r.ok) return null;
+    const b = await r.blob();
+    if (!b.size || b.size > 65536) return null;
+    if (!/^image\//.test(b.type || '')) return null;
+    return await new Promise((done) => {
+      const fr = new FileReader();
+      fr.onload = () => done(typeof fr.result === 'string' ? fr.result : null);
+      fr.onerror = () => done(null);
+      fr.readAsDataURL(b);
+    });
+  } catch (e) { return null }
+})()"#;
 
 /// One JPEG/PNG frame off `Page.screencastFrame`.
 #[derive(Debug, Clone)]
@@ -275,6 +338,219 @@ impl KeyPress {
     }
 }
 
+// ── nav state: what an address bar shows (P1-5) ─────────────────────────────
+
+/// One entry of `Page.getNavigationHistory`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NavEntry {
+    /// CDP's `entryId` — the only thing `Page.navigateToHistoryEntry` accepts.
+    pub id: i64,
+    pub url: String,
+    pub title: String,
+}
+
+/// The page's back/forward stack, exactly as CDP reports it.
+///
+/// **CDP has no relative `go`.** `Page.navigateToHistoryEntry` takes an absolute
+/// `entryId`, so "back" is `entries[currentIndex - 1].id` and the whole of
+/// [`AgentContext::go`] is the index arithmetic in
+/// [`entry_at_delta`](Self::entry_at_delta). This is a pure value type precisely
+/// so that arithmetic — the part that can be off by one and silently navigate a
+/// human somewhere they never asked for — is testable without a browser.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NavHistory {
+    pub current_index: i64,
+    pub entries: Vec<NavEntry>,
+}
+
+impl NavHistory {
+    /// Parse a `Page.getNavigationHistory` result. A missing or malformed field
+    /// yields an empty history, never a panic: this parses browser output.
+    ///
+    /// `currentIndex` defaults to `-1` (not `0`) so an unreadable result reports
+    /// *no* history rather than a first entry that does not exist — `can_go_back`
+    /// on a lie is a button that navigates a human somewhere at random.
+    pub fn from_cdp(v: &Value) -> Self {
+        let entries = v
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|e| NavEntry {
+                        id: e.get("id").and_then(Value::as_i64).unwrap_or(-1),
+                        url: str_of(e.get("url")),
+                        title: str_of(e.get("title")),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            current_index: v.get("currentIndex").and_then(Value::as_i64).unwrap_or(-1),
+            entries,
+        }
+    }
+
+    /// Is there an entry BEHIND the current one?
+    pub fn can_go_back(&self) -> bool {
+        self.entry_at_delta(-1).is_some()
+    }
+
+    /// …and one AHEAD?
+    pub fn can_go_forward(&self) -> bool {
+        self.entry_at_delta(1).is_some()
+    }
+
+    /// The `entryId` `delta` steps from here, or `None` when that falls off
+    /// either end of the stack — which is the honest answer to "can I go back?"
+    /// at the first page, not an error.
+    ///
+    /// `delta == 0` is `None` on purpose: re-navigating to the entry you are
+    /// already on is a reload wearing a different name, and
+    /// [`AgentContext::reload`] is the call that means it.
+    pub fn entry_at_delta(&self, delta: i64) -> Option<i64> {
+        if delta == 0 {
+            return None;
+        }
+        let target = self.current_index.checked_add(delta)?;
+        let index = usize::try_from(target).ok()?;
+        self.entries.get(index).map(|e| e.id)
+    }
+
+    /// The URL of the entry the page is ON, if the stack has one. Authoritative
+    /// over a remembered `frameNavigated`, because it is what Chrome itself
+    /// considers the current document after a history step.
+    pub fn current_url(&self) -> Option<&str> {
+        usize::try_from(self.current_index)
+            .ok()
+            .and_then(|i| self.entries.get(i))
+            .map(|e| e.url.as_str())
+    }
+}
+
+/// A modal `alert` / `confirm` / `prompt` / `beforeunload` the page has opened.
+///
+/// This is page **state**, not an event, and it lives on [`NavState`] for one
+/// decisive reason: a JS dialog blocks the renderer, so a human attaching to a
+/// page that is *already* blocked must learn about it from the very first frame
+/// they are handed. An event they were not connected for would leave them
+/// staring at a frozen page with nothing to press.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PageDialog {
+    /// CDP's `type`: `alert` | `confirm` | `prompt` | `beforeunload`.
+    pub kind: String,
+    pub message: String,
+    /// The prefilled value of a `prompt()`'s input; empty for the other kinds.
+    pub default_prompt: String,
+}
+
+/// **What the address bar shows** — the live nav state of one page.
+///
+/// Produced by [`AgentContext::watch_nav`] and consumed twice: pushed to the
+/// takeover socket as the live omnibox feed, and written through to
+/// `browser_tabs` so the tab list stops showing where a page *was*.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NavState {
+    pub url: String,
+    pub title: String,
+    /// A `data:` URI of the page's icon, fetched **in the page** (see
+    /// [`FAVICON_JS`]). `None` until one is found, and `None` again when the
+    /// site moves and its new icon cannot be read — never a stale icon for a
+    /// site the human is no longer on.
+    pub favicon: Option<String>,
+    pub loading: bool,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
+    /// **Transport only**: the scheme is `https:`/`wss:`. It answers "is this
+    /// connection encrypted", it does NOT answer "is this certificate trusted",
+    /// and the UI must not draw it as if it did.
+    pub secure: bool,
+    /// The modal blocking the page right now, if any.
+    pub dialog: Option<PageDialog>,
+}
+
+/// A running nav-state watcher: the pump task and the channel it publishes on.
+///
+/// A [`watch`] channel, not a [`broadcast`] one — the difference matters. Nav
+/// state is *state*: a client attaching mid-page must be handed the current
+/// value immediately, and a client that fell behind wants the latest one, not a
+/// replay of every redirect hop. Frames are the opposite, which is why the
+/// screencast pump next door is a broadcast.
+struct NavWatcher {
+    tx: watch::Sender<NavState>,
+    pump: JoinHandle<()>,
+}
+
+/// A JSON string field, or `""`. The watcher parses browser output constantly
+/// and every field of it is optional in practice.
+fn str_of(v: Option<&Value>) -> String {
+    v.and_then(Value::as_str).unwrap_or_default().to_string()
+}
+
+/// Does this URL's scheme mean the transport is encrypted?
+///
+/// URL-derived on purpose (v1): `Security.securityStateChanged` reports
+/// certificate trust, which is a much stronger claim than the padlock this
+/// feeds, and one we would then have to keep honest. `http:` is false,
+/// `about:blank` is false — there is no encrypted connection to a page that was
+/// never fetched, and claiming otherwise is exactly the fiction a padlock must
+/// never tell.
+pub fn secure_scheme(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("wss://")
+}
+
+/// `scheme://host[:port]` of an absolute URL — the favicon cache key.
+///
+/// String surgery rather than a URL parser by design: this decides only whether
+/// to re-fetch an icon, so a URL it cannot read simply misses the cache and
+/// costs one extra in-page `fetch`.
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if scheme.is_empty() || host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
+/// Is this event about the page's MAIN frame?
+///
+/// A subframe's load must never move the address bar or spin the spinner. An
+/// *unknown* main frame — the window between the pump starting and its first
+/// frame-tree read — counts as main, because dropping the first real signal
+/// after attach would leave the bar blank until the human navigated again.
+fn is_main_frame(params: &Value, key: &str, main: Option<&str>) -> bool {
+    let Some(id) = params.get(key).and_then(Value::as_str) else {
+        return main.is_none();
+    };
+    match main {
+        Some(m) => m == id,
+        None => true,
+    }
+}
+
+/// `Runtime.evaluate` on a flat-mode session, value or [`Value::Null`].
+///
+/// A free function because the pump owns no `&self`: it holds the client and the
+/// session id directly so it can outlive nothing and borrow nothing.
+async fn eval_on(client: &CdpClient, session: &str, expression: &str) -> Value {
+    client
+        .call_with_timeout(
+            Some(session),
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
+            NAV_READ_BUDGET,
+        )
+        .await
+        .ok()
+        .and_then(|v| v.get("result").and_then(|r| r.get("value")).cloned())
+        .unwrap_or(Value::Null)
+}
+
 /// A live per-agent browser context.
 pub struct AgentContext {
     /// The lock subject — a session name for scratch, a `tb_…` tab id for a
@@ -297,6 +573,8 @@ pub struct AgentContext {
     viewport_h: AtomicU32,
     /// Live screencast pump, if one is running.
     screencast: Mutex<Option<Screencast>>,
+    /// Live nav-state watcher, if one is running (P1-5).
+    nav: Mutex<Option<NavWatcher>>,
 }
 
 struct Screencast {
@@ -450,6 +728,7 @@ impl AgentContext {
             viewport_w: AtomicU32::new(width),
             viewport_h: AtomicU32::new(height),
             screencast: Mutex::new(None),
+            nav: Mutex::new(None),
         };
         // Domains we need events + evaluation from.
         me.session_call("Page.enable", json!({})).await?;
@@ -514,7 +793,7 @@ impl AgentContext {
     pub async fn navigate(&self, actor: Actor, url: &str) -> Result<()> {
         self.lock.gate(actor)?;
         // Subscribe BEFORE issuing the command so a fast load cannot race us.
-        let mut events = self.client.subscribe();
+        let events = self.client.subscribe();
         let result = self
             .session_call("Page.navigate", json!({ "url": url }))
             .await?;
@@ -524,19 +803,40 @@ impl AgentContext {
                 message: format!("{url}: {err}"),
             });
         }
+        self.await_nav(events, &["Page.loadEventFired"], url).await;
+        Ok(())
+    }
+
+    /// Wait (bounded) for one of `methods` on THIS page.
+    ///
+    /// `events` must have been subscribed **before** the command that will
+    /// produce them — that ordering is the whole point, and the reason this
+    /// takes a receiver instead of making one: a fast load that lands between
+    /// the command and a subscribe is a caller that waits out the full budget
+    /// for an event it already missed.
+    ///
+    /// Never an error: navigation was *started* regardless, and this only bounds
+    /// how long the caller blocks. A slow third-party page must not wedge a tool
+    /// call or an HTTP handler.
+    async fn await_nav(
+        &self,
+        mut events: broadcast::Receiver<CdpEvent>,
+        methods: &[&str],
+        what: &str,
+    ) {
         let want = self.cdp_session_id.clone();
         let waited = tokio::time::timeout(LOAD_BUDGET, async {
             loop {
                 match events.recv().await {
                     Ok(ev) => {
-                        if ev.method == "Page.loadEventFired"
-                            && ev.session_id.as_deref() == Some(want.as_str())
+                        if ev.session_id.as_deref() == Some(want.as_str())
+                            && methods.contains(&ev.method.as_str())
                         {
                             return;
                         }
                     }
-                    // Lagged: we may have missed the load event, so stop
-                    // waiting rather than hang until the budget expires.
+                    // Lagged: we may have missed the event, so stop waiting
+                    // rather than hang until the budget expires.
                     Err(broadcast::error::RecvError::Lagged(_)) => return,
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
@@ -544,9 +844,91 @@ impl AgentContext {
         })
         .await;
         if waited.is_err() {
-            debug!(session = %self.session, url, "browser: load event not seen within budget");
+            debug!(session = %self.session, what, "browser: nav event not seen within budget");
         }
+    }
+
+    // ── navigation controls (P1-4) ──────────────────────────────────────────
+    //
+    // Gated exactly like every other mutating verb, so they inherit the drive
+    // lock for free: an agent is refused while a human holds the wheel, and
+    // `Actor::Human` always passes (that IS the escalation path).
+
+    /// Reload the page. `ignore_cache` is the hard reload a human means when the
+    /// soft one did not fix it.
+    pub async fn reload(&self, actor: Actor, ignore_cache: bool) -> Result<()> {
+        self.lock.gate(actor)?;
+        let events = self.client.subscribe();
+        self.session_call("Page.reload", json!({ "ignoreCache": ignore_cache }))
+            .await?;
+        self.await_nav(events, &["Page.loadEventFired"], "reload")
+            .await;
         Ok(())
+    }
+
+    /// Stop the in-flight load — the X next to the address bar.
+    ///
+    /// Does not wait for anything: "stop" is finished the moment Chrome accepts
+    /// it, and the page it leaves behind is whatever had already arrived.
+    pub async fn stop(&self, actor: Actor) -> Result<()> {
+        self.lock.gate(actor)?;
+        self.session_call("Page.stopLoading", json!({}))
+            .await
+            .map(|_| ())
+    }
+
+    /// The back/forward stack. **Ungated**: reading where a page has been is an
+    /// observation, exactly like [`current_url`](Self::current_url).
+    pub async fn history(&self) -> Result<NavHistory> {
+        let out = self
+            .session_call("Page.getNavigationHistory", json!({}))
+            .await?;
+        Ok(NavHistory::from_cdp(&out))
+    }
+
+    /// Step `delta` entries through the page's own history.
+    ///
+    /// `Ok(false)` ⇒ **there was no entry there** — the honest answer to "back"
+    /// on the first page of a stack, and deliberately not an error: a UI that
+    /// showed a red toast for pressing Back at the start of history would be
+    /// lying about what went wrong.
+    pub async fn go(&self, actor: Actor, delta: i64) -> Result<bool> {
+        self.lock.gate(actor)?;
+        let Some(entry_id) = self.history().await?.entry_at_delta(delta) else {
+            return Ok(false);
+        };
+        let events = self.client.subscribe();
+        self.session_call(
+            "Page.navigateToHistoryEntry",
+            json!({ "entryId": entry_id }),
+        )
+        .await?;
+        // The WIDER event set: a bfcache restore never re-parses the document
+        // and so never fires `load` (see `HISTORY_DONE`).
+        self.await_nav(events, &HISTORY_DONE, "history").await;
+        Ok(true)
+    }
+
+    /// Answer the modal the page has opened (`Page.handleJavaScriptDialog`).
+    ///
+    /// **Not gated on the drive lock's human/agent split beyond the usual
+    /// `gate`**, and load-bearing for the human path: an `alert()` blocks the
+    /// renderer outright, so a viewer with no way to dismiss one is a viewer
+    /// watching a permanently frozen page.
+    pub async fn handle_dialog(
+        &self,
+        actor: Actor,
+        accept: bool,
+        prompt_text: Option<&str>,
+    ) -> Result<()> {
+        self.lock.gate(actor)?;
+        let mut params = json!({ "accept": accept });
+        if let Some(text) = prompt_text {
+            params["promptText"] = json!(text);
+        }
+        self.session_call("Page.handleJavaScriptDialog", params)
+            .await
+            .map(|_| ())
     }
 
     /// Evaluate JS in the page and return the value (`returnByValue`).
@@ -966,6 +1348,70 @@ impl AgentContext {
             .to_string())
     }
 
+    // ── the nav-state watcher (P1-5) ────────────────────────────────────────
+
+    /// Subscribe to this page's live nav state, starting the watcher if it is
+    /// not already running. **Ungated** — observing a page is never a conflict.
+    ///
+    /// Idempotent: every caller shares one pump and one channel, so a takeover
+    /// socket attaching to a tab that already has a write-through consumer costs
+    /// nothing extra. The receiver is handed the current value immediately
+    /// (`watch` semantics), so a client that attaches to a page which has not
+    /// moved in an hour still gets an address bar.
+    ///
+    /// # Where each field comes from
+    ///
+    /// | field | source |
+    /// |---|---|
+    /// | `url` | `Page.frameNavigated` (main frame) + `Page.navigatedWithinDocument` (SPA routing), confirmed by `Page.getNavigationHistory` on settle |
+    /// | `loading` | `Page.frameStartedLoading` / `Page.frameStoppedLoading` |
+    /// | `title` | `Target.targetInfoChanged` live, plus `document.title` on settle |
+    /// | `favicon` | [`FAVICON_JS`] on settle — in-page, cached per origin |
+    /// | `can_go_*` | `Page.getNavigationHistory` on settle |
+    /// | `secure` | the URL scheme ([`secure_scheme`]) |
+    /// | `dialog` | `Page.javascriptDialogOpening` / `…Closed` |
+    pub async fn watch_nav(&self) -> Result<watch::Receiver<NavState>> {
+        let mut slot = self.nav.lock().await;
+        if let Some(w) = slot.as_ref() {
+            return Ok(w.tx.subscribe());
+        }
+        // Subscribe BEFORE the enables, for the same reason `navigate` does:
+        // an event that lands between them is an event nobody ever sees.
+        let events = self.client.subscribe();
+        // Titles without a round trip per navigation. Browser-level (it takes no
+        // sessionId) and idempotent, so N tabs calling it is one setting. Its
+        // events carry no `sessionId` either, which is why the pump filters
+        // `Target.targetInfoChanged` on `targetId` instead.
+        let _ = self
+            .client
+            .call("Target.setDiscoverTargets", json!({ "discover": true }))
+            .await;
+
+        let (tx, rx) = watch::channel(NavState::default());
+        let pump = {
+            let client = self.client.clone();
+            let want = self.cdp_session_id.clone();
+            let target = self.target_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(nav_pump(client, want, target, tx, events))
+        };
+        *slot = Some(NavWatcher { tx, pump });
+        Ok(rx)
+    }
+
+    /// The current nav state without starting a watcher — `None` when none is
+    /// running. A read for callers that must not spawn machinery.
+    pub async fn nav_now(&self) -> Option<NavState> {
+        self.nav.lock().await.as_ref().map(|w| w.tx.borrow().clone())
+    }
+
+    /// Stop the nav-state watcher and drop its pump.
+    pub async fn stop_nav(&self) {
+        if let Some(w) = self.nav.lock().await.take() {
+            w.pump.abort();
+        }
+    }
+
     // ── teardown ────────────────────────────────────────────────────────────
 
     /// Close the page and dispose the browser context. Best-effort: every step
@@ -976,6 +1422,7 @@ impl AgentContext {
         if let Some(sc) = taken {
             sc.pump.abort();
         }
+        self.stop_nav().await;
         if let Err(e) = self
             .client
             .call("Target.closeTarget", json!({ "targetId": self.target_id }))
@@ -1003,9 +1450,452 @@ impl AgentContext {
     }
 }
 
+/// **The nav-state pump** — one per live page, modelled on the screencast pump
+/// next door: subscribe once to the whole CDP event stream, filter on this
+/// page's `sessionId`, fan out on one channel.
+///
+/// # The settle debounce is the design
+///
+/// The cheap signals (url, loading, dialog, title-from-`targetInfoChanged`) are
+/// applied and published the instant they arrive — that is the spinner and the
+/// address bar, and they must feel immediate. The **expensive** ones — a
+/// history read, `document.title`, and an in-page favicon fetch — are deferred
+/// until the page has been quiet for [`NAV_SETTLE`]. A redirect chain is then
+/// three cheap url updates and *one* expensive read at the landing, instead of
+/// three of each on pages that are moving anyway.
+///
+/// # A dialog freezes the reads, not the pump
+///
+/// `Runtime.evaluate` against a page blocked on `alert()` does not return until
+/// the human answers. Running the settle there would hang the pump — and the
+/// pump is the only thing that can tell the human a dialog is up. So while
+/// `dialog` is set the settle publishes what it already knows and reads nothing.
+async fn nav_pump(
+    client: Arc<CdpClient>,
+    want: String,
+    target: String,
+    tx: watch::Sender<NavState>,
+    mut events: broadcast::Receiver<CdpEvent>,
+) {
+    let mut state = NavState::default();
+    let mut main_frame: Option<String> = None;
+    // The origin the current `favicon` was read for, so a same-site navigation
+    // does not re-fetch an icon we already hold.
+    let mut icon_origin: Option<String> = None;
+    // `Some(deadline)` ⇒ a settle is pending. Seeded to "now" so the first thing
+    // the pump does is read the page it attached to.
+    let mut settle_at: Option<Instant> = Some(Instant::now());
+
+    loop {
+        let settle = async {
+            match settle_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                // Nothing pending: park forever and let the event arm drive.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            event = events.recv() => {
+                let ev = match event {
+                    Ok(ev) => ev,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Frames and nav events share one channel and frames are
+                        // 60/s, so lagging here is normal. Re-settle rather than
+                        // guess: whatever we missed, a fresh read is the truth.
+                        debug!(dropped = n, "browser: nav pump lagged");
+                        settle_at = Some(Instant::now() + NAV_SETTLE);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let ours = ev.session_id.as_deref() == Some(want.as_str());
+                let mut publish = false;
+                match ev.method.as_str() {
+                    "Page.frameNavigated" if ours => {
+                        let frame = ev.params.get("frame").cloned().unwrap_or(json!({}));
+                        // A SUBFRAME navigation is not the address bar.
+                        if frame.get("parentId").is_some() {
+                            continue;
+                        }
+                        main_frame = frame.get("id").and_then(Value::as_str).map(str::to_string);
+                        let url = str_of(frame.get("url"));
+                        if !url.is_empty() {
+                            state.url = url;
+                            state.secure = secure_scheme(&state.url);
+                        }
+                        publish = true;
+                        settle_at = Some(Instant::now() + NAV_SETTLE);
+                    }
+                    "Page.navigatedWithinDocument" if ours => {
+                        // SPA routing: same document, new address. No load event
+                        // will ever fire for it, which is exactly why the bar
+                        // has to be told here.
+                        if !is_main_frame(&ev.params, "frameId", main_frame.as_deref()) {
+                            continue;
+                        }
+                        let url = str_of(ev.params.get("url"));
+                        if !url.is_empty() {
+                            state.url = url;
+                            state.secure = secure_scheme(&state.url);
+                        }
+                        publish = true;
+                        settle_at = Some(Instant::now() + NAV_SETTLE);
+                    }
+                    "Page.frameStartedLoading" if ours => {
+                        if is_main_frame(&ev.params, "frameId", main_frame.as_deref()) {
+                            state.loading = true;
+                            publish = true;
+                        }
+                    }
+                    "Page.frameStoppedLoading" if ours => {
+                        if is_main_frame(&ev.params, "frameId", main_frame.as_deref()) {
+                            state.loading = false;
+                            publish = true;
+                            settle_at = Some(Instant::now() + NAV_SETTLE);
+                        }
+                    }
+                    "Page.loadEventFired" if ours => {
+                        state.loading = false;
+                        publish = true;
+                        settle_at = Some(Instant::now() + NAV_SETTLE);
+                    }
+                    "Page.javascriptDialogOpening" if ours => {
+                        state.dialog = Some(PageDialog {
+                            kind: str_of(ev.params.get("type")),
+                            message: str_of(ev.params.get("message")),
+                            default_prompt: str_of(ev.params.get("defaultPrompt")),
+                        });
+                        // Publish IMMEDIATELY and cancel any pending settle: the
+                        // renderer is blocked from this instant, and this frame
+                        // is the human's only way to learn it.
+                        settle_at = None;
+                        publish = true;
+                    }
+                    "Page.javascriptDialogClosed" if ours => {
+                        state.dialog = None;
+                        publish = true;
+                        settle_at = Some(Instant::now() + NAV_SETTLE);
+                    }
+                    // Browser-level: no `sessionId`, so it is matched on the
+                    // targetId instead. This is the free live title.
+                    "Target.targetInfoChanged" => {
+                        let info = ev.params.get("targetInfo").cloned().unwrap_or(json!({}));
+                        if info.get("targetId").and_then(Value::as_str) != Some(target.as_str()) {
+                            continue;
+                        }
+                        let title = str_of(info.get("title"));
+                        // Chrome falls back to the URL as a target's "title"
+                        // before the document has one; showing that in a title
+                        // slot next to the address bar is a duplicate, not a
+                        // title.
+                        if !title.is_empty() && title != state.url {
+                            state.title = title;
+                            publish = true;
+                        }
+                    }
+                    _ => continue,
+                }
+                if publish {
+                    publish_nav(&tx, &state);
+                }
+            }
+
+            () = settle => {
+                settle_at = None;
+                // See the doc comment: a blocked renderer answers no reads.
+                if state.dialog.is_none() {
+                    let read = client.call_with_timeout(
+                        Some(&want),
+                        "Page.getNavigationHistory",
+                        json!({}),
+                        NAV_READ_BUDGET,
+                    );
+                    if let Ok(v) = read.await {
+                        let history = NavHistory::from_cdp(&v);
+                        state.can_go_back = history.can_go_back();
+                        state.can_go_forward = history.can_go_forward();
+                        // Chrome's own idea of the current document beats a
+                        // remembered `frameNavigated` after a history step.
+                        if let Some(url) = history.current_url() {
+                            if !url.is_empty() {
+                                state.url = url.to_string();
+                                state.secure = secure_scheme(url);
+                            }
+                        }
+                    }
+                    if main_frame.is_none() {
+                        // Seed the main frame id so a subframe cannot spin the
+                        // spinner for the rest of this page's life.
+                        let read = client.call_with_timeout(
+                            Some(&want),
+                            "Page.getFrameTree",
+                            json!({}),
+                            NAV_READ_BUDGET,
+                        );
+                        if let Ok(v) = read.await {
+                            main_frame = v
+                                .pointer("/frameTree/frame/id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                        }
+                    }
+                    if let Some(title) = eval_on(&client, &want, "document.title").await.as_str() {
+                        state.title = title.to_string();
+                    }
+                    let origin = origin_of(&state.url);
+                    // Re-read the icon only when the SITE moved. Same-site
+                    // navigation keeps its icon, and this is a network fetch.
+                    if origin.is_some() && (state.favicon.is_none() || icon_origin != origin) {
+                        state.favicon = match eval_on(&client, &want, FAVICON_JS).await {
+                            Value::String(uri)
+                                if uri.starts_with("data:image/")
+                                    && uri.len() <= MAX_FAVICON_BYTES =>
+                            {
+                                Some(uri)
+                            }
+                            // No icon, an unreadable one, or one too big to
+                            // relay: say so, rather than keep the last site's.
+                            _ => None,
+                        };
+                        icon_origin = origin;
+                    } else if origin.is_none() {
+                        state.favicon = None;
+                        icon_origin = None;
+                    }
+                }
+                publish_nav(&tx, &state);
+            }
+        }
+    }
+}
+
+/// Publish only a state that actually CHANGED.
+///
+/// `watch` wakes every receiver on send, and the takeover socket turns each wake
+/// into a WebSocket frame. Re-sending an identical state on every settle would
+/// be a steady drip of frames that say nothing.
+fn publish_nav(tx: &watch::Sender<NavState>, state: &NavState) {
+    // Scoped so the read guard is released before the send takes the write one.
+    let changed = { *tx.borrow() != *state };
+    if changed {
+        tx.send_replace(state.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── P1-4: the go-delta → entryId index math ─────────────────────────────
+
+    fn history_of(current: i64, ids: &[i64]) -> NavHistory {
+        NavHistory {
+            current_index: current,
+            entries: ids
+                .iter()
+                .map(|id| NavEntry {
+                    id: *id,
+                    url: format!("https://example.test/{id}"),
+                    title: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_history_step_resolves_to_the_neighbouring_entry_id() {
+        // CDP has no relative `go`: back is `entries[current - 1].id`, and the
+        // ids are NOT the indices — 40/41/42 here on purpose, because using the
+        // index as the entryId is the bug this pins.
+        let h = history_of(1, &[40, 41, 42]);
+        assert_eq!(h.entry_at_delta(-1), Some(40));
+        assert_eq!(h.entry_at_delta(1), Some(42));
+        assert_eq!(h.entry_at_delta(-2), None, "off the front of the stack");
+        assert_eq!(h.entry_at_delta(2), None, "off the back of the stack");
+        assert!(h.can_go_back());
+        assert!(h.can_go_forward());
+    }
+
+    #[test]
+    fn the_ends_of_the_stack_are_a_none_not_a_wrap() {
+        let first = history_of(0, &[40, 41]);
+        assert_eq!(first.entry_at_delta(-1), None);
+        assert!(!first.can_go_back());
+        assert!(first.can_go_forward());
+
+        let last = history_of(1, &[40, 41]);
+        assert_eq!(last.entry_at_delta(1), None);
+        assert!(last.can_go_back());
+        assert!(!last.can_go_forward());
+    }
+
+    #[test]
+    fn a_zero_delta_is_never_a_navigation() {
+        // Re-entering the current entry is a reload with a different name, and
+        // `reload` is the call that means it.
+        assert_eq!(history_of(1, &[40, 41, 42]).entry_at_delta(0), None);
+    }
+
+    #[test]
+    fn an_unreadable_history_offers_no_buttons_at_all() {
+        // The default `currentIndex` is -1, not 0: a history we could not read
+        // must not claim a first entry that may not exist, because
+        // `can_go_back` on a lie is a button that navigates a human at random.
+        let empty = NavHistory::from_cdp(&json!({}));
+        assert_eq!(empty.current_index, -1);
+        assert!(empty.entries.is_empty());
+        assert!(!empty.can_go_back());
+        assert!(!empty.can_go_forward());
+        assert_eq!(empty.current_url(), None);
+        // …and arithmetic on it cannot panic or wrap.
+        assert_eq!(empty.entry_at_delta(-1), None);
+        assert_eq!(empty.entry_at_delta(1), None);
+        assert_eq!(empty.entry_at_delta(i64::MIN), None);
+        assert_eq!(empty.entry_at_delta(i64::MAX), None);
+    }
+
+    #[test]
+    fn a_cdp_history_parses_into_ids_urls_and_a_current_page() {
+        let h = NavHistory::from_cdp(&json!({
+            "currentIndex": 1,
+            "entries": [
+                { "id": 7, "url": "https://a.test/", "title": "A" },
+                { "id": 9, "url": "https://b.test/x", "title": "B" },
+                { "id": 11 },
+            ],
+        }));
+        assert_eq!(h.current_index, 1);
+        assert_eq!(h.entries.len(), 3);
+        assert_eq!(h.entries[0].id, 7);
+        assert_eq!(h.entries[1].title, "B");
+        // A partial entry is empty strings, not a panic and not a dropped row —
+        // dropping it would shift every index after it.
+        assert_eq!(h.entries[2].url, "");
+        assert_eq!(h.current_url(), Some("https://b.test/x"));
+        assert_eq!(h.entry_at_delta(-1), Some(7));
+        assert_eq!(h.entry_at_delta(1), Some(11));
+    }
+
+    // ── P1-5: the shape and the sourcing of nav state ───────────────────────
+
+    #[test]
+    fn the_padlock_is_a_transport_claim_and_nothing_more() {
+        assert!(secure_scheme("https://example.test/x"));
+        assert!(secure_scheme("HTTPS://EXAMPLE.TEST/"));
+        assert!(secure_scheme("wss://example.test/socket"));
+        assert!(!secure_scheme("http://example.test/x"));
+        // No page was fetched, so there is no encrypted connection to claim.
+        assert!(!secure_scheme("about:blank"));
+        assert!(!secure_scheme(""));
+        // A scheme that merely CONTAINS https is not https.
+        assert!(!secure_scheme("javascript:void('https://')"));
+    }
+
+    #[test]
+    fn the_favicon_cache_key_is_the_site_not_the_page() {
+        // Same site, different page ⇒ same key ⇒ no re-fetch.
+        assert_eq!(
+            origin_of("https://a.test/one?q=1#f"),
+            origin_of("https://a.test/two")
+        );
+        assert_eq!(origin_of("https://a.test:8443/x").as_deref(), Some("https://a.test:8443"));
+        // A different scheme or host is a different site.
+        assert_ne!(origin_of("https://a.test/"), origin_of("http://a.test/"));
+        assert_ne!(origin_of("https://a.test/"), origin_of("https://b.test/"));
+        // Nothing to key on ⇒ no cache, and the caller clears the icon.
+        assert_eq!(origin_of("about:blank"), None);
+        assert_eq!(origin_of(""), None);
+        assert_eq!(origin_of("https://"), None);
+    }
+
+    #[test]
+    fn a_subframe_never_moves_the_address_bar() {
+        let main = json!({ "frameId": "F-main" });
+        let sub = json!({ "frameId": "F-sub" });
+        assert!(is_main_frame(&main, "frameId", Some("F-main")));
+        assert!(!is_main_frame(&sub, "frameId", Some("F-main")));
+        // Before the first frame-tree read we do not know which frame is main,
+        // and dropping the first real signal after attach would leave the bar
+        // blank until the human navigated again.
+        assert!(is_main_frame(&sub, "frameId", None));
+        // An event with no frame at all is only ours while nothing is known.
+        assert!(is_main_frame(&json!({}), "frameId", None));
+        assert!(!is_main_frame(&json!({}), "frameId", Some("F-main")));
+    }
+
+    #[test]
+    fn the_favicon_is_read_inside_the_page_never_by_the_server() {
+        // The invariant, pinned as text because it is a privacy property, not a
+        // style one: the icon is fetched by the PAGE, with the page's own
+        // credentials, so the request stays inside the profile's cookie jar and
+        // the server's IP never appears on a URL the page chose.
+        assert!(FAVICON_JS.contains("fetch("));
+        assert!(FAVICON_JS.contains("credentials"));
+        assert!(FAVICON_JS.contains("readAsDataURL"));
+        assert!(FAVICON_JS.contains(r#"link[rel~="icon"]"#));
+        assert!(FAVICON_JS.contains("/favicon.ico"));
+        // Every failure mode degrades to `null`, never to an exception that
+        // `evaluate` would turn into an error the human sees.
+        assert!(FAVICON_JS.contains("catch"));
+        // …and it never navigates the page it is reading.
+        assert!(!FAVICON_JS.contains("location.href ="));
+    }
+
+    #[test]
+    fn nav_state_is_the_shape_the_address_bar_parses() {
+        let state = NavState {
+            url: "https://example.test/inbox".into(),
+            title: "Inbox".into(),
+            favicon: Some("data:image/png;base64,AAA".into()),
+            loading: false,
+            can_go_back: true,
+            can_go_forward: false,
+            secure: true,
+            dialog: Some(PageDialog {
+                kind: "confirm".into(),
+                message: "Discard?".into(),
+                default_prompt: String::new(),
+            }),
+        };
+        let v: Value = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(v["url"], json!("https://example.test/inbox"));
+        assert_eq!(v["title"], json!("Inbox"));
+        assert_eq!(v["favicon"], json!("data:image/png;base64,AAA"));
+        assert_eq!(v["loading"], json!(false));
+        assert_eq!(v["can_go_back"], json!(true));
+        assert_eq!(v["can_go_forward"], json!(false));
+        assert_eq!(v["secure"], json!(true));
+        assert_eq!(v["dialog"]["kind"], json!("confirm"));
+        assert_eq!(v["dialog"]["message"], json!("Discard?"));
+        assert_eq!(v["dialog"]["default_prompt"], json!(""));
+        // An unknown icon is null, not "" — the client draws a placeholder for
+        // one and a broken image for the other.
+        let bare = serde_json::to_value(NavState::default()).unwrap();
+        assert_eq!(bare["favicon"], Value::Null);
+        assert_eq!(bare["dialog"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_nav_state_is_not_republished() {
+        // `watch` wakes every receiver on send and the takeover socket turns
+        // each wake into a WebSocket frame, so a settle that learned nothing
+        // must be silent rather than a steady drip of identical frames.
+        let (tx, mut rx) = watch::channel(NavState::default());
+        let mut state = NavState {
+            url: "https://a.test/".into(),
+            ..NavState::default()
+        };
+        publish_nav(&tx, &state);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().url, "https://a.test/");
+
+        publish_nav(&tx, &state);
+        assert!(!rx.has_changed().unwrap(), "identical state must not wake anyone");
+
+        state.loading = true;
+        publish_nav(&tx, &state);
+        assert!(rx.has_changed().unwrap(), "a real change must");
+    }
 
     #[test]
     fn the_cdp_payload_matches_the_profile() {

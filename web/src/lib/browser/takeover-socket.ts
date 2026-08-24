@@ -30,6 +30,7 @@
 import { authToken, wsUrl } from '@/env'
 
 import type { FrameMetadata, TakeoverFrame } from './frame-map'
+import { EMPTY_NAV, parseNavState, type NavState } from './nav-state'
 
 /** The slice of `WebSocket` this module uses — so a test can be a socket. */
 export interface SocketLike {
@@ -74,8 +75,20 @@ export interface TakeoverSnapshot {
   state: TakeoverState
   /** `null` until the server has told us; never guessed. */
   mode: DriveMode | null
-  /** The page's URL at attach time. */
+  /** The page's URL. Seeded by the fire-once `target` frame and then kept
+   *  honest by every `nav_state` — see [[TakeoverSnapshot.nav]]. */
   url: string
+  /**
+   * **The live address bar** — title, favicon, spinner, the honest
+   * back/forward affordances, the padlock and the modal blocking the page.
+   *
+   * Never `null`: an attached socket that has not been told anything yet
+   * renders [[EMPTY_NAV]], whose every flag is false, so the chrome greys its
+   * controls rather than inventing them. Nav state changes a few times per
+   * navigation, which is why it rides the SNAPSHOT channel and not the frame
+   * one — the whole point of the two-channel split.
+   */
+  nav: NavState
   /** The last input the server dropped, and why — cleared on the next accepted
    *  gesture so a stale banner cannot outlive its cause. */
   refused: string | null
@@ -85,6 +98,7 @@ export const EMPTY_SNAPSHOT: TakeoverSnapshot = {
   state: 'connecting',
   mode: null,
   url: '',
+  nav: EMPTY_NAV,
   refused: null,
 }
 
@@ -431,6 +445,60 @@ export class TakeoverSocket {
     this.send({ type: 'resync' })
   }
 
+  // ── the navigation controls (P1-4) ────────────────────────────────────────
+  //
+  // These ride the SOCKET rather than the REST door whenever one is attached,
+  // and the difference is not micro-optimisation: the REST route re-loads the
+  // row, wakes the tab, runs the verb and re-reads the row, and every one of
+  // those hops is latency between a thumb and a page. On an attached socket the
+  // frame lands in the relay that is already holding the page.
+  //
+  // The server handles all of them ABOVE the drive gate (`takeover.rs`), on
+  // purpose: the wheel governs the INPUT relay, not the address bar. A human
+  // watching an agent may still press Back — refusing that while the identical
+  // REST route accepts it would be incoherent, not safer.
+
+  /** The address bar's Enter, over the live socket. */
+  navigate(url: string): void {
+    if (!url) return
+    this.send({ type: 'navigate', url })
+  }
+
+  /** One step back through the page's own history. */
+  back(): void {
+    this.send({ type: 'back' })
+  }
+
+  /** …and one forward. */
+  forward(): void {
+    this.send({ type: 'forward' })
+  }
+
+  /** Reload. `ignoreCache` is the hard reload (the reload button's long-press). */
+  reload(ignoreCache = false): void {
+    this.send({ type: 'reload', ignore_cache: !!ignoreCache })
+  }
+
+  /** Stop the in-flight load — the button Reload turns into while `loading`. */
+  stopLoading(): void {
+    this.send({ type: 'stop' })
+  }
+
+  /**
+   * Answer the modal the page has opened.
+   *
+   * DISMISS is the default on the server too (`#[serde(default)] accept`), and
+   * that direction is the safe one: a garbled or half-built frame must never
+   * be read as "yes" to a `confirm()` the human never saw.
+   */
+  dialog(accept: boolean, promptText?: string): void {
+    this.send({
+      type: 'dialog',
+      accept: !!accept,
+      prompt_text: promptText ?? undefined,
+    })
+  }
+
   // ── inbound ───────────────────────────────────────────────────────────────
 
   private receive(raw: unknown): void {
@@ -454,8 +522,18 @@ export class TakeoverSocket {
         this.patch({ state: 'live' })
         return
       case 'target':
+        // The seed, and only the seed: it carries the canvas size the panel
+        // needs on attach. Its url is superseded the moment a nav_state lands.
         this.patch({ url: String(msg.url ?? '') })
         return
+      case 'nav_state': {
+        const nav = parseNavState(msg)
+        // `url` is patched from the SAME frame rather than left to the target
+        // seed, so every consumer of `snapshot.url` — the omnibox, the strip,
+        // the security chip — follows a page that navigates itself.
+        this.patch({ nav, url: nav.url || this.snap.url })
+        return
+      }
       case 'mode':
         this.patch({ mode: msg.mode as DriveMode, refused: null })
         return

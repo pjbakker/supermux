@@ -29,12 +29,33 @@
 // a red toast reading "a tab needs an http(s) URL". `parseAddress` decides
 // between GO and SEARCH the way every browser does, and the leading icon shows
 // WHICH ONE the Enter key is about to take, before it is pressed.
+//
+// ── PHASE 3 ──────────────────────────────────────────────────────────────────
+//
+// THE FIELD NOW FOLLOWS A LIVE PAGE. `url` used to be the fire-once `target`
+// frame's snapshot; it is the `nav_state` feed's url now, so a redirect, an
+// OAuth hop or an agent clicking a link all move the address bar — EXCEPT while
+// the human is editing it, which is what `draft !== null` has always meant. A
+// bar that overwrites what somebody is typing because the page moved is worse
+// than a stale one.
+//
+// THE LEAD ICON GREW A PANEL (`SecurityChip`), and the parse grew a list
+// (`OmniboxSuggestions`). Both are the same idea as the lead icon itself: show
+// the human what is true and what the next keystroke will do, in the place they
+// are already looking.
 import * as React from 'react'
 
-import { Globe, Lock, Search, X } from 'lucide-react'
+import { Globe, Search, X } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
-import { displayUrl, isSecure, parseAddress, type AddressIntent } from '@/lib/api/browser'
+import { displayUrl, isSecure, parseAddress, type AddressIntent, type BrowserTab } from '@/lib/api/browser'
+import { moveHighlight, omniboxRows, type OmniboxRow } from '@/lib/browser/omnibox'
+import { OmniboxSuggestions, rowDomId } from '@/components/browser/omnibox-suggestions'
+import {
+  SecurityChip,
+  SecurityPanel,
+  securityTone,
+} from '@/components/browser/security-chip'
 
 /** `useLayoutEffect` that does not shout on the server. The unit suite renders
  *  this component with `renderToStaticMarkup`, where a layout effect is both
@@ -44,14 +65,16 @@ const useIsoLayoutEffect =
   typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect
 
 export interface AddressBarProps {
-  /** The page's REAL url — the live socket's snapshot when there is one, else
+  /** The page's REAL url — the live nav-state feed's when there is one, else
    *  the tab row's. Shown formatted while idle, raw the moment it is focused. */
   url: string
   /** A live page. Drives the padlock's honesty: a tab that is asleep has no
    *  connection to make a claim about, so it gets the neutral globe. */
   live?: boolean
-  /** A navigate / wake is in flight → the 2px hairline along the bottom edge.
-   *  The prop is the seam the Phase-3 nav-state stream plugs into unchanged. */
+  /** The SERVER's transport claim off the nav-state feed. Undefined ⇒ fall back
+   *  to the url-only guess, which is all there is before a socket attaches. */
+  secure?: boolean
+  /** A navigate / wake / page load is in flight → the 2px hairline. */
   loading?: boolean
   /** No tab at all: the bar still stands (chrome is persistent), and Enter
    *  mints one. */
@@ -64,16 +87,33 @@ export interface AddressBarProps {
   /** Fired with the RESOLVED destination — a page url, or the search url. The
    *  host never re-parses; there is one parser. */
   onNavigate: (url: string) => void
+  /** The open tabs, for the suggestion list. A tab row SWITCHES rather than
+   *  navigating — nobody wants a ninth copy of the same inbox. */
+  tabs?: BrowserTab[]
+  onSwitchTab?: (id: string) => void
+  /** The active tab's origin allowlist + evidence line, for the chip's panel. */
+  origins?: string[]
+  stateDetail?: string
+  lent?: number
+  /** Open the grant sheet from the chip's panel — where origins are edited. */
+  onManage?: () => void
   className?: string
 }
 
 export function AddressBar({
   url,
   live,
+  secure,
   loading,
   placeholder = 'Search or type a URL',
   focusKey = 0,
   onNavigate,
+  tabs,
+  onSwitchTab,
+  origins,
+  stateDetail,
+  lent,
+  onManage,
   className,
 }: AddressBarProps) {
   // `null` = not editing, so the field FOLLOWS the page: a navigation, an agent
@@ -81,7 +121,10 @@ export function AddressBar({
   // human owns the field until they submit, blur or press Escape.
   const [draft, setDraft] = React.useState<string | null>(null)
   const [refusal, setRefusal] = React.useState<string | null>(null)
+  const [highlight, setHighlight] = React.useState(-1)
+  const [chipOpen, setChipOpen] = React.useState(false)
   const inputRef = React.useRef<HTMLInputElement | null>(null)
+  const rootRef = React.useRef<HTMLDivElement | null>(null)
   // Select-all has to happen AFTER the value swaps from the display form to the
   // raw url, or the selection is dropped by the very re-render that focus
   // caused. A ref + layout effect, not a `setTimeout`.
@@ -93,6 +136,26 @@ export function AddressBar({
     inputRef.current?.select()
   })
 
+  // A popover that only closes from its own Close button is a popover that
+  // covers the page until somebody finds the button. Pointer-down (not click)
+  // so it closes on the same gesture that starts the next action, and Escape
+  // for the keyboard.
+  React.useEffect(() => {
+    if (!chipOpen) return
+    const away = (e: Event) => {
+      if (!rootRef.current?.contains(e.target as Node)) setChipOpen(false)
+    }
+    const esc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setChipOpen(false)
+    }
+    document.addEventListener('pointerdown', away, true)
+    document.addEventListener('keydown', esc)
+    return () => {
+      document.removeEventListener('pointerdown', away, true)
+      document.removeEventListener('keydown', esc)
+    }
+  }, [chipOpen])
+
   // Focus only — `onFocus` below does the state work (seed the draft, arm the
   // select), so the caret arrives by exactly the same path a tap takes.
   React.useEffect(() => {
@@ -103,13 +166,50 @@ export function AddressBar({
   const editing = draft !== null
   const value = editing ? draft : displayUrl(url)
   const intent: AddressIntent = editing ? parseAddress(draft) : { kind: 'empty' }
+  // The chip's claim is the SERVER's when a socket is attached (it is derived
+  // where the connection actually is) and the url-only guess otherwise.
+  const tone = securityTone(url, secure ?? isSecure(url), !!live)
+
+  // The suggestion rows are derived, not stored: a list in state is a list that
+  // can disagree with the field that produced it, one keystroke later.
+  const rows = React.useMemo(
+    () => (editing && draft ? omniboxRows(draft, tabs ?? []) : []),
+    [editing, draft, tabs],
+  )
+  // A highlight that outlived its list would send Enter to whatever row slid
+  // into that index. Clamped here rather than reset in three handlers.
+  const active = highlight >= 0 && highlight < rows.length ? highlight : -1
+  const listId = 'omnibox-suggestions'
 
   const restore = () => {
     setDraft(null)
     setRefusal(null)
+    setHighlight(-1)
+  }
+
+  const go = (dest: string) => {
+    onNavigate(dest)
+    restore()
+    // Drop the phone keyboard: the page is what the human wants to look at now.
+    inputRef.current?.blur()
+  }
+
+  const pick = (row: OmniboxRow) => {
+    if (row.action.kind === 'switch') {
+      onSwitchTab?.(row.action.tabId)
+      restore()
+      inputRef.current?.blur()
+      return
+    }
+    go(row.action.url)
   }
 
   const submit = () => {
+    // A highlighted row outranks the parse — that is what highlighting MEANS.
+    if (active >= 0) {
+      pick(rows[active])
+      return
+    }
     const decided = parseAddress(draft ?? url)
     if (decided.kind === 'empty') return
     if (decided.kind === 'refuse') {
@@ -118,15 +218,11 @@ export function AddressBar({
       setRefusal(decided.reason)
       return
     }
-    onNavigate(decided.url)
-    setDraft(null)
-    setRefusal(null)
-    // Drop the phone keyboard: the page is what the human wants to look at now.
-    inputRef.current?.blur()
+    go(decided.url)
   }
 
   return (
-    <div className={cn('relative flex min-w-0 items-center gap-2', className)}>
+    <div ref={rootRef} className={cn('relative flex min-w-0 items-center gap-2', className)}>
       <div
         data-address-bar=""
         data-address-intent={editing ? intent.kind : 'idle'}
@@ -135,7 +231,22 @@ export function AddressBar({
           refusal ? 'border-amber-500' : 'border-border focus-within:border-primary',
         )}
       >
-        <LeadIcon idle={!editing} kind={intent.kind} secure={isSecure(url)} live={!!live} />
+        {/* Idle: the security chip, which is a claim about the connection and
+            opens the panel. Typing: the PARSE, so the human sees whether Enter
+            searches or navigates before pressing it. */}
+        {editing ? (
+          intent.kind === 'search' ? (
+            <Search className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+          ) : (
+            <Globe className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+          )
+        ) : (
+          <SecurityChip
+            tone={tone}
+            open={chipOpen}
+            onToggle={() => setChipOpen((o) => !o)}
+          />
+        )}
         <input
           ref={inputRef}
           // ── the hygiene. Each line is a reproduced defect. ──
@@ -148,14 +259,23 @@ export function AddressBar({
           autoComplete="off" // no password-manager junk in an address bar
           name="address"
           aria-label="Address and search"
+          role="combobox"
+          aria-expanded={rows.length > 0}
+          aria-controls={listId}
+          aria-autocomplete="list"
+          aria-activedescendant={active >= 0 ? rowDomId(listId, active) : undefined}
           placeholder={placeholder}
           value={value}
           onChange={(e) => {
             setDraft(e.target.value)
             setRefusal(null)
+            // A new query is a new list; keeping the old index would point the
+            // highlight at a row that no longer means what it did.
+            setHighlight(-1)
           }}
           onFocus={() => {
             selectRef.current = true
+            setChipOpen(false)
             // Focus shows the TRUTH: the full url, scheme and all, selected —
             // so typing over it is one gesture, exactly like a desktop browser.
             setDraft(url)
@@ -165,11 +285,27 @@ export function AddressBar({
             if (e.key === 'Enter') {
               e.preventDefault()
               submit()
+              return
             }
             if (e.key === 'Escape') {
               e.preventDefault()
+              // Escape peels one layer at a time: the list first, the edit
+              // second. Collapsing both at once loses the draft of anybody who
+              // only wanted the popover out of the way.
+              if (rows.length > 0 && active >= 0) {
+                setHighlight(-1)
+                return
+              }
               restore()
               inputRef.current?.blur()
+              return
+            }
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+              if (rows.length === 0) return
+              e.preventDefault()
+              setHighlight((h) =>
+                moveHighlight(h, e.key === 'ArrowDown' ? 1 : -1, rows.length),
+              )
             }
           }}
           // 16px FLOOR, never below — index.html's viewport contract depends on
@@ -186,6 +322,7 @@ export function AddressBar({
             onClick={() => {
               setDraft('')
               setRefusal(null)
+              setHighlight(-1)
               inputRef.current?.focus()
             }}
             aria-label="Clear the address"
@@ -205,47 +342,38 @@ export function AddressBar({
           />
         )}
       </div>
+      {/* All three overlays hang off the OUTER wrapper: the field itself is
+          `overflow-hidden` so the loading hairline can follow its rounded
+          corners, and anything rendered inside it would be clipped. */}
       {refusal && (
         <p
           role="alert"
           data-address-refusal=""
-          className="absolute inset-x-0 top-full z-10 mt-1 rounded-lg border border-amber-500/40 bg-card px-2 py-1 text-[12px] text-amber-600 dark:text-amber-500"
+          className="absolute inset-x-0 top-full z-30 mt-1 rounded-lg border border-amber-500/40 bg-card px-2 py-1 text-[12px] text-amber-600 dark:text-amber-500"
         >
           {refusal}
         </p>
       )}
+      {!refusal && (
+        <OmniboxSuggestions
+          id={listId}
+          rows={rows}
+          highlighted={active}
+          onPick={pick}
+          onHighlight={setHighlight}
+        />
+      )}
+      {chipOpen && !editing && (
+        <SecurityPanel
+          tone={tone}
+          url={url}
+          origins={origins ?? []}
+          detail={stateDetail}
+          lent={lent}
+          onManage={onManage}
+          onClose={() => setChipOpen(false)}
+        />
+      )}
     </div>
-  )
-}
-
-/** What the Enter key is about to do, drawn before it is pressed.
- *
- *  Idle it is the security chip (§5.3's honest `isSecure`); while typing it
- *  becomes a magnifier for a search and a globe for a page, so the human SEES
- *  the branch the parser took rather than discovering it in a new tab. */
-function LeadIcon({
-  idle,
-  kind,
-  secure,
-  live,
-}: {
-  idle: boolean
-  kind: AddressIntent['kind']
-  secure: boolean
-  live: boolean
-}) {
-  if (!idle) {
-    return kind === 'search' ? (
-      <Search className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-    ) : (
-      <Globe className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-    )
-  }
-  // A padlock is a claim about a CONNECTION. An asleep tab has none, so it gets
-  // the neutral globe rather than a green lock over a page that is not open.
-  return secure && live ? (
-    <Lock className="size-4 shrink-0 text-emerald-600" aria-hidden />
-  ) : (
-    <Globe className="size-4 shrink-0 text-muted-foreground" aria-hidden />
   )
 }

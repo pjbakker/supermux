@@ -11,6 +11,23 @@
 // on).
 
 import type { SocketLike, TakeoverOptions } from '@/lib/browser/takeover-socket'
+import type { NavState } from '@/lib/browser/nav-state'
+
+/** Back to the WIRE. The bench must put the server's own snake_case field names
+ *  on the socket, not our camelCase ones — otherwise it would screenshot a
+ *  parse that never happened. */
+function toWire(n: NavState): Record<string, unknown> {
+  return {
+    url: n.url,
+    title: n.title,
+    favicon: n.favicon,
+    loading: n.loading,
+    can_go_back: n.canGoBack,
+    can_go_forward: n.canGoForward,
+    secure: n.secure,
+    dialog: n.dialog,
+  }
+}
 
 /** One real JPEG frame, base64. */
 export const RECORDED_FRAME =
@@ -214,6 +231,22 @@ export function mockOptions(
   fail?: MockFailure,
   /** Never answer the handshake at all — the `connecting` / `waking` states. */
   silent = false,
+  /**
+   * PHASE 3 — the nav-state feed, faked at the SOCKET rather than at the
+   * component.
+   *
+   * This is the whole reason the bench is worth having: the address bar, the
+   * padlock, the arrows, the rail's favicon/title/spinner and the JS-dialog
+   * surface all reach their state through the real `nav_state` frame, the real
+   * `parseNavState`, and the real snapshot channel. A prop that injected the
+   * finished state into the component would screenshot a layout while leaving
+   * the entire parse-and-plumb path untested.
+   *
+   * It also ANSWERS the control frames (see below), so the bench is clickable:
+   * Reload really does turn into Stop, and answering a dialog really does
+   * clear it.
+   */
+  nav?: NavState,
 ): TakeoverOptions {
   return {
     token: () => 'bench',
@@ -224,6 +257,12 @@ export function mockOptions(
     cancel: () => undefined,
     factory: () => {
       let live = mode
+      let navNow: NavState | null = nav ? { ...nav } : null
+      const pushNav = (patch: Partial<NavState>) => {
+        if (!navNow) return
+        navNow = { ...navNow, ...patch }
+        sock.onmessage?.({ data: JSON.stringify({ type: 'nav_state', ...toWire(navNow) }) })
+      }
       const sock: SocketLike = {
         onopen: null,
         onmessage: null,
@@ -261,10 +300,26 @@ export function mockOptions(
                 },
               }),
             })
+            if (navNow) {
+              sock.onmessage?.({
+                data: JSON.stringify({ type: 'nav_state', ...toWire(navNow) }),
+              })
+            }
             if (fail?.afterSeed) {
               sock.onclose?.({ code: fail.code, reason: fail.reason })
             }
           }
+          // The nav controls, answered the way a page would answer them — so
+          // the bench exercises the round trip and not just the paint.
+          if (msg.type === 'navigate') {
+            const url = String((msg as { url?: string }).url ?? '')
+            pushNav({ url, title: url, canGoBack: true, loading: false })
+          }
+          if (msg.type === 'back') pushNav({ canGoBack: false, canGoForward: true })
+          if (msg.type === 'forward') pushNav({ canGoBack: true, canGoForward: false })
+          if (msg.type === 'reload') pushNav({ loading: true })
+          if (msg.type === 'stop') pushNav({ loading: false })
+          if (msg.type === 'dialog') pushNav({ dialog: null })
           if (msg.type === 'hand_back' || msg.type === 'take_over') {
             live = msg.type === 'hand_back' ? 'agent_driving' : 'human_driving'
             sock.onmessage?.({ data: JSON.stringify({ type: 'mode', mode: live }) })

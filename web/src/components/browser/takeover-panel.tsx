@@ -91,6 +91,7 @@ import { ClickCounter, TouchGesture, type GestureAction } from '@/lib/browser/ge
 import { keyboardScrollDelta, trapKeyAction } from '@/lib/browser/keyboard-trap'
 import { viewportState, type ViewportVerb, type ViewportView } from '@/lib/browser/viewport-state'
 import { useKeyboardViewport } from '@/hooks/use-keyboard-viewport'
+import { PageDialogSurface } from '@/components/browser/page-dialog'
 
 /** Cap the backing store at 2× — a 3× phone would triple the fill cost of
  *  every frame for a JPEG that is 512px wide to begin with. */
@@ -155,6 +156,21 @@ export interface TakeoverControls {
   /** Dial again after a terminal state (busy / offline / no-context). The tab
    *  route rehydrates on attach, so on an asleep tab this IS the wake. */
   retry: () => void
+  // ── the browser's own verbs (phase 3) ──────────────────────────────────────
+  // Published here rather than left to REST because the socket is ALREADY
+  // holding this page: the frame goes straight into the relay instead of
+  // round-tripping a row load, a wake and a row re-read. The host falls back to
+  // the REST door only when nothing is attached — see `workspace.tsx`.
+  /** The omnibox's Enter. */
+  navigate: (url: string) => void
+  back: () => void
+  forward: () => void
+  /** `hard` = ignore the cache. */
+  reload: (hard?: boolean) => void
+  /** Stop the in-flight load — what Reload becomes while `loading`. */
+  stop: () => void
+  /** Answer the modal blocking the page. Dismiss is the safe default. */
+  dialog: (accept: boolean, promptText?: string) => void
 }
 
 /** What a host-drawn header renders from. Plain values only. */
@@ -324,6 +340,12 @@ export function TakeoverPanel({
         handBack: () => sock.handBack(),
         resync: () => sock.resync(),
         retry: () => sock.restart(),
+        navigate: (url: string) => sock.navigate(url),
+        back: () => sock.back(),
+        forward: () => sock.forward(),
+        reload: (hard?: boolean) => sock.reload(!!hard),
+        stop: () => sock.stopLoading(),
+        dialog: (accept: boolean, promptText?: string) => sock.dialog(accept, promptText),
       }
     }
     if (attached) sock.start()
@@ -707,6 +729,11 @@ export function TakeoverPanel({
     subject: kind,
   })
 
+  // The page's own modal, straight off the feed. The bench reaches this through
+  // a real `nav_state` frame on its mock socket, not through a prop — so the
+  // screenshot and the product share one path.
+  const dialog = snap.nav.dialog
+
   const act = (verb: ViewportVerb) => {
     const sock = socketRef.current
     switch (verb) {
@@ -859,6 +886,17 @@ export function TakeoverPanel({
           <ViewportScreen view={view} onAct={act} canWake={!!onWake} canReload={!!onReload} />
         )}
         {view.cover === 'banner' && <ViewportBanner view={view} onAct={act} />}
+        {/* A page that opened an `alert()` is a page that has STOPPED: chrome
+            blocks the renderer until the modal is answered, so without this
+            surface the viewport is a frozen picture with no explanation and no
+            way out. It sits over the page (the message is about that page) and
+            it is the one overlay that must outrank the state banners. */}
+        {dialog && (
+          <PageDialogSurface
+            dialog={dialog}
+            onAnswer={(accept, text) => socketRef.current?.dialog(accept, text)}
+          />
+        )}
         {keyboardUp && <KeyboardDoneBar onDone={() => trapRef.current?.blur()} />}
         <StatusVeil refused={snap.refused} />
       </div>

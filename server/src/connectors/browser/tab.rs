@@ -32,9 +32,10 @@
 //! granted agent on tab B — which the session-keyed cardinality could not
 //! express.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 use super::context::AgentContext;
 use super::lock::{DriveLock, DriveMode};
@@ -65,6 +66,15 @@ pub struct Tab {
     id: TabId,
     page: Arc<AgentContext>,
     meta: RwLock<TabMeta>,
+    /// The nav-state → `browser_tabs` write-through task (P1-5), if one is
+    /// running. Held here rather than in the service's registry so that
+    /// [`close`](Self::close) — the ONE teardown every path goes through, reaper
+    /// and shutdown included — is also the one place it can be leaked from.
+    ///
+    /// A `std::sync::Mutex` on purpose: it is set once and taken once, nothing
+    /// is awaited under it, and an async lock here would make `close` care about
+    /// ordering it has no reason to.
+    nav_writer: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Tab {
@@ -91,6 +101,21 @@ impl Tab {
             id,
             page,
             meta: RwLock::new(meta),
+            nav_writer: Mutex::new(None),
+        }
+    }
+
+    /// Adopt the nav-state write-through task for this tab (P1-5). Replacing an
+    /// existing one aborts it, so a double-adopt cannot leak a second writer
+    /// racing the first for the same row.
+    pub fn set_nav_writer(&self, task: JoinHandle<()>) {
+        let previous = self
+            .nav_writer
+            .lock()
+            .map(|mut slot| slot.replace(task))
+            .unwrap_or(None);
+        if let Some(old) = previous {
+            old.abort();
         }
     }
 
@@ -158,6 +183,18 @@ impl Tab {
     /// does not own, which is what makes this safe: disposing the DEFAULT context
     /// would take every other tab — and the profile's cookies — with it.
     pub async fn close(&self) {
+        // Before the page, not after: the writer follows the page's nav watcher,
+        // and a writer still awake while the target is torn down would write the
+        // dying page's last state over the location `dehydrate_tab` just
+        // persisted.
+        let writer = self
+            .nav_writer
+            .lock()
+            .map(|mut slot| slot.take())
+            .unwrap_or(None);
+        if let Some(w) = writer {
+            w.abort();
+        }
         self.page.close().await;
     }
 }

@@ -106,6 +106,36 @@ export async function navigateTab(id: string, url: string): Promise<BrowserTab> 
   })
 }
 
+/**
+ * `POST /api/browser/tabs/{id}/{back,forward,reload,stop}` — the human's
+ * navigation controls, over HTTP.
+ *
+ * THE SECOND DOOR, and the one that can wake a sleeping tab: each of these
+ * `ensure_tab`s first (a human pressing Reload is somebody USING a browser —
+ * the lazy-start invariant is honoured, not repealed) and then runs the verb as
+ * `Actor::Human`. When a takeover socket is attached the UI prefers the socket
+ * instead (`ClientMsg::Back` &c), because that frame lands in the relay already
+ * holding the page — see `workspace.tsx`'s `drive()`.
+ *
+ * `moved:false` is the HONEST answer, not an error: Back at the start of the
+ * history did not go anywhere. The UI greys the arrow from `can_go_back` on the
+ * nav-state feed and reconciles against this if it did not.
+ */
+export type NavControl = 'back' | 'forward' | 'reload' | 'stop'
+
+export interface NavControlResult extends BrowserTab {
+  moved: boolean
+}
+
+export async function navControlTab(
+  id: string,
+  verb: NavControl,
+): Promise<NavControlResult> {
+  return settingsRequest<NavControlResult>(`/api/browser/tabs/${enc(id)}/${verb}`, {
+    method: 'POST',
+  })
+}
+
 /** `POST /api/browser/tabs/{id}/open` — wake a dehydrated tab where it stands.
  *
  *  Idempotent (`ensure_tab` is), and it reopens at the row's own `url` with the

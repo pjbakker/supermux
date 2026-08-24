@@ -18,12 +18,14 @@ import {
   deleteTab,
   grantTab,
   listTabs,
+  navControlTab,
   navigateTab,
   openTab,
   patchTab,
   revokeTabGrant,
   sortTabs,
   type BrowserTab,
+  type NavControl,
   type TabPatch,
 } from '@/lib/api/browser'
 import { devMockActive } from '@/hooks/use-sessions'
@@ -35,6 +37,7 @@ export const BROWSER_TABS_KEY = ['browser-tabs'] as const
 export type TabVerb =
   | 'open'
   | 'navigate'
+  | 'nav'
   | 'wake'
   | 'sleep'
   | 'pin'
@@ -46,6 +49,7 @@ export type TabVerb =
 const VERB_LEAD: Record<TabVerb, string> = {
   open: "Couldn't open that tab",
   navigate: "Couldn't go there",
+  nav: "Couldn't move the page",
   wake: "Couldn't wake the tab",
   sleep: "Couldn't close the page",
   pin: "Couldn't change the pin",
@@ -123,6 +127,10 @@ export interface BrowserTabActions {
   navigate: (id: string, url: string) => Promise<BrowserTab | null>
   /** Wake a dehydrated tab where it stands, at its own url. */
   wake: (id: string) => Promise<BrowserTab | null>
+  /** back / forward / reload / stop over HTTP — the door used when no takeover
+   *  socket is attached (it wakes the tab first). `false` = the page did not
+   *  move, which for Back at the start of a history is a state, not a failure. */
+  navControl: (id: string, verb: NavControl) => Promise<boolean>
   /** Close the PAGE and keep the tab — the inverse of `wake`. Not `close`,
    *  which drops the row. */
   sleep: (id: string) => Promise<BrowserTab | null>
@@ -182,6 +190,11 @@ export function useBrowserTabActions(): BrowserTabActions {
     onSuccess: settle,
     onError: fail('wake'),
   })
+  const navM = useMutation({
+    mutationFn: (v: { id: string; verb: NavControl }) => navControlTab(v.id, v.verb),
+    onSuccess: settle,
+    onError: fail('nav'),
+  })
   const sleepM = useMutation({
     mutationFn: (id: string) => closeTabPage(id),
     onSuccess: settle,
@@ -214,6 +227,7 @@ export function useBrowserTabActions(): BrowserTabActions {
       createM.isPending ||
       navigateM.isPending ||
       wakeM.isPending ||
+      navM.isPending ||
       sleepM.isPending ||
       patchM.isPending ||
       closeM.isPending ||
@@ -222,6 +236,10 @@ export function useBrowserTabActions(): BrowserTabActions {
     create: (url) => settled(createM.mutateAsync(url)),
     navigate: (id, url) => settled(navigateM.mutateAsync({ id, url })),
     wake: (id) => settled(wakeM.mutateAsync(id)),
+    navControl: async (id, verb) => {
+      const out = await settled(navM.mutateAsync({ id, verb }))
+      return out !== null && out.moved
+    },
     sleep: (id) => settled(sleepM.mutateAsync(id)),
     setPinned: async (id, pinned) =>
       (await settled(patchM.mutateAsync({ id, patch: { pinned }, verb: 'pin' }))) !== null,

@@ -42,6 +42,13 @@ export function BrowserRoute() {
         // has to know that "asleep" was a state.
         onNavigate={(id, url) => void actions.navigate(id, url)}
         onWake={(id) => void actions.wake(id)}
+        // The REST half of the nav controls. The workspace prefers the takeover
+        // socket whenever one is attached (no round-trip); these are the door
+        // that still works — and still wakes the tab — when it is not.
+        onBack={(id) => void actions.navControl(id, 'back')}
+        onForward={(id) => void actions.navControl(id, 'forward')}
+        onReload={(id) => void actions.navControl(id, 'reload')}
+        onStop={(id) => void actions.navControl(id, 'stop')}
         // "Close" on the chip DELETES the row; this closes the PAGE and keeps
         // the tab, its grants and its cookies. Two acts, two verbs.
         onSleep={(id) => void actions.sleep(id)}

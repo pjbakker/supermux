@@ -64,7 +64,7 @@
 //! [`crate::ws::verify_auth_frame`] / [`crate::ws::origin_allowed`].
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::extract::ws::{close_code, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -78,7 +78,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use super::context::{AckPolicy, AgentContext, ScreencastOptions};
+use super::context::{AckPolicy, AgentContext, NavState, ScreencastOptions};
 use super::lock::{Actor, DriveMode, HandOff};
 use crate::state::AppState;
 use crate::ws::{
@@ -332,6 +332,39 @@ pub enum ClientMsg {
     /// (spike gotcha #1), so a client that missed the seed would otherwise sit
     /// on a blank canvas until something on the page moved.
     Resync,
+
+    // ── navigation controls (P1-4) ──────────────────────────────────────────
+    //
+    // All CONTROL frames: they carry no page coordinates, so `to_cdp` — which
+    // is input-only and pure — returns `None` for every one of them and `drive`
+    // handles them in its own match arm, next to `HandBack` / `Viewport`.
+    //
+    // Deliberately handled ABOVE the drive gate, for the same reason the REST
+    // door does not grab the wheel: the human owns the browser, and the wheel
+    // governs the *input relay*, not the address bar. Refusing a WS `navigate`
+    // that the identical REST route accepts would be incoherent, not safer.
+    /// The address bar: go to this URL.
+    Navigate { url: String },
+    /// One step back through the page's own history.
+    Back,
+    /// …and one step forward.
+    Forward,
+    /// Reload. `ignore_cache` is the hard reload.
+    Reload {
+        #[serde(default)]
+        ignore_cache: bool,
+    },
+    /// Stop the in-flight load.
+    Stop,
+    /// Answer the modal the page has opened. `prompt_text` is the reply to a
+    /// `prompt()`; ignored by the other dialog kinds.
+    Dialog {
+        #[serde(default)]
+        accept: bool,
+        #[serde(default)]
+        prompt_text: Option<String>,
+    },
+
     /// Client-initiated liveness ping.
     Ping,
 }
@@ -351,9 +384,26 @@ pub enum ServerMsg<'a> {
     },
     /// One JPEG, base64, plus the CDP metadata the client maps taps with.
     Frame { data: &'a str, metadata: &'a Value },
+    /// **The live address bar** (P1-5) — url, title, favicon, spinner, honest
+    /// back/forward affordances, the padlock, and the modal that is blocking the
+    /// page right now.
+    ///
+    /// Serialised flat, so the wire shape is
+    /// `{"type":"nav_state","url":…,"title":…,"favicon":…,"loading":…,
+    /// "can_go_back":…,"can_go_forward":…,"secure":…,"dialog":…}` — pinned by a
+    /// test, because the web client parses these names.
+    ///
+    /// This is what replaces the fire-once [`Target`](Self::Target) frame as the
+    /// omnibox's feed: `Target` still seeds the canvas size on attach, but it is
+    /// a snapshot and a page that navigates itself leaves it stale within
+    /// seconds.
+    NavState(&'a NavState),
     /// The live drive mode — the AGENT/HUMAN pill.
     Mode { mode: DriveMode },
-    /// An input event was dropped because the human does not hold the wheel.
+    /// A frame was dropped rather than acted on, and why. Two callers: an input
+    /// event arriving while the human does not hold the wheel, and a `navigate`
+    /// to a scheme the human door refuses (`file:`/`data:` inside a profile that
+    /// IS the human's cookie jar is a local read, not navigation).
     Refused { reason: &'a str },
 }
 
@@ -632,6 +682,16 @@ pub fn to_cdp(msg: &ClientMsg, viewport: Viewport) -> Option<CdpCall> {
         | ClientMsg::TakeOver
         | ClientMsg::Resync
         | ClientMsg::Viewport { .. }
+        // The navigation controls are page COMMANDS, not input events. They
+        // reach the page through `AgentContext`'s gated verbs in `drive`, never
+        // through `dispatch_input` — whose allowlist is `Input.*` and must stay
+        // that way.
+        | ClientMsg::Navigate { .. }
+        | ClientMsg::Back
+        | ClientMsg::Forward
+        | ClientMsg::Reload { .. }
+        | ClientMsg::Stop
+        | ClientMsg::Dialog { .. }
         | ClientMsg::Ping => None,
     }
 }
@@ -643,6 +703,58 @@ pub fn to_cdp(msg: &ClientMsg, viewport: Viewport) -> Option<CdpCall> {
 /// or if something else released the context underneath us.
 pub fn human_may_drive(mode: DriveMode) -> bool {
     matches!(mode, DriveMode::HumanDriving)
+}
+
+/// One navigation command from the socket, ready to run off the loop.
+#[derive(Debug)]
+enum NavCmd {
+    /// The address bar. Already scheme-checked by the caller.
+    Go(String),
+    /// A history step: `-1` back, `+1` forward.
+    Step(i64),
+    Reload(bool),
+    Stop,
+    Dialog {
+        accept: bool,
+        prompt_text: Option<String>,
+    },
+}
+
+/// Run one navigation command **off the socket loop**.
+///
+/// `navigate` / `reload` / `go` each wait (bounded) for the page's load event,
+/// and awaiting that inline would freeze the viewer for the whole of it: no
+/// frames relayed, no acks paid — and an unacked frame stalls chrome's 2-slot
+/// in-flight window permanently — and no pongs, so a slow page could time the
+/// socket out. Spawned instead, and the **nav watcher** reports what actually
+/// happened on the very feed the address bar already reads.
+fn spawn_nav(ctx: &Arc<AgentContext>, subject: &str, cmd: NavCmd) {
+    let ctx = ctx.clone();
+    let subject = subject.to_string();
+    tokio::spawn(async move {
+        let done = match &cmd {
+            NavCmd::Go(url) => ctx.navigate(Actor::Human, url).await.map(|()| true),
+            NavCmd::Step(delta) => ctx.go(Actor::Human, *delta).await,
+            NavCmd::Reload(ignore_cache) => {
+                ctx.reload(Actor::Human, *ignore_cache).await.map(|()| true)
+            }
+            NavCmd::Stop => ctx.stop(Actor::Human).await.map(|()| true),
+            NavCmd::Dialog { accept, prompt_text } => ctx
+                .handle_dialog(Actor::Human, *accept, prompt_text.as_deref())
+                .await
+                .map(|()| true),
+        };
+        match done {
+            Ok(true) => {}
+            // A history step off the end of the stack. A normal state, not an
+            // error: the client has already greyed that button from
+            // `can_go_back`/`can_go_forward` on the nav-state feed.
+            Ok(false) => {
+                debug!(subject = %subject, ?cmd, "browser takeover: no history entry that way");
+            }
+            Err(e) => warn!(subject = %subject, ?cmd, error = %e, "browser takeover: nav command"),
+        }
+    });
 }
 
 /// Truncate to `max` BYTES on a char boundary (never mid-UTF-8).
@@ -835,7 +947,7 @@ enum Outcome {
     StartFailed,
 }
 
-async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Outcome {
+async fn drive(socket: &mut WebSocket, session: &str, ctx: &Arc<AgentContext>) -> Outcome {
     // Seed: the target line, a still frame, and the current mode. The still is
     // load-bearing — a static page produces NO screencast frames (gotcha #1),
     // so without it a client attaching to an idle page sees a blank canvas.
@@ -884,6 +996,31 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Out
         .is_err()
     {
         return Outcome::SendFailed;
+    }
+
+    // **The live address bar** (P1-5). `watch` semantics do the seeding for us:
+    // a receiver is handed the CURRENT state, so a client attaching to a page
+    // that has not moved in an hour still gets a url, a title, a favicon and
+    // honest back/forward affordances — and one that attaches to a page already
+    // blocked on an `alert()` is told so by its first nav frame.
+    let mut nav = match ctx.watch_nav().await {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            // Not fatal: the canvas, the input relay and the mode pill all still
+            // work. The client falls back to the `Target` seed's url.
+            warn!(session = %session, error = %e, "browser takeover: nav watcher");
+            None
+        }
+    };
+    if let Some(rx) = nav.as_mut() {
+        let seed = rx.borrow_and_update().clone();
+        if socket
+            .send(ServerMsg::NavState(&seed).to_frame())
+            .await
+            .is_err()
+        {
+            return Outcome::SendFailed;
+        }
     }
 
     // The screencast, with the ack handed to US (see the module docs on
@@ -1007,6 +1144,58 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Out
                                 }
                                 continue;
                             }
+                            // ── navigation controls (P1-4) ─────────────────
+                            //
+                            // Handled HERE, above the drive gate, and NOT routed
+                            // through `to_cdp`: they are page commands, not input
+                            // events, and `dispatch_input`'s allowlist is `Input.*`.
+                            //
+                            // Above the gate on purpose. The REST door
+                            // (`api::navigate_handler`) moves a page without
+                            // grabbing the wheel — deliberately, so that typing an
+                            // address does not silently lock every granted agent
+                            // out of the tab. A WS `navigate` that refused what the
+                            // identical REST call accepts would be incoherent, not
+                            // safer, and the human owns the browser either way.
+                            ClientMsg::Navigate { url } => {
+                                // The same scheme gate the REST route applies, for
+                                // the same reason: `file:`/`data:` in a profile that
+                                // IS the human's cookie jar is a local-read
+                                // escalation, not navigation.
+                                let url = url.trim().to_string();
+                                if super::tools::host_of(&url).is_none() {
+                                    let no = ServerMsg::Refused { reason: "only http(s) URLs" };
+                                    if socket.send(no.to_frame()).await.is_err() {
+                                        return Outcome::SendFailed;
+                                    }
+                                    continue;
+                                }
+                                spawn_nav(ctx, session, NavCmd::Go(url));
+                                continue;
+                            }
+                            ClientMsg::Back => {
+                                spawn_nav(ctx, session, NavCmd::Step(-1));
+                                continue;
+                            }
+                            ClientMsg::Forward => {
+                                spawn_nav(ctx, session, NavCmd::Step(1));
+                                continue;
+                            }
+                            ClientMsg::Reload { ignore_cache } => {
+                                spawn_nav(ctx, session, NavCmd::Reload(ignore_cache));
+                                continue;
+                            }
+                            ClientMsg::Stop => {
+                                spawn_nav(ctx, session, NavCmd::Stop);
+                                continue;
+                            }
+                            // Answering a modal is never gated on the wheel: an
+                            // `alert()` blocks the RENDERER, so a watcher with no
+                            // way to dismiss one is a watcher of a frozen page.
+                            ClientMsg::Dialog { accept, prompt_text } => {
+                                spawn_nav(ctx, session, NavCmd::Dialog { accept, prompt_text });
+                                continue;
+                            }
                             ClientMsg::Auth { .. } | ClientMsg::Ping => continue,
                             _ => {}
                         }
@@ -1072,6 +1261,31 @@ async fn drive(socket: &mut WebSocket, session: &str, ctx: &AgentContext) -> Out
                         }
                     }
                     Err(RecvError::Closed) => return Outcome::ScreencastGone,
+                }
+            }
+
+            // The address bar's own feed. `Option` because a page whose watcher
+            // failed to start still deserves a working canvas; `pending()` parks
+            // this arm forever in that case instead of spinning.
+            changed = async {
+                match nav.as_mut() {
+                    Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if !changed {
+                    // The watcher died (the context is going away). The canvas
+                    // and the mode pill are still live, so keep the socket and
+                    // stop pushing an address bar we no longer have.
+                    nav = None;
+                    continue;
+                }
+                let state = match nav.as_mut() {
+                    Some(rx) => rx.borrow_and_update().clone(),
+                    None => continue,
+                };
+                if socket.send(ServerMsg::NavState(&state).to_frame()).await.is_err() {
+                    return Outcome::SendFailed;
                 }
             }
 
@@ -1304,8 +1518,70 @@ mod tests {
             r#"{"type":"viewport","width":1200,"height":800,"dpr":2}"#,
             r#"{"type":"ping"}"#,
             r#"{"type":"auth","token":"x"}"#,
+            // The P1-4 navigation controls. They are page COMMANDS, and
+            // `to_cdp` builds `Input.*` payloads — one of which reaching
+            // `dispatch_input` would be refused by its allowlist anyway, so
+            // this pins the routing rather than trusting the allowlist to.
+            r#"{"type":"navigate","url":"https://example.test/"}"#,
+            r#"{"type":"back"}"#,
+            r#"{"type":"forward"}"#,
+            r#"{"type":"reload"}"#,
+            r#"{"type":"reload","ignore_cache":true}"#,
+            r#"{"type":"stop"}"#,
+            r#"{"type":"dialog","accept":true}"#,
+            r#"{"type":"dialog","accept":true,"prompt_text":"hello"}"#,
         ] {
             assert!(to_cdp(&parse(raw), Viewport::default()).is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_navigation_controls_parse_into_the_commands_drive_runs() {
+        let ClientMsg::Navigate { url } = parse(r#"{"type":"navigate","url":"https://example.test/x"}"#)
+        else {
+            panic!("not a navigate")
+        };
+        assert_eq!(url, "https://example.test/x");
+
+        // A bare reload is the SOFT one: `ignore_cache` defaults to false, so a
+        // client that omits it never accidentally asks for a cache-busting
+        // reload of a page it just loaded.
+        let ClientMsg::Reload { ignore_cache } = parse(r#"{"type":"reload"}"#) else {
+            panic!("not a reload")
+        };
+        assert!(!ignore_cache);
+        let ClientMsg::Reload { ignore_cache } = parse(r#"{"type":"reload","ignore_cache":true}"#)
+        else {
+            panic!("not a reload")
+        };
+        assert!(ignore_cache);
+
+        assert!(matches!(parse(r#"{"type":"back"}"#), ClientMsg::Back));
+        assert!(matches!(parse(r#"{"type":"forward"}"#), ClientMsg::Forward));
+        assert!(matches!(parse(r#"{"type":"stop"}"#), ClientMsg::Stop));
+
+        // A dialog answer defaults to DISMISS: a garbled frame must not accept
+        // a `beforeunload` on the human's behalf.
+        let ClientMsg::Dialog { accept, prompt_text } = parse(r#"{"type":"dialog"}"#) else {
+            panic!("not a dialog")
+        };
+        assert!(!accept);
+        assert_eq!(prompt_text, None);
+        let ClientMsg::Dialog { accept, prompt_text } =
+            parse(r#"{"type":"dialog","accept":true,"prompt_text":"hi"}"#)
+        else {
+            panic!("not a dialog")
+        };
+        assert!(accept);
+        assert_eq!(prompt_text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn a_nav_control_is_never_an_input_method() {
+        // The other half of the routing rule: whatever a navigation control
+        // does, it must not be reachable through the relay's CDP allowlist.
+        for method in AgentContext::INPUT_METHODS {
+            assert!(method.starts_with("Input."), "{method}");
         }
     }
 
@@ -1380,6 +1656,34 @@ mod tests {
             target,
             r#"{"type":"target","session":"s","url":"https://example.test/","width":1200,"height":800}"#,
         );
+    }
+
+    #[test]
+    fn the_nav_state_frame_is_flat_and_tagged() {
+        // The web client's address bar reads these names off the top level, so
+        // the internally-tagged newtype must NOT nest the state under a key.
+        let state = NavState {
+            url: "https://example.test/inbox".into(),
+            title: "Inbox".into(),
+            favicon: None,
+            loading: true,
+            can_go_back: true,
+            can_go_forward: false,
+            secure: true,
+            dialog: None,
+        };
+        let raw = serde_json::to_string(&ServerMsg::NavState(&state)).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["type"], json!("nav_state"));
+        assert_eq!(v["url"], json!("https://example.test/inbox"));
+        assert_eq!(v["title"], json!("Inbox"));
+        assert_eq!(v["loading"], json!(true));
+        assert_eq!(v["can_go_back"], json!(true));
+        assert_eq!(v["can_go_forward"], json!(false));
+        assert_eq!(v["secure"], json!(true));
+        assert_eq!(v["favicon"], Value::Null);
+        assert_eq!(v["dialog"], Value::Null);
+        assert!(v.get("nav_state").is_none(), "must be flat, not nested: {raw}");
     }
     // ── real-chrome end-to-end (phase 2's whole claim) ──────────────────────
 
@@ -1799,6 +2103,181 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
     /// A human attaching to an ASLEEP workspace tab used to be hung up on with
     /// 4404, which is why P0-1's wake still showed a blank canvas half the time.
     /// Now the socket rehydrates behind the same in-band bearer auth the REST
+    /// **P1-4 + P1-5 end to end, against a real Chrome and the real socket.**
+    ///
+    /// The seed carries a live `nav_state` (url, title, favicon, honest
+    /// back/forward), a `navigate` control frame moves the page and the feed
+    /// says so, `back` restores the first page with `can_go_forward` now true,
+    /// and an `alert()` — which blocks the renderer outright — is reported and
+    /// then dismissed by a `dialog` frame.
+    #[tokio::test]
+    #[ignore = "spawns a real chrome; run with --ignored on a box that has the pinned binary"]
+    async fn real_chrome_the_socket_streams_nav_state_and_drives_the_history() {
+        use futures_util::SinkExt;
+        let (state, dir) = ws_state().await;
+        if !state.browser.config().executable.exists() {
+            eprintln!("SKIP: no chrome at {}", state.browser.config().executable.display());
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        // Two pages plus a 1×1 gif at /favicon.ico, so the in-page favicon read
+        // has something real to find.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (ctype, body): (&str, Vec<u8>) = if req.contains("GET /favicon.ico") {
+                        // The smallest valid gif there is.
+                        let gif: [u8; 35] = [
+                            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00,
+                            0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00,
+                            0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+                        ];
+                        ("image/gif", gif.to_vec())
+                    } else if req.contains("GET /two") {
+                        ("text/html", b"<title>Second</title><body>second</body>".to_vec())
+                    } else if req.contains("GET /alerting") {
+                        (
+                            "text/html",
+                            b"<title>Alerting</title><body onload=\"setTimeout(()=>alert('stop right there'),50)\">wait</body>".to_vec(),
+                        )
+                    } else {
+                        ("text/html", b"<title>First</title><body>first</body>".to_vec())
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        ctype,
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        let one = format!("http://127.0.0.1:{port}/");
+        let two = format!("http://127.0.0.1:{port}/two");
+        let alerting = format!("http://127.0.0.1:{port}/alerting");
+        let id = "tb_navstatecontrols";
+        crate::db::browser_tabs::create(&state.pool, id, &one, None, &["127.0.0.1".to_string()])
+            .await
+            .unwrap();
+
+        let addr = serve(&state).await;
+        let mut ws = dial(addr, &format!("/ws/browser/tab/{id}")).await;
+
+        /// Read frames until one is a `nav_state` that `want` accepts. Frames
+        /// interleave with a 60 fps screencast, so "the next frame" is never the
+        /// one you are looking for.
+        async fn nav_until(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            what: &str,
+            want: impl Fn(&Value) -> bool,
+        ) -> Value {
+            for _ in 0..400 {
+                let Some(Ok(text)) = next_event(ws).await else {
+                    panic!("socket closed while waiting for {what}");
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                if v["type"] == json!("nav_state") && want(&v) {
+                    return v;
+                }
+            }
+            panic!("never saw a nav_state matching {what}");
+        }
+
+        // ── 1. the seed feed: the page the tab actually stored ───────────────
+        let landed = nav_until(&mut ws, "the first page", |v| {
+            v["url"].as_str().unwrap_or_default().ends_with(&format!("{port}/"))
+                && v["title"] == json!("First")
+        })
+        .await;
+        assert_eq!(landed["loading"], json!(false), "{landed}");
+        assert_eq!(landed["can_go_back"], json!(false), "the first page has nothing behind it: {landed}");
+        assert_eq!(landed["can_go_forward"], json!(false), "{landed}");
+        assert_eq!(landed["secure"], json!(false), "loopback http is NOT a padlock: {landed}");
+        assert_eq!(landed["dialog"], Value::Null, "{landed}");
+        assert!(
+            landed["favicon"].as_str().unwrap_or_default().starts_with("data:image/"),
+            "the icon is read IN the page and relayed as a data URI: {landed}"
+        );
+
+        // ── 2. a navigate control frame moves the page ───────────────────────
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({ "type": "navigate", "url": two }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let second = nav_until(&mut ws, "the second page", |v| {
+            v["title"] == json!("Second") && v["loading"] == json!(false)
+        })
+        .await;
+        assert_eq!(second["url"], json!(two), "{second}");
+        assert_eq!(second["can_go_back"], json!(true), "there is now a page behind: {second}");
+        assert_eq!(second["can_go_forward"], json!(false), "{second}");
+
+        // ── 3. back really steps the history, forward becomes honest ─────────
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({ "type": "back" }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let back = nav_until(&mut ws, "the page behind", |v| {
+            v["title"] == json!("First") && v["can_go_forward"] == json!(true)
+        })
+        .await;
+        assert_eq!(back["can_go_back"], json!(false), "we are at the front again: {back}");
+
+        // ── 4. a non-http scheme is refused at the socket, like at REST ──────
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({ "type": "navigate", "url": "file:///etc/passwd" }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut refused = false;
+        for _ in 0..200 {
+            let Some(Ok(text)) = next_event(&mut ws).await else { break };
+            if text.contains(r#""type":"refused""#) {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "file: in the human's own cookie jar is a local read, not navigation");
+
+        // ── 5. an alert() blocks the renderer; the feed says so and the ──────
+        //      dialog frame is the only way back out.
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({ "type": "navigate", "url": alerting }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let blocked = nav_until(&mut ws, "the dialog", |v| v["dialog"].is_object()).await;
+        assert_eq!(blocked["dialog"]["kind"], json!("alert"), "{blocked}");
+        assert_eq!(blocked["dialog"]["message"], json!("stop right there"), "{blocked}");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({ "type": "dialog", "accept": true }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let cleared = nav_until(&mut ws, "the dialog clearing", |v| v["dialog"].is_null()).await;
+        assert_eq!(cleared["dialog"], Value::Null, "{cleared}");
+
+        drop(ws);
+        state.browser.shutdown().await;
+        server.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// wake door demands, and the seed `target` frame carries the tab's own
     /// stored URL — the same page, from the same on-disk profile.
     #[tokio::test]
