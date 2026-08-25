@@ -836,6 +836,30 @@ async fn finish(
             let _ = db::workflows::record_manual(&state.pool, &wf.id, now).await;
         }
     }
+
+    // A delayed "send later" (composer `delay-send`) is an EPHEMERAL one-shot: it
+    // exists only to deliver its message at the chosen time. Once it has fired it
+    // will never run again and becomes dead weight that piles up in the bot's
+    // workflow list (the owner's report). So when a one-shot that carries the
+    // delay-send auto-title has just completed (`recompute_next` is None — it has
+    // no future fire), soft-delete it here — the SAME path the composer's Cancel
+    // uses, so it leaves the list live over SSE and never accumulates. The title
+    // match is the convention the client's `isDelayRow` uses to recognise these;
+    // the one-shot guard keeps a user's recurring workflow safe even if it happens
+    // to share the stem.
+    if is_delay_send_title(&wf.title) && recompute_next(wf, now).is_none() {
+        if db::workflows::soft_delete(&state.pool, &wf.id).await.unwrap_or(0) > 0 {
+            super::emit_workflows(state, wf, "deleted");
+        }
+    }
+}
+
+/// A workflow title written by the composer's delay-send (`delayTitle`): the bare
+/// stem, or the stem + `· <preview>`. The ` · ` separator makes this specific to
+/// the auto-title — a user's own "Send later" is extremely unlikely to carry it —
+/// and the caller additionally gates on the one-shot having no future fire.
+fn is_delay_send_title(title: &str) -> bool {
+    title == "Send later" || title.starts_with("Send later · ")
 }
 
 /// One `ScheduleError`-category push, spawned so no run loop blocks on the push

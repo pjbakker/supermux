@@ -434,15 +434,25 @@ export async function cancelDelayedSend(
  * finished one-shot (the engine nulls `next_run` when a `once` workflow fires) —
  * belongs to the Workflows view, not to a composer chip.
  */
-export function isDelayRow(row: WorkflowWithSteps, session: string, nowMs: number): boolean {
-  if (row.session !== session) return false
+/** The durable SHAPE of a delay-send workflow, independent of session/time: a
+ *  one-shot whose title carries the auto-stem and whose single step is prompt-only
+ *  (no command). This is what the Workflows list hides so a bot's "send later"
+ *  messages never clutter it — a FIRED one is soft-deleted server-side, so only
+ *  the still-pending ones reach the list, and this drops them. `isDelayRow` adds
+ *  the session + still-scheduled checks the composer's own chip rehydration needs. */
+export function isDelaySendShape(row: WorkflowWithSteps): boolean {
   if (row.trigger_kind !== 'once') return false
-  if (row.enabled !== 1 || row.deleted != null) return false
   if (!row.title.startsWith(DELAY_TITLE)) return false
   const steps = row.steps ?? []
   if (steps.length !== 1) return false
   const step = steps[0]!
-  if (step.command.trim() || !step.prompt.trim()) return false
+  return !step.command.trim() && !!step.prompt.trim()
+}
+
+export function isDelayRow(row: WorkflowWithSteps, session: string, nowMs: number): boolean {
+  if (row.session !== session) return false
+  if (row.enabled !== 1 || row.deleted != null) return false
+  if (!isDelaySendShape(row)) return false
   const due = row.next_run ? Date.parse(row.next_run) : Number.NaN
   return Number.isFinite(due) && due > nowMs
 }

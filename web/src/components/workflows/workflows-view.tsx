@@ -19,6 +19,7 @@ import { Copy, MoreVertical, Play, Plus, Square, Trash2 } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import { springs } from '@/lib/springs'
+import { isDelaySendShape } from '@/components/chat/delay-send'
 import { useToast } from '@/components/ui/use-toast'
 import { ArmedButton } from '@/components/ui/armed-button'
 import { useArmedConfirm } from '@/hooks/use-armed-confirm'
@@ -90,8 +91,14 @@ export function WorkflowsView({
 
   const shown = React.useMemo(
     () =>
-      rows.filter((w) =>
-        filter === 'all' ? true : filter === 'active' ? w.enabled === 1 : w.enabled === 0,
+      rows.filter(
+        (w) =>
+          // A "send later" is an ephemeral delay-send, not a routine — it belongs
+          // to the composer's own countdown chip, not this list (the owner's
+          // report: the list ballooned with them). Fired ones are soft-deleted
+          // server-side; this hides the still-pending ones.
+          !isDelaySendShape(w) &&
+          (filter === 'all' ? true : filter === 'active' ? w.enabled === 1 : w.enabled === 0),
       ),
     [rows, filter],
   )

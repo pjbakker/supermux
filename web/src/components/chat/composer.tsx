@@ -45,7 +45,7 @@ import { AtIcon, ClockIcon, Composer, MicIcon, PlusIcon } from './ui'
 import ChatActionsSheet from './chat-actions-sheet'
 import ChatActionsPopover from './chat-actions-menu'
 import { DelaySendPopover, DelaySendSheet } from './delay-send-menu'
-import { delayGateReason, type DelayOption } from './delay-send'
+import { arrivalLabel, delayGateReason, type DelayOption } from './delay-send'
 import type { DelaySend } from './use-delay-send'
 import { QueuedSends } from './queued-sends'
 import { AttachmentChips } from './attachment-chips'
@@ -452,6 +452,12 @@ export function ChatComposer({
       return !open
     })
   }, [coarse])
+  // ARM, DON'T FIRE. Picking a time no longer schedules on the spot — the clock is
+  // a time-PICKER, not a second send button (the owner's report: choosing a time
+  // acted as Send). It records the choice; a chip appears in the composer and the
+  // Send disc becomes "schedule", and the message is only queued when the user
+  // actually SENDS. `null` = send now, as normal.
+  const [armedDelay, setArmedDelay] = React.useState<DelayOption | null>(null)
   const pickDelay = React.useCallback(
     (option: DelayOption) => {
       setDelayOpen(false)
@@ -459,9 +465,47 @@ export function ChatComposer({
       // activation racing the state that disabled it): the gate is checked
       // where the write happens, not only where it is drawn.
       if (delayDisabled) return
-      delay?.queue(draft, option)
+      setArmedDelay(option)
     },
-    [delay, draft, delayDisabled],
+    [delayDisabled],
+  )
+  // Commit the armed delayed send — the Send disc and Enter both route here while
+  // a time is armed, so a scheduled send is filed by the SAME gesture a normal
+  // send is, never by the act of picking a time. No-op if the gate has since
+  // closed or the box emptied (the chip can still be cleared).
+  const commitArmed = React.useCallback(() => {
+    if (!armedDelay || delayDisabled || draft.trim().length === 0) return
+    delay?.queue(draft, armedDelay)
+    setArmedDelay(null)
+  }, [armedDelay, delayDisabled, delay, draft])
+  // ENTER COMMITS THE ARMED SCHEDULE (desktop), so the key that normally sends now
+  // files the scheduled send while a time is armed — the two paths agree. Only the
+  // unambiguous send-Enter is taken: no modifier, not mid-IME-composition, no
+  // `@`/`/` popover open (Enter accepts a row there), no hand-off draft, and
+  // fine-pointer only (a soft keyboard's Enter is a newline; the disc sends).
+  // Everything else falls straight through to the normal handler.
+  const onFieldKeyDown = React.useCallback(
+    (e: Parameters<typeof onKeyDown>[0]) => {
+      if (
+        armedDelay &&
+        e.key === 'Enter' &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.nativeEvent.isComposing &&
+        !picker.open &&
+        !handoff &&
+        !phone &&
+        draft.trim().length > 0
+      ) {
+        e.preventDefault()
+        commitArmed()
+        return
+      }
+      onKeyDown(e)
+    },
+    [armedDelay, picker.open, handoff, phone, draft, commitArmed, onKeyDown],
   )
   // The escape to the full editor — the row that used to be the leading clock.
   const pickTime = React.useMemo(
@@ -573,6 +617,51 @@ export function ChatComposer({
           empty. */}
       {attachments && (
         <AttachmentChips attachments={attachments.attachments} onDismiss={attachments.dismiss} />
+      )}
+      {/* ARMED — a time is chosen but the message has NOT been scheduled yet: it
+          waits for the Send disc. A glass pill (the queued-receipt look) that says
+          when it will go, with an × to disarm and go back to sending now. */}
+      {delay && armedDelay && (
+        <div className="mb-2 flex flex-wrap" data-testid="chat-armed-delay">
+          <span
+            className={cn(
+              'inline-flex max-w-full items-center gap-1.5 rounded-full',
+              'border-[0.5px] border-hairline bg-surface py-1 pl-2.5 pr-1',
+              'backdrop-blur-[60px] backdrop-saturate-[180%] shadow-[var(--sm-popover-shadow)]',
+              phone ? 'text-[12px]' : 'text-[12.5px]',
+              'tracking-[-0.05px] text-ink-2',
+            )}
+          >
+            <ClockIcon className="text-brand" />
+            <span aria-hidden className="text-ink">
+              Sends at {arrivalLabel(delay.nowMs + armedDelay.ms)}
+            </span>
+            <span className="sr-only">
+              This message is scheduled to send at {arrivalLabel(delay.nowMs + armedDelay.ms)} when
+              you press send. Press this button to cancel and send now instead.
+            </span>
+            <button
+              type="button"
+              onClick={() => setArmedDelay(null)}
+              aria-label="Cancel scheduled send"
+              data-testid="chat-armed-cancel"
+              className="ml-0.5 grid size-5 place-items-center rounded-full text-ink-3 hover:bg-fill-soft hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </span>
+        </div>
       )}
       {/* THE RECEIPTS — closest to the pill, because they are about the message
           that just left it. Renders nothing when the queue is empty and no write
@@ -732,7 +821,7 @@ export function ChatComposer({
           readOnly: blocked ? true : undefined,
           'aria-disabled': blocked ? true : undefined,
           onChange: onChange,
-          onKeyDown: onKeyDown,
+          onKeyDown: onFieldKeyDown,
           onSelect: onSelect,
           // Paste an image → a chip. Only wired when uploads are (so an unwired
           // composer carries no extra handler); the desktop textarea reads it
@@ -828,15 +917,17 @@ export function ChatComposer({
                       // element, same cell, no swap: only the sentence differs.
                       testId="chat-send"
                       label={
-                        uploading
-                          ? 'Waiting for uploads…'
-                          : handoff
-                            ? `Hand to ${handoff.label}`
-                            : `Send to ${label}`
+                        armedDelay
+                          ? `Schedule for ${arrivalLabel((delay?.nowMs ?? 0) + armedDelay.ms)}`
+                          : uploading
+                            ? 'Waiting for uploads…'
+                            : handoff
+                              ? `Hand to ${handoff.label}`
+                              : `Send to ${label}`
                       }
                       data-handoff={handoff ? handoff.to : undefined}
                       phone={phone}
-                      onClick={submit}
+                      onClick={armedDelay ? commitArmed : submit}
                       // Disabled while a POST is in flight, while an upload is
                       // still settling, or when there is nothing actually sendable
                       // (only errored chips + an empty box) — `!canSend` folds all
@@ -849,7 +940,9 @@ export function ChatComposer({
                           holds the arrow becomes the RECIPIENT'S FACE, which is
                           this app's word for "this is going to them" everywhere
                           else. Same cell, same size, no reflow. */}
-                      {handoff ? (
+                      {armedDelay ? (
+                        <ClockIcon className="size-[18px]" />
+                      ) : handoff ? (
                         <SessionMark
                           seed={handoff.to}
                           size={phone ? 19 : 21}
