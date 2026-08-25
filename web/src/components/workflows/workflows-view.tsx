@@ -149,7 +149,7 @@ export function WorkflowsView({
         )}
       </div>
 
-      <div className={cn('min-h-0 flex-1 overflow-y-auto', isPage ? 'px-4 pb-10 sm:px-6' : 'pb-2')}>
+      <div className={cn('min-h-0 flex-1 overflow-y-auto pt-3', isPage ? 'px-4 pb-10 sm:px-6' : 'pb-2')}>
         {loading ? (
           <ListSkeleton />
         ) : failed ? (

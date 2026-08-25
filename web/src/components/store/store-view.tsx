@@ -273,7 +273,7 @@ export function StoreView({
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-10 pt-1 sm:px-6">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-10 pt-3 sm:px-6">
         {showTabs && tab === 'installed' ? (
           <div role="tabpanel" id="store-tabpanel-installed" aria-labelledby="store-tab-installed" className="pt-2">
             <InstalledPanel cards={localCards} q={q} />
