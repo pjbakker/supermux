@@ -682,6 +682,10 @@ export function BrowserWorkspace({
           // Only an OPEN tab is attached on sight. Attaching rehydrates, and a
           // human selecting a row must not start a browser by looking at it.
           attach={active.live || !!forceLive}
+          // Drive by default: the shared browser is a human-first tool, so opening
+          // or browsing to a page takes the wheel automatically (one-shot; Hand
+          // back still sticks). The bench opts out so its screenshots stay watch.
+          driveOnAttach={!forceLive}
           waking={busy}
           needsLogin={active.login_state === 'needs_login'}
           crashed={crashed}

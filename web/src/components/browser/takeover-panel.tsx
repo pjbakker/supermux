@@ -263,6 +263,13 @@ export interface TakeoverPanelProps {
    * **Wake** is what dials (which is also what wakes it).
    */
   attach?: boolean
+  /** **Take the wheel automatically when this tab first goes live.** The shared
+   *  browser is a human-first tool, so opening or browsing to a page should DRIVE
+   *  by default rather than start in watch-first (the workspace passes this). A
+   *  ONE-SHOT per mount: it fires once when the socket first reaches `live`, so a
+   *  later **Hand back to agent** sticks and a reconnect never re-grabs the wheel.
+   *  The panel is keyed by tab, so switching tabs re-arms it for the new page. */
+  driveOnAttach?: boolean
   /** A wake / navigate is in flight on the host's side. */
   waking?: boolean
   /** The tab's last login probe said signed out — drawn as a banner OVER the
@@ -300,6 +307,7 @@ export function TakeoverPanel({
   controlsRef,
   tabLive,
   attach,
+  driveOnAttach,
   waking,
   needsLogin,
   crashed,
@@ -378,6 +386,24 @@ export function TakeoverPanel({
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null)
   const socketRef = React.useRef<TakeoverSocket | null>(null)
   const [signInOpen, setSignInOpen] = React.useState(false)
+  /** Auto-drive one-shot: set once we have taken the wheel on this mount, so a
+   *  Hand back sticks and a reconnect never re-grabs. Reset only by a remount
+   *  (the panel is keyed by tab), which is exactly "a new page was opened". */
+  const autoDroveRef = React.useRef(false)
+
+  // DRIVE BY DEFAULT (workspace tabs). The shared browser is a human-first tool,
+  // so opening or browsing to a page takes the wheel automatically rather than
+  // starting watch-first. One-shot per mount (`autoDroveRef`): fires the first
+  // time the socket reaches `live` and we are not already driving, so a Hand back
+  // sticks and a reconnect never re-grabs. Only ever for a `driveOnAttach` host —
+  // the in-chat session socket already drives server-side, the bench never asks.
+  React.useEffect(() => {
+    if (!driveOnAttach || autoDroveRef.current) return
+    if (snap.state === 'live' && snap.mode !== 'human_driving') {
+      autoDroveRef.current = true
+      socketRef.current?.takeOver()
+    }
+  }, [driveOnAttach, snap.state, snap.mode])
 
   /** The frame currently ON the canvas — the mapping basis for every gesture.
    *  A ref, not state: sixty re-renders a second to paint a canvas React does
