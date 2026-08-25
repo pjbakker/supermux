@@ -239,7 +239,11 @@ function ModelPicker({
   }
 
   return (
-    <DropdownMenu>
+    // `modal={false}` — same reason as the row + actions menus: this picker lives
+    // inside the bot-panel's Vaul sheet on a phone, where a modal Radix menu
+    // portalled to <body> lands under the drawer's pointer-events:none and reads
+    // as dead on touch. See session-actions-menu.tsx for the full note.
+    <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <button
           type="button"

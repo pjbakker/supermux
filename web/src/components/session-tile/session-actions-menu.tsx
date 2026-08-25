@@ -242,7 +242,14 @@ export function SessionActionsMenu({
           />,
           document.body,
         )}
-      <DropdownMenu open={open} onOpenChange={setOpen}>
+      {/* `modal={false}` so this opens when nested inside a Vaul/Radix modal
+          drawer (the bot-panel `variant="sheet"` on a phone). A modal Vaul/Radix
+          drawer sets `pointer-events: none` on everything outside it, and a
+          modal Radix menu portalled to <body> lands there — so on touch the menu
+          appeared dead. Non-modal keeps its trigger + items interactive; on
+          desktop the only change is no scroll-lock, which a small action menu
+          does not need. (Same note as pwa/a2hs-sheet.tsx.) */}
+      <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
         <DropdownMenuTrigger asChild>
           <button
             ref={infoAnchorRef}

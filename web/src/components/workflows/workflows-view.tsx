@@ -346,7 +346,11 @@ function RowMenu({
   onDuplicate: () => void
 }) {
   return (
-    <DropdownMenu>
+    // `modal={false}` — this row menu lives inside the bot-panel's Vaul sheet on
+    // a phone; a modal Vaul/Radix drawer sets pointer-events:none on the body
+    // where a modal Radix menu portals, so on touch it read as dead. See the
+    // fuller note in session-actions-menu.tsx.
+    <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <button
           type="button"
