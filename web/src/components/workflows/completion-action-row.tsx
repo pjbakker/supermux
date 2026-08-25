@@ -18,6 +18,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 
 import { cn } from '@/lib/utils'
 import { springs } from '@/lib/springs'
+import { SessionPicker } from '@/components/session/session-picker'
 import { useSessionConnectors } from '@/stores/connectors-store'
 import type { SessionConnector } from '@/lib/api/connectors'
 import type { CompletionAction } from '@/lib/api/workflows'
@@ -194,24 +195,22 @@ export function CompletionActionRow({
             className="overflow-hidden"
           >
             <div className="pt-2.5">
-              <label className="flex flex-col gap-1 text-[12px] text-muted-foreground">
+              {/* The SAME shared SessionPicker the composer's "Run by" uses, so
+                  every bot choice in this surface draws the roster's SessionFace
+                  rather than a native <select> slug. `allowEmpty={false}` keeps
+                  the required-pick placeholder until a bot is chosen. */}
+              <div className="flex flex-col gap-1 text-[12px] text-muted-foreground">
                 Which bot
-                <select
-                  aria-label="Which bot"
+                <SessionPicker
                   value={value.session}
-                  onChange={(e) => onChange({ kind: 'message_bot', session: e.target.value })}
-                  className="h-11 w-full rounded-lg border border-input bg-transparent px-3 text-base text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
-                >
-                  <option value="">Pick a bot…</option>
-                  {bots
-                    .filter((b) => b.name !== session)
-                    .map((b) => (
-                      <option key={b.name} value={b.name}>
-                        {b.display_name || b.name}
-                      </option>
-                    ))}
-                </select>
-              </label>
+                  onChange={(name) => onChange({ kind: 'message_bot', session: name })}
+                  sessions={bots.filter((b) => b.name !== session)}
+                  allowEmpty={false}
+                  placeholder="Pick a bot…"
+                  ariaLabel="Which bot"
+                  menuLabel="Which bot"
+                />
+              </div>
               {/* No text field here, ever: the body is the server-generated run
                   summary. A message box would be `command:` wearing a hat. */}
               <p className="mt-1.5 text-[11.5px] leading-snug text-muted-foreground">
@@ -275,7 +274,10 @@ export function completionSentence(
 export function completionProblem(value: CompletionAction): string | null {
   if (value.kind === 'connector_send') {
     if (!value.connector_id || !value.account_ref) return 'Pick the account to send from'
-    if (!value.to.trim()) return 'Say who the summary goes to'
+    // `?.` guards a legacy/partial row that reached render with `to` absent —
+    // parseCompletion now normalizes it to '', but this stays null-safe so the
+    // validator can never throw during render regardless of its input.
+    if (!value.to?.trim()) return 'Say who the summary goes to'
   }
   if (value.kind === 'message_bot' && !value.session) return 'Pick which bot gets the summary'
   return null

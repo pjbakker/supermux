@@ -354,14 +354,36 @@ export function parseConnectors(json: string | null | undefined): string[] {
  *  read back as `none` — the UI never invents an action it cannot show. */
 const COMPLETION_KINDS = ['none', 'notify', 'disable', 'connector_send', 'message_bot']
 
-/** Read an `on_complete` column into the typed union. */
+/** Read an `on_complete` column into the typed union.
+ *
+ *  Each variant is NORMALIZED to a complete shape rather than cast blindly: a
+ *  legacy/partial/hand-authored row (e.g. a `connector_send` with no `to`) once
+ *  cast straight through as `{ to: undefined }`, and the render-time validator
+ *  then crashed on `value.to.trim()` — a white-screen on the edit route. Filling
+ *  the missing string fields here fixes it at the boundary, so the whole
+ *  completion subtree (row inputs AND the sentence) receives well-formed values. */
 export function parseCompletion(json: string | null | undefined): CompletionAction {
   if (!json || !json.trim()) return { kind: 'none' }
   try {
     const v = JSON.parse(json)
     if (!v || typeof v !== 'object' || typeof v.kind !== 'string') return { kind: 'none' }
     if (!COMPLETION_KINDS.includes(v.kind)) return { kind: 'none' }
-    return v as CompletionAction
+    const str = (x: unknown): string => (typeof x === 'string' ? x : '')
+    switch (v.kind) {
+      case 'connector_send':
+        return {
+          kind: 'connector_send',
+          connector_id: str(v.connector_id),
+          account_ref: str(v.account_ref),
+          to: str(v.to),
+          subject: typeof v.subject === 'string' ? v.subject : null,
+        }
+      case 'message_bot':
+        return { kind: 'message_bot', session: str(v.session) }
+      default:
+        // none / notify / disable carry no fields.
+        return { kind: v.kind } as CompletionAction
+    }
   } catch {
     return { kind: 'none' }
   }

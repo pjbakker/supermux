@@ -210,6 +210,56 @@ describe('the wire boundary', () => {
     expect(d.onComplete).toEqual({ kind: 'notify' })
     expect(stepsToWire(d.steps)[0].command).toBe('/numbers')
   })
+
+  test('a legacy connector_send row missing `to` normalizes — the edit route no longer white-screens', () => {
+    const d = draftFromWorkflow({
+      workflow: {
+        id: 'WF-2',
+        title: 'Legacy',
+        session: 'scout',
+        company_id: null,
+        enabled: 1,
+        trigger_kind: 'manual',
+        schedule_expr: null,
+        next_run: null,
+        last_run: null,
+        run_count: 0,
+        // A partial/hand-authored row: connector_id + account_ref, no `to`.
+        on_complete: '{"kind":"connector_send","connector_id":"gmail","account_ref":"a1"}',
+        created: 0,
+        updated: 0,
+        deleted: null,
+      },
+      steps: [
+        {
+          id: 'S1',
+          workflow_id: 'WF-2',
+          position: 0,
+          title: 'Do',
+          command: '',
+          prompt: 'the thing',
+          files: '[]',
+          connectors: '[]',
+          timeout_secs: 1800,
+          on_complete: null,
+          created: 0,
+          updated: 0,
+        },
+      ],
+      last_run_summary: null,
+    })
+    // Normalized to a complete shape at the parse boundary.
+    expect(d.onComplete).toEqual({
+      kind: 'connector_send',
+      connector_id: 'gmail',
+      account_ref: 'a1',
+      to: '',
+      subject: null,
+    })
+    // The render-time validator must not throw on it — it names the gap instead.
+    expect(() => draftProblem(d)).not.toThrow()
+    expect(draftProblem(d)).toBe('Say who the summary goes to')
+  })
 })
 
 describe('the dragon’s options are GONE, not hidden', () => {

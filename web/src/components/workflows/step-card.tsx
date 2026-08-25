@@ -149,9 +149,17 @@ export function StepCard({
   // (rightly) refuses.
   const changeRef = React.useRef(onChange)
   const stepRef = React.useRef(step)
+  // `onUploading` gets the SAME ref treatment as `onChange`, and for the same
+  // reason: the composer passes it as a fresh inline arrow every render, so
+  // depending on it in the effect below re-fires the effect → setState → re-render
+  // → new arrow → … ("Maximum update depth exceeded"). Reading it through a ref
+  // lets the effect depend on `staged.uploading` ALONE, so it fires only when the
+  // upload state actually flips.
+  const uploadingRef = React.useRef(onUploading)
   React.useEffect(() => {
     changeRef.current = onChange
     stepRef.current = step
+    uploadingRef.current = onUploading
   })
   React.useEffect(() => {
     const ready = staged.attachments.filter(
@@ -170,8 +178,8 @@ export function StepCard({
   }, [staged])
 
   React.useEffect(() => {
-    onUploading?.(staged.uploading)
-  }, [staged.uploading, onUploading])
+    uploadingRef.current?.(staged.uploading)
+  }, [staged.uploading])
 
   const move = (delta: -1 | 1) => {
     buzz()

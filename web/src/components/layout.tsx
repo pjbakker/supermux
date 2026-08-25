@@ -480,7 +480,18 @@ export function Layout() {
   // never routes here (the route redirects when bot mode is off), so every
   // existing path keeps `chromeless === isFocus` exactly.
   const isTeamDetail = pathname.startsWith('/team/')
-  const chromeless = isFocus || isTeamDetail
+  // The workflow COMPOSER (/workflows/new, /workflows/:id/edit) is a full-screen
+  // editor like focus/team-detail: it renders its OWN sticky header (back + Save)
+  // and a pinned footer, and it was authored chromeless (its comments assume no
+  // BottomNav below the footer). Without this it mounted plainly under <Layout>,
+  // so the shell's MobileTopBar double-stacked its header AND the BottomNav sat
+  // under its `pb-safe` footer (collision + double-counted inset). Gating it here
+  // drops both and flips `<main>` to `overflow-hidden`, so the composer's own
+  // `h-full` flex chain fills and scrolls internally. The read-only DETAIL route
+  // (/workflows/:id) is a normal scroll page and deliberately NOT matched.
+  const isWorkflowCompose =
+    pathname === '/workflows/new' || /^\/workflows\/[^/]+\/edit$/.test(pathname)
+  const chromeless = isFocus || isTeamDetail || isWorkflowCompose
   // Archived sheet open-state lives in a shared store so the ⌘K command and the
   // overview overflow item open the same shell-mounted instance (no permanent
   // estate — the sheet is only in the DOM as an overlay when opened).

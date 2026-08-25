@@ -194,7 +194,7 @@ export function WorkflowComposer() {
 
   if (editing && !loaded.data) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center p-8 text-[13px] text-muted-foreground">
+      <div className="flex h-full min-h-0 items-center justify-center p-8 text-[13px] text-muted-foreground">
         {loaded.error ? 'That workflow isn’t here anymore.' : 'Loading…'}
       </div>
     )
@@ -347,7 +347,18 @@ export function ComposerBody({
   const hintStep = draft.steps.find((s) => s.key === hintFor) ?? null
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    // `h-full`, not `flex-1`: the app shell's `<main#shell-content>` is a BLOCK
+    // scroll container (`display:block; overflow:auto`), and `flex-1` (flex-grow)
+    // is inert inside a block parent — so a `flex-1` root collapses to its
+    // CONTENT height and overflows `<main>` instead of filling it, floating the
+    // sticky footer mid-screen (the same class of bug the browser route fixed in
+    // a6090c3). `h-full` takes 100% of main's definite height, giving the
+    // header → scroll → footer flex chain a real box: header pins top, the inner
+    // `min-h-0 flex-1 overflow-y-auto` div is the one thing that scrolls, and the
+    // footer pins the true viewport bottom. This route is `chromeless` (see
+    // layout.tsx), so `<main>` is `overflow-hidden` and there is no BottomNav
+    // below the footer to collide with — the footer's `pb-safe` owns the inset.
+    <div className="flex h-full min-h-0 flex-col">
       {/* header */}
       {/* pt reserves the iOS status-bar inset (0 off a notched standalone PWA),
           mirroring the other full-screen route headers; the bottom bar already

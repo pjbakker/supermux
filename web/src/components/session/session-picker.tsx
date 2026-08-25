@@ -118,7 +118,8 @@ export function SessionPicker({
 
   const fallback = placeholder ?? emptyLabel
   // Render the picked option's LABEL (honours display_name), not the raw slug.
-  const triggerLabel = options.find((o) => o.name === value)?.label || fallback
+  const picked = options.find((o) => o.name === value)
+  const triggerLabel = picked?.label || fallback
   const triggerAria = `${ariaLabel}: ${triggerLabel} — switch`
 
   const trigger = (onClick?: () => void) => (
@@ -136,10 +137,24 @@ export function SessionPicker({
         className,
       )}
     >
-      <TerminalSquare
-        className="size-3.5 shrink-0 opacity-70"
-        aria-hidden
-      />
+      {/* The picked bot's own FACE — the same roster identity the overview and
+          the dropdown rows show, so the trigger reads as the top-of-the-world
+          affordance rather than a generic terminal glyph. Falls back to the
+          neutral glyph only when nothing is picked (no session ⇒ no face). */}
+      {value ? (
+        <SessionFace
+          name={value}
+          status={picked?.status as SessionStatus | undefined}
+          size={18}
+          animate={false}
+          className="shrink-0"
+        />
+      ) : (
+        <TerminalSquare
+          className="size-3.5 shrink-0 opacity-70"
+          aria-hidden
+        />
+      )}
       <span
         className={cn(
           'min-w-0 truncate',
