@@ -1,15 +1,18 @@
 import * as React from 'react'
 import { Outlet, useLocation } from 'react-router-dom'
+// Primary-nav glyphs — Phosphor (duotone), a deliberately more designed set than
+// the Feather-derived default. `type Icon` is Phosphor's component type; it takes
+// the same `className` the rail passes, plus a `weight` the render sites set.
 import {
-  FolderClosed,
+  FlowArrow,
+  Folder,
+  GearSix,
   Globe,
-  LayoutGrid,
-  Plug,
-  Settings as SettingsIcon,
-  Terminal,
-  Workflow,
-  type LucideIcon,
-} from 'lucide-react'
+  Plugs,
+  SquaresFour,
+  TerminalWindow,
+  type Icon,
+} from '@phosphor-icons/react'
 
 import { cn } from '@/lib/utils'
 import { isShellSubstrateEnabled } from '@/lib/shell-substrate-flag'
@@ -47,7 +50,7 @@ import { useViewportShellVars } from '@/hooks/use-keyboard-viewport'
 interface NavItem {
   to: string
   label: string
-  icon: LucideIcon
+  icon: Icon
   /** Only the Overview route matches exactly; others match by prefix. */
   end?: boolean
   /** Onboarding-tour anchor id (sets `data-tour` on the nav link). */
@@ -80,31 +83,31 @@ interface NavItem {
 }
 
 const NAV: NavItem[] = [
-  { to: '/', label: 'Overview', icon: LayoutGrid, end: true },
+  { to: '/', label: 'Overview', icon: SquaresFour, end: true },
   // Focus — desktop-only entry that redirects to /focus/<last-active-session>
   // (see [[FocusEntry]] in routes/focus.tsx). `end: false` (default) so the
   // item stays highlighted while you're on any /focus/* sub-route. The
   // Terminal glyph (>_) matches the abstract-geometric rest of the rail and
   // names what focus mode IS — sitting inside a terminal session.
-  { to: '/focus', label: 'Focus', icon: Terminal, desktopOnly: true, grokHidden: true },
+  { to: '/focus', label: 'Focus', icon: TerminalWindow, desktopOnly: true, grokHidden: true },
   // Connectors — the Connector-store entry (#22). The store is a fully built
   // route (/store) that had NO nav surface at all; this `grokOnly` item makes it
   // a first-class Grok destination on the rail and the phone nav (Plug glyph,
   // the same mark the command palette already uses for it). Base app unchanged.
-  { to: '/store', label: 'Connectors', icon: Plug, grokOnly: true },
+  { to: '/store', label: 'Connectors', icon: Plugs, grokOnly: true },
   // Workflows — a bot, an ordered list of prompts, and one trigger (#—). Sits
   // immediately AFTER Connectors because that is the order the two are learned
   // in: you give a bot its tools, then you give it a job. `grokOnly` like the
   // store, so the BASE rail stays four items and no `--nav-n` / tab-count /
   // Liquid-Pill geometry is respec'd; under grok the phone bar goes 4 → 5.
-  { to: '/workflows', label: 'Workflows', icon: Workflow, grokOnly: true },
+  { to: '/workflows', label: 'Workflows', icon: FlowArrow, grokOnly: true },
   // Shared browser — the human's persistent, logged-in browser workspace
   // (shared-browser v1 §6.1). `grokOnly` for the same reason /store is: it is a
   // Grok-native doorway, and the base app must stay byte-identical (both nav
   // surfaces filter it out when grok is off, and `--nav-n` / the sliding pill
   // geometry follow the filtered count automatically).
   { to: '/browser', label: 'Browser', icon: Globe, grokOnly: true },
-  { to: '/files', label: 'Files', icon: FolderClosed },
+  { to: '/files', label: 'Files', icon: Folder },
   // Hosts registry AND the scheduler both moved into Settings (rare-use config
   // doesn't need a primary-nav slot). `/hosts` → /settings#hosts and
   // `/scheduler` → /settings#schedules (App.tsx) so old bookmarks land in the
@@ -118,7 +121,7 @@ const NAV: NavItem[] = [
   {
     to: '/settings',
     label: 'Settings',
-    icon: SettingsIcon,
+    icon: GearSix,
     tour: 'settings',
     badgeKind: 'updates',
     // Under grok the roster's top-right `.gr-me` avatar IS the Settings doorway
@@ -209,7 +212,7 @@ function SideNav({ grok }: { grok: boolean }) {
                           className="absolute inset-0 rounded-xl bg-primary"
                         />
                       )}
-                      <item.icon className="relative size-5" />
+                      <item.icon weight="duotone" className="relative size-5" />
                       {/* Desktop: place the dot at the icon's top-right corner.
                        *  inset-y centred on the icon: top ~10px, right ~10px so
                        *  it sits just outside the 20px icon glyph. */}
@@ -411,6 +414,7 @@ function BottomNav({ grok }: { grok: boolean }) {
                       outline→filled tell + lift on the active glyph; base CSS
                       ignores it and it is absent off grok (byte-identical). */}
                   <item.icon
+                    weight="duotone"
                     className="size-5"
                     data-active={grok && isActive ? '' : undefined}
                   />

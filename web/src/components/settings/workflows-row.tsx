@@ -11,7 +11,8 @@
 // in the wild (the old /scheduler redirect landed on this fragment), and a
 // fragment that scrolls nowhere is a broken link.
 
-import { ArrowRight, Workflow } from 'lucide-react'
+import { ArrowRight } from 'lucide-react'
+import { FlowArrow } from '@phosphor-icons/react'
 import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
 
@@ -34,7 +35,7 @@ export function WorkflowsRow() {
               to={WORKFLOWS_ROUTE}
               className="flex items-center gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <Workflow className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+              <FlowArrow weight="duotone" className="size-4 shrink-0 text-muted-foreground" aria-hidden />
               Workflows
             </Link>
           }
