@@ -78,6 +78,28 @@ export const STEP_STATUS: Record<
   cancelled: { label: 'stopped', icon: Minus, tone: 'text-muted-foreground' },
 }
 
+/** The chip a status glyph sits in — the tinted wash + the glyph's own colour,
+ *  keyed by the same six outcomes as {@link STEP_STATUS}. Encoding the outcome in
+ *  FORM (a coloured chip), not just a word, is what makes a run scannable. */
+const STATUS_CHIP: Record<string, string> = {
+  running: 'bg-primary/15 text-primary',
+  ok: 'bg-emerald-500/15 text-emerald-500',
+  skipped: 'bg-muted text-muted-foreground',
+  error: 'bg-destructive/15 text-destructive',
+  timeout: 'bg-amber-500/15 text-amber-500',
+  interrupted: 'bg-amber-500/15 text-amber-500',
+  cancelled: 'bg-muted text-muted-foreground',
+}
+
+/** The card wash for a run that did NOT end clean — a faint semantic tint so a
+ *  failure or a timeout reads at a glance in a stack of clean runs, without an
+ *  accent rail. Clean / running / skipped keep the neutral card. */
+const RUN_WASH: Record<string, string> = {
+  error: 'border-destructive/25 bg-destructive/[0.045]',
+  timeout: 'border-amber-500/25 bg-amber-500/[0.045]',
+  interrupted: 'border-amber-500/25 bg-amber-500/[0.045]',
+}
+
 /** How a step ended, in words rather than in an enum value. */
 export function signalLabel(signal: string): string {
   switch (signal) {
@@ -228,30 +250,48 @@ function RunCard({
     hour: 'numeric',
     minute: '2-digit',
   })
+  const dur = run.finished_at ? duration(run.started_at, run.finished_at) : ''
+  const trigger =
+    run.trigger === 'tick' ? 'on schedule' : run.trigger === 'manual' ? 'by hand' : run.trigger
+  // A failed / timed-out run tints its whole card and colours its label; a clean
+  // one stays neutral with the label in plain ink.
+  const bad = run.status === 'error' || run.status === 'timeout' || run.status === 'interrupted'
   const ending = run.finished_at && onComplete ? runEndingLine(onComplete, session) : null
 
   return (
-    <article className="rounded-xl border border-border bg-card px-3 py-2.5">
-      <header className="flex items-center gap-2">
-        <Icon
-          className={cn('size-4 shrink-0', status.tone, run.status === 'running' && 'animate-spin')}
+    <article className={cn('rounded-xl border px-3 py-2.5', RUN_WASH[run.status] ?? 'border-border bg-card')}>
+      <header className="flex items-center gap-2.5">
+        <span
+          className={cn(
+            'grid size-7 shrink-0 place-items-center rounded-lg',
+            STATUS_CHIP[run.status] ?? STATUS_CHIP.skipped,
+          )}
           aria-hidden="true"
-        />
-        <span className="text-[13.5px] font-medium text-foreground">{status.label}</span>
-        <span className="text-[12px] text-muted-foreground">
-          {when}
-          {run.finished_at ? ` · ${duration(run.started_at, run.finished_at)}` : ''}
+        >
+          <Icon className={cn('size-4', run.status === 'running' && 'animate-spin')} />
         </span>
-        <span className="ml-auto shrink-0 text-[11.5px] text-muted-foreground">
-          {run.trigger === 'tick' ? 'on schedule' : run.trigger === 'manual' ? 'by hand' : run.trigger}
+        <span
+          className={cn(
+            'text-[14px] font-semibold capitalize',
+            bad ? status.tone : 'text-foreground',
+          )}
+        >
+          {status.label}
+        </span>
+        <span className="text-[12.5px] tabular-nums text-muted-foreground">
+          {when}
+          {dur ? ` · ${dur}` : ''}
+        </span>
+        <span className="ml-auto shrink-0 rounded-full bg-secondary/60 px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+          {trigger}
         </span>
       </header>
 
       {run.note && (
-        <p className="mt-1 text-[12.5px] leading-snug text-muted-foreground">{run.note}</p>
+        <p className="mt-2 text-[12.5px] leading-snug text-muted-foreground">{run.note}</p>
       )}
 
-      <ol className="mt-2 flex flex-col">
+      <ol className="mt-2.5 flex flex-col">
         {detail.steps.map((sr, i) => (
           <StepNode
             key={sr.id}

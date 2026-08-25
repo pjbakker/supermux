@@ -122,14 +122,13 @@ export function WorkflowDetail() {
             />
             <span className="text-[12px] text-muted-foreground">{hint.steps}</span>
           </div>
-          <p className="mt-1.5 text-[12.5px] text-muted-foreground">
-            <span className="text-foreground/80">{hint.human}</span>
-            {' · '}
-            {running ? 'running now' : `next ${hint.next}`}
+          <p className="mt-2.5 text-[14px] font-medium text-foreground">{hint.human}</p>
+          <p className="mt-1 text-[12.5px] text-muted-foreground">
+            {running ? 'Running now' : `Next ${hint.next}`}
             {' · '}
             {`ran ${hint.last}`}
           </p>
-          <p className="mt-1 text-[12.5px] text-muted-foreground">
+          <p className="mt-1.5 text-[12.5px] text-muted-foreground">
             {completionSentence(action, w.session)}
           </p>
           <div className="mt-2.5 flex gap-2">
@@ -174,7 +173,7 @@ export function WorkflowDetail() {
           </div>
         </section>
 
-        <div role="tablist" aria-label="Workflow detail" className="flex gap-1">
+        <div role="tablist" aria-label="Workflow detail" className="flex gap-5 border-b border-border">
           {(['runs', 'steps'] as Tab[]).map((t) => (
             <button
               key={t}
@@ -183,13 +182,17 @@ export function WorkflowDetail() {
               aria-selected={tab === t}
               onClick={() => setTab(t)}
               className={cn(
-                'h-9 rounded-full px-3.5 text-[13px] font-medium transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                tab === t
-                  ? 'bg-foreground text-background'
-                  : 'bg-secondary text-muted-foreground hover:text-foreground',
+                'relative -mb-px h-9 text-[13.5px] font-semibold transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                tab === t ? 'text-foreground' : 'text-muted-foreground hover:text-foreground',
               )}
             >
               {t === 'runs' ? 'Runs' : 'Steps'}
+              {tab === t && (
+                <span
+                  className="absolute inset-x-0 -bottom-px h-0.5 rounded-full bg-primary"
+                  aria-hidden="true"
+                />
+              )}
             </button>
           ))}
         </div>
