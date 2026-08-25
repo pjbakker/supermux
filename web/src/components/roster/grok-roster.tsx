@@ -791,6 +791,34 @@ export default function GrokRoster() {
   )
   const groups = React.useMemo(() => groupSessions(sorted, needNames), [sorted, needNames])
 
+  // SWITCHING COMPANY RE-HOMES THE PANE. The rail's scope (`activeCompany`) only
+  // ever filtered the LIST; the open agent was left untouched, so after a switch
+  // you kept staring at a bot from the company you just left — it stayed resolved
+  // because `selectedSession` looks it up in the full roster, not the scoped one.
+  // Reconcile here, in render (previous-value-in-state, the same "adjust state
+  // while rendering" pattern the pane-reset below uses — never an effect, so the
+  // stale bot is never painted for even one frame): when the open selection no
+  // longer belongs to the new scope, open the company's TOP agent — the first row
+  // the rail shows, in its own attention order (needs → active → done → idle) —
+  // or clear the pane when the company has no bots. A global search lifts scoping
+  // (`hasQuery`), so it never re-homes; and a selection that IS in scope (you
+  // switched INTO the company that owns it) is kept as-is.
+  const [scopeAt, setScopeAt] = React.useState(activeCompany)
+  if (activeCompany !== scopeAt) {
+    setScopeAt(activeCompany)
+    if (!hasQuery && selected) {
+      const stillInScope =
+        selected.kind === 'bot'
+          ? filtered.some((s) => s.name === selected.name)
+          : filteredTeams.some((t) => t.team_name === selected.team)
+      if (!stillInScope) {
+        const top =
+          groups.needs[0] ?? groups.active[0] ?? groups.done[0] ?? groups.idle[0] ?? null
+        setSelected(top ? { kind: 'bot', name: top.name } : null)
+      }
+    }
+  }
+
   // Per-company attention for the switcher's need-you dots — the cross-company
   // awareness the scoped census (above) intentionally drops. Computed from the
   // FULL, UNFILTERED roster (`allSessions`, so scope/search never hide a signal)

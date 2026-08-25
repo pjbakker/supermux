@@ -534,6 +534,14 @@ export function ChatConversation({
           // body (the jury's worst honesty break). Inert off grok — the base
           // app's dot is unchanged.
           tailError={isError}
+          // The mode switch presses Shift+Tab to converge; while ANY prompt is on
+          // screen that keystroke would answer it, so the header's mode chip stays
+          // an inert label until the dialog / permission / question is gone.
+          modeLocked={
+            dialog != null ||
+            session?.permission_request != null ||
+            session?.question_request != null
+          }
         />
       }
       footer={

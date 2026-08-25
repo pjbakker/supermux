@@ -161,8 +161,17 @@ export function CompanySwitcher({
         return
       }
       // Jump-to-Nth — ⌘/Ctrl+1..9, only without Shift (Shift+digit is a symbol).
+      // ⌘1 is ALWAYS HQ (so HQ has a shortcut of its own); companies start at ⌘2,
+      // so ⌘2 → the first company, ⌘3 → the second, and so on.
       if (!e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
-        const c = companyForDigit(companies, Number(e.key))
+        const digit = Number(e.key)
+        if (digit === 1) {
+          e.preventDefault()
+          setActiveCompany(null)
+          setOpen(false)
+          return
+        }
+        const c = companyForDigit(companies, digit - 1)
         if (c) {
           e.preventDefault()
           setActiveCompany(c.id)
@@ -276,6 +285,11 @@ export function CompanySwitcher({
           {attention.has(null) && <span className="sr-only"> — needs you</span>}
           <span className="ml-auto flex items-center gap-2 pl-2">
             {attention.has(null) && <NeedDot />}
+            {!sheet && (
+              <kbd className="hidden text-[11px] tabular-nums text-muted-foreground sm:inline">
+                ⌘1
+              </kbd>
+            )}
             {activeCompany === null && (
               <Check size={16} style={{ color: 'var(--sm-accent)' }} aria-hidden />
             )}
@@ -319,9 +333,9 @@ export function CompanySwitcher({
               {needs && <span className="sr-only"> — needs you</span>}
               <span className="ml-auto flex items-center gap-2 pl-2">
                 {needs && <NeedDot />}
-                {!sheet && i < 9 && (
+                {!sheet && i < 8 && (
                   <kbd className="hidden text-[11px] tabular-nums text-muted-foreground sm:inline">
-                    ⌘{i + 1}
+                    ⌘{i + 2}
                   </kbd>
                 )}
                 {on && (

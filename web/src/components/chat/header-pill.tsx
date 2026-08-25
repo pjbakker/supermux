@@ -45,6 +45,10 @@ import { attentionFor } from '../../lib/mark-status'
 import { motionOff, tweens } from '../../lib/springs'
 import { cn } from '../../lib/utils'
 import { modeChipLabel } from '../focus-mode/mode-labels'
+// A local zustand store (no query layer) — safe to import into this
+// bun-test-rendered module: opening the shell's agent-tools sheet is a setState,
+// and it is where the permission-mode switcher lives (relocated in 6905fe0).
+import { useAgentToolsSheet } from '../../stores/claude-tools-store'
 import { usageTitle, worstWindow } from '../../lib/rate-limits'
 import { StatusDot } from '../session-tile/status-dot'
 import type { TileSession } from '../session-tile/types'
@@ -127,16 +131,57 @@ function TitleChevron() {
  * trailing slot and the desktop can keep it in the row without two copies of the
  * class list drifting apart.
  */
-function ModeChip({ children, className }: { children: React.ReactNode; className?: string }) {
+function ModeChip({
+  children,
+  className,
+  onOpen,
+  label,
+}: {
+  children: React.ReactNode
+  className?: string
+  /** When set, the chip is a BUTTON that opens the permission-mode switcher —
+   *  the owner taps this to change or reset the mode (bypass restarts the pty; the
+   *  other three switch live). Absent → a plain, non-interactive label. */
+  onOpen?: () => void
+  /** The accessible name for the interactive chip (the visible text is often just
+   *  the mode word or a glyph). */
+  label?: string
+}) {
+  const cls = cn(
+    'flex-none rounded-full border-[0.5px] border-hairline-soft bg-fill-soft px-2 py-[3px] text-[11.5px] font-medium tracking-[0.1px] text-ink-2',
+    onOpen &&
+      'inline-flex items-center gap-1 cursor-pointer transition-colors hover:bg-fill-soft-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+    className,
+  )
+  if (onOpen) {
+    return (
+      <button type="button" onClick={onOpen} aria-label={label} title={label} className={cls}>
+        {children}
+      </button>
+    )
+  }
+  return <span className={cls}>{children}</span>
+}
+
+/** The permission-mode glyph — a small shield. Shown alone in the Normal state
+ *  (where there is no mode word to draw) so the switch is still reachable without
+ *  cluttering the common header with the word "Normal". */
+function ShieldGlyph() {
   return (
-    <span
-      className={cn(
-        'flex-none rounded-full border-[0.5px] border-hairline-soft bg-fill-soft px-2 py-[3px] text-[11.5px] font-medium tracking-[0.1px] text-ink-2',
-        className,
-      )}
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="text-ink-3"
+      aria-hidden="true"
     >
-      {children}
-    </span>
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    </svg>
   )
 }
 
@@ -249,6 +294,14 @@ export interface SessionHeaderPillProps {
   leading?: React.ReactNode
   trailing?: React.ReactNode
   /**
+   * A blocking prompt is on screen (a pty dialog, a permission request, or an
+   * AskUserQuestion). Switching mode converges by pressing Shift+Tab, and that
+   * keystroke would ANSWER the prompt (BTab accepts a permission dialog — a0 §3,
+   * live-verified), so while one is up the mode chip is an INERT label, never a
+   * control. Gated here by construction — the gate that cannot be forgotten.
+   */
+  modeLocked?: boolean
+  /**
    * The quiet status bits — the data-plane chip (`<ConnectionNote>`: "Not up to
    * date", "Offline", …). Separated from `trailing` (the renderer toggle) so the
    * phone header can GROUP the status bits together and give the toggle its own
@@ -306,6 +359,7 @@ export function SessionHeaderPill({
   surface = 'desktop',
   leading,
   trailing,
+  modeLocked,
   connection,
   offline = false,
   tailError = false,
@@ -326,6 +380,10 @@ export function SessionHeaderPill({
   // `normal` is the absence of a mode rather than a mode; a chip that always
   // reads "Normal" is one more thing to look past.
   const mode = session?.mode && session.mode !== 'normal' ? modeChipLabel(session.mode) : null
+  // Tapping the mode chip opens the permission-mode switcher (the working control
+  // in the shell's agent-tools sheet). Scoped to this session so bypass relaunches
+  // the right pty.
+  const openTools = useAgentToolsSheet((s) => s.openSheet)
 
   // The presence dot — green "ready" / the busy spinner / the grey offline disc.
   // It doubles as the ACTIVITY spinner (busy states spin it), so there is one
@@ -538,7 +596,24 @@ export function SessionHeaderPill({
                 )
               ) : (
                 <>
-                  {mode && <ModeChip className="ml-auto">{mode}</ModeChip>}
+                  {/* The permission-mode switch — reachable on desktop so you can
+                      enter a mode (bypass, plan…) from Normal too, and reset out of
+                      it. Labeled when in a mode; a subtle shield in Normal (no
+                      "Normal" clutter). Tap → the mode switcher. While a prompt is
+                      up (`modeLocked`) it is an inert LABEL: the switch presses
+                      Shift+Tab, which would answer the prompt. In Normal it then
+                      has nothing to say, so it drops out entirely (as before). */}
+                  {(mode || !modeLocked) && (
+                    <ModeChip
+                      className="ml-auto"
+                      onOpen={modeLocked ? undefined : () => openTools(name)}
+                      label={
+                        mode ? `Permission mode: ${mode} — tap to change` : 'Set permission mode'
+                      }
+                    >
+                      {mode ?? <ShieldGlyph />}
+                    </ModeChip>
+                  )}
                   {connection}
                   {trailing}
                 </>
