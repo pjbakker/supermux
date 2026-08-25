@@ -333,10 +333,17 @@ describe('the SignInSheet keeps the field-aware contract', () => {
 describe('the TakeoverPanel wires the smart path', () => {
   const src = readFileSync(new URL('../../src/components/browser/takeover-panel.tsx', import.meta.url), 'utf8')
 
-  test('proactively scans, and the Sign-in control is gated on the scan', () => {
+  test('proactively scans, feeds the gate to the sheet, and exposes the toolbar triggers', () => {
     expect(src).toContain('signInGate(snap.caps.signIn, snap.loginScan)')
     expect(src).toContain('socketRef.current?.scanLogin()')
-    expect(src).toContain('data-signin-gate={signIn.kind}')
+    // The gate still drives the sheet; the Paste/Sign-in TRIGGERS moved OUT of a
+    // canvas overlay and onto the chrome toolbar via the control bridge.
+    expect(src).toContain('gate={signIn}')
+    expect(src).toContain('openSignIn:')
+    expect(src).toContain('paste:')
+    // No floating cluster over the page any more.
+    expect(src).not.toContain('data-takeover-signin')
+    expect(src).not.toContain('data-takeover-paste')
   })
 
   test('the detected fill types each value into its selector via fillField; Enter only on opt-in', () => {
@@ -347,5 +354,33 @@ describe('the TakeoverPanel wires the smart path', () => {
   test('caps-absent still hands the sheet the blind relay (degrade, not spin)', () => {
     expect(src).toContain('onBlindFill={relaySignIn}')
     expect(src).toContain('onFillDetected={relayDetectedFill}')
+  })
+})
+
+describe('the toolbar hosts Paste + Sign-in (out of the page)', () => {
+  const chrome = readFileSync(
+    new URL('../../src/components/browser/browser-chrome.tsx', import.meta.url),
+    'utf8',
+  )
+  const ws = readFileSync(
+    new URL('../../src/components/browser/workspace.tsx', import.meta.url),
+    'utf8',
+  )
+
+  test('driving shows Paste + Sign-in in the toolbar slot; watching shows resync', () => {
+    // One slot, forked on `driving` — Paste/Sign-in while driving, the resync
+    // ("refresh the picture") while watching.
+    expect(chrome).toContain('driving ? (')
+    expect(chrome).toContain('data-chrome-paste')
+    expect(chrome).toContain('data-chrome-signin')
+    expect(chrome).toContain('data-chrome-resync')
+  })
+
+  test('Sign-in carries the no-form reason (the "not usable when no fields" rule)', () => {
+    expect(chrome).toContain('signInDisabledReason')
+    // The workspace computes the gate and passes the reason + the triggers.
+    expect(ws).toContain('signInGate(caps.signIn')
+    expect(ws).toContain('onPaste={() => ctl.current?.paste()}')
+    expect(ws).toContain('onSignIn={() => ctl.current?.openSignIn()}')
   })
 })

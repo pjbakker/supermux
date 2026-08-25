@@ -105,6 +105,8 @@ import {
 } from '@/lib/browser/closed-tabs'
 import { applyOrder } from '@/lib/browser/tab-order'
 import { NO_CAPS, NO_FIND, copyText, type FindResult, type PageCaps } from '@/lib/browser/page-tools'
+import { signInGate } from '@/lib/browser/sign-in-state'
+import type { LoginScan } from '@/lib/browser/login-detect'
 
 /** What the live socket knows that the tab row does not. Flat values plus the
  *  nav state — which is itself flat, changes a few times per navigation, and is
@@ -118,6 +120,9 @@ interface PanelHead {
    *  server today — the find bar reads it and says so. */
   caps: PageCaps
   find: FindResult
+  /** The last login scan — what `signInGate` reads to decide whether the
+   *  toolbar's Sign-in is usable (a page with no login form disables it). */
+  loginScan: LoginScan | null
 }
 
 export interface BrowserWorkspaceProps {
@@ -348,6 +353,9 @@ export function BrowserWorkspace({
   // ── find ───────────────────────────────────────────────────────────────────
   const caps = head?.caps ?? NO_CAPS
   const findResult = head?.find ?? NO_FIND
+  // Sign-in's usability, for the toolbar: disabled with a reason when the page
+  // has no login form (the same gate the sheet reads).
+  const signInState = signInGate(caps.signIn, head?.loginScan ?? null)
   const openFind = () => {
     setFinding(true)
     setFindFocus((n) => n + 1)
@@ -611,6 +619,13 @@ export function BrowserWorkspace({
           )
         }
         onResync={() => ctl.current?.resync()}
+        onPaste={() => ctl.current?.paste()}
+        onSignIn={() => ctl.current?.openSignIn()}
+        signInDisabledReason={
+          signInState.kind === 'disabled' || signInState.kind === 'frame'
+            ? signInState.reason
+            : undefined
+        }
         onWatch={() => ctl.current?.handBack()}
         onDrive={() => ctl.current?.takeOver()}
         onMenu={() => active && setSheetFor(active.id)}
@@ -752,6 +767,7 @@ function PanelBridge({
   const nav = head.snapshot.nav
   const caps = head.snapshot.caps
   const find = head.snapshot.find
+  const loginScan = head.snapshot.loginScan
   // Field-by-field, not by object identity: the snapshot object is rebuilt on
   // every patch, so depending on it would re-run this effect for a `refused`
   // banner or a mode echo that the chrome does not read.
@@ -765,6 +781,7 @@ function PanelBridge({
       driving,
       caps,
       find,
+      loginScan,
       nav: { url, title, favicon, loading, canGoBack, canGoForward, secure, dialog },
     })
   }, [
@@ -772,6 +789,7 @@ function PanelBridge({
     driving,
     caps,
     find,
+    loginScan,
     onChange,
     url,
     title,

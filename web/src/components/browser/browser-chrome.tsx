@@ -35,7 +35,7 @@
 // same reason.
 import * as React from 'react'
 
-import { Aperture, MoreHorizontal, Power, Users } from 'lucide-react'
+import { Aperture, ClipboardPaste, KeyRound, MoreHorizontal, Power, Users } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import { activeGrantees, tabState, type BrowserTab } from '@/lib/api/browser'
@@ -92,8 +92,18 @@ export interface BrowserChromeProps {
   onBack?: () => void
   onForward?: () => void
   onStop?: () => void
-  /** Ask the socket for a fresh full frame — the picture, not the page. */
+  /** Ask the socket for a fresh full frame — the picture, not the page. Shown
+   *  in the toolbar only while WATCHING; while driving the slot holds Paste +
+   *  Sign-in instead (a canvas cannot be autofilled, so they reach the page
+   *  from the toolbar rather than floating over — and covering — the page). */
   onResync?: () => void
+  /** Type the clipboard into the focused page field (driving only). */
+  onPaste?: () => void
+  /** Open the field-aware sign-in sheet (driving only). */
+  onSignIn?: () => void
+  /** When set, Sign-in is disabled and carries this reason (no login form on the
+   *  page / the form is in a cross-origin frame). */
+  signInDisabledReason?: string
   onWatch: () => void
   onDrive: () => void
   onMenu: () => void
@@ -123,6 +133,9 @@ export function BrowserChrome({
   onForward,
   onStop,
   onResync,
+  onPaste,
+  onSignIn,
+  signInDisabledReason,
   onWatch,
   onDrive,
   onMenu,
@@ -232,17 +245,43 @@ export function BrowserChrome({
               data-chrome-wake=""
             />
           )}
-          {/* Not the page — the PICTURE. `resync` asks the socket for a fresh
-              full frame, which is the fix for a canvas that has drifted. A
-              distinct icon from Reload on purpose: they repair different
-              things, and Reload now lives in `NavControls` next door. */}
-          <ChromeButton
-            label="Refresh the picture"
-            icon={Aperture}
-            disabled={!live || !onResync}
-            onClick={() => onResync?.()}
-            data-chrome-resync=""
-          />
+          {/* One slot, context-appropriate. WHILE DRIVING it holds Paste +
+              Sign-in — a canvas cannot be autofilled (the human's clipboard and
+              password manager cannot see fields that live in a picture), so they
+              reach the page from HERE rather than floating over — and covering —
+              the page's own buttons. WHILE WATCHING it holds resync ("refresh the
+              picture"), which repairs a drifted canvas and matters more when you
+              are only looking. */}
+          {driving ? (
+            <>
+              <ChromeButton
+                label="Paste into the focused field"
+                icon={ClipboardPaste}
+                disabled={!live || !onPaste}
+                onClick={() => onPaste?.()}
+                data-chrome-paste=""
+              />
+              {/* Disabled with a reason when the page has no login form (the
+                  smart sign-in's "not usable when there are no fields"); it still
+                  opens the sheet on tap so the reason is legible on a phone. */}
+              <ChromeButton
+                label={signInDisabledReason ?? 'Sign in to this page'}
+                icon={KeyRound}
+                disabled={!live || !onSignIn}
+                onClick={() => onSignIn?.()}
+                data-chrome-signin=""
+                data-signin-disabled={signInDisabledReason ? '' : undefined}
+              />
+            </>
+          ) : (
+            <ChromeButton
+              label="Refresh the picture"
+              icon={Aperture}
+              disabled={!live || !onResync}
+              onClick={() => onResync?.()}
+              data-chrome-resync=""
+            />
+          )}
           {/* No flex-1 spacer here: in a WRAPPING row a growing spacer eats
               the first line and pushes the Watch/Drive pair onto a second one.
               `justify-end` on the group does the same job without competing

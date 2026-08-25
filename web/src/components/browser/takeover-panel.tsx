@@ -69,9 +69,7 @@ import * as React from 'react'
 import {
   ChevronLeft,
   ChevronRight,
-  ClipboardPaste,
   Keyboard,
-  KeyRound,
   Loader2,
   Minimize2,
   Power,
@@ -214,6 +212,15 @@ export interface TakeoverControls {
   findClose: () => void
   /** Ask for the page's current selection as text. `false` = no copy-out. */
   copySelection: () => boolean
+  // ── the driving affordances, hoisted to the toolbar ─────────────────────────
+  // Paste and Sign-in used to float over the canvas bottom-right, where they
+  // covered the page's own buttons. The host renders them in the chrome toolbar
+  // instead (only while driving); these are how it triggers them without
+  // reaching into the panel's state.
+  /** Type the clipboard into the focused page field. */
+  paste: () => void
+  /** Open the field-aware sign-in sheet (which scans + maps + fills). */
+  openSignIn: () => void
 }
 
 /** What a host-drawn header renders from. Plain values only. */
@@ -481,6 +488,26 @@ export function TakeoverPanel({
           sock.find(query, opts),
         findClose: () => sock.findClose(),
         copySelection: () => sock.copySelection(),
+        // The clipboard, typed into the focused page field. Read here (not via
+        // the later `pasteFromClipboard`, which this effect cannot close over)
+        // and relayed as text; a blocked clipboard fails quietly. The toolbar
+        // only offers this while driving, and the server refuses text otherwise.
+        paste: () => {
+          navigator.clipboard
+            ?.readText()
+            .then((t) => {
+              if (t) sock.text(t)
+            })
+            .catch(() => {
+              /* clipboard blocked — the trap-input paste still works */
+            })
+        },
+        openSignIn: () => {
+          // Re-scan on open so a form that appeared after a client-side route
+          // change is picked up; `scanLogin` no-ops when the relay has no caps.
+          sock.scanLogin()
+          setSignInOpen(true)
+        },
       }
     }
     if (attached) sock.start()
@@ -1179,20 +1206,9 @@ export function TakeoverPanel({
     socketRef.current?.focusField(selector)
   }
 
-  // One tap: the clipboard the human already holds, typed into the focused page
-  // field. `readText()` can reject (permission, an insecure origin, a browser
-  // that still wants its own gesture) — when it does, the trap input's
-  // long-press paste and the sign-in sheet are the fallbacks, so this fails
-  // quietly rather than raising a toast for a non-error.
-  const pasteFromClipboard = async () => {
-    if (!driving) return
-    try {
-      const text = await navigator.clipboard.readText()
-      if (text) socketRef.current?.text(text)
-    } catch {
-      /* clipboard blocked — trap-input paste + the sheet still work */
-    }
-  }
+  // Paste (the clipboard, typed into the focused field) now lives in the chrome
+  // toolbar via `TakeoverControls.paste`; the panel no longer floats it over the
+  // page. See the controls setup above and `browser-chrome.tsx`.
 
   // ── what the box is doing, and the one thing to do about it ────────────────
   const view = viewportState({
@@ -1465,58 +1481,10 @@ export function TakeoverPanel({
           className="absolute left-0 top-0 size-px border-0 bg-transparent p-0 text-transparent caret-transparent opacity-0 outline-none"
         />
 
-        {/* THE FILL CLUSTER. A canvas cannot be autofilled — the human's own
-            password manager and their clipboard cannot see fields that live in
-            a picture — so paste and sign-in reach the page from HERE. Shown
-            only while driving (typing into a watched page is what the wheel
-            prevents) and only when a page is visible (a `screen` cover means
-            there is nothing to fill yet). Bottom-RIGHT so it clears the centred
-            zoom-reset; `stopPropagation` on pointer-down so a tap on the pill
-            never also lands as a click on the page beneath it. */}
-        {driving && view.cover !== 'screen' && (
-          <div
-            style={{ bottom: 'max(12px, env(safe-area-inset-bottom))' }}
-            className="absolute right-3 z-20 flex items-center gap-2"
-          >
-            <button
-              type="button"
-              data-takeover-paste=""
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => void pasteFromClipboard()}
-              className="inline-flex min-h-11 items-center gap-1.5 rounded-full border border-hairline bg-surface/95 px-4 text-[12.5px] font-medium text-ink shadow-lg backdrop-blur transition-colors hover:bg-fill-soft motion-reduce:transition-none"
-            >
-              <ClipboardPaste className="size-3.5" aria-hidden />
-              Paste
-            </button>
-            {/* GATED on the scan (spec §3.1): when the page has no login form
-                the control is not usable — muted, `aria-disabled`, and carrying
-                the reason. It still opens the sheet (which explains, never
-                spins), because a dead button on a phone has no way to say why.
-                Tapping it also re-scans on a capable relay, so a form that
-                appeared after a client-side route change is picked up. */}
-            <button
-              type="button"
-              data-takeover-signin=""
-              data-signin-gate={signIn.kind}
-              aria-disabled={signIn.kind === 'disabled' ? true : undefined}
-              title={signIn.kind === 'disabled' || signIn.kind === 'frame' ? signIn.reason : undefined}
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => {
-                if (snap.caps.signIn) socketRef.current?.scanLogin()
-                setSignInOpen(true)
-              }}
-              className={cn(
-                'inline-flex min-h-11 items-center gap-1.5 rounded-full border border-hairline bg-surface/95 px-4 text-[12.5px] font-medium shadow-lg backdrop-blur transition-colors motion-reduce:transition-none',
-                signIn.kind === 'disabled'
-                  ? 'text-ink-3 hover:bg-surface/95'
-                  : 'text-ink hover:bg-fill-soft',
-              )}
-            >
-              <KeyRound className="size-3.5" aria-hidden />
-              Sign in
-            </button>
-          </div>
-        )}
+        {/* Paste + Sign-in moved OUT of the canvas (they floated bottom-right and
+            covered the page's own buttons) and into the chrome toolbar — see
+            `browser-chrome.tsx`, driven through `TakeoverControls.paste` /
+            `.openSignIn`. Nothing is drawn over the page here any more. */}
 
         {view.cover === 'screen' && (
           <ViewportScreen view={view} onAct={act} canWake={!!onWake} canReload={!!onReload} />
