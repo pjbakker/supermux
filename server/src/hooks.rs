@@ -183,6 +183,31 @@ async fn hook_handler(
     // variant and are skipped here — they are handled by the activity/lifecycle
     // dispatch below, NOT by the turn state machine.
     if let Some(event) = HookEvent::from_event_str(&body.event) {
+        // An `idle_prompt` notification is Claude Code's POST-TURN idle ping
+        // ("Claude is waiting for your input"), fired while the session sits at its
+        // empty `❯` prompt — NOT a needs-you signal (only `permission_prompt` /
+        // `agent_needs_input` are; the activity dispatch below keeps that
+        // distinction for `waiting_message`). Folding it into the turn machine as a
+        // generic Notification lets it read `Waiting` — the roster's red "needs
+        // you" — whenever the turn's own `Stop` hook was missed/raced (hooks run
+        // `--max-time 1`), so `turn_end` never advanced past `turn_start` and
+        // `TurnState::classify`'s `turn_already_ended` guard cannot fire. Record it
+        // as a turn END instead: an idle_prompt PROVES the turn is over, so the
+        // machine settles straight to Idle without ever passing through Active
+        // (unlike merely dropping it). `record_hook` only folds into `TurnState`
+        // — no notification, DB write or SSE — so the remap has no collateral.
+        let event = if matches!(event, HookEvent::Notification)
+            && body
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("notification_type").or_else(|| p.get("notificationType")))
+                .and_then(Value::as_str)
+                == Some("idle_prompt")
+        {
+            HookEvent::Stop
+        } else {
+            event
+        };
         state.record_hook(&body.session, event);
     }
 
