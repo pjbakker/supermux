@@ -463,7 +463,6 @@ export const SCAN_LOGIN_JS: string = '(() => {' + LOGIN_DETECT_BODY + '})()'
  */
 export function detectLogin(document: Document, window?: Window & typeof globalThis): LoginScan {
   const win = window ?? (document.defaultView as Window & typeof globalThis)
-  // eslint-disable-next-line no-new-func
   const fn = new Function('document', 'window', LOGIN_DETECT_BODY) as (
     d: Document,
     w: Window & typeof globalThis | null,

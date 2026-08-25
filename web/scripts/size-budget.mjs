@@ -1119,7 +1119,14 @@ const BUDGET_ENTRY_JS = 161 * KB
 // socket), and their data layers — each paid for only by a visitor who opens that
 // surface. THE HERO PATH DID NOT MOVE: entry JS is 153.12 / 161 KB (95%), so none
 // of these six features lands on cold load. ceil(measured)=384, same rule as B3.
-const BUDGET_APP_JS = 384 * KB
+//
+// RATCHETED 384 → 412 by the shared-browser mobile wave: the smart field-aware
+// sign-in (detection algorithm + state machine + sheet), the browser toolbar +
+// keyboard/viewport fixes, and the mobile-UA path. All of it lands in the LAZY
+// /browser + roster chunks (takeover-panel-*.js is its own 15.68 KB chunk), not
+// on cold load — the ENTRY gate held at 153.46 / 161 KB (95%). ceil(measured 405.25)
+// + a little headroom = 412, same argue-in-the-PR rule as every bump above.
+const BUDGET_APP_JS = 412 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating
@@ -1163,7 +1170,11 @@ const BUDGET_APP_JS = 384 * KB
 // without a ratchet; ceil(measured)=34, the same rule the ratchets above use.
 // Phone-scoped + grok-scoped: the ENTRY gate is unmoved and green (157.10/161),
 // desktop keeps its static header, and the base app off grok matches none of it.
-const BUDGET_CSS = 34 * KB
+//
+// RATCHETED 34 → 36 by the shared-browser mobile wave (the takeover chrome,
+// safe-area rules on the remaining full-screen panels, and the sign-in sheet).
+// Measured 34.83; ceil + headroom = 36, same rule as above. ENTRY gate unmoved.
+const BUDGET_CSS = 36 * KB
 
 function gzipSize(path) {
   return gzipSync(readFileSync(path), { level: 9 }).length
