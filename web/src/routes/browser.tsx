@@ -24,8 +24,15 @@ export function BrowserRoute() {
   // reaped) must not leave the route pointing at a row that no longer exists.
   const active = tabs.some((t) => t.id === activeId) ? activeId : tabs[0]?.id ?? null
 
-  return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+    return (
+    // `h-full`, not `flex-1`: the shell's `<main#shell-content>` is a BLOCK
+    // scroll container (`display:block; overflow:auto`) so that grow-and-scroll
+    // routes (overview, files) work. `flex-1` is inert inside a block parent —
+    // flex-grow only applies in a flex container — so a `flex-1` child collapses
+    // to its CONTENT height, and the takeover box then sizes to the 512² seed
+    // frame instead of the viewport (the black-band bug). `h-full` takes 100% of
+    // main's definite height, giving the flex chain below a real box to fill.
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
       <BrowserWorkspace
         tabs={tabs}
         activeId={active}
