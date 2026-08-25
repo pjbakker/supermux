@@ -743,8 +743,17 @@ function TeamPanelBody({
 
   return (
     <div className={cn('flex min-h-0 flex-col', variant === 'pane' && 'h-full')}>
-      {/* sticky header — facepile · team name · crew sub-line · Open thread */}
-      <header className="flex items-center gap-3 border-b border-border bg-background/80 px-5 py-3 backdrop-blur-sm">
+      {/* sticky header — facepile · team name · crew sub-line · Open thread.
+          Full-screen `pane` on a phone reserves the iOS status-bar inset (0 on
+          desktop / in a browser tab); the `sheet` drawer keeps plain padding. */}
+      <header
+        className={cn(
+          'flex items-center gap-3 border-b border-border bg-background/80 px-5 pb-3 backdrop-blur-sm',
+          variant === 'pane'
+            ? 'pt-[max(0.75rem,env(safe-area-inset-top))]'
+            : 'pt-3',
+        )}
+      >
         {team.members.length > 0 ? (
           <Facepile team={team} />
         ) : (

@@ -888,8 +888,22 @@ function BotPanelBody({
 
   return (
     <div className={cn('flex min-h-0 flex-col', variant === 'pane' && 'h-full')}>
-      {/* sticky header — face · editable name · sub-line · Open thread · [...] */}
-      <header className="flex items-center gap-3 border-b border-border bg-background/80 px-5 py-3 backdrop-blur-sm">
+      {/* sticky header — face · editable name · sub-line · Open thread · [...]
+          The `pane` variant is FULL-SCREEN on a phone (the grok roster's detail
+          view), so its top runs under the iOS status bar / Dynamic Island unless
+          it reserves the inset — the same fix Overview/Files/Connectors got.
+          `env(safe-area-inset-top)` is 0 on desktop and in a normal browser tab,
+          so this is a no-op off a notched standalone PWA; `max()` keeps the base
+          0.75rem there. The `sheet` variant is a bottom drawer — never under the
+          status bar — so it keeps the plain `py-3`. */}
+      <header
+        className={cn(
+          'flex items-center gap-3 border-b border-border bg-background/80 px-5 pb-3 backdrop-blur-sm',
+          variant === 'pane'
+            ? 'pt-[max(0.75rem,env(safe-area-inset-top))]'
+            : 'pt-3',
+        )}
+      >
         <SessionFace name={name} status={session?.status} size={40} />
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="min-w-0">
