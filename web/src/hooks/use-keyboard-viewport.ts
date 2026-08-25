@@ -353,3 +353,92 @@ export function useViewportShellVars(): void {
     )
   }, [height, keyboardInset, keyboardOffsetTop, keyboardOpen])
 }
+
+/**
+ * **Shrink the whole app root to the visible viewport while a keyboard is open.**
+ *
+ * The takeover canvas is a FILL surface (like the chat column): it must end
+ * exactly on the keyboard top, not scroll under it and not leave a black band.
+ * The documented iOS behaviour is that the LAYOUT viewport keeps its full height
+ * while `visualViewport.height` shrinks (and `offsetTop` scrolls) — so any
+ * normal-flow "subtract the keyboard with a margin" trick fights the iOS scroll
+ * and over/under-shoots. This is the technique the chat composer already uses on
+ * the owner's iOS PWA (`kb-modes/mode-9-root-resize.tsx`), lifted into a hook:
+ * imperatively pin `html`/`body`/`#root` to `visualViewport.height` (inline
+ * `height` AND `minHeight`, because globals.css pins all three to
+ * `min-height:100vh` under `display-mode: standalone`, and min-height beats
+ * height). The normal-flow `h-full` chain below then collapses onto the keyboard
+ * top with no `lift`, no fixed, no translate.
+ *
+ * Guarded on `active` (only while the surface owns the keyboard) AND on the
+ * shared open-detector (so a cold-launch short `visualViewport.height` never
+ * pins a black bar). Every inline value is saved and restored on close/unmount,
+ * touching ONLY height/minHeight — it never clobbers the CSS vars
+ * `useViewportShellVars` writes to `<html>`.
+ */
+export function useKeyboardRootResize(active: boolean): void {
+  React.useEffect(() => {
+    if (!active) return
+    const visual = typeof window !== 'undefined' ? window.visualViewport : undefined
+    if (!visual) return
+
+    const targets = (
+      [
+        document.documentElement,
+        document.body,
+        document.getElementById('root'),
+      ].filter(Boolean) as HTMLElement[]
+    ).map((el) => ({
+      el,
+      prevHeight: el.style.height,
+      prevMinHeight: el.style.minHeight,
+      mutated: false,
+    }))
+
+    let raf = 0
+    const detect = createKeyboardOpenDetector()
+
+    const restore = () => {
+      for (const t of targets) {
+        if (!t.mutated) continue
+        t.el.style.height = t.prevHeight
+        t.el.style.minHeight = t.prevMinHeight
+        t.mutated = false
+      }
+    }
+
+    const apply = () => {
+      raf = 0
+      const { open } = detect(visual)
+      if (open) {
+        const px = `${visual.height}px`
+        for (const t of targets) {
+          t.el.style.height = px
+          t.el.style.minHeight = px
+          t.mutated = true
+        }
+      } else {
+        restore()
+      }
+    }
+
+    const schedule = () => {
+      if (raf) return
+      raf =
+        typeof requestAnimationFrame !== 'undefined'
+          ? requestAnimationFrame(apply)
+          : (apply() as unknown as number)
+    }
+
+    apply()
+    visual.addEventListener('resize', schedule)
+    visual.addEventListener('scroll', schedule)
+
+    return () => {
+      if (raf) cancelAnimationFrame(raf)
+      visual.removeEventListener('resize', schedule)
+      visual.removeEventListener('scroll', schedule)
+      restore()
+    }
+  }, [active])
+}

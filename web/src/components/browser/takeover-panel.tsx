@@ -123,7 +123,7 @@ import {
 } from '@/lib/browser/zoom'
 import { keyboardScrollDelta, trapKeyAction } from '@/lib/browser/keyboard-trap'
 import { viewportState, type ViewportVerb, type ViewportView } from '@/lib/browser/viewport-state'
-import { useKeyboardViewport } from '@/hooks/use-keyboard-viewport'
+import { useKeyboardViewport, useKeyboardRootResize } from '@/hooks/use-keyboard-viewport'
 import { PageDialogSurface } from '@/components/browser/page-dialog'
 
 /** Cap the backing store at 2× — a 3× phone would triple the fill cost of
@@ -627,7 +627,15 @@ export function TakeoverPanel({
   // instead of a page scrolled out from under their thumb.
   const kbInset = benchKeyboard ?? (kb.keyboardOpen ? kb.keyboardInset : 0)
   const keyboardUp = driving && kbInset > 0
-  const lift = keyboardUp ? kbInset : 0
+  // How the canvas gets out from under the soft keyboard. NOT a `marginBottom`
+  // lift on this box — the documented iOS behaviour is that the LAYOUT viewport
+  // keeps its full height while `visualViewport` shrinks and SCROLLS (offsetTop),
+  // so subtracting the keyboard with a margin fights the iOS scroll and
+  // over-shrinks (the page collapsed into a strip with a black band). Instead we
+  // pin the whole app root to `visualViewport.height` while driving with the
+  // keyboard open — the same technique the chat composer uses on this device —
+  // so the normal-flow `h-full` chain below simply ends on the keyboard top.
+  useKeyboardRootResize(driving)
 
   const focusTrap = React.useCallback(() => {
     // `preventScroll`: the trap is a 1px box inside the viewport, and letting
@@ -1300,11 +1308,10 @@ export function TakeoverPanel({
         onKeyDown={onKeyDown}
         onKeyUp={onKeyUp}
         onPaste={onPaste}
-        // The lift is the keyboard's height (iOS overlays the layout viewport;
-        // on Android the layout already shrank and this is 0). The resize it
-        // causes re-negotiates the page's own box, so the page gets SMALLER
-        // rather than scrolling out from under the thumb.
-        style={lift ? { marginBottom: lift } : undefined}
+        // No keyboard `marginBottom` here: `useKeyboardRootResize(driving)` pins
+        // the app root to `visualViewport.height` while the keyboard is open, so
+        // this normal-flow box already ends on the keyboard top. The old margin
+        // fought the iOS visual-viewport scroll and over-shrank the page.
         className={cn(
           // `overflow-hidden` is load-bearing since phase 4: a zoomed canvas is
           // a `scale()`d element, which paints OUTSIDE its own box unless it is
@@ -1501,25 +1508,6 @@ export function TakeoverPanel({
           />
         )}
         {keyboardUp && <KeyboardDoneBar onDone={() => trapRef.current?.blur()} />}
-        {/* TEMP viewport debug — remove after the keyboard-shrink diagnosis. */}
-        {driving && (
-          <div className="pointer-events-none absolute left-1 top-1 z-40 rounded bg-black/80 px-1.5 py-1 text-left font-mono text-[9px] leading-[1.35] text-emerald-300">
-            box {boxRef.current?.clientWidth ?? '?'}×{boxRef.current?.clientHeight ?? '?'}
-            {'  '}win{' '}
-            {typeof window !== 'undefined' ? window.innerWidth : '?'}×
-            {typeof window !== 'undefined' ? window.innerHeight : '?'}
-            <br />
-            vv{' '}
-            {typeof window !== 'undefined' && window.visualViewport
-              ? `${Math.round(window.visualViewport.width)}×${Math.round(window.visualViewport.height)}`
-              : '?'}
-            {'  '}kbInset {Math.round(kbInset)} lift {Math.round(lift)}
-            <br />
-            frame {paintedRef.current?.frame?.metadata?.deviceWidth ?? '?'}×
-            {paintedRef.current?.frame?.metadata?.deviceHeight ?? '?'}
-            {'  '}kbOpen {String(kb.keyboardOpen)}
-          </div>
-        )}
         <StatusVeil refused={snap.refused} />
       </div>
 
