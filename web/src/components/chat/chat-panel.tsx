@@ -69,6 +69,7 @@ import { useComposer } from './use-composer'
 import { useDelaySend } from './use-delay-send'
 import { useHarnessEvents } from './use-harness-events'
 import { useDialogAnswer } from './use-dialog-answer'
+import { useQuestionAnswer } from './use-question-answer'
 import { LoginCard, ProviderAuthCard } from './login-card'
 import { loginOwnsScreen as loginOwns } from './login-lens'
 import { useLogin } from './use-login'
@@ -658,6 +659,14 @@ export default function ChatPanel({
   const onFeedback = React.useCallback(() => focusComposer(name), [name])
   const dialog = useDialogAnswer({ peek, input: plane, onFeedback })
 
+  // ── Answering the structured AskUserQuestion ───────────────────────────────
+  // The one card that is answered WITHOUT a pty sighting: the server parses the
+  // tool call into `session.question_request`, so the payload is the authority
+  // (`use-question-answer` presses `Down`×index + `Enter` down the same `/keys`
+  // lane the dialog uses, with no re-verification to do). This is the last wire
+  // of that feature — the card has always drawn the options; this makes them act.
+  const question = useQuestionAnswer({ ask: session?.question_request, input: plane })
+
   // ── Signing in (AREA 3) ────────────────────────────────────────────────────
   // `/login` is the one needs-input state chat could not answer: it is pty-only
   // (the transcript records the slash command and nothing else), so the READ has
@@ -1001,6 +1010,11 @@ export default function ChatPanel({
       dialog={loginOwnsScreen ? null : dialog.card}
       dialogBusy={dialog.busy}
       onChooseDialog={dialog.choose}
+      // The structured AskUserQuestion card answers itself (its own `/keys` lane),
+      // independent of the pty-scrape `dialog` above. `questionChosen` lights the
+      // picked pill until the server clears the ask on PostToolUse.
+      onAnswerQuestion={question.onAnswer}
+      questionChosen={question.chosen}
       dialogResolved={loginOwnsScreen ? null : dialog.resolved}
       // The sign-in card is what is asking on this frame, so it is what the
       // screen reader is told about (`ASK_SAY`).

@@ -200,6 +200,9 @@ export interface LiveLayerProps {
    * question, which the card draws inert (see `QuestionCard`).
    */
   onAnswerQuestion?: (optionIndex: number) => void
+  /** The option the user just chose on the live question, so `QuestionCard` can
+   *  light it and go inert until the server clears the ask. Absent → answerable. */
+  questionChosen?: number | null
   /** What the card became once an answer landed. Dialog outcomes write nothing
    *  to the transcript (a0 §3), so this line is the only record. */
   dialogResolved?: string | null
@@ -244,6 +247,7 @@ export function LiveLayer({
   dialogBusy = null,
   onChooseDialog,
   onAnswerQuestion,
+  questionChosen,
   dialogResolved,
   stalled = null,
   compacting = null,
@@ -407,7 +411,7 @@ export function LiveLayer({
         // exactly why it used to fall through to ``Run `AskUserQuestion`?`` with
         // dead buttons. Drawn above `permission_request` (which the server also
         // suppresses for this tool) so the answerable card always wins.
-        <QuestionCard ask={session.question_request} onAnswer={onAnswerQuestion} />
+        <QuestionCard ask={session.question_request} onAnswer={onAnswerQuestion} chosen={questionChosen} />
       ) : session?.permission_request ? (
         <PermissionCard
           request={session.permission_request}
@@ -845,20 +849,33 @@ export function commandChip(command: string): string {
 export function QuestionCard({
   ask,
   onAnswer,
+  chosen,
 }: {
   ask: QuestionRequestInfo
   onAnswer?: (optionIndex: number) => void
+  /** The option the user just picked, once they have — the card lights it in the
+   *  accent and lets the rest recede while the terminal advances and the server
+   *  clears the ask. `null`/absent → the card is still answerable. */
+  chosen?: number | null
 }) {
   const multi = ask.multi_select
+  // A choice is in flight or made: the card stops offering to press keys and shows
+  // WHICH answer it sent, so the ~1s until the server clears `question_request` on
+  // PostToolUse reads as "done" rather than "still asking".
+  const answered = chosen != null
   const options: ChoiceOption[] = ask.options.map((label, i) => ({
     label,
-    // The first option is the model's own default on a single-select question;
-    // a multi-select card highlights nothing, because nothing is chosen for you.
-    primary: i === 0 && !multi,
+    // The first option is the model's own default on a single-select question,
+    // until a real pick supersedes it; a multi-select card highlights nothing,
+    // because nothing is chosen for you.
+    primary: i === 0 && !multi && !answered,
     // A hint, never sent — the digit CC prints beside the row, so the card and
     // the terminal read the same 1-2-3.
     kbd: String(i + 1),
-    disabled: multi,
+    // Multi-select is inert throughout; once answered, every option BUT the chosen
+    // one recedes (the chosen one carries the accent via `selectedIndex`, at full
+    // emphasis) and none is pressable again.
+    disabled: multi || (answered && i !== chosen),
     hint: multi ? MULTISELECT_HINT : undefined,
   }))
   return (
@@ -867,7 +884,8 @@ export function QuestionCard({
         eyebrow={ask.header}
         question={ask.question || 'Claude is asking you to choose.'}
         options={options}
-        onChoose={onAnswer && !multi ? onAnswer : undefined}
+        selectedIndex={answered ? chosen : undefined}
+        onChoose={onAnswer && !multi && !answered ? onAnswer : undefined}
       />
       {multi && (
         <p className="ml-11 mt-[7px] text-[12.6px] tracking-[-0.05px] text-ink-2">

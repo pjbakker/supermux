@@ -20,6 +20,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 import { ASK_SAY, LiveLayer, QuestionCard, askKind } from '../../src/components/chat/live-layer'
 import { answerQuestion, questionAnswerKeys } from '../../src/components/chat/question-answer'
+import { askKey, canAnswerQuestion } from '../../src/components/chat/use-question-answer'
 import type { KeyName } from '../../src/lib/session-input/types'
 import type { QuestionRequestInfo } from '../../src/lib/api/sessions'
 import type { TileSession } from '../../src/components/session-tile/types'
@@ -143,5 +144,74 @@ describe('answering a question maps the option index to keys', () => {
       sent.push(k)
     }, -1)
     expect(sent).toEqual([])
+  })
+})
+
+/* ── the safety gate: when a click may press keys, and when it may NOT ─────── */
+
+describe('canAnswerQuestion — the whole gate, pure', () => {
+  test('a real row on a fresh single-select ask, nothing in flight → yes', () => {
+    expect(canAnswerQuestion(FRUIT, null, false, 0)).toBe(true)
+    expect(canAnswerQuestion(FRUIT, null, false, 2)).toBe(true)
+  })
+
+  test('a sequence already in flight → no (two taps must not both answer)', () => {
+    expect(canAnswerQuestion(FRUIT, null, true, 1)).toBe(false)
+  })
+
+  test('a choice already made on this ask → no (a late click must not answer the NEXT question)', () => {
+    expect(canAnswerQuestion(FRUIT, 0, false, 1)).toBe(false)
+  })
+
+  test('nothing is asking → no', () => {
+    expect(canAnswerQuestion(null, null, false, 0)).toBe(false)
+    expect(canAnswerQuestion(undefined, null, false, 0)).toBe(false)
+  })
+
+  test('a multi-select ask → no (it is toggled-and-confirmed in the terminal for now)', () => {
+    expect(canAnswerQuestion({ ...FRUIT, multi_select: true }, null, false, 0)).toBe(false)
+  })
+
+  test('an index outside the option list → no', () => {
+    expect(canAnswerQuestion(FRUIT, null, false, -1)).toBe(false)
+    expect(canAnswerQuestion(FRUIT, null, false, 3)).toBe(false) // == options.length
+    expect(canAnswerQuestion(FRUIT, null, false, 1.5)).toBe(false)
+  })
+})
+
+describe('askKey — a fresh ask is a fresh chance, the same ask is not', () => {
+  test('nothing asking → null', () => {
+    expect(askKey(null)).toBeNull()
+    expect(askKey(undefined)).toBeNull()
+  })
+
+  test('the same ask yields the same key; a changed question/options/header yields a new one', () => {
+    expect(askKey(FRUIT)).toBe(askKey({ ...FRUIT }))
+    expect(askKey(FRUIT)).not.toBe(askKey({ ...FRUIT, question: 'Which vegetable?' }))
+    expect(askKey(FRUIT)).not.toBe(askKey({ ...FRUIT, options: ['Apple', 'Banana'] }))
+    expect(askKey(FRUIT)).not.toBe(askKey({ ...FRUIT, header: 'Snack choice' }))
+  })
+})
+
+/* ── once answered, the card shows WHICH and goes inert ───────────────────── */
+
+describe('the answered question card', () => {
+  test('the chosen option is lit and the rest recede — none pressable again', () => {
+    // Banana (index 1) picked.
+    const out = html(<QuestionCard ask={FRUIT} onAnswer={() => {}} chosen={1} />)
+    // Every label is still on screen (the question stays readable).
+    for (const label of FRUIT.options) expect(out).toContain(label)
+    // The picked pill carries the selection cursor (accent), and it is NOT one of
+    // the disabled ones.
+    expect(out).toContain('data-selected="true"')
+    // Exactly the two NON-chosen options are inert (`disabled=""`), so a click
+    // landing after the answer cannot press a second selection.
+    expect((out.match(/disabled=""/g) ?? []).length).toBe(2)
+  })
+
+  test('an unanswered single-select card disables nothing — every option is live', () => {
+    const out = html(<QuestionCard ask={FRUIT} onAnswer={() => {}} />)
+    expect(out).not.toContain('disabled=""')
+    expect(out).not.toContain('data-selected="true"')
   })
 })
