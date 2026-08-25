@@ -41,7 +41,7 @@
 //! [`Actor::Human`] always passes. Read-only helpers are ungated — observing
 //! the page is never a conflict.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -599,6 +599,54 @@ fn device_metrics_params(width: u32, height: u32, scale: f64, mobile: bool) -> V
     })
 }
 
+/// The `userAgentMetadata` (UA Client Hints) that MUST ride alongside a
+/// `setUserAgentOverride` — a UA string with no metadata leaves the high-entropy
+/// hints (`Sec-CH-UA-Platform`, `-Mobile`) saying something the string
+/// contradicts, and that mismatch is exactly the detection the module docs warn
+/// about. Both variants keep the SAME Chromium brand + major as the pinned
+/// binary ([`PINNED_CHROME_MAJOR`]); only the platform/model/`mobile` differ. The
+/// GREASE `Not.A/Brand` entry mirrors stock Chrome's own low-entropy filler.
+fn user_agent_metadata(mobile: bool) -> Value {
+    let major = super::launch::PINNED_CHROME_MAJOR;
+    let v = major.to_string();
+    let fv = format!("{major}.0.0.0");
+    let brands = json!([
+        { "brand": "Chromium", "version": v },
+        { "brand": "Google Chrome", "version": v },
+        { "brand": "Not.A/Brand", "version": "24" },
+    ]);
+    let full_version_list = json!([
+        { "brand": "Chromium", "version": fv },
+        { "brand": "Google Chrome", "version": fv },
+        { "brand": "Not.A/Brand", "version": "24.0.0.0" },
+    ]);
+    if mobile {
+        json!({
+            "brands": brands,
+            "fullVersionList": full_version_list,
+            "platform": "Android",
+            "platformVersion": "13.0.0",
+            "architecture": "",
+            "model": "Pixel 7",
+            "mobile": true,
+            "bitness": "",
+            "wow64": false,
+        })
+    } else {
+        json!({
+            "brands": brands,
+            "fullVersionList": full_version_list,
+            "platform": "Linux",
+            "platformVersion": "",
+            "architecture": "x86",
+            "model": "",
+            "mobile": false,
+            "bitness": "64",
+            "wow64": false,
+        })
+    }
+}
+
 /// **The override this target is running with, and the reason it is shared.**
 ///
 /// A main-frame navigation silently un-sizes the CAPTURE. Measured against
@@ -684,6 +732,14 @@ pub struct AgentContext {
     screencast: Mutex<Option<Screencast>>,
     /// Live nav-state watcher, if one is running (P1-5).
     nav: Mutex<Option<NavWatcher>>,
+    /// Which User-Agent override is currently applied: `-1` never touched (the
+    /// launch `--user-agent` flag's pinned desktop UA + the binary's native
+    /// UA-CH), `0` desktop override, `1` mobile override. Tracked so a viewport
+    /// tick only issues `Emulation.setUserAgentOverride` when the mobile flag
+    /// actually flips — the override persists across navigations, so re-sending
+    /// it every negotiate would be pure chatter — and so a phone-first tab never
+    /// needlessly overrides the clean native desktop UA-CH.
+    ua_applied: AtomicI8,
 }
 
 struct Screencast {
@@ -837,6 +893,7 @@ impl AgentContext {
             metrics: Arc::new(DeviceMetrics::new(width, height, 1.0, false)),
             screencast: Mutex::new(None),
             nav: Mutex::new(None),
+            ua_applied: AtomicI8::new(-1),
         };
         // Domains we need events + evaluation from.
         me.session_call("Page.enable", json!({})).await?;
@@ -1241,6 +1298,56 @@ impl AgentContext {
         // repair that re-issues these same values — can never publish a box the
         // page was refused.
         self.metrics.store(width, height, scale, mobile);
+        // A phone VIEWPORT is not enough for UA-sniffing sites (Google): they
+        // pick mobile-vs-desktop off the User-Agent, which `setDeviceMetricsOverride`
+        // never touches. Match the UA to the viewport's mobile flag so they serve
+        // the mobile layout the human is looking at.
+        self.apply_user_agent(mobile).await?;
+        Ok(())
+    }
+
+    /// **Point the User-Agent (string + UA-CH) at the viewport's mobile flag.**
+    ///
+    /// Only issues a CDP call when the flag actually flips (`ua_applied`), because
+    /// the override persists across navigations. A phone-first tab that never
+    /// shows a desktop viewer keeps the launch flag's pinned desktop UA and the
+    /// binary's clean native UA-CH untouched; the desktop override is written only
+    /// to UNDO a previous mobile one, and then string + metadata are switched
+    /// together so the UA-CH never contradicts the string (the drift the module
+    /// docs call a detection, not a cosmetic bug).
+    ///
+    /// NOTE: the UA rides the navigation REQUEST, so a page ALREADY loaded under
+    /// the old UA keeps its layout until the next navigation/reload — the caller's
+    /// concern, not this method's.
+    async fn apply_user_agent(&self, mobile: bool) -> Result<()> {
+        let want: i8 = i8::from(mobile);
+        let prev = self.ua_applied.load(Ordering::Relaxed);
+        if prev == want {
+            return Ok(());
+        }
+        // Never touched + desktop wanted: the launch `--user-agent` already serves
+        // the pinned desktop UA with the binary's native (clean) UA-CH. Overriding
+        // it would only risk drift, so just record the state and leave it.
+        if prev == -1 && !mobile {
+            self.ua_applied.store(0, Ordering::Relaxed);
+            return Ok(());
+        }
+        let ua = if mobile {
+            super::launch::CHROME_USER_AGENT_MOBILE
+        } else {
+            super::launch::CHROME_USER_AGENT
+        };
+        self.session_call(
+            "Emulation.setUserAgentOverride",
+            json!({
+                "userAgent": ua,
+                "acceptLanguage": "en-US,en;q=0.9",
+                "platform": if mobile { "Android" } else { "Linux" },
+                "userAgentMetadata": user_agent_metadata(mobile),
+            }),
+        )
+        .await?;
+        self.ua_applied.store(want, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2043,6 +2150,29 @@ mod tests {
         assert_eq!(p["deviceScaleFactor"], json!(2.0));
         assert_eq!(p["mobile"], json!(true));
         assert_eq!(p, device_metrics_params(390, 700, 2.0, true));
+    }
+
+    /// **The UA-CH must AGREE with the UA string**, or the high-entropy hints
+    /// betray the spoof (the module docs' detection, not cosmetics). Both variants
+    /// carry the pinned binary's Chromium major; only platform/`mobile` differ.
+    #[test]
+    fn the_user_agent_metadata_matches_the_pinned_major_and_the_viewport() {
+        let major = super::super::launch::PINNED_CHROME_MAJOR.to_string();
+
+        let mob = user_agent_metadata(true);
+        assert_eq!(mob["mobile"], json!(true));
+        assert_eq!(mob["platform"], json!("Android"));
+        assert_eq!(mob["brands"][0]["version"], json!(major));
+        assert_eq!(
+            mob["fullVersionList"][1]["version"],
+            json!(format!("{major}.0.0.0"))
+        );
+
+        let desk = user_agent_metadata(false);
+        assert_eq!(desk["mobile"], json!(false));
+        assert_eq!(desk["platform"], json!("Linux"));
+        // Same brand major on both — only the platform/mobile flip.
+        assert_eq!(desk["brands"][0]["version"], mob["brands"][0]["version"]);
     }
 
     /// **The signal the repair runs off.** A frame captured at a box that is

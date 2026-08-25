@@ -95,6 +95,18 @@ pub const PINNED_CHROME_MAJOR: u32 = 149;
 pub const CHROME_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
+/// The User-Agent applied when a viewer negotiates a PHONE viewport, so
+/// UA-sniffing sites (Google is the loud one) serve their mobile layout — a
+/// device-metrics `mobile:true` alone only flips the viewport meta / touch, not
+/// the UA. Android Chrome, **not** iOS Safari: the engine actually running is
+/// Chromium, so the UA-CH brand list we send alongside this (see
+/// `context::user_agent_metadata`) stays honestly Chromium. Pinned to the SAME
+/// [`PINNED_CHROME_MAJOR`] as the desktop UA and the binary — a mobile UA whose
+/// Chrome major drifts from the binary is the exact UA-CH mismatch the module
+/// docs warn about.
+pub const CHROME_USER_AGENT_MOBILE: &str = "Mozilla/5.0 (Linux; Android 13; Pixel 7) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36";
+
 /// Disk-cache ceiling (256 MiB). The root filesystem on the deploy box runs hot
 /// and a durable profile's cache is otherwise unbounded (v1 spec §10 Q2).
 const DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -665,15 +677,28 @@ mod tests {
     /// whose major does not match the binary's is worse than no spoof at all.
     #[test]
     fn the_pinned_user_agent_major_matches_the_pinned_binary() {
-        let major = CHROME_USER_AGENT
-            .split("Chrome/")
-            .nth(1)
-            .and_then(|rest| rest.split('.').next())
-            .and_then(|m| m.parse::<u32>().ok())
-            .expect("the UA carries a Chrome/<major> token");
+        let major_of = |ua: &str| {
+            ua.split("Chrome/")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|m| m.parse::<u32>().ok())
+                .expect("the UA carries a Chrome/<major> token")
+        };
         assert_eq!(
-            major, PINNED_CHROME_MAJOR,
+            major_of(CHROME_USER_AGENT),
+            PINNED_CHROME_MAJOR,
             "CHROME_USER_AGENT and PINNED_CHROME_MAJOR must be bumped together"
+        );
+        // The mobile UA is spoofed too and rides the SAME UA-CH major (drift is a
+        // detection, not a cosmetic bug) — and it must actually read as mobile.
+        assert_eq!(
+            major_of(CHROME_USER_AGENT_MOBILE),
+            PINNED_CHROME_MAJOR,
+            "CHROME_USER_AGENT_MOBILE must be bumped with PINNED_CHROME_MAJOR too"
+        );
+        assert!(
+            CHROME_USER_AGENT_MOBILE.contains("Mobile"),
+            "the mobile UA must carry the `Mobile` token or UA-sniffers serve desktop"
         );
     }
 
