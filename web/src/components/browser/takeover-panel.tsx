@@ -1501,6 +1501,25 @@ export function TakeoverPanel({
           />
         )}
         {keyboardUp && <KeyboardDoneBar onDone={() => trapRef.current?.blur()} />}
+        {/* TEMP viewport debug — remove after the keyboard-shrink diagnosis. */}
+        {driving && (
+          <div className="pointer-events-none absolute left-1 top-1 z-40 rounded bg-black/80 px-1.5 py-1 text-left font-mono text-[9px] leading-[1.35] text-emerald-300">
+            box {boxRef.current?.clientWidth ?? '?'}×{boxRef.current?.clientHeight ?? '?'}
+            {'  '}win{' '}
+            {typeof window !== 'undefined' ? window.innerWidth : '?'}×
+            {typeof window !== 'undefined' ? window.innerHeight : '?'}
+            <br />
+            vv{' '}
+            {typeof window !== 'undefined' && window.visualViewport
+              ? `${Math.round(window.visualViewport.width)}×${Math.round(window.visualViewport.height)}`
+              : '?'}
+            {'  '}kbInset {Math.round(kbInset)} lift {Math.round(lift)}
+            <br />
+            frame {paintedRef.current?.frame?.metadata?.deviceWidth ?? '?'}×
+            {paintedRef.current?.frame?.metadata?.deviceHeight ?? '?'}
+            {'  '}kbOpen {String(kb.keyboardOpen)}
+          </div>
+        )}
         <StatusVeil refused={snap.refused} />
       </div>
 
