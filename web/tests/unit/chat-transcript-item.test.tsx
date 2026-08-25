@@ -354,3 +354,30 @@ describe('thinking', () => {
     expect(out).toContain('not saved')
   })
 })
+
+describe('a cross-session coordination event', () => {
+  // The wire fold has already mapped the protocol to a calm line and a tone;
+  // these pin that the row DRAWS as a compact event line and never leaks JSON.
+  test('renders the calm line with the sender’s face, no raw wrapper', () => {
+    const out = render([
+      { uuid: 'c1', ts: 1_760_000_000, text: 'pagina-catalogus is available', kind: 'coordination', label: 'pagina-catalogus', tone: 'teammate' },
+    ])
+    const flat = text(out)
+    expect(flat).toContain('pagina-catalogus is available')
+    expect(flat).not.toContain('<teammate-message')
+    expect(flat).not.toContain('{')
+    // The centred event row and its tone marker are present…
+    expect(out).toContain('data-testid="chat-coordination"')
+    expect(out).toContain('data-tone="teammate"')
+    // …and it hangs a face (an <svg> mark) because it named a teammate.
+    expect(out).toContain('<svg')
+  })
+
+  test('a faceless system notice renders no mark and reads dim when quiet', () => {
+    const out = render([
+      { uuid: 'c2', ts: 1_760_000_000, text: 'the session ended', kind: 'coordination', tone: 'system' },
+    ])
+    expect(text(out)).toBe('the session ended')
+    expect(out).not.toContain('<svg')
+  })
+})

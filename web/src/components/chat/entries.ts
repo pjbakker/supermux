@@ -33,6 +33,13 @@ export interface ChatEntry {
   label?: string
   /** `kind:'human'` only — the immutable author (P3c). */
   author?: ChatAuthor
+  /**
+   * `kind:'coordination'` only — the calm tone a cross-session event reads in
+   * (`coordination.ts`). `teammate` shows the sender's face at full weight,
+   * `system` is a faceless notice ("shut down"), `quiet` is dimmed chrome (an
+   * approval, an unknown protocol type). Absent for every other kind.
+   */
+  tone?: 'teammate' | 'system' | 'quiet'
   ok?: boolean
   /** Server clipped `text` at the wire cap. Rendered as a marker: without it
    *  a clipped message is indistinguishable from one that simply ended. */
@@ -173,6 +180,25 @@ export type ChatItem =
       lines: ReceiptLine[]
       overflow: number
     }
+  | {
+      /**
+       * A CROSS-SESSION COORDINATION event (bot/grok mode) — a teammate went
+       * idle, shut down, approved a shutdown, or sent some other protocol
+       * message (`coordination.ts`). Its own centred, faceable row rather than a
+       * user bubble: it is chrome about the fleet, not anybody speaking to the
+       * user, and the raw wrapper it comes from would otherwise render as ugly
+       * XML/JSON in a plain prompt bubble (the owner report).
+       */
+      type: 'coordination'
+      uuid: string
+      ts: number
+      /** The calm human line, already mapped from the protocol. Never raw JSON. */
+      text: string
+      /** The subject teammate's slug — the face seed + pigment. Absent = no face
+       *  (the anonymous "system" sender). */
+      seed?: string
+      tone: 'teammate' | 'system' | 'quiet'
+    }
 
 /** P3 volume guard (master plan §4.2): Claude runs 30–100 calls/turn; a
  *  receipts block shows at most this many lines + an overflow count. */
@@ -239,6 +265,18 @@ export function toDisplayList(entries: ChatEntry[]): ChatItem[] {
         text: e.text,
         truncated: e.truncated,
         retracted: e.retracted,
+      })
+    } else if (e.kind === 'coordination') {
+      // A cross-session event (`coordination.ts`). `label` carries the subject
+      // teammate's slug (the face seed), `tone` how it reads; both may be absent
+      // (a faceless "system" notice defaults to the system tone).
+      out.push({
+        type: 'coordination',
+        uuid: e.uuid,
+        ts: e.ts,
+        text: e.text,
+        seed: e.label,
+        tone: e.tone ?? 'system',
       })
     } else {
       out.push({

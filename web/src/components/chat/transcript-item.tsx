@@ -249,6 +249,10 @@ export const TranscriptItem = React.memo(function TranscriptItem(
   // Claude talking.
   if (item.type === 'blocked')
     return <BlockedRow item={item} onOpenTerminal={props.onOpenTerminal} />
+  // A cross-session coordination event — a compact, faceable event row, checked
+  // before the generic system arm (which reads `item.type === 'user'`).
+  if (item.type === 'coordination')
+    return <CoordinationRow item={item} pinFor={props.pinFor} />
   if (speaker === 'system') return <SystemRow item={item} labels={props.labels} />
   if (speaker === 'me') return <UserRow {...props} item={item} grouped={grouped} />
   // A human colleague's message (P3c) — a circle mark + name chip + hue keyline,
@@ -853,6 +857,60 @@ function BlockedRow({
         )}
       </div>
     </div>
+  )
+}
+
+/* ── a cross-session event ───────────────────────────────────────────────── */
+
+/**
+ * A COORDINATION event, as one compact centred row (bot/grok mode).
+ *
+ * This is how sessions talk to each other in bot mode — a teammate going idle,
+ * shutting down, approving a shutdown — arriving as a JSON protocol payload
+ * inside the "Another Claude session sent a message:" wrapper. The parser
+ * (`coordination.ts`) has already turned it into a calm human line + an optional
+ * face seed + a tone; this only draws it, reusing the surface's own event
+ * vocabulary (`SystemLine` + the `SessionMark`) rather than inventing a
+ * component. Restrained on purpose: it is chrome, not a hero.
+ *
+ *   · a `seed` hangs the sender's face inline, in its own pigment — the same
+ *     provenance cue a delegation's arrival divider carries, at divider size.
+ *   · the tone tunes weight: `quiet` (an approval, an unknown type) steps back
+ *     with opacity; `teammate`/`system` read at the system line's normal ink.
+ *
+ * The face is drawn, never the name in accent — the sentence already carries the
+ * name, and a second coloured copy would be louder than a fleet event earns.
+ */
+function CoordinationRow({
+  item,
+  pinFor,
+}: {
+  item: ChatItem
+  pinFor?: (seed: string) => MarkPin | undefined
+}) {
+  if (item.type !== 'coordination') return null
+  return (
+    <SystemLine>
+      <span
+        data-testid="chat-coordination"
+        data-tone={item.tone}
+        className={cn(
+          'inline-flex items-center gap-1.5 align-middle',
+          item.tone === 'quiet' && 'opacity-70',
+        )}
+      >
+        {item.seed && (
+          <SessionMark
+            seed={item.seed}
+            pin={pinFor?.(item.seed)}
+            size={MARK_SIZE.divider}
+            animate={false}
+            label={null}
+          />
+        )}
+        <span>{item.text}</span>
+      </span>
+    </SystemLine>
   )
 }
 
