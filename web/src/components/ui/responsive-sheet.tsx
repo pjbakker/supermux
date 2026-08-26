@@ -47,6 +47,11 @@ export interface ResponsiveSheetProps {
   descriptionTrailing?: React.ReactNode
   /** Action row rendered under the title (run-now/delete/toggle etc). */
   headerActions?: React.ReactNode
+  /** Hide the visible title bar (border + padding) entirely, keeping `title`/
+   *  `description` as sr-only for a11y. For panels that render their OWN rich
+   *  identity header in the body (e.g. the bot panel: face + editable name +
+   *  status) and must not stack a second generic bar above it. */
+  hideHeader?: boolean
   /** Sticky footer (save/delete) — pinned to the bottom in both shells. */
   footer?: React.ReactNode
   /** Scrollable body. */
@@ -78,6 +83,7 @@ function MobileBody({
   description,
   descriptionTrailing,
   headerActions,
+  hideHeader,
   footer,
   children,
   contentTheme,
@@ -130,30 +136,40 @@ function MobileBody({
               dead space it used to add above the handle. */}
           <div className="mx-auto mt-1.5 h-[5px] w-9 shrink-0 rounded-[2.5px] bg-muted-foreground/30" />
 
-          <div className="border-b border-border px-5 pb-3 pt-2 text-left">
-            <Drawer.Title className="truncate text-lg font-semibold text-foreground">
-              {title}
-            </Drawer.Title>
-            {/* Always present so Radix's a11y description requirement is met;
-                renders sr-only when the consumer passes none. Wrapped in a
-                flex row so a `descriptionTrailing` action sits on the SAME
-                line, right-aligned — the bulk-action pattern (no extra row,
-                no extra height). */}
-            <div className="flex items-center justify-between gap-3">
-              <Drawer.Description
-                className={cn(
-                  'min-w-0 flex-1 truncate text-sm text-muted-foreground',
-                  !description && 'sr-only',
+          {hideHeader ? (
+            // The consumer draws its OWN identity header in the body — keep the
+            // Radix a11y title/description but render NO visible bar, so nothing
+            // stacks above the body header.
+            <>
+              <Drawer.Title className="sr-only">{title}</Drawer.Title>
+              <Drawer.Description className="sr-only">{description}</Drawer.Description>
+            </>
+          ) : (
+            <div className="border-b border-border px-5 pb-3 pt-2 text-left">
+              <Drawer.Title className="truncate text-lg font-semibold text-foreground">
+                {title}
+              </Drawer.Title>
+              {/* Always present so Radix's a11y description requirement is met;
+                  renders sr-only when the consumer passes none. Wrapped in a
+                  flex row so a `descriptionTrailing` action sits on the SAME
+                  line, right-aligned — the bulk-action pattern (no extra row,
+                  no extra height). */}
+              <div className="flex items-center justify-between gap-3">
+                <Drawer.Description
+                  className={cn(
+                    'min-w-0 flex-1 truncate text-sm text-muted-foreground',
+                    !description && 'sr-only',
+                  )}
+                >
+                  {description}
+                </Drawer.Description>
+                {descriptionTrailing && (
+                  <div className="shrink-0">{descriptionTrailing}</div>
                 )}
-              >
-                {description}
-              </Drawer.Description>
-              {descriptionTrailing && (
-                <div className="shrink-0">{descriptionTrailing}</div>
-              )}
+              </div>
+              {headerActions && <div className="mt-2">{headerActions}</div>}
             </div>
-            {headerActions && <div className="mt-2">{headerActions}</div>}
-          </div>
+          )}
 
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             {children}

@@ -54,7 +54,6 @@ import { GrantedConnectors, RestartToApply } from '@/components/roster/granted-c
 import { LearnedNotes } from '@/components/roster/learned-notes'
 import { NotifPolicyControl } from '@/components/focus-mode/notif-policy-control'
 import {
-  NameEditor,
   DescEditor,
   TagsEditor,
   GitRow,
@@ -900,50 +899,67 @@ function BotPanelBody({
           so this is a no-op off a notched standalone PWA; `max()` keeps the base
           0.75rem there. The `sheet` variant is a bottom drawer — never under the
           status bar — so it keeps the plain `py-3`. */}
+      {/* ONE identity header (no generic "Bot" bar above it anymore). Two calm
+          rows: the face + editable name lead; the status line and the single
+          primary action sit below with room to breathe — the airy hierarchy the
+          cramped one-row version lacked. */}
       <header
         className={cn(
-          'flex items-center gap-3 border-b border-border bg-background/80 px-5 pb-3 backdrop-blur-sm',
+          'flex flex-col gap-3 border-b border-border bg-background/80 px-5 pb-4 backdrop-blur-sm',
           variant === 'pane'
-            ? 'pt-[max(0.75rem,env(safe-area-inset-top))]'
-            : 'pt-3',
+            ? 'pt-[max(0.875rem,env(safe-area-inset-top))]'
+            : 'pt-4',
         )}
       >
-        <SessionFace name={name} status={session?.status} size={40} />
-        <div className="flex min-w-0 flex-1 flex-col">
-          <div className="min-w-0">
-            <NameEditor name={name} displayName={label} />
+        <div className="flex items-start gap-3.5">
+          <SessionFace name={name} status={session?.status} size={48} />
+          {/* The name is the title — one clean line, no bordered field and no
+              second "id" row (that clutter is what made the old header read as a
+              form). Rename lives in the ⋯ menu, reachable right beside it. */}
+          <div className="min-w-0 flex-1 pt-0.5">
+            <h2 className="truncate text-[19px] font-semibold leading-tight tracking-tight text-foreground">
+              {label}
+            </h2>
           </div>
-          {sub && <span className="mt-0.5 truncate text-[12.5px] capitalize text-muted-foreground">{sub}</span>}
+          {session && (
+            <SessionActionsMenu
+              session={session}
+              variant="row"
+              className="!static !size-9 !opacity-100 -mr-2 -mt-1 flex-none"
+            />
+          )}
         </div>
-        {onOpenTerminal ? (
-          <button
-            type="button"
-            onClick={onOpenTerminal}
-            data-vr="bot-open-terminal"
-            className="inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-[10px] bg-primary px-3 text-[13px] font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <Terminal className="size-3.5" aria-hidden />
-            Open terminal
-            <ArrowRight className="size-3.5" aria-hidden />
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={onOpenThread}
-            data-vr="bot-open-thread"
-            className="inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-[10px] bg-primary px-3 text-[13px] font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            Open thread
-            <ArrowRight className="size-3.5" aria-hidden />
-          </button>
-        )}
-        {session && (
-          <SessionActionsMenu
-            session={session}
-            variant="row"
-            className="!static !size-9 !opacity-100"
-          />
-        )}
+        <div className="flex items-center justify-between gap-3">
+          {sub ? (
+            <span className="min-w-0 flex-1 truncate text-[13px] capitalize text-muted-foreground">
+              {sub}
+            </span>
+          ) : (
+            <span className="flex-1" />
+          )}
+          {onOpenTerminal ? (
+            <button
+              type="button"
+              onClick={onOpenTerminal}
+              data-vr="bot-open-terminal"
+              className="inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-full bg-primary px-4 text-[13.5px] font-medium text-primary-foreground shadow-sm transition-[background-color,transform] hover:bg-primary/90 active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Terminal className="size-3.5" aria-hidden />
+              Open terminal
+              <ArrowRight className="size-3.5" aria-hidden />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpenThread}
+              data-vr="bot-open-thread"
+              className="inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-full bg-primary px-4 text-[13.5px] font-medium text-primary-foreground shadow-sm transition-[background-color,transform] hover:bg-primary/90 active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Open thread
+              <ArrowRight className="size-3.5" aria-hidden />
+            </button>
+          )}
+        </div>
       </header>
 
       {/* tab bar — an EQUAL-WIDTH segmented control. Each tab is `flex-1
@@ -1073,8 +1089,11 @@ export function BotPanel({
       <ResponsiveSheet
         open={open ?? false}
         onOpenChange={onOpenChange ?? (() => {})}
-        title="Bot"
-        description={name}
+        // The body draws its OWN identity header (face · name · status · Open
+        // thread), so suppress the sheet's generic bar — it was stacking a second
+        // "Bot / <name>" title above the real one (the triple-name clutter).
+        title={name}
+        hideHeader
         className="max-w-2xl"
       >
         {/* `data-grok` so the sheet (portalled to <body>, outside the shell root)
