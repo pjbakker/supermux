@@ -118,6 +118,12 @@ pub struct Row {
     /// fake being tagged by writing an address in a post.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tagged: Vec<String>,
+    /// The author's DISPLAY NAME, when one is known (human rows carry it). This
+    /// is presentation only — the immutable `author_session` (`user:<id>`) stays
+    /// the render side's hue seed, never this mutable name. `serde(default)` so
+    /// old log lines (written before this field existed) rehydrate cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
 }
 
 /// What a caller hands [`append`]; `seq`/`ts` are assigned by the server.
@@ -130,12 +136,23 @@ pub struct NewRow {
     pub run_id: Option<String>,
     /// Router routing lines only — see [`Row::tagged`].
     pub tagged: Vec<String>,
+    /// The author's display name, when known — human posts carry it. See
+    /// [`Row::author_name`].
+    pub author_name: Option<String>,
 }
 
 impl NewRow {
     /// The ordinary shape: an authored row that tags nobody.
     pub fn plain(author_session: String, author_kind: &'static str, body: String) -> Self {
-        Self { author_session, author_kind, body, wrapper: None, run_id: None, tagged: Vec::new() }
+        Self {
+            author_session,
+            author_kind,
+            body,
+            wrapper: None,
+            run_id: None,
+            tagged: Vec::new(),
+            author_name: None,
+        }
     }
 }
 
@@ -298,6 +315,7 @@ fn to_entry(row: &Row) -> ChatEntry {
             "wrapper": row.wrapper,
             "run_id": row.run_id,
             "tagged": row.tagged,
+            "author_name": row.author_name,
         }),
     }
 }
@@ -404,6 +422,7 @@ pub async fn append(
         wrapper: new.wrapper,
         run_id: new.run_id,
         tagged: new.tagged,
+        author_name: new.author_name,
     };
     let line = serde_json::to_string(&row)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("groupchat row encode failed: {e}")))?;
@@ -773,6 +792,16 @@ pub async fn post_handler(
         // The OWNER reaches every company by the same rule, and reaches this
         // branch by the same door: `posting_human` resolves who they are, the
         // body never does.)
+        //
+        // Resolve the poster's DISPLAY NAME exactly as `wake_router_on_human`
+        // does, server-side from the `human_users` row — never from the body.
+        // It rides the row as presentation only; the hue seed stays the id.
+        let author_name = db::human_users::get(&state.pool, user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.display_name)
+            .filter(|n| !n.trim().is_empty());
         let posted = append(
             &state,
             company.id,
@@ -788,6 +817,8 @@ pub async fn post_handler(
                 // `run_id` is a workflow-summary key; a human post is not one.
                 run_id: None,
                 tagged: Vec::new(),
+                // The person's name for the hero's byline — server-resolved.
+                author_name,
             },
         )
         .await?;
@@ -861,6 +892,8 @@ pub async fn post_as_session(
             wrapper: None,
             run_id,
             tagged: Vec::new(),
+            // A bot/router post is bylined by its session slug, not a person.
+            author_name: None,
         },
     )
     .await
@@ -1082,6 +1115,7 @@ pub async fn record_tag(
             wrapper: Some(crate::agents::delegate::DELEGATION_TAG.to_string()),
             run_id: None,
             tagged: vec![target.to_string()],
+            author_name: None,
         },
     )
     .await
@@ -1142,6 +1176,7 @@ pub async fn post_workflow_summary(
             wrapper: None,
             run_id: Some(run_id.to_string()),
             tagged: Vec::new(),
+            author_name: None,
         },
     )
     .await?;
@@ -1360,6 +1395,7 @@ mod tests {
                 wrapper: None,
                 run_id: None,
                 tagged: Vec::new(),
+                author_name: None,
             };
             append_line(path, &serde_json::to_string(&row).unwrap()).unwrap();
         }
@@ -1474,6 +1510,7 @@ mod tests {
                 wrapper: None,
                 run_id: None,
                 tagged: Vec::new(),
+                author_name: None,
             };
             append_line(&path, &serde_json::to_string(&row).unwrap()).unwrap();
         }
@@ -2148,6 +2185,7 @@ mod tests {
                 wrapper: Some(crate::agents::delegate::HUMAN_TAG.to_string()),
                 run_id: None,
                 tagged: Vec::new(),
+                author_name: None,
             },
         )
         .await
@@ -2321,6 +2359,7 @@ mod tests {
             wrapper: None,
             run_id: None,
             tagged: Vec::new(),
+            author_name: None,
         };
         let e = to_entry(&row);
         assert_eq!(e.offset, 42);
@@ -2328,6 +2367,39 @@ mod tests {
         assert_eq!(e.body["author_kind"], AUTHOR_BOT);
         let human = Row { author_kind: AUTHOR_HUMAN.into(), ..row };
         assert_eq!(to_entry(&human).kind, Kind::Prompt, "a human row is a prompt");
+    }
+
+    /// A human row's display name rides the wire on `body.author_name` (which is
+    /// the field the hero's `wire.ts` reads), survives a log round-trip, and an
+    /// OLD line written before the field existed still rehydrates — `serde`
+    /// defaults it to `None` rather than failing the whole row.
+    #[test]
+    fn a_human_row_carries_its_author_name_to_the_wire_and_round_trips() {
+        let row = Row {
+            seq: 3,
+            ts: 9,
+            author_session: human_author_session(7),
+            author_kind: AUTHOR_HUMAN.into(),
+            body: "ship it".into(),
+            wrapper: Some(crate::agents::delegate::HUMAN_TAG.to_string()),
+            run_id: None,
+            tagged: Vec::new(),
+            author_name: Some("Ada Lovelace".into()),
+        };
+        // The wire entry carries the name where the hero's adapter reads it.
+        let e = to_entry(&row);
+        assert_eq!(e.body["author_name"], "Ada Lovelace");
+        // The seed stays the immutable id — the name is presentation only.
+        assert_eq!(e.body["author_session"], "user:7");
+        // Log round-trip: serialize → deserialize keeps the name.
+        let line = serde_json::to_string(&row).unwrap();
+        let back: Row = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.author_name.as_deref(), Some("Ada Lovelace"));
+        // An OLD line with no `author_name` field still rehydrates (serde default).
+        let legacy = r#"{"seq":1,"ts":1,"author_session":"user:1","author_kind":"human","body":"hi"}"#;
+        let old: Row = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.author_name, None, "a pre-field line defaults cleanly");
+        assert_eq!(to_entry(&old).body["author_name"], Value::Null);
     }
 
     /// THE TIMESTAMP UNIT, pinned (finding 7).
@@ -2356,6 +2428,7 @@ mod tests {
             wrapper: None,
             run_id: None,
             tagged: Vec::new(),
+            author_name: None,
         };
         let e = to_entry(&row);
         assert_eq!(e.ts_ms, row.ts, "`ts_ms` is the row's ms clock, unconverted");

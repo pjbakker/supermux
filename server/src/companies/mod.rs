@@ -368,6 +368,17 @@ async fn provision_group_chat(state: &AppState, company: &Company) {
         return;
     }
 
+    // 3.5. The STANDING routing rules, as a `CLAUDE.md` in the Router's cwd.
+    //      `router_brief` is a FIRST-turn prompt only; the harness re-reads a
+    //      cwd `CLAUDE.md` every turn, so this is what keeps the Router routing
+    //      via `tag_bot` (the one waking path) instead of relaying with
+    //      `post_message` (which wakes nobody) turn after turn. The dir was
+    //      already mkdir'd by `sessions::create` (a company session's cwd is
+    //      forced to `<root_dir>/<name>`), so we derive the same path here.
+    //      Best-effort: a failed write must NOT fail provisioning — the
+    //      first-turn brief still routes, this only makes it durable per-turn.
+    write_router_claude_md(&company.root_dir, &router, &company.display_name);
+
     // 4. Boot it with the routing brief as its first turn (the `teams::start`
     //    pattern). Spawned: booting a pty takes seconds, and the owner is
     //    waiting on an HTTP 201 for a row that already exists.
@@ -401,17 +412,60 @@ fn router_brief(slug: &str, display_name: &str) -> String {
     format!(
         "You are the router for {display_name}'s group chat (company `{slug}`).
 
-         You wake ONLY on messages from a human. When you do, decide which bot — or which two          bots — should act, and hand each ONE distilled request with          `mcp__group_chat__tag_bot(session, distilled_request)`. Never do the work yourself.
+         You wake ONLY on messages from a human. Your ONLY job is to ROUTE: decide which bot —          or which two bots — should act, and hand each ONE distilled request with          `mcp__group_chat__tag_bot(session, distilled_request)`. `tag_bot` is the ONLY thing that          reaches a bot. Never do the work yourself.
+
+         NEVER restate or relay a request with `mcp__group_chat__post_message` — a post wakes          nobody, so the bot will never see it. Use `post_message` ONLY to answer a human directly          when genuinely no bot is needed.
 
          Rules the SERVER enforces, so do not try to route around them:
          - At most {max} tags per human message. The {max}+1th is dropped, not queued.
-         - `mcp__group_chat__post_message` strips every '@': a post cannot summon anyone. Use it          only to answer a human directly when no bot is needed.
+         - `mcp__group_chat__post_message` strips every '@': a post cannot summon anyone.
          - Bots never read each other's posts, so tagging is the only thing that reaches one.
 
          Start each turn with `mcp__group_chat__who_tagged_me` or          `mcp__group_chat__read_history` only if you need context you do not already have — a          read costs the human's tokens. `mcp__group_chat__whoami` tells you who you are.
 
          If nobody should act, post one short reply saying so, and tag no one."
     )
+}
+
+/// The STANDING routing rules for the Router, written as a `CLAUDE.md` into its
+/// working dir at provision time. Unlike [`router_brief`] (a first-turn prompt),
+/// the harness re-reads a cwd `CLAUDE.md` on EVERY turn — which is what keeps a
+/// long-lived Router routing via `tag_bot` rather than drifting into relaying
+/// with `post_message` (which wakes nobody). This is the first server-authored
+/// `CLAUDE.md`; it relies on Claude Code's own cwd-`CLAUDE.md` behaviour, not on
+/// any server mechanism.
+fn router_claude_md(display_name: &str) -> String {
+    let max = crate::companies::groupchat::MAX_TAGS_PER_TURN;
+    format!(
+        "# {display_name} group-chat Router (Main Assistant)
+
+You are the router for {display_name}'s group chat. These rules apply EVERY turn.
+
+- Whenever a `supermux-human` message arrives, your ONLY job is to ROUTE it. Call \
+`mcp__group_chat__tag_bot(session, distilled_request)` for the ONE bot — or at most two — \
+that should act, handing each a clear, distilled request.
+- NEVER restate or relay a request with `mcp__group_chat__post_message`. A post wakes \
+nobody; the bot will never see it. `tag_bot` is the only thing that reaches a bot.
+- Use `post_message` ONLY to answer a human directly when genuinely no bot is needed.
+- Never do a bot's work yourself.
+- The server caps tags at {max} per human message; the {max}+1th is dropped, not queued. \
+Pick the most important bots first."
+    )
+}
+
+/// Write [`router_claude_md`] into the Router's cwd (`<root_dir>/<router>/`).
+/// Best-effort by contract: a failure is warned and swallowed so it can never
+/// fail company provisioning — the first-turn brief still routes without it.
+fn write_router_claude_md(root_dir: &str, router: &str, display_name: &str) {
+    let path = std::path::Path::new(root_dir).join(router).join("CLAUDE.md");
+    if let Err(e) = std::fs::write(&path, router_claude_md(display_name)) {
+        tracing::warn!(
+            router = %router,
+            path = %path.display(),
+            error = %e,
+            "group chat: could not write the Router CLAUDE.md (routing brief still applies)",
+        );
+    }
 }
 
 async fn patch_handler(
@@ -608,6 +662,35 @@ mod tests {
 
     fn root_under(dir: &std::path::Path, name: &str) -> String {
         dir.join(name).display().to_string()
+    }
+
+    /// Provisioning writes a `CLAUDE.md` into the Router's cwd carrying the
+    /// standing routing rules — the per-turn instruction that keeps the Router
+    /// routing via `tag_bot` instead of relaying with `post_message`. The dir is
+    /// the same `<root_dir>/<router>` the session's cwd is forced to (mkdir'd by
+    /// `sessions::create` in the live path — here we mkdir it ourselves).
+    #[test]
+    fn provisioning_writes_the_router_claude_md_with_the_routing_rule() {
+        let base = std::env::temp_dir().join(format!("supermux-router-md-{}", uuid::Uuid::new_v4()));
+        let router = groupchat::router_name("acme");
+        let router_dir = base.join(&router);
+        std::fs::create_dir_all(&router_dir).unwrap();
+
+        write_router_claude_md(&base.display().to_string(), &router, "Acme Corp");
+
+        let path = router_dir.join("CLAUDE.md");
+        assert!(path.exists(), "the Router CLAUDE.md was written");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("Acme Corp"), "it names the company: {body}");
+        assert!(
+            body.contains("mcp__group_chat__tag_bot"),
+            "the routing rule is present: {body}",
+        );
+        assert!(
+            body.contains("NEVER restate or relay a request with `mcp__group_chat__post_message`"),
+            "the never-relay rule is present: {body}",
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Serializes the tests that mutate the process-global `SUPERMUX_PROJECT_DIRS`

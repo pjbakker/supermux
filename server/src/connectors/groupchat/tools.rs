@@ -183,6 +183,27 @@ pub async fn run(
     }
 }
 
+/// Build the prompt DELIVERED to a tagged bot: the Router's distilled request
+/// plus a standing instruction to post the answer back to the channel.
+///
+/// The tagged bot is woken through `deliver_delegation` and otherwise arrives
+/// with nothing but the distilled request — no reason to reply to the group. A
+/// bot that does its work and returns silently leaves the human staring at a
+/// routing pill and no answer, which is exactly the live incident. Appending the
+/// post-back reminder here (and ONLY to the delivered prompt — the recorded row
+/// body stays the bare request) closes that loop.
+///
+/// Contains no supermux wrapper markup, so it never trips `deliver_delegation`'s
+/// wrapper guard: the reminder is plain English naming the `post_message` tool,
+/// never a `<supermux-…>` tag.
+fn delivered_prompt(company_display: &str, request: &str) -> String {
+    format!(
+        "{request}\n\nThis request came from {company_display}'s group chat. When you have the \
+answer, post it back to the channel with `mcp__group_chat__post_message` (a short, clear reply \
+the whole company can read). Do the work, then post the result."
+    )
+}
+
 /// `tag_bot` — the ONE tool that wakes another agent, and therefore the one
 /// with the most gates.
 ///
@@ -262,11 +283,16 @@ async fn tag_bot(
     };
 
     // The visible routing line (the hero's DelegationPill), recorded BEFORE the
-    // delivery so a failed wake still leaves the decision in the feed.
+    // delivery so a failed wake still leaves the decision in the feed. The ROW
+    // body stays the BARE `request` — the routing pill must read clean.
     let row = gc::record_tag(state, company.id, session, target, request).await?;
-    // …and the ONE waking delegation. `actor: None` audits as `agent:<router>`,
-    // which is exactly what happened.
-    crate::agents::delegate::deliver_delegation(state, session, target, request, None).await?;
+    // …and the ONE waking delegation. The DELIVERED prompt (only) gets a
+    // standing post-back instruction appended: the tagged bot arrives with the
+    // distilled request AND the reminder to post its answer back to the channel
+    // (`post_message`), so the human actually sees the result. `actor: None`
+    // audits as `agent:<router>`, which is exactly what happened.
+    let prompt = delivered_prompt(&company.display_name, request);
+    crate::agents::delegate::deliver_delegation(state, session, target, &prompt, None).await?;
     Ok(json!({
         "tagged": true,
         "session": target,
@@ -333,6 +359,7 @@ mod tests {
                 wrapper: None,
                 run_id: None,
                 tagged: Vec::new(),
+                author_name: None,
             },
         )
         .await
@@ -474,6 +501,61 @@ mod tests {
         .await
         .expect_err("cross-company tag must be refused");
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The DELIVERED prompt appends a standing post-back instruction to the
+    /// distilled request — that is what makes the tagged bot answer back to the
+    /// channel — while carrying no supermux wrapper markup (so it clears
+    /// `deliver_delegation`'s guard).
+    #[test]
+    fn the_delivered_prompt_appends_a_post_back_instruction() {
+        let p = delivered_prompt("Acme", "ship the migration");
+        assert!(p.starts_with("ship the migration"), "the request leads: {p}");
+        assert!(
+            p.contains("mcp__group_chat__post_message"),
+            "the bot is told how to answer back: {p}",
+        );
+        assert!(p.contains("Acme"), "the company is named: {p}");
+        assert!(
+            !crate::agents::delegate::wrapper_markup(&p),
+            "the suffix must not trip the wrapper guard",
+        );
+    }
+
+    /// End to end: a successful tag DELIVERS the appended prompt but records the
+    /// ROUTING ROW with the BARE request — the hero's pill must stay clean.
+    #[tokio::test]
+    async fn the_recorded_row_stays_the_bare_request() {
+        let (state, dir) = test_state().await;
+        let c = seed(&state, "acme", &["acme-assistant", "acme-a"]).await;
+        human_row(&state, c.id).await;
+        let out = run(
+            &state,
+            &c,
+            "acme-assistant",
+            "tag_bot",
+            &json!({ "session": "acme-a", "distilled_request": "ship the migration" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["tagged"], true);
+        // Read the log back and find the router routing row.
+        let path = gc::log_path(&state, c.id);
+        let (rows, _) = gc::read_history(&path, None, Some(gc::HISTORY_TOOL_MAX_TOKENS));
+        let pill = rows
+            .iter()
+            .find(|r| r.kind == gc::AUTHOR_ROUTER)
+            .expect("a routing row was recorded");
+        assert_eq!(
+            pill.text, "ship the migration",
+            "the recorded pill is the bare request, not the delivered prompt",
+        );
+        assert!(
+            !pill.text.contains("mcp__group_chat__post_message"),
+            "the post-back suffix must NOT leak into the row body",
+        );
         state.pool.close().await;
         std::fs::remove_dir_all(dir).ok();
     }
