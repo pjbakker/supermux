@@ -23,9 +23,9 @@ import { ChevronRight } from 'lucide-react'
 import type { ApiSession } from '@/lib/api'
 import { ago } from '@/lib/api/browser'
 import type { Company } from '@/lib/companies'
-import { CompanyMark } from '@/components/roster/company-mark'
 import { cn } from '@/lib/utils'
 
+import { Facepile, type FacepileMember } from '../ui'
 import { useCompanyChannel } from './use-company-channel'
 import type { GroupChatRow } from './types'
 
@@ -59,7 +59,9 @@ export function GroupChatEntry({ company, sessions, onOpen, style, className }: 
   // HQ, or a company that never enabled group chat: nothing at all.
   if (!enabled || !company) return null
 
-  const memberWord = members.length === 1 ? 'member' : 'members'
+  // ChannelMember IS a FacepileMember (seed/pin/name/state/attention); the cluster
+  // draws the first three, so a big company shows a tidy 3-face badge, not 41.
+  const pile: readonly FacepileMember[] = members
   const preview = latest
     ? previewOf(latest)
     : feed.isLoading
@@ -79,19 +81,24 @@ export function GroupChatEntry({ company, sessions, onOpen, style, className }: 
         className,
       )}
     >
-      <CompanyMark
-        slug={company.slug}
-        name={company.display_name}
-        size={38}
+      {/* GROUP identity, not the company logo again. In company scope the header
+          already wears the company mark + name, so repeating them here read as
+          redundant chrome (owner: "#slug + logootje is loos"). A members facepile
+          is the honest identity of a GROUP chat — it shows WHO is in the room (the
+          team), a distinct object from the company itself, and it can't be
+          confused with the header's single company mark. */}
+      <Facepile
+        members={pile}
+        variant="cluster"
+        ring={null}
         className="flex-none"
       />
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
+        <div className="flex items-baseline gap-2">
+          {/* The facepile already says "a group", so the title need not repeat a
+              member count on this line — it gets the room instead. */}
           <span className="truncate text-[14px] font-semibold tracking-[-0.1px] text-ink">
-            #{company.slug}
-          </span>
-          <span className="flex-none text-[12px] text-ink-3">
-            · {members.length} {memberWord}
+            Company chat
           </span>
           {latest && (
             <span className="ml-auto flex-none pl-1 text-[11.5px] tabular-nums text-ink-3">
