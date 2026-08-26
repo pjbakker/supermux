@@ -48,6 +48,24 @@ import {
 import { AttentionProvider, useAttentionProvider } from '@/hooks/use-attention'
 import { useViewportShellVars } from '@/hooks/use-keyboard-viewport'
 
+// The scope circle is LAZY: the switcher + its picker (companies data, the
+// create/invite sheets) must not ride the hero-path entry bundle — they load as
+// their own chunk when the shell mounts. Until it resolves, an empty ringed
+// circle holds the slot (no flash of layout). grok-only, so the base app never
+// even requests it.
+const LazyCompanySwitcher = React.lazy(() =>
+  import('@/components/roster/company-switcher').then((m) => ({
+    default: m.CompanySwitcher,
+  })),
+)
+function NavScopeCircle({ shortcuts }: { shortcuts?: boolean }) {
+  return (
+    <React.Suspense fallback={<span className="gr-scope-circle" aria-hidden />}>
+      <LazyCompanySwitcher variant="circle" shortcuts={shortcuts} />
+    </React.Suspense>
+  )
+}
+
 interface NavItem {
   to: string
   label: string
@@ -229,6 +247,16 @@ function SideNav({ grok }: { grok: boolean }) {
           )
         })}
       </div>
+      {/* Scope circle — the WHOLE-app company switcher, docked at the rail's
+          bottom (WHOOP "profile in the corner"). grok-only (companies is a grok
+          surface); it OWNS the ⌘⇧O / ⌘1-9 shortcuts (the mobile dock passes
+          shortcuts=false so the two instances never double-fire). Its menu opens
+          up-and-right from here (variant='circle'). */}
+      {grok && (
+        <div data-scope-dock="rail" className="mb-1">
+          <NavScopeCircle />
+        </div>
+      )}
       <ThemeToggle />
     </nav>
   )
@@ -352,6 +380,7 @@ function BottomNav({ grok }: { grok: boolean }) {
     reconcileNavPill(navRef.current, grok, activeIndex)
   }, [grok, pathname, activeIndex])
   return (
+    <>
     <nav
       ref={navRef}
       aria-label="Primary"
@@ -437,6 +466,18 @@ function BottomNav({ grok }: { grok: boolean }) {
         )
       })}
     </nav>
+      {/* The scope circle — docked to the RIGHT of the floating capsule (grok
+          CSS fixes it there and shrinks the capsule to make room), the WHOOP
+          detached-profile slot. It is OUTSIDE the <nav>, so it is never a pill
+          cell — `--nav-n` and the sliding-pill math are untouched. `md:hidden`
+          via the dock CSS (the desktop rail carries its own). shortcuts=false:
+          the desktop rail instance owns the keyboard. */}
+      {grok && (
+        <div data-scope-dock="bar" className="md:hidden">
+          <NavScopeCircle shortcuts={false} />
+        </div>
+      )}
+    </>
   )
 }
 

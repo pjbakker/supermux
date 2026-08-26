@@ -11,7 +11,6 @@
 import * as React from 'react'
 
 import { BrowserWorkspace } from '@/components/browser/workspace'
-import { ScopedPageHeader } from '@/components/roster/scoped-page-header'
 import { useCompanyScope } from '@/components/roster/use-company-scope'
 import { useBrowserTabActions, useBrowserTabs } from '@/hooks/use-browser-tabs'
 import { useSessions } from '@/hooks/use-sessions'
@@ -49,18 +48,11 @@ export function BrowserRoute() {
     // to its CONTENT height, and the takeover box then sizes to the 512² seed
     // frame instead of the viewport (the black-band bug). `h-full` takes 100% of
     // main's definite height, giving the flex chain below a real box to fill.
+    //
+    // No page header here: the browser is a full-bleed live canvas, and the
+    // company scope now lives in the nav scope circle (out of every header). The
+    // workspace's own tab strip + omnibox ARE its chrome; nothing stacks above.
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      {/* A COMPACT scope bar only — the browser is a full-bleed live canvas, so a
-          large-title header would eat the workspace and break the takeover box's
-          height. `flex-none` keeps it out of the flex-grow chain; the switcher
-          stays visible + switchable above the rail, balanced by the Settings gear
-          like every other scoped page. */}
-      <div className="flex-none px-4 pb-1.5 pt-[max(0.75rem,env(safe-area-inset-top))] sm:px-6">
-        <ScopedPageHeader title="Browser" compact />
-      </div>
-      {/* `flex-1 min-h-0` gives the workspace a DEFINITE box to fill under the bar
-          (its takeover canvas sizes to `h-full` of this) — without it the canvas
-          collapses to the 512² seed frame (the black-band bug). */}
       <div className="min-h-0 flex-1">
       <BrowserWorkspace
         tabs={scopedTabs}

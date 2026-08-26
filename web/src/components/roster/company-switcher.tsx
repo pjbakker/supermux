@@ -94,8 +94,21 @@ export function CompanySwitcher({
    *  bot needing attention, from the roster's own needs-you rollup. A dot shows
    *  on each row in the set. Defaults to empty so a bench can render it bare. */
   attention = EMPTY_ATTENTION,
+  /** Trigger shape. `'chip'` (default) is the labelled `.gr-company` pill.
+   *  `'circle'` is the compact ringed scope MARK that docks in the nav (mobile
+   *  bottom-bar right, desktop rail bottom — the WHOOP "profile in the corner"
+   *  slot), so the scope leaves every page header. Both open the SAME picker. */
+  variant = 'chip',
+  /** Register the global ⌘⇧O / ⌘1-9 shortcuts. TRUE on exactly one mounted
+   *  instance — otherwise every mounted switcher toggles its own picker open on
+   *  ⌘⇧O (the mobile dock's bottom sheet is body-portaled, so a `display:none`
+   *  wrapper would NOT hide it). The desktop rail owns the keyboard; the mobile
+   *  dock passes `false`. */
+  shortcuts = true,
 }: {
   attention?: ReadonlySet<number | null>
+  variant?: 'chip' | 'circle'
+  shortcuts?: boolean
 } = {}) {
   const { companies } = useCompanies()
   const activeCompany = useUI((s) => s.activeCompany)
@@ -152,6 +165,7 @@ export function CompanySwitcher({
 
   // ── Global shortcuts: ⌘/Ctrl+⇧+O opens; ⌘/Ctrl+1..9 jumps to the Nth ─────────
   React.useEffect(() => {
+    if (!shortcuts) return
     const onKey = (e: KeyboardEvent) => {
       if (!isCmdOrCtrl(e)) return
       // Open — ⌘/Ctrl+Shift+O (KeyO is layout-stable).
@@ -181,7 +195,7 @@ export function CompanySwitcher({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [companies, setActiveCompany])
+  }, [companies, setActiveCompany, shortcuts])
 
   // Seat the highlight on the active row whenever the list opens (both shells).
   // Done on the open TRANSITION during render (the "adjust state when a prop
@@ -405,32 +419,61 @@ export function CompanySwitcher({
   return (
     <>
       <div className="relative">
-        <button
-          ref={triggerRef}
-          type="button"
-          className="gr-company"
-          role="combobox"
-          aria-haspopup="menu"
-          aria-expanded={open}
-          aria-controls={menuId}
-          aria-label="Company scope"
-          onClick={() => setOpen((v) => !v)}
-        >
-          {active ? (
-            <CompanyMark
-              slug={active.slug}
-              name={active.display_name}
-              size={22}
-              className="grok-identity"
-            />
-          ) : (
-            <HqMark size={22} />
-          )}
-          <span className="gr-company-lbl">{label}</span>
-          <ChevronsUpDown size={15} className="gr-company-cv" aria-hidden />
-        </button>
+        {variant === 'circle' ? (
+          <button
+            ref={triggerRef}
+            type="button"
+            className="gr-scope-circle"
+            role="combobox"
+            aria-haspopup="menu"
+            aria-expanded={open}
+            aria-controls={menuId}
+            aria-label={`Company scope: ${label}`}
+            title={`Scope — ${label}`}
+            onClick={() => setOpen((v) => !v)}
+          >
+            {active ? (
+              <CompanyMark
+                slug={active.slug}
+                name={active.display_name}
+                size={26}
+                className="grok-identity"
+              />
+            ) : (
+              <HqMark size={26} />
+            )}
+          </button>
+        ) : (
+          <button
+            ref={triggerRef}
+            type="button"
+            className="gr-company"
+            role="combobox"
+            aria-haspopup="menu"
+            aria-expanded={open}
+            aria-controls={menuId}
+            aria-label="Company scope"
+            onClick={() => setOpen((v) => !v)}
+          >
+            {active ? (
+              <CompanyMark
+                slug={active.slug}
+                name={active.display_name}
+                size={22}
+                className="grok-identity"
+              />
+            ) : (
+              <HqMark size={22} />
+            )}
+            <span className="gr-company-lbl">{label}</span>
+            <ChevronsUpDown size={15} className="gr-company-cv" aria-hidden />
+          </button>
+        )}
 
-        {/* DESKTOP (fine pointer): the compact anchored menu, viewport-safe. */}
+        {/* DESKTOP (fine pointer): the compact anchored menu, viewport-safe. The
+            `circle` trigger docks at the rail's BOTTOM-LEFT, so its menu opens
+            UP-and-RIGHT (bottom-aligned, to the side) instead of downward off the
+            screen edge; the chip keeps the under-the-trigger drop. */}
         {open && !isMobile && (
           <div
             ref={menuRef}
@@ -444,7 +487,11 @@ export function CompanySwitcher({
             // right viewport edge on any width — the collision-safe replacement
             // for the old fixed `w-[300px]`.
             style={{ width: 'min(300px, calc(100vw - 24px))' }}
-            className="gr-cmenu absolute left-0 top-full z-30 mt-1.5 flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none"
+            className={
+              variant === 'circle'
+                ? 'gr-cmenu absolute bottom-0 left-full z-30 ml-2 flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none'
+                : 'gr-cmenu absolute left-0 top-full z-30 mt-1.5 flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none'
+            }
           >
             {renderOptions('menu')}
 
@@ -500,5 +547,33 @@ export function CompanySwitcher({
         </React.Suspense>
       )}
     </>
+  )
+}
+
+/**
+ * `<ScopeTitle>` — the READ-ONLY scope identity for a page header (the overview
+ * leads with it). It shows the active scope's mark + name exactly as the switcher
+ * chip did, but it is NOT a control: switching now lives in the nav scope circle
+ * (`<CompanySwitcher variant="circle">`), so the page just REFLECTS the active
+ * scope while the nav OWNS the switch. Presentational — no picker, no state.
+ */
+export function ScopeTitle() {
+  const { companies } = useCompanies()
+  const activeCompany = useUI((s) => s.activeCompany)
+  const active = companies.find((c) => c.id === activeCompany) ?? null
+  return (
+    <span className="gr-scope-title">
+      {active ? (
+        <CompanyMark
+          slug={active.slug}
+          name={active.display_name}
+          size={24}
+          className="grok-identity"
+        />
+      ) : (
+        <HqMark size={24} />
+      )}
+      <span className="gr-scope-title-lbl">{active ? active.display_name : 'HQ'}</span>
+    </span>
   )
 }

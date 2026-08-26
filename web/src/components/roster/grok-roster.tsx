@@ -73,8 +73,6 @@ import {
 import {
   groupSessions,
   groupTeamsByTier,
-  rosteredTeams,
-  totalBotCount,
   type LeadSignal,
 } from '@/lib/team-attention'
 import { useUI } from '@/stores/ui-store'
@@ -83,9 +81,8 @@ import {
   resolveActiveCompany,
   inCompanyScope,
   companyFirstOrder,
-  companiesNeedingAttention,
 } from '@/lib/companies'
-import { CompanySwitcher } from '@/components/roster/company-switcher'
+import { ScopeTitle } from '@/components/roster/company-switcher'
 import { NavBadgeDot } from '@/components/layout'
 import { useUpdateBadge } from '@/hooks/use-update-badge'
 import { agentHueVars } from '@/lib/grok-agent-hue'
@@ -819,16 +816,6 @@ export default function GrokRoster() {
     }
   }
 
-  // Per-company attention for the switcher's need-you dots — the cross-company
-  // awareness the scoped census (above) intentionally drops. Computed from the
-  // FULL, UNFILTERED roster (`allSessions`, so scope/search never hide a signal)
-  // and REUSING the roster's own needs-you predicate (`needNames` — the same
-  // app-wide rollup the NEEDS YOU section and header count read), so there is
-  // exactly ONE definition of "needs you". `null` in the set = HQ needs you.
-  const companyAttention = React.useMemo(
-    () => companiesNeedingAttention(allSessions, (name) => needNames.has(name)),
-    [allSessions, needNames],
-  )
 
   // OD-2 = FOLD: a team is no longer a leading divider — it sorts into the SAME
   // four sections as a bot, by its own derived attention (`team-attention.ts`).
@@ -853,7 +840,6 @@ export default function GrokRoster() {
   // section PLUS teams in the needs section — so the header can never disagree
   // with what the sections show (the property the old two-ordering split
   // violated: R7/R8).
-  const needCount = groups.needs.length + teamGroups.needs.length
   // The VISIBLE list is empty when neither a (rostered) team nor any session
   // survives the current filter — the honest trigger for the empty state (jury
   // d). `totalBots` counts the UNFILTERED roster, so it cannot answer "did this
@@ -1069,10 +1055,6 @@ export default function GrokRoster() {
   // search-aware), so the two stay in lockstep while searching too. All-HQ (no
   // companies) ⇒ `filtered` is every session and `filteredTeams` every team, so
   // this is byte-identical to the old unfiltered census — behaviour-neutral.
-  const totalBots = totalBotCount(filtered.length, filteredTeams)
-  // The crew census the folded roster no longer says with a divider (OD-2) —
-  // scoped to the crews whose lead is in the active company.
-  const crewCount = rosteredTeams(filteredTeams).length
   const hasDetail = !!selectedSession || !!selectedTeam
 
   const SECTIONS: { key: GroupKey; label: string }[] = [
@@ -1093,24 +1075,11 @@ export default function GrokRoster() {
       style={headH ? ({ '--gr-head-h': `${headH}px` } as React.CSSProperties) : undefined}
     >
       <header className="gr-head" ref={headRef}>
-        {/* The HQ/company scope chip is the overview TITLE — the leftmost
-            identity. The old `.gr-brand` wordmark (a rainbow spark tile + the
-            literal "supermux") was dropped: the switcher already renders the
-            active scope's name (`active.display_name` or "HQ") next to its mark,
-            so the active TEAM name leads instead of a static wordmark. HQ now
-            shows the real blue-S brand `<Logo>` (via `<HqMark>`), not the
-            invented spark. */}
-        <CompanySwitcher attention={companyAttention} />
-        <span className="gr-count">
-          {totalBots} {totalBots === 1 ? 'bot' : 'bots'}
-          {crewCount > 0 && ` · ${crewCount} ${crewCount === 1 ? 'crew' : 'crews'}`}
-          {needCount > 0 && (
-            <>
-              {' · '}
-              <b>{needCount} need you</b>
-            </>
-          )}
-        </span>
+        {/* The overview TITLE — the active scope's mark + name, READ-ONLY. The
+            switch itself moved to the nav scope circle (the WHOOP corner slot),
+            so the scope is out of every header — this just reflects it. HQ shows
+            the real blue-S brand `<HqMark>`; a company shows its `<CompanyMark>`. */}
+        <ScopeTitle />
 
         {/* The create verb — a LABELLED accent-filled primary pill, left-anchored
             next to the count so the next action reads as an action, not a lone

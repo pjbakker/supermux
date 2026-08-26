@@ -630,6 +630,69 @@
    shell root. The tab bar is safe to blur because it has no fixed descendants
    (its children are flow + one `position:absolute` chip), so the blur is a leaf
    effect exactly like the substrate `::before`. */
+
+/* ═══ SCOPE CIRCLE + SCOPE TITLE (Companies moved out of the page headers) ═════
+   The company scope used to lead every page header as a labelled chip. It now
+   lives ONCE, in the nav — a ringed circle showing the active scope's mark
+   (`<CompanySwitcher variant="circle">`), the WHOOP "profile in the corner"
+   slot. So every header is clean, and the scope is switchable from anywhere.
+   Two docks: the mobile bottom-bar (positioned in the ≤md block below) and the
+   desktop rail bottom (`[data-scope-dock='rail']`). Base styling is shared. */
+[data-grok] .gr-scope-circle {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border-radius: 50%;
+  border: 0.5px solid var(--sm-sidebar-separator);
+  background: var(--sm-raised-fill);
+  -webkit-backdrop-filter: var(--sm-glass-raised);
+  backdrop-filter: var(--sm-glass-raised);
+  /* Lift (a peer of the capsule) + a glass top-bevel + a soft accent RING so it
+     reads as the tappable identity, not a nav glyph. The ring is the only frame
+     — subtle, one accent hairline, never the rainbow. */
+  box-shadow:
+    var(--sm-nav-shadow),
+    inset 0 1px 0 color-mix(in srgb, #fff 22%, transparent),
+    0 0 0 1.5px color-mix(in srgb, var(--sm-accent) 42%, transparent);
+  cursor: pointer;
+  transition: transform 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.15);
+}
+[data-grok] .gr-scope-circle:active {
+  transform: scale(0.92);
+}
+/* The mark inside keeps its own rounded-square shape, centred in the circle. */
+[data-grok] .gr-scope-circle > * {
+  pointer-events: none;
+}
+/* Desktop rail dock: the circle sits in the 64px column flow (before the theme
+   toggle). Slightly smaller so it breathes inside the rail. */
+[data-grok] [data-scope-dock='rail'] .gr-scope-circle {
+  width: 44px;
+  height: 44px;
+}
+
+/* SCOPE TITLE — the read-only scope identity the overview header now leads with
+   (`<ScopeTitle>`): the same mark + name the chip showed, but as a TITLE, not a
+   control (switching is the nav circle's job). Reads as the page's owner line. */
+[data-grok] .gr-scope-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+[data-grok] .gr-scope-title-lbl {
+  font-weight: 660;
+  font-size: 19px;
+  letter-spacing: -0.015em;
+  color: var(--sm-sidebar-text, inherit);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 @media (max-width: 767px) {
   /* A. Float it off the floor. `pb-safe` stops being a floor-filler: the
      safe-area becomes the capsule's OUTER bottom margin, so the bar clears the
@@ -638,7 +701,11 @@
   [data-grok] [data-shell-tabs] {
     position: fixed;
     z-index: 30;
-    right: 12px;
+    /* Room on the RIGHT for the detached scope circle (48px + a 12px gap): the
+       capsule ends at 72px from the edge, the circle floats in the gap — the
+       WHOOP "pill + profile" split. Off this surface (base app) the rule never
+       applies, so the full-bleed bar is untouched. */
+    right: 72px;
     bottom: calc(env(safe-area-inset-bottom) + 10px);
     left: 12px;
     /* Horizontal padding is 8px, NOT 4px (owner: the active tint-chip on the
@@ -680,6 +747,20 @@
   }
   [data-grok] [data-shell-tabs]::after {
     content: none;
+  }
+
+  /* THE DETACHED SCOPE CIRCLE (mobile) — floats in the gap the capsule's right
+     inset opened, vertically centred against it. A member of the capsule's glass
+     family (same raised fill, blur and lift) so the two read as one system. It
+     is NOT a nav cell — a fixed sibling of <nav>, so `--nav-n` / the sliding-pill
+     math never see it. The desktop rail carries its own copy; this is ≤md only. */
+  [data-grok] [data-scope-dock='bar'] {
+    position: fixed;
+    z-index: 31;
+    right: 12px;
+    /* Centre the 48px circle on the ~68px capsule (bottom safe+10, ~68 tall →
+       centre at safe+44; circle centre wants the same → bottom = safe+20). */
+    bottom: calc(env(safe-area-inset-bottom) + 20px);
   }
 
   /* Cells + Search paint ABOVE the sliding pill (the pill is z-0, an earlier
@@ -1532,15 +1613,15 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  height: 34px;
-  min-width: 34px;
-  padding: 0 13px;
-  border-radius: 10px;
+  gap: 5px;
+  height: 30px;
+  min-width: 30px;
+  padding: 0 11px;
+  border-radius: 9px;
   border: 0;
   cursor: pointer;
   font: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--gr-onaccent);
@@ -1557,7 +1638,7 @@
 /* the label folds away on a narrow header; the 44×44 phone rule keeps the tap */
 @media (max-width: 520px) {
   [data-grok] .grok-roster .gr-newbot {
-    padding: 0 9px;
+    padding: 0 7px;
   }
   [data-grok] .grok-roster .gr-newbot-lbl {
     display: none;
