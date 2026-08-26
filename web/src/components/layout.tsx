@@ -537,7 +537,11 @@ export function Layout() {
   // (/workflows/:id) is a normal scroll page and deliberately NOT matched.
   const isWorkflowCompose =
     pathname === '/workflows/new' || /^\/workflows\/[^/]+\/edit$/.test(pathname)
-  const chromeless = isFocus || isTeamDetail || isWorkflowCompose
+  // The company group chat (`/company/:id/chat`) is a full-bleed channel like
+  // focus/team-detail — it paints the whole window and scrolls internally, so it
+  // takes no top bar and no bottom nav.
+  const isCompanyChat = /^\/company\/[^/]+\/chat$/.test(pathname)
+  const chromeless = isFocus || isTeamDetail || isWorkflowCompose || isCompanyChat
   // Archived sheet open-state lives in a shared store so the ⌘K command and the
   // overview overflow item open the same shell-mounted instance (no permanent
   // estate — the sheet is only in the DOM as an overlay when opened).

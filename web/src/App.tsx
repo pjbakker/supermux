@@ -70,6 +70,9 @@ const WorkflowDetail = lazy(() =>
 const TeamDetail = lazy(() =>
   import('@/routes/team-detail').then((m) => ({ default: m.TeamDetail })),
 )
+const CompanyChat = lazy(() =>
+  import('@/routes/company-chat').then((m) => ({ default: m.CompanyChat })),
+)
 
 // DEV-only verification pages (/dev/tiles, /dev/term/:name, …). Lazy so
 // neither the route component nor its mock data lands in the production bundle.
@@ -416,6 +419,17 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <TeamDetail />
+                    </Suspense>
+                  }
+                />
+                {/* The company GROUP CHAT, full-bleed (spec §7). The overview
+                    carries only a compact doorway; this is where the channel is
+                    a page. Chromeless like /team — <Layout> gates it below. */}
+                <Route
+                  path="/company/:companyId/chat"
+                  element={
+                    <Suspense fallback={null}>
+                      <CompanyChat />
                     </Suspense>
                   }
                 />

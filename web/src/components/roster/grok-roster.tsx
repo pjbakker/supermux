@@ -82,7 +82,7 @@ import {
   inCompanyScope,
   companyFirstOrder,
 } from '@/lib/companies'
-import { GroupChatHero } from '@/components/chat/group-chat'
+import { GroupChatEntry, routerName } from '@/components/chat/group-chat'
 import { ScopeTitle } from '@/components/roster/company-switcher'
 import { NavBadgeDot } from '@/components/layout'
 import { useUpdateBadge } from '@/hooks/use-update-badge'
@@ -1206,22 +1206,27 @@ export default function GrokRoster() {
         </span>
       </header>
 
-      {/* ── THE COMPANY GROUP CHAT HERO (spec §7.3) ──────────────────────────
-          Between the header and the two-pane body, `flex-none`, inside the
-          rail's own hue scope.
+      {/* ── THE COMPANY GROUP CHAT DOORWAY (spec §7.3, rev) ──────────────────
+          One COMPACT row between the header and the two-pane body — NOT the
+          embedded hero it used to be. The channel is a destination now: this row
+          shows `#slug`, the member count and the latest line with an unread
+          badge, and tapping it opens the full-bleed `/company/:id/chat` page
+          where the chat has the whole screen. That ends the "worst of both
+          worlds": the overview keeps its room, and the chat gets its own.
 
-          IT RENDERS NOTHING unless there is something real behind it: HQ has no
-          company, and a company that never enabled group chat has no Main
-          Assistant — in both cases this is `null` and the overview is
-          byte-identical to before. That is what makes mounting it safe while
-          provisioning is still landing: the hero appears the moment a company
-          actually has a channel, and not one render earlier. */}
-      <GroupChatHero
-        company={activeCompanyRow}
-        sessions={companySessions}
-        style={railHueStyle}
-        className="gc-hero flex-none border-b-[0.5px] border-hairline"
-      />
+          Gated on the Router's existence (the same enablement read the entry
+          makes) so HQ and a company that never opted in add ZERO DOM — no empty
+          padded strip above the roster. */}
+      {activeCompanyRow &&
+        companySessions.some((s) => s.name === routerName(activeCompanyRow.slug)) && (
+          <div className="gc-dock flex-none px-3 pb-2" style={railHueStyle}>
+            <GroupChatEntry
+              company={activeCompanyRow}
+              sessions={companySessions}
+              onOpen={() => navigate(`/company/${activeCompanyRow.id}/chat`)}
+            />
+          </div>
+        )}
 
       <div className="gr-two">
         <div

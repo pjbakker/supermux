@@ -404,6 +404,10 @@ export interface ChatChannelProps {
   routerLabel?: string
   /** Why sending is unavailable, when it is. */
   composerNote?: string
+  /** A control rendered at the START of the header row — the full-bleed
+   *  `/company/:id/chat` page passes a Back button here so the channel keeps ONE
+   *  header (no second bar stacked above it). Omitted on the overview. */
+  headerLeading?: React.ReactNode
   /** Merged into the section's own ground — the caller's hue scope. */
   style?: React.CSSProperties
   className?: string
@@ -426,6 +430,7 @@ export function ChatChannel({
   onSend,
   routerLabel,
   composerNote,
+  headerLeading,
   style,
   className,
 }: ChatChannelProps) {
@@ -516,6 +521,7 @@ export function ChatChannel({
         className="flex flex-none items-center gap-2.5 px-3.5 py-2.5"
         style={{ borderBottom: '0.5px solid var(--gr-line)' }}
       >
+        {headerLeading}
         {/* The company hue lives HERE and nowhere else on the surface (§7.2.4). */}
         <CompanyMark slug={company.slug} name={company.display_name} size={24} />
         <div className="min-w-0 flex-1">
