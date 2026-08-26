@@ -1,16 +1,18 @@
 import * as React from 'react'
 import { Outlet, useLocation } from 'react-router-dom'
-// Primary-nav glyphs — Phosphor (duotone), a deliberately more designed set than
-// the Feather-derived default. `type Icon` is Phosphor's component type; it takes
-// the same `className` the rail passes, plus a `weight` the render sites set.
+// Primary-nav glyphs — Phosphor, a deliberately more designed set than the
+// Feather-derived default. Rendered at `bold` when idle and `fill` when active
+// (the outline→solid selection tell — duotone's second tone is invisible on a
+// monochrome rail). `type Icon` is Phosphor's component type; it takes the same
+// `className` the rail passes, plus the `weight` the render sites set per state.
 import {
-  FlowArrow,
   Folder,
   GearSix,
   Globe,
-  Plugs,
+  Plug,
   SquaresFour,
   TerminalWindow,
+  TreeStructure,
   type Icon,
 } from '@phosphor-icons/react'
 
@@ -94,13 +96,13 @@ const NAV: NavItem[] = [
   // route (/store) that had NO nav surface at all; this `grokOnly` item makes it
   // a first-class Grok destination on the rail and the phone nav (Plug glyph,
   // the same mark the command palette already uses for it). Base app unchanged.
-  { to: '/store', label: 'Connectors', icon: Plugs, grokOnly: true },
+  { to: '/store', label: 'Connectors', icon: Plug, grokOnly: true },
   // Workflows — a bot, an ordered list of prompts, and one trigger (#—). Sits
   // immediately AFTER Connectors because that is the order the two are learned
   // in: you give a bot its tools, then you give it a job. `grokOnly` like the
   // store, so the BASE rail stays four items and no `--nav-n` / tab-count /
   // Liquid-Pill geometry is respec'd; under grok the phone bar goes 4 → 5.
-  { to: '/workflows', label: 'Workflows', icon: FlowArrow, grokOnly: true },
+  { to: '/workflows', label: 'Workflows', icon: TreeStructure, grokOnly: true },
   // Shared browser — the human's persistent, logged-in browser workspace
   // (shared-browser v1 §6.1). `grokOnly` for the same reason /store is: it is a
   // Grok-native doorway, and the base app must stay byte-identical (both nav
@@ -212,7 +214,7 @@ function SideNav({ grok }: { grok: boolean }) {
                           className="absolute inset-0 rounded-xl bg-primary"
                         />
                       )}
-                      <item.icon weight="duotone" className="relative size-5" />
+                      <item.icon weight={isActive ? 'fill' : 'bold'} className="relative size-5" />
                       {/* Desktop: place the dot at the icon's top-right corner.
                        *  inset-y centred on the icon: top ~10px, right ~10px so
                        *  it sits just outside the 20px icon glyph. */}
@@ -414,7 +416,7 @@ function BottomNav({ grok }: { grok: boolean }) {
                       outline→filled tell + lift on the active glyph; base CSS
                       ignores it and it is absent off grok (byte-identical). */}
                   <item.icon
-                    weight="duotone"
+                    weight={isActive ? 'fill' : 'bold'}
                     className="size-5"
                     data-active={grok && isActive ? '' : undefined}
                   />
