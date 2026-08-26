@@ -5,7 +5,10 @@
  * groupchat WS adapter will map onto.
  */
 export { ChatChannel, type ChatChannelProps } from './channel'
-export { GroupChatHero, type GroupChatHeroProps } from './hero'
+export { ChannelComposer, type ChannelComposerProps } from './channel-composer'
+export { GroupChatHero, routerName, type GroupChatHeroProps } from './hero'
+export { useGroupChat, type GroupChatFeed } from './use-group-chat'
+export { mergeRows, parseRouting, toGroupChatRow, toGroupChatRows } from './wire'
 export {
   GROUP_WINDOW_SECONDS,
   isGrouped,

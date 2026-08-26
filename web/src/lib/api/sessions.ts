@@ -1040,6 +1040,20 @@ export interface NewCompany {
   slug: string
   display_name: string
   root_dir: string
+  /**
+   * Provision the company's GROUP CHAT at create time (spec §6).
+   *
+   * On the server this auto-creates the Main Assistant (`<slug>-assistant`, a
+   * normal Claude session on the subscription default model), the sidecar log,
+   * the `group-chat` connector grant for the `@company:<id>` tier, and a
+   * welcome row. There is no post-hoc enable route today — `PATCH /api/companies`
+   * only touches `display_name`/`archived` — so this is a CREATE-TIME decision,
+   * which is why the sheet defaults it on rather than hiding it in settings.
+   *
+   * Optional on the wire: the field is `#[serde(default)]` server-side, so an
+   * older server ignores it and an older client still creates companies.
+   */
+  enable_group_chat?: boolean
 }
 
 export const companiesApi = {

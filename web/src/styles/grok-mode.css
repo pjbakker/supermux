@@ -2708,6 +2708,21 @@
   [data-grok] .grok-roster[data-head-hidden] .gr-head {
     transform: translateY(-100%);
   }
+  /* GROUP-CHAT HERO clearance (review finding 6). The mobile roster header is
+     `position:absolute` (out of flow), so an in-flow hero would paint UNDER it.
+     When a channel hero is present, move the header clearance ONTO the hero and
+     zero it on `.gr-list` (now below the hero), and collapse it in sync with the
+     header's scroll-away so no dead band is left when the header hides. */
+  [data-grok] .grok-roster:has(.gc-hero) .gr-list {
+    padding-top: 0;
+  }
+  [data-grok] .grok-roster .gc-hero {
+    margin-top: var(--gr-head-h, 132px);
+    transition: margin-top 0.26s ease-out;
+  }
+  [data-grok] .grok-roster[data-head-hidden] .gc-hero {
+    margin-top: 0;
+  }
 }
 
 /* ══ GROK MODE — ONE PICKER (search · +new · @// mention · ⌘K) (WS7) ═══════════

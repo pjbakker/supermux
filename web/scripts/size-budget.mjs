@@ -1147,7 +1147,21 @@ const BUDGET_ENTRY_JS = 161 * KB
 // `MentionChip`, `Facepile`, `Composer`) rather than shipping a second chat
 // surface, which is what keeps the delta at 3 KB instead of 15.
 // ceil(measured 417.41) + headroom = 418, same rule as every bump above.
-const BUDGET_APP_JS = 418 * KB
+//
+// RATCHETED 418 → 423 by WIRING that hero to the live channel: the shared
+// `ChatSocket` pointed at `/ws/companies/{id}/groupchat` (a `path` seam, not a
+// second socket), the history-paging hook, the `for_company` badge tick, and a
+// real composer — the `@`-member popover (`<EntityPickerView>`, the same listbox
+// chat / ⌘K / the workflow prompt field use) plus the waking send into the Main
+// Assistant. MEASURED IN ISOLATION by unmounting the hero and rebuilding:
+// 415.12 without it, 421.33 with it — 6.21 KB gz for the whole feature, of which
+// 4.65 lands in the LAZY `grok-roster` chunk (7.39 → 12.04) and the remainder is
+// the picker + `use-sse` hoisting into the shared graph. THE HERO PATH DID NOT
+// MOVE: entry JS 158.23 → 158.73 / 161 KB (99%), so none of it is on cold load.
+// The number is small because the socket, the picker, the composer pill and the
+// input plane are all REUSED — a second data plane here would have cost 20 KB.
+// ceil(measured 421.33) + headroom = 423, same rule as every bump above.
+const BUDGET_APP_JS = 423 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

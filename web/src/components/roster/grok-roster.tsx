@@ -82,6 +82,7 @@ import {
   inCompanyScope,
   companyFirstOrder,
 } from '@/lib/companies'
+import { GroupChatHero } from '@/components/chat/group-chat'
 import { ScopeTitle } from '@/components/roster/company-switcher'
 import { NavBadgeDot } from '@/components/layout'
 import { useUpdateBadge } from '@/hooks/use-update-badge'
@@ -696,6 +697,17 @@ export default function GrokRoster() {
     [activeCompanyRow, resolvedTheme],
   )
 
+  // The group chat's MEMBERS — every bot that belongs to the active company,
+  // read off the same live sessions list the rows below use (so a face in the
+  // pile and the same face in the list can never disagree about status). Not the
+  // search-filtered list: typing in the roster's search must not empty the
+  // channel's facepile.
+  const companySessions = React.useMemo(
+    () =>
+      activeCompany === null ? [] : allSessions.filter((s) => s.company_id === activeCompany),
+    [allSessions, activeCompany],
+  )
+
   const [rawQuery, setRawQuery] = React.useState('')
   const [sort, setSort] = React.useState<'smart' | 'alpha'>('smart')
   const [density, setDensity] = React.useState<Density>(readDensity)
@@ -1193,6 +1205,23 @@ export default function GrokRoster() {
           </button>
         </span>
       </header>
+
+      {/* ── THE COMPANY GROUP CHAT HERO (spec §7.3) ──────────────────────────
+          Between the header and the two-pane body, `flex-none`, inside the
+          rail's own hue scope.
+
+          IT RENDERS NOTHING unless there is something real behind it: HQ has no
+          company, and a company that never enabled group chat has no Main
+          Assistant — in both cases this is `null` and the overview is
+          byte-identical to before. That is what makes mounting it safe while
+          provisioning is still landing: the hero appears the moment a company
+          actually has a channel, and not one render earlier. */}
+      <GroupChatHero
+        company={activeCompanyRow}
+        sessions={companySessions}
+        style={railHueStyle}
+        className="gc-hero flex-none border-b-[0.5px] border-hairline"
+      />
 
       <div className="gr-two">
         <div

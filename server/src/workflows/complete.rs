@@ -54,6 +54,21 @@ pub enum CompletionAction {
     /// Deliberately has NO text field: the body is the server-generated run
     /// summary. A text field here would be `command:<text>` wearing a hat.
     MessageBot { session: String },
+    /// Post the run summary to the workflow's COMPANY GROUP CHAT.
+    ///
+    /// **Presence of this arm IS the opt-in checkbox** (spec §5.2, default ON in
+    /// the composer): there is no `enabled` field to fall out of sync with the
+    /// UI, and no migration — `on_complete` is already tagged JSON.
+    ///
+    /// No fields at all, on purpose. The body is [`run_summary`], the target is
+    /// the workflow's own company, and the author is the bot the workflow runs
+    /// on. There is nothing here a caller could turn into free text, and nothing
+    /// that could aim it at another company.
+    ///
+    /// It wakes NOBODY: the row lands in the sidecar log and repaints the hero.
+    /// That is why it is the one outward-facing arm an AGENT may arm
+    /// ([`parse_for_hook`] lets it through).
+    GroupChatPost,
 }
 
 impl Default for CompletionAction {
@@ -71,6 +86,10 @@ pub enum CompletionOutcome {
     /// The instruction was DELIVERED to a bot. The string is user-facing and
     /// says "asked …", because that is all that happened.
     Asked(String),
+    /// A row was appended to the company channel. Distinct from [`Self::Asked`]
+    /// precisely because nothing was asked of anybody: the server wrote it, and
+    /// no agent spent a turn. The string is user-facing.
+    Posted(String),
     Failed(String),
 }
 
@@ -84,7 +103,7 @@ pub fn parse(json: &str) -> Result<CompletionAction, AppError> {
     serde_json::from_str::<CompletionAction>(s).map_err(|_| {
         AppError::BadRequest(
             "on_complete must be one of {\"kind\":\"none\"|\"notify\"|\"disable\"|\
-             \"connector_send\"|\"message_bot\"}"
+             \"connector_send\"|\"message_bot\"|\"group_chat_post\"}"
                 .into(),
         )
     })
@@ -105,6 +124,12 @@ pub fn parse_for_hook(json: &str) -> Result<CompletionAction, AppError> {
         CompletionAction::MessageBot { .. } => Err(AppError::BadRequest(
             "a workflow created by an agent may not arm a message to another bot".into(),
         )),
+        // `GroupChatPost` is deliberately NOT refused here. The two arms above
+        // are refused because a session token must not be able to email the
+        // world or type into another bot's pane; this one does neither — it
+        // appends a server-generated summary to the workflow's OWN company
+        // channel and wakes nobody. It cannot name a company, so "same company"
+        // is structural rather than a check that could be got wrong.
         other => Ok(other),
     }
 }
@@ -147,6 +172,13 @@ fn run_summary(wf: &Workflow, steps: usize) -> String {
         steps,
         if steps == 1 { "" } else { "s" }
     )
+}
+
+/// The one-shot key a `GroupChatPost` row carries, so the guard and the row
+/// agree on what "this run" means. Named here rather than formatted at the call
+/// site: the guard reads it back out of the log, so the two must not drift.
+pub fn run_key(run_id: i64) -> String {
+    format!("wf-run-{run_id}")
 }
 
 /// Apply one typed completion action.
@@ -222,6 +254,47 @@ pub async fn fire(
                 Err(e) => {
                     fail(state, run, &wf, format!("could not reach '{target}': {e}")).await
                 }
+            }
+        }
+
+        CompletionAction::GroupChatPost => {
+            let Some(company_id) = wf.company_id else {
+                // A main/PA bot's workflow has no company channel to post to.
+                // Say so rather than dropping the row silently.
+                return fail(
+                    state,
+                    run,
+                    &wf,
+                    "this workflow's bot is not in a company, so it has no group chat".into(),
+                )
+                .await;
+            };
+            let steps = db::workflows::step_runs_for(&state.pool, run.id)
+                .await
+                .map(|s| s.iter().filter(|r| r.status == "ok").count())
+                .unwrap_or(0);
+            let summary = run_summary(&wf, steps);
+            // ONE row per run, enforced against the LOG (not memory), so a run
+            // that completes either side of a restart still posts exactly once.
+            match crate::companies::groupchat::post_workflow_summary(
+                state,
+                company_id,
+                &wf.session,
+                &summary,
+                &run_key(run.id),
+            )
+            .await
+            {
+                Ok(Some(_)) => CompletionOutcome::Posted(format!(
+                    "posted the run summary to {}'s group chat",
+                    wf.session
+                )),
+                // The guard fired: this run already has its row. A success —
+                // the invariant is "exactly one", not "one per attempt".
+                Ok(None) => CompletionOutcome::Posted(
+                    "this run had already posted its summary".to_string(),
+                ),
+                Err(e) => fail(state, run, &wf, format!("could not post to the group chat: {e}")).await,
             }
         }
 
@@ -384,6 +457,53 @@ async fn fail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The arm's JSON shape is the OPT-IN itself: `{"kind":"group_chat_post"}`,
+    /// no fields. A field here would be somewhere free text could grow back.
+    #[test]
+    fn group_chat_post_is_a_fieldless_tagged_arm() {
+        let parsed = parse(r#"{"kind":"group_chat_post"}"#).expect("a known kind");
+        assert_eq!(parsed, CompletionAction::GroupChatPost);
+        let encoded = serde_json::to_string(&CompletionAction::GroupChatPost).unwrap();
+        assert_eq!(encoded, r#"{"kind":"group_chat_post"}"#);
+    }
+
+    /// An AGENT may arm it. The two arms `parse_for_hook` refuses reach OUTWARD
+    /// (an email to the world, a keystroke into another bot's pane); this one
+    /// appends a server-generated summary to the bot's OWN company channel and
+    /// wakes nobody, so refusing it would be superstition rather than a rule.
+    #[test]
+    fn an_agent_may_arm_a_group_chat_post_but_still_not_the_outward_arms() {
+        assert_eq!(
+            parse_for_hook(r#"{"kind":"group_chat_post"}"#).unwrap(),
+            CompletionAction::GroupChatPost
+        );
+        assert!(parse_for_hook(r#"{"kind":"message_bot","session":"x"}"#).is_err());
+        assert!(parse_for_hook(
+            r#"{"kind":"connector_send","connector_id":"c","account_ref":"a","to":"t","subject":null}"#
+        )
+        .is_err());
+    }
+
+    /// The one-shot key is a NAMED function because the guard reads it back out
+    /// of the log — two spellings of it would post twice.
+    #[test]
+    fn the_run_key_is_one_spelling() {
+        assert_eq!(run_key(7), "wf-run-7");
+    }
+
+    /// A posted row says POSTED, never "asked": nobody was asked to do anything
+    /// — the server wrote the row itself.
+    #[test]
+    fn a_posted_outcome_never_claims_to_have_asked_a_bot() {
+        let CompletionOutcome::Posted(text) =
+            CompletionOutcome::Posted("posted the run summary to scout\'s group chat".into())
+        else {
+            panic!()
+        };
+        assert!(text.starts_with("posted "), "{text}");
+        assert!(!text.contains("asked "), "{text}");
+    }
 
     /// The honesty rule, as an assertion rather than a comment: nothing this
     /// module can produce claims the SERVER sent anything. (The rest of this

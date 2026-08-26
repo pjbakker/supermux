@@ -133,6 +133,15 @@ pub struct CreateCompanyInput {
     /// client may still send it as a hint; the value is discarded.
     #[serde(default)]
     pub root_dir: Option<String>,
+    /// Turn on the COMPANY GROUP CHAT for this company (spec §6).
+    ///
+    /// **Absent = OFF**, deliberately. The web checkbox defaults to ON and sends
+    /// `true`; an older client, a script or a `curl` that says nothing gets the
+    /// behaviour it has always had — provisioning a live Claude session and a
+    /// connector grant is not something an unchanged caller should suddenly
+    /// start doing because the server was upgraded.
+    #[serde(default)]
+    pub enable_group_chat: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,7 +266,139 @@ async fn create_handler(
         }
         Err(e) => return Err(AppError::from(e)),
     };
+
+    // ── group chat (spec §3.1) ───────────────────────────────────────────────
+    // BEST-EFFORT, and after the row exists: a company must not fail to be
+    // created because a bot could not boot. Every step logs what it could not
+    // do rather than half-failing the create.
+    if input.enable_group_chat.unwrap_or(false) {
+        provision_group_chat(&state, &created).await;
+    }
     Ok((StatusCode::CREATED, ok(created)))
+}
+
+/// Stand up a company's group chat: the welcome row (which creates the sidecar
+/// log), the company-wide connector grant, and the Main Assistant bot.
+///
+/// Ordered cheapest-and-most-durable first. The log and the grant are local,
+/// fast and idempotent; the bot is a real Claude process, so it is created last
+/// and BOOTED in the background — a company create must not block for the
+/// seconds a pty takes, and a boot failure must leave a normal, startable
+/// session row rather than wedging the create.
+async fn provision_group_chat(state: &AppState, company: &Company) {
+    // 1. The welcome row. Creates `<data_dir>/companies/<id>/groupchat.log.jsonl`
+    //    so the hero opens on a real first message instead of empty air.
+    if let Err(e) = groupchat::append(
+        state,
+        company.id,
+        groupchat::NewRow::plain(
+            "server".to_string(),
+            groupchat::AUTHOR_WORKFLOW,
+            welcome_row(&company.display_name),
+        ),
+    )
+    .await
+    {
+        tracing::warn!(company = company.id, error = %e, "group chat: welcome row failed");
+    }
+
+    // 2. The connector grant, on the `@company:<id>` tier — so every bot in this
+    //    company inherits it (`grants_for_session` tier 2) with no per-bot grant
+    //    and no migration.
+    let company_key = format!(
+        "{}{}",
+        crate::db::connectors::COMPANY_PREFIX,
+        company.id
+    );
+    if let Err(e) = crate::db::connectors::grant(
+        &state.pool,
+        &company_key,
+        crate::connectors::groupchat::GROUPCHAT_ID,
+        None,
+        true,
+    )
+    .await
+    {
+        tracing::warn!(company = company.id, error = %e, "group chat: connector grant failed");
+    }
+
+    // 3. The Main Assistant — a NORMAL company bot on the subscription default
+    //    model (no API-token side channel, no special cheap model), created the
+    //    same way `teams::start` creates a lead.
+    let router = groupchat::router_name(&company.slug);
+    let created = crate::sessions::create(
+        state,
+        crate::sessions::CreateInput {
+            name: router.clone(),
+            display_name: Some(format!("{} assistant", company.display_name)),
+            // None: `sessions::create` FORCES a company session's dir under the
+            // company root (`<root_dir>/<name>`), which is exactly where it goes.
+            dir: None,
+            desc: Some(format!("Group-chat router for {}", company.display_name)),
+            provider: Some("claude".into()),
+            creator: Some("group-chat".into()),
+            flags: None,
+            bypass_permissions: None,
+            tags: Some(vec!["group-chat".into(), "router".into()]),
+            branch: None,
+            mcp: None,
+            worktree: None,
+            host_id: None,
+            runtime: None,
+            model: None,
+            company_id: Some(company.id),
+        },
+    )
+    .await;
+    if let Err(e) = created {
+        tracing::warn!(company = company.id, error = %e, "group chat: could not create the assistant bot");
+        return;
+    }
+
+    // 4. Boot it with the routing brief as its first turn (the `teams::start`
+    //    pattern). Spawned: booting a pty takes seconds, and the owner is
+    //    waiting on an HTTP 201 for a row that already exists.
+    let st = state.clone();
+    let prompt = router_brief(&company.slug, &company.display_name);
+    tokio::spawn(async move {
+        if let Err(e) = crate::sessions::lifecycle::start(&st, &router, Some(&prompt)).await {
+            tracing::warn!(session = %router, error = %e, "group chat: assistant boot failed");
+        }
+    });
+}
+
+/// The welcome row a new channel opens with (usecase #9). Server-authored, so
+/// it is `author_kind = workflow` — nobody claimed to have said it.
+fn welcome_row(display_name: &str) -> String {
+    format!(
+        "This is {display_name}'s group chat. Drop a request here and the assistant routes it to          the right bot; bots post milestones and finished workflows. Everyone in the company          reads the same feed."
+    )
+}
+
+/// The Router's first turn (spec §3.2): what it is for, and — decisively — what
+/// it must not do.
+///
+/// The two hard rules are stated as facts about the SERVER, not as requests:
+/// the tag cap and the `@`-strip are enforced in code, so a Router that tries to
+/// exceed them fails rather than succeeds quietly. Telling it so up front is the
+/// difference between a cooperative router and one that spends turns discovering
+/// its own limits.
+fn router_brief(slug: &str, display_name: &str) -> String {
+    let max = crate::companies::groupchat::MAX_TAGS_PER_TURN;
+    format!(
+        "You are the router for {display_name}'s group chat (company `{slug}`).
+
+         You wake ONLY on messages from a human. When you do, decide which bot — or which two          bots — should act, and hand each ONE distilled request with          `mcp__group_chat__tag_bot(session, distilled_request)`. Never do the work yourself.
+
+         Rules the SERVER enforces, so do not try to route around them:
+         - At most {max} tags per human message. The {max}+1th is dropped, not queued.
+         - `mcp__group_chat__post_message` strips every '@': a post cannot summon anyone. Use it          only to answer a human directly when no bot is needed.
+         - Bots never read each other's posts, so tagging is the only thing that reaches one.
+
+         Start each turn with `mcp__group_chat__who_tagged_me` or          `mcp__group_chat__read_history` only if you need context you do not already have — a          read costs the human's tokens. `mcp__group_chat__whoami` tells you who you are.
+
+         If nobody should act, post one short reply saying so, and tag no one."
+    )
 }
 
 async fn patch_handler(
@@ -384,6 +525,7 @@ mod tests {
                 slug: "acme".into(),
                 display_name: "Acme".into(),
                 root_dir: None,
+                enable_group_chat: None,
             }),
         )
         .await;
@@ -413,6 +555,7 @@ mod tests {
                 display_name: "Acme".into(),
                 // A BOGUS client-supplied jail root — must NOT be honored.
                 root_dir: Some("/home/supermux".into()),
+                enable_group_chat: None,
             }),
         )
         .await
@@ -446,6 +589,105 @@ mod tests {
             agent_dir.display().to_string(),
             dir.join("companies").join("acme").join("bot-a").display().to_string(),
             "agent dir forced under <projects>/companies/<slug>/<agent>"
+        );
+
+        state.pool.close().await;
+        std::env::remove_var("SUPERMUX_PROJECT_DIRS");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Enabling group chat at create time stands the channel up: a welcome row
+    /// in the sidecar log, the `@company:<id>` connector grant every bot in the
+    /// company inherits, and the Main Assistant session row. (Booting the
+    /// assistant is spawned and best-effort — a company must exist even if a pty
+    /// cannot start.)
+    #[tokio::test]
+    async fn enabling_group_chat_provisions_the_channel_and_the_router() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (state, dir) = test_state().await;
+        std::env::set_var("SUPERMUX_PROJECT_DIRS", &dir);
+        // The card is seeded at boot (`main`), and the grant's FK points at it —
+        // so a test that skips the seed would assert against a grant the real
+        // server writes and this one silently could not.
+        crate::connectors::groupchat::seed(&state).await;
+
+        create_handler(
+            State(state.clone()),
+            crate::scope::OptCtx(None),
+            Json(CreateCompanyInput {
+                slug: "acme".into(),
+                display_name: "Acme".into(),
+                root_dir: None,
+                enable_group_chat: Some(true),
+            }),
+        )
+        .await
+        .expect("create should succeed");
+
+        let id = companies::get_by_slug(&state.pool, "acme").await.unwrap().unwrap().id;
+
+        // 1. The welcome row — the hero opens on a real message, not empty air.
+        let (rows, _) = groupchat::rehydrate(&groupchat::log_path(&state, id));
+        assert_eq!(rows.len(), 1, "one welcome row");
+        assert_eq!(rows[0].author_session, "server", "server-authored");
+        assert!(rows[0].body.contains("Acme"), "{}", rows[0].body);
+
+        // 2. The company-tier grant: every bot in this company inherits it.
+        let key = format!("{}{}", crate::db::connectors::COMPANY_PREFIX, id);
+        let granted = crate::db::connectors::grants_for_connector(
+            &state.pool,
+            crate::connectors::groupchat::GROUPCHAT_ID,
+        )
+        .await
+        .unwrap();
+        assert!(
+            granted.iter().any(|g| g.session_name == key && g.enabled == 1),
+            "expected an enabled @company grant, got {granted:?}"
+        );
+
+        // 3. The Main Assistant, by the one naming convention, in this company.
+        let router = crate::db::sessions::get(&state.pool, "acme-assistant")
+            .await
+            .unwrap()
+            .expect("the assistant session row exists");
+        assert_eq!(router.company_id, Some(id));
+        assert_eq!(router.provider, "claude");
+
+        state.pool.close().await;
+        std::env::remove_var("SUPERMUX_PROJECT_DIRS");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// ABSENT means OFF. An older client, a script or a `curl` that says nothing
+    /// must not suddenly start booting a Claude session because the server was
+    /// upgraded — the web checkbox is what sends `true`.
+    #[tokio::test]
+    async fn group_chat_is_off_unless_the_caller_asks_for_it() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (state, dir) = test_state().await;
+        std::env::set_var("SUPERMUX_PROJECT_DIRS", &dir);
+
+        create_handler(
+            State(state.clone()),
+            crate::scope::OptCtx(None),
+            Json(CreateCompanyInput {
+                slug: "quiet".into(),
+                display_name: "Quiet".into(),
+                root_dir: None,
+                enable_group_chat: None,
+            }),
+        )
+        .await
+        .expect("create should succeed");
+
+        let id = companies::get_by_slug(&state.pool, "quiet").await.unwrap().unwrap().id;
+        assert!(
+            !groupchat::log_path(&state, id).exists(),
+            "no channel is created for a company that did not ask"
+        );
+        assert!(
+            crate::db::sessions::get(&state.pool, "quiet-assistant").await.unwrap().is_none(),
+            "no assistant bot is created either"
         );
 
         state.pool.close().await;
@@ -492,6 +734,7 @@ mod tests {
                 slug: "acme".into(),
                 display_name: "Acme".into(),
                 root_dir: None,
+                enable_group_chat: None,
             }),
         )
         .await;

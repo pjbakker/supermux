@@ -83,3 +83,27 @@ export const CANARY_ROWS: GroupChatRow[] = [
     body: 'Patch is up either way; the cap is a one-line change.',
   },
 ]
+
+/** The page "Earlier messages" brings in — deliberately a DIFFERENT day, so a
+ *  screenshot shows the join between a paged block and the live window. */
+export const CANARY_OLDER: GroupChatRow[] = [
+  {
+    seq: -2,
+    ts: T0 - 86_400,
+    kind: 'workflow',
+    authorKind: 'workflow',
+    authorSeed: 'connector-store',
+    authorName: 'connector-store',
+    runLabel: 'store · card audit',
+    body: '12 steps · 12 succeeded · 0 failed. Every card resolves to a real URL; two placeholder entries removed.',
+  },
+  {
+    seq: -1,
+    ts: T0 - 82_800,
+    kind: 'milestone',
+    authorKind: 'bot',
+    authorSeed: 'ios-shell',
+    authorName: 'ios-shell',
+    body: 'Composer band fix is live on the PWA — the keyboard-open scroll anchor holds at 390 and 402px.',
+  },
+]

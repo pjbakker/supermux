@@ -40,19 +40,19 @@ import { CompanyMark } from '@/components/roster/company-mark'
 import { HumanMark } from '@/components/roster/human-mark'
 import { cn } from '@/lib/utils'
 
-import { ComposerFrame } from '../composer-shell'
 import {
   ACCENT_INK_CLASS,
   accentInkVarsForSeed,
   ArrowIcon,
   CheckIcon,
-  Composer,
   Facepile,
   MARK_SIZE,
   MentionChip,
   MessageRow,
   type FacepileMember,
 } from '../ui'
+
+import { ChannelComposer } from './channel-composer'
 
 import { isGrouped, type ChannelMember, type GroupChatKind, type GroupChatRow } from './types'
 
@@ -282,6 +282,31 @@ export interface ChatChannelProps {
   /** Max height of the SCROLLING feed. The channel is a hero on the overview,
    *  not the page — it must never eat the roster below it. */
   feedMaxHeight?: number | string
+  /**
+   * No seed has landed yet. The empty state is suppressed while this holds:
+   * "we don't know yet" and "there is nothing" are different sentences, and
+   * printing the second while the first is true is the lie this flag prevents.
+   */
+  loading?: boolean
+  /** The data plane gave up. Says so once, quietly, above the feed. */
+  error?: boolean
+  /** There are older rows below the top of the window. */
+  hasMore?: boolean
+  loadingMore?: boolean
+  onLoadMore?: () => void
+  /** Rows that landed since the reader last saw the bottom. */
+  unread?: number
+  /** The reader is looking at the newest row — clear the unread count. */
+  onSeenBottom?: () => void
+  /**
+   * Deliver a human message to the Router. Absent ⇒ the composer is read-only.
+   * Resolving means the SERVER accepted it, not that anyone has read it.
+   */
+  onSend?: (text: string) => Promise<unknown>
+  /** The Router's display name — the send control says where it goes. */
+  routerLabel?: string
+  /** Why sending is unavailable, when it is. */
+  composerNote?: string
   /** Merged into the section's own ground — the caller's hue scope. */
   style?: React.CSSProperties
   className?: string
@@ -293,6 +318,16 @@ export function ChatChannel({
   rows,
   surface = 'phone',
   feedMaxHeight = 320,
+  loading = false,
+  error = false,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
+  unread = 0,
+  onSeenBottom,
+  onSend,
+  routerLabel,
+  composerNote,
   style,
   className,
 }: ChatChannelProps) {
@@ -315,13 +350,33 @@ export function ChatChannel({
     [members],
   )
 
-  // Newest-at-the-bottom, like every other transcript in the app.
+  // Newest-at-the-bottom, like every other transcript in the app — but STICKY,
+  // not forced: a reader who has scrolled up to read an older row must not be
+  // yanked back by the next milestone. `atBottomRef` is a ref rather than state
+  // because the scroll handler runs on every frame of a flick and a `setState`
+  // there would re-render the whole feed for a number nothing draws.
   const feedRef = React.useRef<HTMLDivElement | null>(null)
+  const atBottomRef = React.useRef(true)
   const lastSeq = rows.length > 0 ? rows[rows.length - 1].seq : 0
+
+  const seen = React.useCallback(() => {
+    if (atBottomRef.current) onSeenBottom?.()
+  }, [onSeenBottom])
+
+  const onScroll = React.useCallback(() => {
+    const el = feedRef.current
+    if (!el) return
+    // 24px of slack: a phone's rubber-band and a sub-pixel row height both leave
+    // a scroller a hair short of its own bottom.
+    atBottomRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 24
+    seen()
+  }, [seen])
+
   React.useEffect(() => {
     const el = feedRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [lastSeq])
+    if (el && atBottomRef.current) el.scrollTop = el.scrollHeight
+    seen()
+  }, [lastSeq, seen])
 
   return (
     <section
@@ -347,6 +402,17 @@ export function ChatChannel({
             {members.length === 1 ? '1 member' : `${members.length} members`}
           </p>
         </div>
+        {unread > 0 && (
+          // The unread count, in the app's accent — an interactive-tier colour
+          // on a badge that IS the "there is something below" affordance
+          // (tapping the feed's bottom clears it). Never a bot hue.
+          <span
+            data-testid="group-chat-unread"
+            className="flex-none rounded-full bg-primary px-2 py-0.5 text-[11px] font-semibold tabular-nums text-primary-foreground"
+          >
+            {unread > 99 ? '99+' : unread}
+          </span>
+        )}
         {pile.length > 0 && (
           <Facepile
             members={pile.slice(0, 6)}
@@ -361,18 +427,46 @@ export function ChatChannel({
       {/* ── the feed ───────────────────────────────────────────────────────── */}
       <div
         ref={feedRef}
+        onScroll={onScroll}
         data-testid="group-chat-feed"
         className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-2 pt-1"
         style={{ maxHeight: feedMaxHeight }}
       >
-        {rows.length === 0 ? (
-          // HONEST EMPTY: the channel exists, nothing has been said in it. No
-          // invented welcome row — the server authors that (spec §3.1).
+        {error && rows.length === 0 && (
+          // ONE quiet line, and only when there is nothing else to show. With
+          // rows on screen the feed says nothing: they are still true, they are
+          // simply not a claim about now — the same reading `connection.ts`
+          // gives a reconnecting transcript.
           <p className="px-3.5 py-6 text-center text-[13px] leading-[1.5] text-ink-2">
-            No messages in #{company.slug} yet.
-            <br />
-            Milestones, completed workflows and routed requests will land here.
+            Can’t reach the channel right now.
           </p>
+        )}
+        {hasMore && rows.length > 0 && (
+          <div className="flex justify-center pb-1 pt-2">
+            <button
+              type="button"
+              onClick={onLoadMore}
+              disabled={loadingMore}
+              data-testid="group-chat-earlier"
+              className="sm-t-hover rounded-full px-3 py-1 text-[12.5px] text-ink-2 hover:bg-fill-soft hover:text-ink disabled:opacity-60"
+            >
+              {loadingMore ? 'Loading…' : 'Earlier messages'}
+            </button>
+          </div>
+        )}
+        {rows.length === 0 ? (
+          // HONEST EMPTY — and only once we actually KNOW it is empty. While the
+          // seed is in flight the feed says nothing at all: a hero that flashes
+          // "no messages" on every mount is claiming something it has not
+          // checked. No invented welcome row either; the server authors that
+          // (spec §3.1).
+          loading || error ? null : (
+            <p className="px-3.5 py-6 text-center text-[13px] leading-[1.5] text-ink-2">
+              No messages in #{company.slug} yet.
+              <br />
+              Milestones, completed workflows and routed requests will land here.
+            </p>
+          )
         ) : (
           rows.map((row, i) => (
             <ChannelRow
@@ -388,33 +482,22 @@ export function ChatChannel({
       </div>
 
       {/* ── the composer ─────────────────────────────────────────────────────
-          The SAME glass pill the focused transcript uses, in the SAME frame
-          (`ComposerFrame`), with the same honesty rung: `readOnly`, and the
-          "why" revealed on focus at zero layout cost. Its copy is this
-          surface's own, because "switch to Terminal" is not the answer here —
-          the send path is a waking delegate into the Main Assistant and it
-          lands in the follow-up (spec §8 step 9). */}
+          The app's own pill, wired to the ONE session a human message is
+          allowed to wake: the company's Main Assistant (spec §3.3). See
+          `channel-composer.tsx` for why an `@mention` is a hint to the Router
+          rather than a second destination. */}
       <div className="flex-none pt-1.5">
-        <ComposerFrame surface={surface} className="px-3.5 pb-3">
-          <>
-            <p
-              aria-hidden
-              className={cn(
-                'pointer-events-none absolute inset-x-0 -top-[22px] text-center',
-                'text-[12.6px] tracking-[-0.05px] text-ink-2',
-                'opacity-0 transition-opacity duration-200 group-focus-within:opacity-100',
-              )}
-            >
-              Read-only preview — sending isn’t wired up yet.
-            </p>
-            <Composer
-              size={surface === 'phone' ? 'mobile' : 'desktop'}
-              readOnly
-              placeholder={`Message #${company.slug}`}
-            />
-          </>
-        </ComposerFrame>
+        <ChannelComposer
+          channel={`#${company.slug}`}
+          members={members}
+          surface={surface}
+          onSend={onSend}
+          routerLabel={routerLabel}
+          disabledNote={composerNote}
+          className="px-3.5 pb-3"
+        />
       </div>
+
     </section>
   )
 }

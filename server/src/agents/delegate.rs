@@ -292,29 +292,42 @@ pub async fn deliver_delegation(
         return Err(AppError::NotFound(format!("session '{to}'")));
     }
 
-    // THE GROUP-CHAT LOOP GUARD (spec §4.3). A company-scoped bot may not
-    // delegate INTO its company's Router (Main Assistant) — that is the one edge
-    // that would let one bot's output cost every other bot a turn, because the
-    // Router's whole job is to fan a message out as `@tags`. Bot posts have
-    // their own path (`POST /api/companies/{id}/groupchat/post`), which appends
-    // to the sidecar log and wakes nobody, so nothing legitimate is lost.
+    // THE GROUP-CHAT LOOP GUARD (spec §4.3). NOTHING delivered through this
+    // core may wake a company's Router (Main Assistant). That single edge is
+    // what would let one bot's output cost every other bot a turn, because the
+    // Router's whole job is to fan a message out as `@tags`.
     //
-    // Only `actor == Some("human")` passes: the composer's human message is the
-    // ONE thing the Router is supposed to wake on (§3.3). That is the same
-    // honest-label contract [`audit_actor`] documents — an already-bearer-authed
-    // caller saying which path it is — and the bot-facing route
-    // (`agents::hook::delegate_handler`, hook-token authenticated) hard-codes
-    // `actor: None`, so a bot cannot reach for this exemption.
+    // UNCONDITIONAL, and each dropped condition was a hole:
     //
-    // A refusal is a SILENT 404 (byte-identical to a nonexistent slug) and
-    // returns BEFORE any delivery, edge or audit row — same discipline as the
-    // company gate above.
-    if actor != Some("human") && from_row.company_id.is_some() {
-        if let Some(cid) = to_row.company_id.filter(|c| Some(*c) == from_row.company_id) {
-            if let Some(company) = db::companies::get(&state.pool, cid).await? {
-                if crate::companies::groupchat::is_router(&company.slug, to) {
-                    return Err(AppError::NotFound(format!("session '{to}'")));
-                }
+    //  * NOT keyed on `actor`. `actor` is a free-text body field from an
+    //    already-bearer-authed caller — the module doc above says in capitals it
+    //    is not an authentication result — so exempting `actor == "human"` made
+    //    a LABEL into the fence. It held only because a bot has no supplied
+    //    bearer; the bearer still sits on disk at `<data_dir>/auth_token`, so
+    //    the guarantee rested on `isolation_mode` (default `BestEffort`) rather
+    //    than on code. A guarantee that depends on a config default is not one.
+    //
+    //  * NOT preconditioned on the SENDER having a company. A main/PA/HQ bot
+    //    (`company_id IS NULL`) reaches every company by design
+    //    ([`delegation_gate_allows`]), so that precondition let the entire HQ
+    //    tier wake any Router, unbounded — and each poke costs the Router a full
+    //    turn even when the 2-tag cap then drops its fan-out.
+    //
+    // No agent of any tier has a legitimate reason to wake a Router: the
+    // Router's entire input is HUMAN messages, and a human message must arrive
+    // through a route carrying a SERVER-RESOLVED `AuthContext` (the discipline
+    // [`wrap_human`] already applies, and which `companies::groupchat`'s post
+    // route now applies too), never through a body field here.
+    //
+    // Bot posts keep their own path (`POST /api/companies/{id}/groupchat/post`),
+    // which appends to the sidecar log and wakes nobody, so nothing legitimate
+    // is lost. A refusal is a SILENT 404 (byte-identical to a nonexistent slug)
+    // and returns BEFORE any delivery, edge or audit row — the same discipline
+    // as the company gate above.
+    if let Some(cid) = to_row.company_id {
+        if let Some(company) = db::companies::get(&state.pool, cid).await? {
+            if crate::companies::groupchat::is_router(&company.slug, to) {
+                return Err(AppError::NotFound(format!("session '{to}'")));
             }
         }
     }

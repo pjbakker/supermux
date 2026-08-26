@@ -157,6 +157,17 @@ pub struct GroupChat {
     /// every routing turn there was. A prompt-only cap is a cap the Router can
     /// ignore — this one drops the third tag whatever it emits.
     tags: std::sync::Mutex<TagTurn>,
+    /// THE WORKFLOW ONE-SHOT LOCK (spec: "a flapping run posts once").
+    ///
+    /// [`post_workflow_summary`]'s guard used to be a check-then-act: the
+    /// `has_run_id` scan ran on the blocking pool and `append` took the writer
+    /// mutex only afterwards, so two completion hooks for the same run (a retry
+    /// plus a late confirmation) could both read `false` and both append. This
+    /// mutex is held ACROSS the disk check and the append, which is what makes
+    /// the guard atomic. The set is a MEMO, not the authority — the log is,
+    /// because a run that completes either side of a restart must still post
+    /// exactly once and only the log remembers that.
+    runs: tokio::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// How many tags the Router has issued in the CURRENT routing turn.
@@ -206,6 +217,17 @@ pub fn router_name(company_slug: &str) -> String {
 /// Is `session` this company's Router?
 pub fn is_router(company_slug: &str, session: &str) -> bool {
     session == router_name(company_slug)
+}
+
+/// The `author_session` a HUMAN row carries: `user:<id>`, derived from the
+/// server-resolved `AuthContext` and never from a request body.
+///
+/// The immutable `human_users` id, not the mutable display name, for the same
+/// reason the render side seeds its hue from the id — and the `:` cannot occur
+/// in a session slug, so a human identity can never collide with (or be
+/// mistaken for) a bot's.
+pub fn human_author_session(user_id: i64) -> String {
+    format!("user:{user_id}")
 }
 
 /// Strip EVERY `@` from a post body.
@@ -314,6 +336,15 @@ pub async fn channel(state: &AppState, company_id: i64) -> Result<Arc<GroupChat>
         store,
         writer: tokio::sync::Mutex::new(next_seq),
         tags: std::sync::Mutex::new(TagTurn::default()),
+        // Seeded from the rehydrated tail so the common case (a run that just
+        // completed) never re-scans the log; anything older falls through to
+        // the on-disk check, which is the actual authority.
+        runs: tokio::sync::Mutex::new(
+            rows.iter()
+                .filter(|r| r.author_kind == AUTHOR_WORKFLOW)
+                .filter_map(|r| r.run_id.clone())
+                .collect(),
+        ),
     });
     Ok(state
         .groupchat_channels
@@ -350,6 +381,18 @@ pub async fn append(
             "post body may not contain supermux wrapper markup".into(),
         ));
     }
+    // THE `@`-STRIP, AT THE PRIMITIVE (spec §4.4) rather than at three call
+    // sites that each have to remember. A HUMAN keeps their `@`s — a human
+    // request is the one thing that may address a bot, and it is also the one
+    // author no bot can forge. Every other author (bot / router / workflow) has
+    // every `@` removed HERE, in the single function every row goes through, so
+    // the next caller cannot post an unstripped body by building a `NewRow` by
+    // hand. Stripping never grows the body, so the caps checked above still hold.
+    let body = if new.author_kind == AUTHOR_HUMAN {
+        new.body
+    } else {
+        strip_ats(&new.body)
+    };
     let gc = channel(state, company_id).await?;
     let mut next = gc.writer.lock().await;
     let row = Row {
@@ -357,7 +400,7 @@ pub async fn append(
         ts: now_ms(),
         author_session: new.author_session,
         author_kind: new.author_kind.to_string(),
-        body: new.body,
+        body,
         wrapper: new.wrapper,
         run_id: new.run_id,
         tagged: new.tagged,
@@ -395,7 +438,14 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{line}")
+    // ONE `write_all` of body+newline, never `writeln!`. `writeln!` goes through
+    // `write_fmt` and emits TWO `write()` syscalls (the body, then `\n`); a
+    // process death between them leaves a newline-less final line that the NEXT
+    // append concatenates onto, producing one malformed line. `rehydrate` skips
+    // it, so TWO rows are lost rather than one — and `next_seq`, derived from the
+    // rows that parsed, regresses by one, so the next append REUSES a `seq`.
+    // A single write under `O_APPEND` is atomic.
+    f.write_all(format!("{line}\n").as_bytes())
 }
 
 // ── history paging (off the log) ─────────────────────────────────────────────
@@ -508,10 +558,15 @@ pub async fn history_handler(
 
 #[derive(Debug, Deserialize)]
 pub struct PostInput {
-    /// The POSTING session. Caller-declared exactly as `delegate`'s `from` is
-    /// (this route sits behind the same admin-equivalent bearer layer); it is
-    /// validated to be a session that actually belongs to `{id}`, which is the
-    /// in-company-bot check §5.1 asks for.
+    /// The POSTING session — a BOT identity, and only honoured on the
+    /// admin-equivalent (owner-bearer) path. Caller-declared exactly as
+    /// `delegate`'s `from` is; it is validated to be a session that actually
+    /// belongs to `{id}`, which is the in-company-bot check §5.1 asks for.
+    ///
+    /// **IGNORED for a scoped human** — see the from-pinning block in
+    /// [`post_handler`]. `#[serde(default)]` so the human composer need not
+    /// invent a session name it is not allowed to declare anyway.
+    #[serde(default)]
     pub session: String,
     pub body: String,
     /// The workflow run this post summarises, when any.
@@ -519,11 +574,172 @@ pub struct PostInput {
     pub run_id: Option<String>,
 }
 
-/// `POST /api/companies/{id}/groupchat/post` — a bot's milestone row.
+/// THE ONE PATH THAT WAKES A COMPANY'S ROUTER (spec §3.3: "wake-only-on-human").
+///
+/// `deliver_delegation`'s Router refusal (`agents/delegate.rs`) is
+/// UNCONDITIONAL — no agent of any tier may wake a Main Assistant, because the
+/// Router's whole job is to fan one message out as `@tags` and that single edge
+/// is what would let one bot's output cost every other bot a turn. That refusal
+/// left the Router with exactly one legitimate input, and this is it: a message
+/// whose author is a SERVER-RESOLVED `AuthContext::Human`.
+///
+/// **The bypass is the call site, not a flag.** This function is PRIVATE to the
+/// module and has exactly one caller — the [`posting_human`] branch of
+/// [`post_handler`], reached only when the MIDDLEWARE resolved the request to a
+/// person (a company colleague, the admin-all human, or the owner bearer's
+/// seeded row). The author identity always came off the auth context and never
+/// off the request body. There is no parameter a caller could set to reach it,
+/// no body field that selects it, and no `pub` for another module to find: a bot
+/// cannot reach this code path at all, which is a stronger statement than "the
+/// guard says no".
+///
+/// **It reuses the existing wake mechanism verbatim.** Not a reimplementation of
+/// `deliver_delegation`'s internals: [`crate::sessions::lifecycle::send_human_text`]
+/// is the SAME funnel the human chat composer (`sessions::send_handler`) uses —
+/// it refuses forgeable wrapper markup, stamps the `<supermux-human>` wrapper
+/// from the resolved identity via `wrap_human`, and hands the result to
+/// `send_harness_text`, which is the function `deliver_delegation` itself calls
+/// to (a) auto-start a stopped/asleep target and (b) type into its pty. One
+/// funnel, so the wake semantics — archive contract, login freeze, auto-wake,
+/// send guard — cannot drift between the composer and the channel.
+///
+/// The Router receives the row WRAPPED AS A HUMAN MESSAGE, which is what its
+/// system prompt keys on ("you wake ONLY on `<supermux-human>` messages") and
+/// what makes it emit its `@tags` through the `group-chat` connector's
+/// `tag_bot`.
+///
+/// Returns whether the Router was actually woken. Never an `Err`: the human's
+/// row is ALREADY durable in the log by the time this runs, so a company with no
+/// group chat enabled (no `<slug>-assistant` session) — or a Router that is
+/// archived, login-frozen, or parked on a modal — must not turn a landed post
+/// into a failed request. It is reported honestly instead, as `routed` on the
+/// response, rather than swallowed into a silent `{"ok":true}`.
+async fn wake_router_on_human(
+    state: &AppState,
+    company: &db::companies::Company,
+    user_id: i64,
+    text: &str,
+) -> bool {
+    let router = router_name(&company.slug);
+    // Group chat may simply never have been enabled for this company, in which
+    // case there is no Assistant session to wake. The `company_id` check is the
+    // same in-company rule the post path applies: a session that merely HAPPENS
+    // to be named `<slug>-assistant` while belonging to another company (or to
+    // no company) is not this company's Router.
+    match db::sessions::get(&state.pool, &router).await {
+        Ok(Some(row)) if row.company_id == Some(company.id) => {}
+        Ok(_) => return false,
+        Err(e) => {
+            tracing::warn!(company = company.id, error = %e, "groupchat: router lookup failed");
+            return false;
+        }
+    }
+    // The display name is not on the `AuthContext` — resolve it from the
+    // `human_users` row exactly as `sessions::send_handler` does. It is the only
+    // free text in the wrapper, and `wrap_human` escapes it; the render side's
+    // hue seed stays the immutable id, never this mutable name.
+    let display_name = db::human_users::get(&state.pool, user_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.display_name)
+        .unwrap_or_default();
+    match crate::sessions::lifecycle::send_human_text(
+        state,
+        &router,
+        text,
+        user_id,
+        &display_name,
+        Some(company.id),
+        None,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                company = company.id,
+                router = %router,
+                error = %e,
+                "groupchat: the Router did not wake; the request row still landed",
+            );
+            false
+        }
+    }
+}
+
+/// WHO is posting, resolved SERVER-SIDE — the whole author question for
+/// [`post_handler`], in one place, answered from the middleware's `AuthContext`
+/// and never from the request body.
+///
+/// `Some(user_id)` ⇒ this is a HUMAN post: an `AUTHOR_HUMAN` row under that
+/// person's own id, and the one authed Router wake. `None` ⇒ it is the
+/// admin-equivalent BOT-post path, where `input.session` names the poster and is
+/// then validated to be a session of this company.
+///
+/// The three identities, and why each answers as it does:
+///
+/// * **A company teammate** (`Human { company_id: Some(_) }`) — ALWAYS a human
+///   post, and `declared_session` is ignored WHATEVER it says. That is the
+///   from-pinning rule: `post_as_session` derives `author_kind` from the NAME
+///   (`<slug>-assistant` ⇒ `AUTHOR_ROUTER`), so without this a colleague could
+///   POST `{"session":"acme-assistant", …}` and have the server stamp their
+///   sentence as a first-class routing decision. `delegate` pins its `from` for
+///   exactly this reason.
+/// * **The dashboard OWNER** — either `Human { company_id: None }` (the
+///   admin-all human) or the bearer `Owner`; `scope.rs` treats the two as one
+///   tier, so this must too, or the overview composer would work for a
+///   colleague and 400 for the owner. They post as themselves whenever they
+///   declare NO session, which is precisely what the composer sends.
+/// * **The owner declaring a session** — the pre-existing admin-equivalent bot
+///   path (a `curl` posting a milestone on a bot's behalf), left intact:
+///   `None`, so the caller falls through to the in-company check below. An
+///   admin could always post as any of their bots; nothing here widens that,
+///   and a human who wants to speak as themselves simply omits the field.
+///
+/// The bearer carries no `user_id` — it is a token, not a person — so it
+/// resolves through [`db::human_users::owner`] to the row 0032 seeds, rather
+/// than to an invented sentinel id. If that row is gone, so is the identity:
+/// `None`, and the caller answers the honest "'session' is required" instead of
+/// writing an unattributable `AUTHOR_HUMAN` row.
+async fn posting_human(
+    state: &AppState,
+    ctx: Option<&crate::auth_human::AuthContext>,
+    declared_session: &str,
+) -> Option<i64> {
+    match ctx? {
+        crate::auth_human::AuthContext::Human {
+            user_id,
+            company_id: Some(_),
+            ..
+        } => Some(*user_id),
+        // Every remaining `Human` is company-unscoped (admin-all).
+        crate::auth_human::AuthContext::Human { user_id, .. } if declared_session.is_empty() => {
+            Some(*user_id)
+        }
+        crate::auth_human::AuthContext::Owner if declared_session.is_empty() => {
+            db::human_users::owner(&state.pool)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "groupchat: owner identity lookup failed");
+                })
+                .ok()
+                .flatten()
+                .map(|u| u.id)
+        }
+        _ => None,
+    }
+}
+
+/// `POST /api/companies/{id}/groupchat/post` — a bot's milestone row, or a
+/// human's request to the Router.
 ///
 /// Its OWN path, physically separate from `deliver_delegation`: nothing here
-/// types into a pty, so a post can never cost another agent a turn. The body is
-/// `@`-stripped before it is written, so a post can never carry a waking tag.
+/// types into a pty for a BOT post, so a post can never cost another agent a
+/// turn. The body is `@`-stripped before it is written, so a post can never
+/// carry a waking tag. The one exception is a post whose author the server
+/// resolved to a human ([`posting_human`]), which is the single authed wake
+/// ([`wake_router_on_human`]) — the whole of spec §3.3.
 pub async fn post_handler(
     Path(id): Path<i64>,
     State(state): State<AppState>,
@@ -531,6 +747,65 @@ pub async fn post_handler(
     Json(input): Json<PostInput>,
 ) -> Result<Json<Value>, AppError> {
     let company = scoped_company(&state, &ctx, id).await?;
+
+    // P3b-STYLE FROM-PINNING. `input.session` is CLIENT-CLAIMED, and
+    // `post_as_session` derives `author_kind` from the NAME (`<slug>-assistant`
+    // ⇒ `AUTHOR_ROUTER`). Without this, any scoped human in the company — a
+    // colleague, not an admin — could POST `{"session":"acme-assistant", …}`
+    // and have the server stamp their sentence as a first-class routing
+    // decision, indistinguishable from a real Assistant one. `delegate` already
+    // carries this exact countermeasure for its `from`.
+    //
+    // So: EVERY human this request resolves to — a scoped colleague and the
+    // owner alike — posts AS THEMSELVES, full stop; author identity comes from
+    // the server-side `AuthContext` ([`posting_human`]), never the body, which
+    // is the same discipline `wrap_human` applies. Only the hook-token path
+    // (`connectors::groupchat::tools`, where the session's identity is actually
+    // proven) and the admin-equivalent bearer declaring a session may name a bot
+    // poster — the pre-existing behaviour below.
+    //
+    // It is also the ONE path that writes an `AUTHOR_HUMAN` row, i.e. the row
+    // that opens a routing turn (`current_turn`) — which is precisely why it
+    // must be unforgeable.
+    if let Some(user_id) = posting_human(&state, ctx.0.as_ref(), input.session.trim()).await {
+        // (`scoped_company` above already refused any id but this human's own,
+        // so `company.id` IS their company — the branch needs no second check.
+        // The OWNER reaches every company by the same rule, and reaches this
+        // branch by the same door: `posting_human` resolves who they are, the
+        // body never does.)
+        let posted = append(
+            &state,
+            company.id,
+            NewRow {
+                author_session: human_author_session(user_id),
+                author_kind: AUTHOR_HUMAN,
+                // A human keeps their `@`s: `append` only strips for non-humans.
+                body: input.body.clone(),
+                // TRUE provenance: this identity really did come out of the
+                // `<supermux-human>` discipline — a server-resolved
+                // `AuthContext`, never a body field.
+                wrapper: Some(crate::agents::delegate::HUMAN_TAG.to_string()),
+                // `run_id` is a workflow-summary key; a human post is not one.
+                run_id: None,
+                tagged: Vec::new(),
+            },
+        )
+        .await?;
+        // THE HUMAN→ROUTER WAKE — the one authed waking path (spec §3.3).
+        //
+        // The row is durable FIRST, the wake second: a Router that cannot be
+        // woken must still leave the request in the feed (edge #14 — the backlog
+        // routes in one turn when it comes back), and the reverse order would
+        // wake an agent on a row a failed append means nobody can read.
+        //
+        // Awaited, not spawned, so the answer can be HONEST: `routed` says
+        // whether the Assistant actually took the message, and the composer is
+        // never told "routing…" for a wake that never happened. See
+        // [`wake_router_on_human`] for why no bot can reach this code.
+        let routed = wake_router_on_human(&state, &company, user_id, &posted.body).await;
+        return Ok(Json(json!({ "ok": true, "data": posted, "routed": routed })));
+    }
+
     let session = input.session.trim();
     if session.is_empty() {
         return Err(AppError::BadRequest("'session' is required".into()));
@@ -574,8 +849,16 @@ pub async fn post_as_session(
         NewRow {
             author_session: session.to_string(),
             author_kind,
-            body: strip_ats(body),
-            wrapper: Some(crate::agents::delegate::DELEGATION_TAG.to_string()),
+            // The `@`-strip now lives in `append` (one place, every caller).
+            body: body.to_string(),
+            // NOT a delegation. `Row::wrapper` names the provenance wrapper this
+            // row's author identity CAME FROM, and a milestone came from none —
+            // the session posted as itself. Inventing `DELEGATION_TAG` for every
+            // bot row makes the field carry nothing, and mis-tells any later
+            // reader (an audit view, a UI delegation affordance) that a
+            // hand-written milestone was a delegated hand-off. `record_tag`
+            // keeps the tag, because there a delegation actually occurs.
+            wrapper: None,
             run_id,
             tagged: Vec::new(),
         },
@@ -666,11 +949,27 @@ pub fn read_history(
             }
         }
     }
-    // The byte budget, counted back from the NEWEST row — the same direction
-    // the seed page counts, so the freshest context always survives.
+    // THE BYTE BUDGET, and WHICH END it counts from is the whole correctness
+    // argument — counting from the wrong end loses rows silently:
+    //
+    //  * cold read (`since_seq = None`) — `picked` is the NEWEST tail, so count
+    //    back from the newest and drop the oldest. The freshest context
+    //    survives, and what falls off is older than anything `since_seq` could
+    //    address anyway.
+    //  * catch-up (`since_seq = Some(n)`) — `picked` is the OLDEST unseen run,
+    //    so count FORWARD from the oldest and cut the TAIL. Cutting the front
+    //    here (what the shared `.rev()` loop used to do) handed back the newest
+    //    of the unseen rows and then advertised THOSE as the cursor, making
+    //    everything between `n` and the page permanently unreachable.
+    let forward = since_seq.is_some();
     let mut spent = 0usize;
     let mut keep = 0usize;
-    for row in picked.iter().rev() {
+    let ordered: Vec<&Row> = if forward {
+        picked.iter().collect()
+    } else {
+        picked.iter().rev().collect()
+    };
+    for row in ordered {
         let cost = row.body.chars().count() + row.author_session.len() + 24;
         if keep > 0 && spent + cost > budget_chars {
             break;
@@ -679,11 +978,19 @@ pub fn read_history(
         keep += 1;
     }
     let dropped_by_budget = picked.len() - keep;
-    let rows: Vec<ReadRow> = picked.iter().skip(dropped_by_budget).map(ReadRow::from).collect();
-    // `more_seq` means "there is more AFTER the last row you got" — so it is
-    // only meaningful for the catching-up direction. A budget cut in a cold
-    // read dropped OLDER rows, which `since_seq` cannot address.
-    let more_seq = truncated.then(|| rows.last().map(|r| r.seq)).flatten();
+    let rows: Vec<ReadRow> = if forward {
+        picked.iter().take(keep).map(ReadRow::from).collect()
+    } else {
+        picked.iter().skip(dropped_by_budget).map(ReadRow::from).collect()
+    };
+    // `more_seq` means "there is more AFTER the last row you got", so it is only
+    // meaningful catching up (a cold read's budget cut dropped OLDER rows, which
+    // `since_seq` cannot address). It must be set whenever ANYTHING was left
+    // behind — by the row cap OR by the budget. A budget-only cut used to report
+    // `None` ("you are caught up") while dropping rows on the floor.
+    let more_seq = (forward && (truncated || dropped_by_budget > 0))
+        .then(|| rows.last().map(|r| r.seq))
+        .flatten();
     (rows, more_seq)
 }
 
@@ -730,20 +1037,27 @@ pub fn current_turn(path: &std::path::Path) -> Option<u64> {
     turn
 }
 
-/// Claim one tag slot in `turn`. `false` ⇒ the cap is spent and this tag must be
+/// Claim one tag slot in `turn`. `None` ⇒ the cap is spent and this tag must be
 /// DROPPED (§4.6) — not queued, not delivered.
 ///
+/// `Some(remaining)` ⇒ the slot is yours, and `remaining` is how many are left
+/// AFTER this claim. The count is returned rather than recomputed by the caller
+/// because it is only true while this lock is held: a constant
+/// `MAX_TAGS_PER_TURN - 1` told the Router "1 left" after its SECOND tag too,
+/// so it spent a whole turn issuing a third tag this function then dropped —
+/// a token-economy cost caused by a dishonest tool result.
+///
 /// A new `turn` resets the counter: the cap is per routing turn, not per hour.
-pub fn claim_tag_slot(gc: &GroupChat, turn: u64) -> bool {
+pub fn claim_tag_slot(gc: &GroupChat, turn: u64) -> Option<usize> {
     let mut g = gc.tags.lock().unwrap_or_else(|e| e.into_inner());
     if g.turn_seq != turn {
         *g = TagTurn { turn_seq: turn, issued: 0 };
     }
     if g.issued >= MAX_TAGS_PER_TURN {
-        return false;
+        return None;
     }
     g.issued += 1;
-    true
+    Some(MAX_TAGS_PER_TURN.saturating_sub(g.issued))
 }
 
 /// Record the Router's tag as a first-class row (the hero's routing pill) —
@@ -761,7 +1075,10 @@ pub async fn record_tag(
         NewRow {
             author_session: router.to_string(),
             author_kind: AUTHOR_ROUTER,
-            body: strip_ats(reason),
+            // The `@`-strip now lives in `append` (one place, every caller).
+            body: reason.to_string(),
+            // The one row where the wrapper is TRUE: a tag IS a delegation, and
+            // the delivery beneath it really does wrap the prompt with this tag.
             wrapper: Some(crate::agents::delegate::DELEGATION_TAG.to_string()),
             run_id: None,
             tagged: vec![target.to_string()],
@@ -797,29 +1114,39 @@ pub async fn post_workflow_summary(
     summary: &str,
     run_id: &str,
 ) -> Result<Option<Row>, AppError> {
-    let path = log_path(state, company_id);
-    let guard_path = path.clone();
+    let gc = channel(state, company_id).await?;
+    // THE GUARD, UNDER A LOCK. Held across the disk check AND the append, so two
+    // hooks for the same `run_id` serialise: the second one sees the first one's
+    // row (in the memo, or in the log) instead of racing it.
+    let mut seen = gc.runs.lock().await;
+    if seen.contains(run_id) {
+        return Ok(None);
+    }
+    let guard_path = gc.path.clone();
     let key = run_id.to_string();
     let already = tokio::task::spawn_blocking(move || has_run_id(&guard_path, &key))
         .await
         .unwrap_or(false);
     if already {
+        seen.insert(run_id.to_string());
         return Ok(None);
     }
-    append(
+    let posted = append(
         state,
         company_id,
         NewRow {
             author_session: session.to_string(),
             author_kind: AUTHOR_WORKFLOW,
-            body: strip_ats(summary),
+            // The `@`-strip now lives in `append` (one place, every caller).
+            body: summary.to_string(),
             wrapper: None,
             run_id: Some(run_id.to_string()),
             tagged: Vec::new(),
         },
     )
-    .await
-    .map(Some)
+    .await?;
+    seen.insert(run_id.to_string());
+    Ok(Some(posted))
 }
 
 // ── the live socket ──────────────────────────────────────────────────────────
@@ -865,12 +1192,22 @@ async fn push_seed(
     // Byte-capped like every other seed; the ring is already sealed, so this is
     // a measure-and-cut, not a re-serialize of the log.
     let start = seed_start(&ring, SEED_MAX_BYTES);
-    let more_seq = ring.get(start).map(|w| w.offset()).filter(|_| start > 0);
+    // `has_more` asks BOTH questions, exactly as the session chat socket does
+    // (`sessions::chat::ws`): did the BYTE cap drop rows (`start > 0`), and is
+    // the oldest row I am sending actually the start of the log? The ring is
+    // only the log's TAIL (`RING_CAP` rows), so a seed that fits whole can still
+    // sit on top of thousands of older rows — answering `false` there tells the
+    // client "this is the whole channel" and makes them unreachable forever.
+    // Log `seq` starts at 0 by construction, so `offset > 0` is exactly "there
+    // is something older than this".
+    let oldest = ring.get(start).map(|w| w.offset());
+    let has_more = start > 0 || oldest.is_some_and(|o| o > 0);
+    let more_seq = oldest.filter(|_| has_more);
     let entries: Vec<WireEntry> = ring.into_iter().skip(start).collect();
     let seed = json!({
         "type": "seed",
         "entries": entries,
-        "has_more": start > 0,
+        "has_more": has_more,
         "more_seq": more_seq,
     });
     if !send_frame(socket, &seed).await {
@@ -1022,6 +1359,7 @@ mod tests {
                 body: format!("row {seq}"),
                 wrapper: None,
                 run_id: None,
+                tagged: Vec::new(),
             };
             append_line(path, &serde_json::to_string(&row).unwrap()).unwrap();
         }
@@ -1107,6 +1445,77 @@ mod tests {
         assert_eq!(last.entries.len(), 2, "the start of the log");
         assert!(!last.has_more);
         assert_eq!(last.more_seq, None);
+    }
+
+    /// THE BYTE CAP, not the count cap (finding 1): with `limit` far above the
+    /// log's length, the ONLY thing that can cut the page is
+    /// [`SEED_MAX_BYTES`] — and it must cut the OLDEST rows, keep the newest,
+    /// and report a `more_seq` that continues exactly where it stopped.
+    ///
+    /// The bug this refuses is an off-by-one in `more_seq`: it is the seq of the
+    /// oldest row that SURVIVED both caps (an exclusive upper bound), so the next
+    /// page must start one below it — a `more_seq` taken from the pre-budget
+    /// window instead would silently strand every row the budget dropped.
+    #[test]
+    fn history_pages_under_the_byte_budget_and_the_cursor_continues() {
+        let path = tmp_log("bytes");
+        // Each row seals to ~15 KiB (under `MAX_ENTRY_BYTES`, so nothing is
+        // per-entry truncated); 120 of them is ~1.8 MiB against a 512 KiB
+        // budget, i.e. more than two pages — so the cursor is walked, not just
+        // produced once.
+        let n = 120u64;
+        for seq in 0..n {
+            let row = Row {
+                seq,
+                ts: 1_000 + seq as i64,
+                author_session: "bot-a".into(),
+                author_kind: AUTHOR_BOT.into(),
+                body: format!("{seq}:{}", "x".repeat(15_000)),
+                wrapper: None,
+                run_id: None,
+                tagged: Vec::new(),
+            };
+            append_line(&path, &serde_json::to_string(&row).unwrap()).unwrap();
+        }
+
+        let page = history_page(&path, u64::MAX, 1_000);
+        assert!(!page.entries.is_empty(), "a non-empty log never pages to nothing");
+        assert!(
+            page.entries.len() < n as usize,
+            "the byte budget cut something: {} of {n}",
+            page.entries.len(),
+        );
+        assert!(page.has_more, "and says so");
+        assert_eq!(
+            page.entries.last().unwrap().offset(),
+            n - 1,
+            "the NEWEST row always ships — the budget is spent backwards from it",
+        );
+        let oldest = page.entries.first().unwrap().offset();
+        assert_eq!(
+            page.more_seq,
+            Some(oldest),
+            "the cursor is the oldest row that SURVIVED, not the oldest one read",
+        );
+
+        // …and it continues with no gap and no overlap.
+        let older = history_page(&path, page.more_seq.unwrap(), 1_000);
+        assert_eq!(
+            older.entries.last().unwrap().offset(),
+            oldest - 1,
+            "the next page starts one below the cursor",
+        );
+        assert!(older.has_more, "~1.8 MiB does not fit in two 512 KiB pages");
+
+        // Walking it to the start reaches seq 0 exactly once, and then stops.
+        let mut seen = older.entries.len() + page.entries.len();
+        let mut cursor = older.more_seq;
+        while let Some(c) = cursor {
+            let p = history_page(&path, c, 1_000);
+            seen += p.entries.len();
+            cursor = p.more_seq;
+        }
+        assert_eq!(seen, n as usize, "every row is served by exactly one page");
     }
 
     #[test]
@@ -1241,6 +1650,409 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+
+    // ── the human → Router wake (the one authed waking path, spec §3.3) ──
+
+    /// A runtime that RECORDS what was typed into the pty instead of owning one.
+    ///
+    /// `alive() == true` on purpose: the already-awake branch of
+    /// `send_harness_text` is the one that can be asserted without booting a
+    /// real `claude` (its auto-wake half is `wake_for_send`'s own, covered by
+    /// `tests/send_wake_guard.rs`). The capture is a ready Claude composer so the
+    /// send-path modal guard admits the write.
+    #[derive(Default)]
+    struct RecordingStub {
+        sent: std::sync::Mutex<Vec<String>>,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingStub {
+        fn sent(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::sessions::runtime::SessionRuntime for RecordingStub {
+        async fn spawn(
+            &self,
+            _d: &std::path::Path,
+            _e: &std::collections::HashMap<String, String>,
+            _s: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn alive(&self) -> bool {
+            true
+        }
+        async fn kill(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text(&self, t: &str) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(t.to_string());
+            Ok(())
+        }
+        async fn send_key(&self, k: &str) -> anyhow::Result<()> {
+            self.keys.lock().unwrap().push(k.to_string());
+            Ok(())
+        }
+        async fn paste(&self, _t: &str, _b: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn resize(&self, _c: u16, _r: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn capture_plain(&self, _lines: usize) -> anyhow::Result<String> {
+            Ok("❯ \n\n? for shortcuts".to_string())
+        }
+        async fn capture_ansi(&self, _lines: usize) -> anyhow::Result<String> {
+            Ok("❯ \n\n? for shortcuts".to_string())
+        }
+        async fn capture_screen_ansi(&self) -> anyhow::Result<String> {
+            Ok("❯ ".to_string())
+        }
+        async fn capture_full(&self) -> anyhow::Result<String> {
+            Ok("❯ ".to_string())
+        }
+        async fn seed(&self) -> anyhow::Result<String> {
+            Ok("❯ ".to_string())
+        }
+        async fn history_window(
+            &self,
+            end_offset: i64,
+            _count: u32,
+        ) -> anyhow::Result<crate::sessions::runtime::HistoryWindow> {
+            Ok(crate::sessions::runtime::HistoryWindow {
+                rows: vec![],
+                history_size: 0,
+                start_offset: end_offset,
+                end_offset,
+                hit_top: true,
+                cols: 80,
+                at_limit: false,
+            })
+        }
+        async fn history_meta(&self) -> (u32, u16) {
+            (0, 80)
+        }
+        async fn pane_pid(&self) -> anyhow::Result<Option<u32>> {
+            Ok(None)
+        }
+        async fn dead(&self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// Add another `company_id`-scoped session to an existing company.
+    async fn seed_extra_session(state: &AppState, company_id: i64, name: &str) {
+        db::sessions::insert_minimal(&state.pool, name, "/tmp", "claude")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET company_id = ? WHERE name = ?")
+            .bind(company_id)
+            .bind(name)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Register the Router's recording pty and hand the stub back.
+    fn attach_router_pty(state: &AppState, router: &str) -> Arc<RecordingStub> {
+        let stub = Arc::new(RecordingStub::default());
+        state
+            .session_runtimes
+            .insert(router.to_string(), stub.clone() as Arc<dyn crate::sessions::runtime::SessionRuntime>);
+        stub
+    }
+
+    /// A scoped colleague of `company_id`.
+    async fn seed_scoped_human(state: &AppState, company_id: i64) -> i64 {
+        db::human_users::insert(
+            &state.pool,
+            &format!("dev-{company_id}@example.com"),
+            "Dana",
+            Some(company_id),
+            "member",
+        )
+        .await
+        .unwrap()
+    }
+
+    fn human_ctx(user_id: i64, company_id: i64) -> crate::scope::OptCtx {
+        crate::scope::OptCtx(Some(crate::auth_human::AuthContext::Human {
+            user_id,
+            company_id: Some(company_id),
+            role: "member".into(),
+        }))
+    }
+
+    /// THE WAKE. A server-resolved human's request lands in the log AND is typed
+    /// into the Router's pty, wrapped as `<supermux-human>` — which is the only
+    /// thing the Assistant's prompt routes on. Without this the Main Assistant
+    /// never runs at all: `deliver_delegation` refuses every bot→Router edge, so
+    /// this branch is the Router's ONLY input.
+    #[tokio::test]
+    async fn a_human_request_wakes_the_router_wrapped_as_a_human() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+        let router = router_name("acme");
+        seed_extra_session(&state, id, &router).await;
+        let pty = attach_router_pty(&state, &router);
+        let user = seed_scoped_human(&state, id).await;
+
+        let out = post_handler(
+            Path(id),
+            State(state.clone()),
+            human_ctx(user, id),
+            Json(PostInput {
+                // CLIENT-CLAIMED and ignored on this branch — the human posts as
+                // themselves (the P3b from-pinning above).
+                session: router.clone(),
+                body: "ship the connector store @acme-bot".into(),
+                run_id: None,
+            }),
+        )
+        .await
+        .expect("a scoped human may drop a request");
+
+        // The row is the human's own, `@`s intact, provenance stamped.
+        let (rows, _) = rehydrate(&log_path(&state, id));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].author_kind, AUTHOR_HUMAN);
+        assert_eq!(rows[0].author_session, human_author_session(user));
+        assert_eq!(rows[0].body, "ship the connector store @acme-bot");
+        assert_eq!(
+            rows[0].wrapper.as_deref(),
+            Some(crate::agents::delegate::HUMAN_TAG),
+        );
+
+        // …AND the Router's pty got it, as a human message.
+        let sent = pty.sent();
+        assert_eq!(sent.len(), 1, "the Router was woken exactly once: {sent:?}");
+        let typed = &sent[0];
+        assert!(
+            typed.starts_with(&format!("<{} user=\"{user}\"", crate::agents::delegate::HUMAN_TAG)),
+            "the Router must see a <supermux-human> wrapper, got: {typed}",
+        );
+        assert!(typed.contains("name=\"Dana\""), "resolved author, got: {typed}");
+        assert!(typed.contains(&format!("company=\"{id}\"")), "got: {typed}");
+        assert!(typed.contains("ship the connector store @acme-bot"), "got: {typed}");
+        assert_eq!(pty.keys.lock().unwrap().as_slice(), ["Enter"], "and submitted");
+        assert_eq!(out.0["routed"], json!(true), "the answer is honest about it");
+
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// THE OTHER HALF, and the reason the wake is a private function with one
+    /// call site rather than a request flag: NOTHING a bot does reaches the
+    /// Router's pty. A milestone post takes the no-pty path (§4.1), and a bot's
+    /// `deliver_delegation` INTO the Router is the unconditional silent 404
+    /// (`agents/delegate.rs`) — asserted here against the SAME live pty, so the
+    /// two halves cannot be true only in separate test files.
+    #[tokio::test]
+    async fn a_bot_post_and_a_bot_delegation_wake_nobody() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+        let router = router_name("acme");
+        seed_extra_session(&state, id, &router).await;
+        let pty = attach_router_pty(&state, &router);
+
+        // 1. A bot's milestone post — the admin-equivalent bearer path.
+        let out = post_handler(
+            Path(id),
+            State(state.clone()),
+            crate::scope::OptCtx(None),
+            Json(PostInput {
+                session: "acme-bot".into(),
+                body: "deploy is green @acme-assistant".into(),
+                run_id: None,
+            }),
+        )
+        .await
+        .expect("an in-company bot may post");
+        assert!(out.0.get("routed").is_none(), "a bot post routes nothing");
+
+        // 2. The same bot trying to wake the Router directly.
+        let err = crate::agents::delegate::deliver_delegation(
+            &state,
+            "acme-bot",
+            &router,
+            "route this for me",
+            Some("human"), // even the `actor` LABEL cannot buy the exemption
+        )
+        .await
+        .expect_err("no bot of any tier may wake the Router");
+        assert!(matches!(err, AppError::NotFound(_)), "silent 404, got {err:?}");
+
+        assert!(
+            pty.sent().is_empty(),
+            "nothing a bot does may cost the Router a turn: {:?}",
+            pty.sent(),
+        );
+
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An admin-all human colleague (`company_id = NULL`, role `admin`): the
+    /// same tier as the owner bearer, resolved from a cookie instead of a token.
+    async fn seed_admin_human(state: &AppState, email: &str) -> i64 {
+        db::human_users::insert(&state.pool, email, "Alex Admin", None, "admin")
+            .await
+            .unwrap()
+    }
+
+    /// THE OWNER'S SEND (gap 1). The dashboard owner resolves to
+    /// `AuthContext::Owner` (bearer) or to the admin-all `Human { company_id:
+    /// None }` — NEITHER is the company-scoped human the wake branch used to
+    /// match, so the overview composer used to fall through to the bot path and
+    /// answer "'session' is required". Both must land an `AUTHOR_HUMAN` row and
+    /// wake the Router, exactly like a colleague's post.
+    #[tokio::test]
+    async fn an_owner_post_lands_as_a_human_and_wakes_the_router() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+        let router = router_name("acme");
+        seed_extra_session(&state, id, &router).await;
+        let pty = attach_router_pty(&state, &router);
+        // The bearer carries no user_id; it resolves to the row 0032 seeds.
+        let owner = db::human_users::owner(&state.pool)
+            .await
+            .unwrap()
+            .expect("0032 seeds exactly one owner row");
+
+        // 1. THE BEARER — the dashboard's own auth.
+        let out = post_handler(
+            Path(id),
+            State(state.clone()),
+            crate::scope::OptCtx(Some(crate::auth_human::AuthContext::Owner)),
+            // The composer sends a body and NOTHING else.
+            Json(PostInput { session: String::new(), body: "ship the store @acme-bot".into(), run_id: None }),
+        )
+        .await
+        .expect("the owner may post from the overview composer");
+        assert_eq!(out.0["routed"], json!(true), "and the Router took it");
+
+        let (rows, _) = rehydrate(&log_path(&state, id));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].author_kind, AUTHOR_HUMAN);
+        assert_eq!(
+            rows[0].author_session,
+            human_author_session(owner.id),
+            "the owner's own id, resolved server-side",
+        );
+        assert_eq!(rows[0].body, "ship the store @acme-bot", "a human keeps their @s");
+        assert_eq!(rows[0].wrapper.as_deref(), Some(crate::agents::delegate::HUMAN_TAG));
+
+        let typed = pty.sent();
+        assert_eq!(typed.len(), 1, "woken exactly once: {typed:?}");
+        assert!(
+            typed[0].starts_with(&format!(
+                "<{} user=\"{}\"",
+                crate::agents::delegate::HUMAN_TAG,
+                owner.id
+            )),
+            "the Router must see a <supermux-human> wrapper, got: {}",
+            typed[0],
+        );
+        assert!(typed[0].contains(&format!("company=\"{id}\"")), "got: {}", typed[0]);
+
+        // 2. THE ADMIN-ALL HUMAN — a cookie identity, company-unscoped. The
+        //    company is not "theirs" (they have none), and the admin-all bypass
+        //    in `scoped_company` is what lets them reach it at all.
+        let admin = seed_admin_human(&state, "alex@example.com").await;
+        let out = post_handler(
+            Path(id),
+            State(state.clone()),
+            crate::scope::OptCtx(Some(crate::auth_human::AuthContext::Human {
+                user_id: admin,
+                company_id: None,
+                role: "admin".into(),
+            })),
+            Json(PostInput { session: String::new(), body: "and the mail card".into(), run_id: None }),
+        )
+        .await
+        .expect("an admin-all human posts as themselves too");
+        assert_eq!(out.0["routed"], json!(true));
+
+        let (rows, _) = rehydrate(&log_path(&state, id));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].author_kind, AUTHOR_HUMAN);
+        assert_eq!(rows[1].author_session, human_author_session(admin));
+        let typed = pty.sent();
+        assert_eq!(typed.len(), 2, "a second human, a second wake");
+        assert!(typed[1].contains("name=\"Alex Admin\""), "got: {}", typed[1]);
+
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The other side of the same branch: broadening it to the owner must NOT
+    /// swallow the admin-equivalent BOT-post path. An owner who DECLARES a
+    /// session is posting a milestone on that bot's behalf — a bot row, `@`s
+    /// stripped, and no wake — which is the path `curl` and the docs describe.
+    ///
+    /// And the from-pinning fix (finding 10) is unchanged where it matters: a
+    /// company-scoped human's `session` is ignored whatever it says
+    /// (`a_human_request_wakes_the_router_wrapped_as_a_human` declares the
+    /// ROUTER's own name and still posts as themselves).
+    #[tokio::test]
+    async fn an_owner_declaring_a_session_still_posts_as_that_bot() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+        let router = router_name("acme");
+        seed_extra_session(&state, id, &router).await;
+        let pty = attach_router_pty(&state, &router);
+
+        let out = post_handler(
+            Path(id),
+            State(state.clone()),
+            crate::scope::OptCtx(Some(crate::auth_human::AuthContext::Owner)),
+            Json(PostInput { session: "acme-bot".into(), body: "deploy green @all".into(), run_id: None }),
+        )
+        .await
+        .expect("the bearer may still post as one of its bots");
+        assert!(out.0.get("routed").is_none(), "a bot post routes nothing");
+
+        let (rows, _) = rehydrate(&log_path(&state, id));
+        assert_eq!(rows[0].author_kind, AUTHOR_BOT);
+        assert_eq!(rows[0].author_session, "acme-bot");
+        assert_eq!(rows[0].body, "deploy green all", "a bot's @s are stripped");
+        assert!(pty.sent().is_empty(), "and nobody was woken: {:?}", pty.sent());
+
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Group chat not enabled ⇒ no `<slug>-assistant` session. The request still
+    /// LANDS (it is the feed's durable truth, and edge #14 routes the backlog
+    /// when a Router does arrive); the human is not shown an error for a post
+    /// that succeeded, and `routed` says plainly that nobody was woken.
+    #[tokio::test]
+    async fn a_human_request_with_no_router_still_lands() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+        let user = seed_scoped_human(&state, id).await;
+
+        let out = post_handler(
+            Path(id),
+            State(state.clone()),
+            human_ctx(user, id),
+            Json(PostInput { session: String::new(), body: "anybody home?".into(), run_id: None }),
+        )
+        .await
+        .expect("a missing Router is not an error the human sees");
+        assert_eq!(out.0["routed"], json!(false), "and we say so honestly");
+
+        let (rows, _) = rehydrate(&log_path(&state, id));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].author_kind, AUTHOR_HUMAN);
+
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// A session that is not this company's is a UNIFORM 404 — the same shape a
     /// nonexistent slug gets, so the endpoint is not a roster oracle. And it
     /// writes nothing.
@@ -1323,6 +2135,179 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    // ── the connector's tool half (steps 5–6) ────────────────────────────
+
+    async fn seed_human(state: &AppState, id: i64, text: &str) -> Row {
+        append(
+            state,
+            id,
+            NewRow {
+                author_session: "owner".into(),
+                author_kind: AUTHOR_HUMAN,
+                body: text.into(),
+                wrapper: Some(crate::agents::delegate::HUMAN_TAG.to_string()),
+                run_id: None,
+                tagged: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `read_history` is a BUDGETED pull: the server's row cap holds however
+    /// much the bot asks for.
+    #[test]
+    fn read_history_caps_rows_whatever_the_bot_asks() {
+        let path = tmp_log("read-cap");
+        write_rows(&path, 50);
+        let (rows, more) = read_history(&path, None, Some(1_000_000));
+        assert_eq!(rows.len(), HISTORY_TOOL_MAX_ROWS, "the server cap wins");
+        assert_eq!(rows.last().unwrap().seq, 49, "a cold read returns the NEWEST");
+        assert_eq!(more, None, "nothing newer than the newest");
+    }
+
+    /// A tiny budget cuts the OLDEST rows — the freshest context survives.
+    #[test]
+    fn read_history_spends_its_budget_on_the_newest_rows() {
+        let path = tmp_log("read-budget");
+        write_rows(&path, 20);
+        let (rows, _) = read_history(&path, None, Some(10));
+        assert!(!rows.is_empty(), "never an empty answer for a non-empty log");
+        assert!(rows.len() < 20, "the budget cut something: {}", rows.len());
+        assert_eq!(rows.last().unwrap().seq, 19, "the newest row always ships");
+    }
+
+    /// `since_seq` reads FORWARD through the backlog, and `more_seq` is the
+    /// cursor to continue with — so a bot catching up reads the middle rather
+    /// than jumping to the end.
+    #[test]
+    fn read_history_pages_forward_from_since_seq() {
+        let path = tmp_log("read-since");
+        write_rows(&path, 45);
+        let (rows, more) = read_history(&path, Some(0), None);
+        assert_eq!(rows.len(), HISTORY_TOOL_MAX_ROWS);
+        assert_eq!(rows[0].seq, 1, "starts just after `since_seq`");
+        assert_eq!(more, Some(rows.last().unwrap().seq), "continue from here");
+        let (next, _) = read_history(&path, more, None);
+        assert_eq!(next[0].seq, more.unwrap() + 1, "no gap, no overlap");
+    }
+
+    /// THE anti-forgery property: `who_tagged_me` reads the RECORDED tag, never
+    /// the text. A bot that writes an address in a post cannot make itself look
+    /// tagged — the `@` is stripped anyway, and the lookup ignores the body.
+    #[tokio::test]
+    async fn who_tagged_me_reads_the_recorded_tag_not_the_text() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+        seed_human(&state, id, "ship the migration").await;
+        // A bot TRYING to look like it tagged someone.
+        post_handler(
+            Path(id),
+            State(state.clone()),
+            crate::scope::OptCtx(None),
+            Json(PostInput { session: "acme-bot".into(), body: "@acme-bot you do it".into(), run_id: None }),
+        )
+        .await
+        .unwrap();
+        let path = log_path(&state, id);
+        assert!(who_tagged_me(&path, "acme-bot").is_none(), "text is not a tag");
+
+        // The ROUTER's recorded tag is.
+        record_tag(&state, id, "acme-assistant", "acme-bot", "you own the migration")
+            .await
+            .unwrap();
+        let (tag, human) = who_tagged_me(&path, "acme-bot").expect("recorded tag found");
+        assert_eq!(tag.author_session, "acme-assistant");
+        assert_eq!(tag.body, "you own the migration");
+        assert_eq!(
+            human.map(|h| h.body),
+            Some("ship the migration".to_string()),
+            "the human request behind the routing decision"
+        );
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// THE code-side tag cap (§4.6): the third tag in one routing turn is
+    /// refused whatever the Router emits, and a NEW human message opens a fresh
+    /// turn with a fresh budget.
+    #[tokio::test]
+    async fn the_tag_cap_is_per_routing_turn_and_code_enforced() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+        let first = seed_human(&state, id, "do the thing").await;
+        let gc = channel(&state, id).await.unwrap();
+
+        assert_eq!(claim_tag_slot(&gc, first.seq), Some(1), "tag 1, one left");
+        assert_eq!(claim_tag_slot(&gc, first.seq), Some(0), "tag 2, none left");
+        assert_eq!(claim_tag_slot(&gc, first.seq), None, "the 3rd tag is DROPPED");
+        assert_eq!(MAX_TAGS_PER_TURN, 2, "the cap is a documented number");
+
+        let second = seed_human(&state, id, "and another thing").await;
+        assert_ne!(second.seq, first.seq);
+        assert!(
+            claim_tag_slot(&gc, second.seq).is_some(),
+            "a new turn, a fresh budget"
+        );
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The routing turn is the newest HUMAN row — a bot post does not open one,
+    /// which is what stops a Router fanning out on its own initiative.
+    #[tokio::test]
+    async fn the_routing_turn_is_the_newest_human_row() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+        let path = log_path(&state, id);
+        post_handler(
+            Path(id),
+            State(state.clone()),
+            crate::scope::OptCtx(None),
+            Json(PostInput { session: "acme-bot".into(), body: "a milestone".into(), run_id: None }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(current_turn(&path), None, "a bot post is not a routing turn");
+        let human = seed_human(&state, id, "please look at this").await;
+        assert_eq!(current_turn(&path), Some(human.seq));
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// THE one-shot guard (§5.2): a flapping run posts ONE row, and the guard is
+    /// read from the log so it survives a restart.
+    #[tokio::test]
+    async fn a_workflow_run_posts_its_summary_exactly_once() {
+        let (state, dir) = test_state().await;
+        let id = seed_company_bot(&state, "acme", "acme-bot").await;
+
+        let first = post_workflow_summary(&state, id, "acme-bot", "Workflow 'nightly' finished.", "wf-run-7")
+            .await
+            .unwrap();
+        assert!(first.is_some(), "the first completion posts");
+        assert_eq!(first.as_ref().unwrap().author_kind, AUTHOR_WORKFLOW);
+        assert_eq!(first.as_ref().unwrap().run_id.as_deref(), Some("wf-run-7"));
+
+        // Simulated restart: the in-memory channel is gone; the guard still holds
+        // because it asks the LOG.
+        state.groupchat_channels.clear();
+        let again = post_workflow_summary(&state, id, "acme-bot", "Workflow 'nightly' finished.", "wf-run-7")
+            .await
+            .unwrap();
+        assert!(again.is_none(), "the same run must not post twice");
+
+        // A DIFFERENT run is a different row.
+        let other = post_workflow_summary(&state, id, "acme-bot", "Workflow 'nightly' finished.", "wf-run-8")
+            .await
+            .unwrap();
+        assert!(other.is_some());
+        let (rows, _) = rehydrate(&log_path(&state, id));
+        assert_eq!(rows.len(), 2, "exactly two rows for two runs");
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// The log seq rides on the entry's `offset` — the paging-cursor domain —
     /// while the wire `seq` stays the store's live boundary counter.
     #[test]
@@ -1335,6 +2320,7 @@ mod tests {
             body: "hi".into(),
             wrapper: None,
             run_id: None,
+            tagged: Vec::new(),
         };
         let e = to_entry(&row);
         assert_eq!(e.offset, 42);
@@ -1342,5 +2328,44 @@ mod tests {
         assert_eq!(e.body["author_kind"], AUTHOR_BOT);
         let human = Row { author_kind: AUTHOR_HUMAN.into(), ..row };
         assert_eq!(to_entry(&human).kind, Kind::Prompt, "a human row is a prompt");
+    }
+
+    /// THE TIMESTAMP UNIT, pinned (finding 7).
+    ///
+    /// `Row::ts` is server-clock MILLISECONDS (`now_ms`) and it rides the wire
+    /// UNCONVERTED, on a field literally named `ts_ms` — which is the whole
+    /// app's `WireEntry` contract (`sessions::chat::model::ChatEntry::ts_ms`,
+    /// "Claude Code's own clock … in ms"), shared by the session transcript and
+    /// this channel.
+    ///
+    /// The seconds convention the surface reads (`GroupChatRow.ts`, "epoch
+    /// SECONDS") is applied at the CLIENT edge, in the one adapter that owns it:
+    /// `web/src/components/chat/group-chat/wire.ts` → `ts: Math.floor(entry.ts_ms
+    /// / 1000)`, exactly as `wire-entries.ts` does `toSeconds(w.ts_ms)` for every
+    /// session entry. Dividing HERE would put seconds in a field named `ts_ms`,
+    /// the client would divide a second time, and every row in the hero would
+    /// date from January 1970 — so this assertion exists to refuse that "fix".
+    #[test]
+    fn the_wire_carries_milliseconds_because_the_field_is_ts_ms() {
+        let row = Row {
+            seq: 1,
+            ts: 1_700_000_000_123,
+            author_session: "acme-bot".into(),
+            author_kind: AUTHOR_BOT.into(),
+            body: "hi".into(),
+            wrapper: None,
+            run_id: None,
+            tagged: Vec::new(),
+        };
+        let e = to_entry(&row);
+        assert_eq!(e.ts_ms, row.ts, "`ts_ms` is the row's ms clock, unconverted");
+        let wire = serde_json::to_value(WireEntry::seal(0, &e)).unwrap();
+        assert_eq!(wire["ts_ms"], json!(1_700_000_000_123i64));
+        assert!(
+            wire.get("ts").is_none(),
+            "the wire has exactly one time field, and its name states its unit",
+        );
+        // And the log keeps the same domain it is written in.
+        assert!(now_ms() > 1_000_000_000_000, "now_ms is ms, not seconds");
     }
 }

@@ -90,7 +90,11 @@ fn project(wf: &Workflow, steps: &[WorkflowStep]) -> serde_json::Value {
     let done_action = match super::complete::parse(&wf.on_complete).unwrap_or_default() {
         CompletionAction::Notify
         | CompletionAction::ConnectorSend { .. }
-        | CompletionAction::MessageBot { .. } => "notify",
+        | CompletionAction::MessageBot { .. }
+        // The retired vocabulary has no word for "posted to the company
+        // channel"; `notify` is the nearest true one — something was announced
+        // when it finished — and it is never an invented `command:`.
+        | CompletionAction::GroupChatPost => "notify",
         CompletionAction::Disable | CompletionAction::None => "disable",
     };
     json!({

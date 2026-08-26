@@ -246,7 +246,10 @@ async fn tag_bot(
             "reason": "there is no human request to route right now",
         }));
     };
-    if !gc::claim_tag_slot(&gcc, turn) {
+    // The claim returns how many slots remain AFTER it, because that number is
+    // only true while the cap's lock is held — and because telling the Router a
+    // constant is what made it spend a turn on a tag this function then dropped.
+    let Some(remaining) = gc::claim_tag_slot(&gcc, turn) else {
         return Ok(json!({
             "tagged": false,
             "dropped": true,
@@ -256,7 +259,7 @@ async fn tag_bot(
             ),
             "max_tags_per_turn": gc::MAX_TAGS_PER_TURN,
         }));
-    }
+    };
 
     // The visible routing line (the hero's DelegationPill), recorded BEFORE the
     // delivery so a failed wake still leaves the decision in the feed.
@@ -269,6 +272,221 @@ async fn tag_bot(
         "session": target,
         "seq": row.seq,
         "turn": turn,
-        "remaining_tags": gc::MAX_TAGS_PER_TURN.saturating_sub(1),
+        // The TRUTH, not `MAX - 1`: after the second tag this is 0, which is
+        // what stops the Router paying for a third.
+        "remaining_tags": remaining,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::companies::groupchat::{NewRow, AUTHOR_HUMAN};
+
+    async fn test_state() -> (AppState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("supermux-gctools-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::config::Config {
+            data_dir: dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            extra_binds: vec![],
+            tls: Default::default(),
+            auth_token: "test-token".to_string(),
+            provider_defaults: Default::default(),
+            ws: Default::default(),
+            remote_callback_url: None,
+            push_sub: None,
+            github_token: None,
+            statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
+            extra_origins: Vec::new(),
+        };
+        let pool = crate::db::init(&config).await.expect("init pool");
+        (AppState::new(pool, config), dir)
+    }
+
+    async fn seed(state: &AppState, slug: &str, bots: &[&str]) -> db::companies::Company {
+        let c = db::companies::create(&state.pool, slug, slug, &format!("/srv/{slug}"))
+            .await
+            .unwrap();
+        for b in bots {
+            db::sessions::insert_minimal(&state.pool, b, "/tmp", "claude").await.unwrap();
+            sqlx::query("UPDATE sessions SET company_id = ? WHERE name = ?")
+                .bind(c.id)
+                .bind(b)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+        c
+    }
+
+    async fn human_row(state: &AppState, id: i64) {
+        gc::append(
+            state,
+            id,
+            NewRow {
+                author_session: "owner".into(),
+                author_kind: AUTHOR_HUMAN,
+                body: "get the migration shipped".into(),
+                wrapper: None,
+                run_id: None,
+                tagged: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `whoami` is the identity a bot needs to know whether `tag_bot` is even
+    /// its to call — and it is SERVER-derived, not env-derived.
+    #[tokio::test]
+    async fn whoami_names_the_company_and_the_router() {
+        let (state, dir) = test_state().await;
+        let c = seed(&state, "acme", &["acme-bot"]).await;
+        let out = run(&state, &c, "acme-bot", "whoami", &json!({})).await.unwrap();
+        assert_eq!(out["company"], "acme");
+        assert_eq!(out["is_router"], false);
+        assert_eq!(out["router"], "acme-assistant");
+        let router = run(&state, &c, "acme-assistant", "whoami", &json!({})).await.unwrap();
+        assert_eq!(router["is_router"], true);
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `post_message` takes the SAME path the REST route does: `@`-stripped,
+    /// appended, and it wakes nobody.
+    #[tokio::test]
+    async fn post_message_strips_ats_through_the_tool_path_too() {
+        let (state, dir) = test_state().await;
+        let c = seed(&state, "acme", &["acme-bot"]).await;
+        let out = run(
+            &state,
+            &c,
+            "acme-bot",
+            "post_message",
+            &json!({ "text": "done — thanks @acme-assistant" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["posted"], true);
+        assert_eq!(out["text"], "done — thanks acme-assistant");
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Only the Router routes. A bot that could tag would be a bot that can wake
+    /// other bots — the exact thing the token economy forbids.
+    #[tokio::test]
+    async fn tag_bot_is_router_only() {
+        let (state, dir) = test_state().await;
+        let c = seed(&state, "acme", &["acme-bot", "acme-backend"]).await;
+        human_row(&state, c.id).await;
+        let err = run(
+            &state,
+            &c,
+            "acme-bot",
+            "tag_bot",
+            &json!({ "session": "acme-backend", "distilled_request": "do it" }),
+        )
+        .await
+        .expect_err("a non-router may not tag");
+        assert!(matches!(err, AppError::Forbidden(_)), "got {err:?}");
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// End to end through the tool: two tags land, the third is DROPPED — and a
+    /// dropped tag is reported honestly rather than queued behind the Router's
+    /// back.
+    #[tokio::test]
+    async fn the_third_tag_in_a_routing_turn_is_dropped() {
+        let (state, dir) = test_state().await;
+        let c = seed(
+            &state,
+            "acme",
+            &["acme-assistant", "acme-a", "acme-b", "acme-c"],
+        )
+        .await;
+        human_row(&state, c.id).await;
+        let tag = |target: &'static str| {
+            let state = state.clone();
+            let c = c.clone();
+            async move {
+                run(
+                    &state,
+                    &c,
+                    "acme-assistant",
+                    "tag_bot",
+                    &json!({ "session": target, "distilled_request": "please handle this" }),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(tag("acme-a").await["tagged"], true);
+        assert_eq!(tag("acme-b").await["tagged"], true);
+        let third = tag("acme-c").await;
+        assert_eq!(third["tagged"], false, "the cap is code-side, not prompt-side");
+        assert_eq!(third["dropped"], true);
+        assert_eq!(third["max_tags_per_turn"], gc::MAX_TAGS_PER_TURN);
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// No human message ⇒ no routing turn ⇒ nothing to route. This is what stops
+    /// an idle Router fanning out on its own initiative.
+    #[tokio::test]
+    async fn tagging_outside_a_routing_turn_is_refused() {
+        let (state, dir) = test_state().await;
+        let c = seed(&state, "acme", &["acme-assistant", "acme-a"]).await;
+        let out = run(
+            &state,
+            &c,
+            "acme-assistant",
+            "tag_bot",
+            &json!({ "session": "acme-a", "distilled_request": "do something" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["tagged"], false);
+        assert_eq!(out["dropped"], true);
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A cross-company target is the uniform 404 — the Router must not become a
+    /// roster oracle for other companies.
+    #[tokio::test]
+    async fn tagging_out_of_company_is_a_silent_404() {
+        let (state, dir) = test_state().await;
+        let c = seed(&state, "acme", &["acme-assistant"]).await;
+        let _globex = seed(&state, "globex", &["globex-bot"]).await;
+        human_row(&state, c.id).await;
+        let err = run(
+            &state,
+            &c,
+            "acme-assistant",
+            "tag_bot",
+            &json!({ "session": "globex-bot", "distilled_request": "do it" }),
+        )
+        .await
+        .expect_err("cross-company tag must be refused");
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_is_a_400_not_a_silent_ok() {
+        let (state, dir) = test_state().await;
+        let c = seed(&state, "acme", &["acme-bot"]).await;
+        let err = run(&state, &c, "acme-bot", "delete_everything", &json!({}))
+            .await
+            .expect_err("unknown tools must not be reachable");
+        assert!(matches!(err, AppError::BadRequest(_)), "got {err:?}");
+        state.pool.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
