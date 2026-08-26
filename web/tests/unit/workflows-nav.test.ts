@@ -50,7 +50,9 @@ describe('the nav item', () => {
     const entry = navBody.slice(navBody.indexOf("to: '/workflows'"))
     const line = entry.slice(0, entry.indexOf('\n'))
     expect(line).toContain('grokOnly: true')
-    expect(line).toContain("label: 'Workflows'")
+    // Nav label shortened to 'Flows' (the page/route stays "workflows"); the
+    // short label keeps the active-pill from overflowing on the phone nav.
+    expect(line).toContain("label: 'Flows'")
   })
 })
 

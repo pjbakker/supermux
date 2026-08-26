@@ -167,8 +167,15 @@ export function Files() {
   // explicit `?view=` wins over the `/files/:name` session param, so "All
   // spaces" works from a session deep link instead of being out-voted by the
   // `:name` still in the URL.
+  // A live company scope OPENS that company's drive directly — not the all-spaces
+  // chooser. Selecting a company in the nav must land you IN its files (the owner
+  // bug: Files showed every space regardless of scope). `companyRoot !== null`
+  // means a real company is active (HQ / a stale id fail open to null → the grid,
+  // unchanged: HQ sees everything). An explicit `?view=` still wins, so "All
+  // spaces" / HQ remain reachable on demand; `requestedPath` already defaults to
+  // `companyRoot`, so this drops the owner straight into that company's root.
   const wantsDirectory =
-    pathParam != null || (!viewParam && (!!name || !!skipTarget))
+    pathParam != null || (!viewParam && (companyRoot !== null || !!name || !!skipTarget))
   const showHq = !wantsDirectory && viewParam === 'hq'
   const showSpaces = !wantsDirectory && !showHq && !projects.isLoading
 
