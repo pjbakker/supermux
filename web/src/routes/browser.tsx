@@ -52,8 +52,17 @@ export function BrowserRoute() {
     // No page header here: the browser is a full-bleed live canvas, and the
     // company scope now lives in the nav scope circle (out of every header). The
     // workspace's own tab strip + omnibox ARE its chrome; nothing stacks above.
+    //
+    // <BrowserWorkspace> mounts DIRECTLY under this flex-col root — NO wrapper
+    // div. A wrapper here was `display:block`, and the workspace's own `flex-1`
+    // (workspace.tsx) is INERT inside a block parent, so the workspace collapsed
+    // to content height and the takeover box measured short → the live page sat
+    // in a short frame at the top with a black band below it. That orphaned
+    // wrapper (left behind when the compact header was removed) was the whole
+    // "black band" bug. Direct mount keeps the workspace a real flex child of a
+    // definite-height flex parent — exactly how the /dev bench mounts it (which
+    // is why the bench always rendered full-height while the route did not).
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div className="min-h-0 flex-1">
       <BrowserWorkspace
         tabs={scopedTabs}
         activeId={active}
@@ -91,7 +100,6 @@ export function BrowserRoute() {
         // make the server refuse, rather than offering a control that 400s.
         bots={sessions.map((s) => ({ name: s.name, company_id: s.company_id ?? null }))}
       />
-      </div>
     </div>
   )
 }
