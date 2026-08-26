@@ -1208,31 +1208,11 @@ export default function GrokRoster() {
             data-fade-top={fade.top ? '' : undefined}
             data-fade-bottom={fade.bottom ? '' : undefined}
           >
-            {/* Persistent HIRE affordance — a ghost row pinned above the first
-                section. Dashed hairline + placeholder mark, always inviting the
-                next hire (not just the zero-bots hint). Hidden while searching
-                (it is a create verb, not a result) and, via CSS, in the compact
-                feed density. ALSO hidden when the list is EMPTY: the zero-bots
-                empty state below already carries its own primary "New bot" CTA,
-                and showing both left TWO create CTAs competing on one screen
-                (sweep 4a). One primary — the centred empty-state verb when there
-                are no bots, this persistent ghost once bots exist. */}
-            {!needle && !listEmpty && (
-              <button
-                type="button"
-                className="gr-ghost grok-row-enter"
-                aria-label="Hire a new bot"
-                onClick={() => setSheetOpen(true)}
-              >
-                <span className="gr-ghost-mark" aria-hidden>
-                  <Plus size={18} aria-hidden />
-                </span>
-                <span className="gr-ghost-col">
-                  <span className="gr-ghost-t">Hire a new bot</span>
-                  <span className="gr-ghost-s">Give it a name and a job.</span>
-                </span>
-              </button>
-            )}
+            {/* The persistent "Hire a new bot" ghost row was removed (owner): with
+                bots present the header's own New-bot button is the single create
+                affordance, and the zero-bots empty state below still carries its
+                centred hire CTA — so a hire prompt shows ONLY when there are no
+                bots, never as a standing dashed card competing with the list. */}
 
             {/* No "Hire a crew" create verb: Claude starts a team itself when a
                 job needs one — teams are not created from the interface. An

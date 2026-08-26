@@ -102,7 +102,7 @@ interface NavItem {
 }
 
 const NAV: NavItem[] = [
-  { to: '/', label: 'Overview', icon: OverviewGlyph, end: true },
+  { to: '/', label: 'Home', icon: OverviewGlyph, end: true },
   // Focus — desktop-only entry that redirects to /focus/<last-active-session>
   // (see [[FocusEntry]] in routes/focus.tsx). `end: false` (default) so the
   // item stays highlighted while you're on any /focus/* sub-route. The
@@ -113,13 +113,13 @@ const NAV: NavItem[] = [
   // route (/store) that had NO nav surface at all; this `grokOnly` item makes it
   // a first-class Grok destination on the rail and the phone nav (Plug glyph,
   // the same mark the command palette already uses for it). Base app unchanged.
-  { to: '/store', label: 'Connectors', icon: ConnectorsGlyph, grokOnly: true },
+  { to: '/store', label: 'Tools', icon: ConnectorsGlyph, grokOnly: true },
   // Workflows — a bot, an ordered list of prompts, and one trigger (#—). Sits
   // immediately AFTER Connectors because that is the order the two are learned
   // in: you give a bot its tools, then you give it a job. `grokOnly` like the
   // store, so the BASE rail stays four items and no `--nav-n` / tab-count /
   // Liquid-Pill geometry is respec'd; under grok the phone bar goes 4 → 5.
-  { to: '/workflows', label: 'Workflows', icon: WorkflowsGlyph, grokOnly: true },
+  { to: '/workflows', label: 'Flows', icon: WorkflowsGlyph, grokOnly: true },
   // Shared browser — the human's persistent, logged-in browser workspace
   // (shared-browser v1 §6.1). `grokOnly` for the same reason /store is: it is a
   // Grok-native doorway, and the base app must stay byte-identical (both nav
