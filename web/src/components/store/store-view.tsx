@@ -108,7 +108,10 @@ export function StoreView({
   // Browse | Installed — a tab on the SAME `/store` route (DRY, one nav slot).
   // Only offered on the page variant (the library `/store`); the bot-scoped sheet
   // is already a working "installed for this bot" list and keeps its single view.
-  const [tab, setTab] = React.useState<StoreTab>('browse')
+  // Open on INSTALLED — the store lands on "what my bots already have" (owner
+  // request); Browse is one tap away. Page variant only shows tabs, so the sheet
+  // (bot-scoped connect flow) is unaffected — it never reads `tab`.
+  const [tab, setTab] = React.useState<StoreTab>('installed')
   const showTabs = variant === 'page' && !botName
 
   const live = useConnectors(mock ? { source: 'local' } : {})
@@ -404,6 +407,10 @@ function BrowseBody({
         {railVisible && featured.length > 0 && (
           <section className="mb-7">
             <h2 className="mb-2.5 text-[13px] font-semibold uppercase tracking-wide text-muted-foreground">Featured</h2>
+            {/* Featured stays ONE column on mobile — the hero card (brand wash +
+                large artwork, unclamped hook) needs the width; halving it wraps
+                the hook to a tall ribbon and collides with the chip. The dense
+                2-col treatment is for the calm catalog grid below. */}
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {featured.map((c) => (
                 <FeaturedCard
@@ -429,7 +436,7 @@ function BrowseBody({
             className={cn(
               isRow
                 ? 'flex flex-col gap-2'
-                : 'grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3',
+                : 'grid grid-cols-2 gap-2.5 sm:grid-cols-2 sm:gap-3 lg:grid-cols-3',
             )}
           >
             {filtered.map((c) => (
