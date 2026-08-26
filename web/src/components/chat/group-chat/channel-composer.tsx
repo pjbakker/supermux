@@ -260,7 +260,7 @@ export function ChannelComposer({
   const hint = disabledNote ?? (onSend ? null : 'Sending isn’t available here yet.')
 
   return (
-    <ComposerFrame surface={surface} className={cn('px-3.5 pb-3', className)}>
+    <ComposerFrame surface={surface} className={cn('px-3.5', className)}>
       <>
         {/* The one line above the pill. Absolutely positioned, so the surface at
             rest is exactly the boards and nothing below it ever reflows. */}

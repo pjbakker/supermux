@@ -39,22 +39,6 @@ import type { GroupChatAuthorKind, GroupChatKind, GroupChatRow } from './types'
 /** The server's `author_kind` strings (`companies/groupchat/mod.rs`). */
 const AUTHOR_KINDS: readonly string[] = ['human', 'bot', 'router', 'workflow']
 
-/** `@bot-a @bot-b — why` → `{tags, why}`. The separator is optional: a Router
- *  that emits only tags is still a valid routing line, and one that emits only
- *  prose (`@none — …` with the tag stripped) is still a reply. */
-export function parseRouting(body: string): { tags: string[]; why: string } {
-  const tags: string[] = []
-  let rest = body.trimStart()
-  for (;;) {
-    const m = /^@([A-Za-z0-9][A-Za-z0-9._-]*)\s*/.exec(rest)
-    if (!m) break
-    tags.push(m[1]!)
-    rest = rest.slice(m[0].length)
-  }
-  // The em/en dash (or a hyphen) the contract line puts between the tags and
-  // the reason is chrome — the sentence starts after it.
-  return { tags, why: rest.replace(/^[—–-]\s*/, '') }
-}
 
 function kindFor(authorKind: GroupChatAuthorKind): GroupChatKind {
   switch (authorKind) {
@@ -107,12 +91,20 @@ export function toGroupChatRow(entry: WireEntry): GroupChatRow | null {
   }
 
   if (authorKind === 'router') {
-    const { tags, why } = parseRouting(text)
-    // A router line with no tags is a reply (`@none — …`), not a routing act,
+    // Tags are STRUCTURED DATA on the row (`body.tagged`), NOT text: the server
+    // strips every `@` from a router body before writing it, so parsing tags out
+    // of the prose (as this did) always found none and every routing act silently
+    // degraded to a plain `reply` — the "Routed to →" chip treatment was dead
+    // code that never fired on live data. Read the field the server actually
+    // writes (`record_tag` → `row.tagged` → `to_entry` "tagged").
+    const tags = Array.isArray(body.tagged)
+      ? (body.tagged as unknown[]).filter((t): t is string => typeof t === 'string')
+      : []
+    // A router line with no tags is a direct reply (`@none`), not a routing act,
     // and drawing an empty "Routed to →" arrow would be chrome with nothing
     // behind it.
     if (tags.length === 0) return { ...row, kind: 'reply' }
-    return { ...row, tags, body: why || text }
+    return { ...row, tags }
   }
 
   if (authorKind === 'workflow') {

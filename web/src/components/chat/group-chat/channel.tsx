@@ -52,9 +52,51 @@ import {
   type FacepileMember,
 } from '../ui'
 
+import { ChatLoadingSkeleton } from '../chat-loading-skeleton'
 import { ChannelComposer } from './channel-composer'
 
 import { isGrouped, type ChannelMember, type GroupChatKind, type GroupChatRow } from './types'
+
+// Full markdown for message bodies — bots post code fences, bullet lists and
+// bold constantly, and the old hand-rolled linkifier rendered all of it as raw
+// text with literal ** and backticks (below Slack AND Grok-bot). Reuse the 1:1
+// chat's OWN renderer (mentions + code highlight + gfm), lazily so its heavy
+// stack (react-markdown + rehype-highlight) stays off the app chunk — the exact
+// discipline `transcript-item.tsx` uses. Suspense falls back to raw text at the
+// same metrics, so a slow chunk never blanks a message.
+const LazyChatMarkdown = React.lazy(() => import('../markdown/chat-markdown'))
+
+/** A message body rendered as markdown, with the channel's members resolved as
+ *  mention chips. Built from the channel's `members` map so an `@name` a human
+ *  typed (the server keeps a human's `@`s) chips to the real bot face. */
+function ChannelBody({
+  text,
+  members,
+  surface,
+}: {
+  text: string
+  members: ReadonlyMap<string, ChannelMember>
+  surface: 'desktop' | 'phone'
+}) {
+  // `mentionSegments` wants lowercased-name → slug; `members` is already keyed
+  // by lowercased seed AND name, so map its values to their seed.
+  const mentions = React.useMemo(() => {
+    const m = new Map<string, string>()
+    for (const [k, v] of members) m.set(k, v.seed)
+    return m
+  }, [members])
+  const pinFor = React.useCallback(
+    (seed: string) => members.get(seed.toLowerCase())?.pin,
+    [members],
+  )
+  return (
+    <React.Suspense
+      fallback={<span className="whitespace-pre-wrap break-words">{text}</span>}
+    >
+      <LazyChatMarkdown text={text} mentions={mentions} pinFor={pinFor} surface={surface} />
+    </React.Suspense>
+  )
+}
 
 /* ── the kind label ──────────────────────────────────────────────────────────
    Spec §7.2.1's differentiator, at the smallest weight that still separates:
@@ -84,92 +126,6 @@ function KindLabel({ kind }: { kind: GroupChatKind }) {
     >
       {label.text}
     </span>
-  )
-}
-
-/* ── @mentions in prose ──────────────────────────────────────────────────────
-   A mention that resolves to a member becomes the app's own `<MentionChip>`
-   (face + name in the member's pigment, zero layout cost). One that does not —
-   `@all`, `@company`, a bot from another company — becomes a quiet highlight
-   rather than a chip, because drawing a face for a session we cannot identify
-   would be a confident lie about who is on it. */
-// One tokenizer, three interactive vocabularies, all carried by the same split so
-// the parser never disagrees with itself about where a token begins:
-//   · `@name`                a member mention  → the app's `<MentionChip>`
-//   · `https://…`            a link            → a real anchor, `text-primary`
-//   · `#123` / `owner/repo#5` a PR / issue ref → `text-primary` highlight (no fetch)
-// Blue is the interactive tier (§7.2.4): a URL is navigable, a ref is a signpost,
-// and both READ as touchable without a bot hue ever leaking in.
-const LINKIFY_RE =
-  /(@[A-Za-z0-9][A-Za-z0-9._-]*|https?:\/\/[^\s<>]+|(?:[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*)?#\d+)/g
-
-/** The markdown `a` renderer's own rule for "is this a real link" — reused so the
- *  two surfaces cannot disagree about what counts as navigable. */
-const isHttp = (s: string) => /^https?:/i.test(s)
-/** Trailing sentence punctuation is NOT part of the URL. */
-const TRAIL_RE = /[.,;:!?)\]]+$/
-
-function MessageText({
-  body,
-  members,
-}: {
-  body: string
-  members: ReadonlyMap<string, ChannelMember>
-}) {
-  const parts = React.useMemo(() => body.split(LINKIFY_RE), [body])
-  return (
-    <>
-      {parts.map((part, i) => {
-        if (!part) return null
-
-        if (part.startsWith('@')) {
-          const member = members.get(part.slice(1).toLowerCase())
-          if (member) {
-            return (
-              <MentionChip key={i} seed={member.seed} pin={member.pin} name={`@${member.name}`} />
-            )
-          }
-          return (
-            <span key={i} className="font-medium text-primary">
-              {part}
-            </span>
-          )
-        }
-
-        if (isHttp(part)) {
-          // Peel any trailing sentence punctuation back into plain prose so the
-          // href never carries the period that ended the sentence.
-          const tail = part.match(TRAIL_RE)?.[0] ?? ''
-          const href = tail ? part.slice(0, -tail.length) : part
-          return (
-            <React.Fragment key={i}>
-              <a
-                href={href}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="break-all font-medium text-primary underline decoration-primary/30 underline-offset-2 hover:decoration-primary"
-              >
-                {href}
-              </a>
-              {tail}
-            </React.Fragment>
-          )
-        }
-
-        if (part.includes('#')) {
-          // A PR / issue ref: a signpost, not a fetch. Highlighted, not linked —
-          // the surface has no repo context to resolve it against, and inventing
-          // a URL would be the confident lie the mention parser also refuses.
-          return (
-            <span key={i} className="font-medium text-primary">
-              {part}
-            </span>
-          )
-        }
-
-        return <React.Fragment key={i}>{part}</React.Fragment>
-      })}
-    </>
   )
 }
 
@@ -249,9 +205,9 @@ function ChannelRow({
         ) : row.kind === 'routed' ? (
           <RoutedBody row={row} members={members} />
         ) : (
-          <p className="mt-0.5 whitespace-pre-wrap break-words text-[15px] leading-[1.45] tracking-[-0.1px] text-ink">
-            <MessageText body={row.body} members={members} />
-          </p>
+          <div className="mt-0.5 text-[15px] leading-[1.45] tracking-[-0.1px] text-ink">
+            <ChannelBody text={row.body} members={members} surface={surface} />
+          </div>
         )}
       </div>
     </MessageRow>
@@ -305,10 +261,50 @@ function RoutedBody({
           ))}
         </div>
       )}
-      <p className="mt-1 whitespace-pre-wrap break-words text-[14px] leading-[1.45] text-ink-2">
-        <MessageText body={row.body} members={members} />
+      {/* The routing ACT is the chips above; the body is the distilled request
+          the Router handed the bot — useful context, but the bot's PROMPT, not
+          channel speech. Keep it quiet and clamped so a route reads as one calm
+          line, not a wall of instruction. */}
+      <p className="mt-1 line-clamp-2 break-words text-[13px] leading-[1.4] text-ink-3">
+        {row.body}
       </p>
     </div>
+  )
+}
+
+/** The Router is live on a turn — an "is routing…" row at the foot of the feed,
+ *  on the SAME `MessageRow` grammar as every other row (face in the gutter +
+ *  content), so it lines up and reads as the assistant thinking rather than as
+ *  silence after a human posts. Driven by the Router's real session status; it
+ *  unmounts the moment the turn ends (its routed/reply row lands). Reuses the
+ *  composer's own `.grok-typing` dots (inert / reduced-motion-safe off-skin). */
+function RouterTypingRow({
+  seed,
+  label,
+  ring,
+  surface,
+}: {
+  seed: string
+  label: string
+  ring: string
+  surface: 'desktop' | 'phone'
+}) {
+  return (
+    <MessageRow
+      surface={surface}
+      grouped={false}
+      gutter={<SessionMark seed={seed} size={MARK_SIZE.gutter} ring={ring} animate={false} label={null} />}
+      className="grok-entry px-3.5"
+    >
+      <div className="flex items-center gap-2 pt-0.5 text-[13.5px] text-ink-2">
+        <span>{label} is routing</span>
+        <span className="grok-typing inline-flex items-center gap-[3px]" aria-hidden>
+          <i className="inline-block size-[3px] rounded-full bg-current" />
+          <i className="inline-block size-[3px] rounded-full bg-current" />
+          <i className="inline-block size-[3px] rounded-full bg-current" />
+        </span>
+      </div>
+    </MessageRow>
   )
 }
 
@@ -402,6 +398,13 @@ export interface ChatChannelProps {
   onSend?: (text: string) => Promise<unknown>
   /** The Router's display name — the send control says where it goes. */
   routerLabel?: string
+  /** The Router (Main Assistant) is live on a turn right now — draws an "is
+   *  routing…" typing row at the foot of the feed, driven by its REAL session
+   *  status (the same signal the 1:1 chat's working row trusts), so a human who
+   *  just posted sees the assistant thinking instead of silence. */
+  routerWorking?: boolean
+  /** The Router's session name (hue seed) for that typing row's face. */
+  routerSeed?: string
   /** Why sending is unavailable, when it is. */
   composerNote?: string
   /** A control rendered at the START of the header row — the full-bleed
@@ -429,6 +432,8 @@ export function ChatChannel({
   onSeenBottom,
   onSend,
   routerLabel,
+  routerWorking = false,
+  routerSeed,
   composerNote,
   headerLeading,
   style,
@@ -594,12 +599,13 @@ export function ChatChannel({
           </div>
         )}
         {rows.length === 0 ? (
-          // HONEST EMPTY — and only once we actually KNOW it is empty. While the
-          // seed is in flight the feed says nothing at all: a hero that flashes
-          // "no messages" on every mount is claiming something it has not
-          // checked. No invented welcome row either; the server authors that
-          // (spec §3.1).
-          loading || error ? null : (
+          // While the seed is in flight, a calm loading skeleton (the SAME one the
+          // 1:1 chat uses) instead of a blank hero that flashes empty-then-full.
+          // Only once we actually KNOW it is empty do we say so — no invented
+          // welcome row (the server authors that, spec §3.1).
+          loading ? (
+            <ChatLoadingSkeleton />
+          ) : error ? null : (
             <p className="px-3.5 py-6 text-center text-[13px] leading-[1.5] text-ink-2">
               No messages in #{company.slug} yet.
               <br />
@@ -607,30 +613,40 @@ export function ChatChannel({
             </p>
           )
         ) : (
-          rows.map((row, i) => {
-            const prev = rows[i - 1]
-            // A calendar-day change draws a divider AND breaks grouping: a run
-            // must never straddle midnight, or the day label lands mid-run with
-            // no avatar under it.
-            const newDay =
-              !prev ||
-              new Date(row.ts * 1000).toDateString() !== new Date(prev.ts * 1000).toDateString()
-            const grouped = !newDay && isGrouped(row, prev)
-            return (
-              <React.Fragment key={row.seq}>
-                {newDay && <DayDivider ts={row.ts} />}
-                {firstUnreadSeq === row.seq && i > 0 && <UnreadDivider />}
-                <ChannelRow
-                  row={row}
-                  grouped={grouped}
-                  members={byName}
-                  ring={ring}
-                  surface={surface}
-                  fresh={seqBaseline.current !== null && row.seq > seqBaseline.current}
-                />
-              </React.Fragment>
-            )
-          })
+          <>
+            {rows.map((row, i) => {
+              const prev = rows[i - 1]
+              // A calendar-day change draws a divider AND breaks grouping: a run
+              // must never straddle midnight, or the day label lands mid-run with
+              // no avatar under it.
+              const newDay =
+                !prev ||
+                new Date(row.ts * 1000).toDateString() !== new Date(prev.ts * 1000).toDateString()
+              const grouped = !newDay && isGrouped(row, prev)
+              return (
+                <React.Fragment key={row.seq}>
+                  {newDay && <DayDivider ts={row.ts} />}
+                  {firstUnreadSeq === row.seq && i > 0 && <UnreadDivider />}
+                  <ChannelRow
+                    row={row}
+                    grouped={grouped}
+                    members={byName}
+                    ring={ring}
+                    surface={surface}
+                    fresh={seqBaseline.current !== null && row.seq > seqBaseline.current}
+                  />
+                </React.Fragment>
+              )
+            })}
+            {routerWorking && routerSeed && (
+              <RouterTypingRow
+                seed={routerSeed}
+                label={routerLabel ?? 'Assistant'}
+                ring={ring}
+                surface={surface}
+              />
+            )}
+          </>
         )}
       </div>
 
@@ -673,7 +689,10 @@ export function ChatChannel({
           // The newest row's seq — the composer's "routing…" pill clears itself
           // when a later row (the router's reply) lands past the send.
           lastSeq={lastSeq}
-          className="px-3.5 pb-3"
+          // No `pb-3`: let ComposerFrame's phone branch own the keyboard-safe
+          // bottom pad (it zeros the home-indicator band on keyboard-open); a
+          // fixed pad here silently overrode it via twMerge last-wins.
+          className="px-3.5"
         />
       </div>
 

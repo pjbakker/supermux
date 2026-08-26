@@ -22,7 +22,9 @@ import { botModeOn, BOT_KILL_SWITCH_KEY } from '@/lib/bot-mode-flag'
 import { GROK_KILL_SWITCH_KEY } from '@/lib/grok-mode-flag'
 import { useCompanies } from '@/hooks/use-companies'
 import { useSessions } from '@/hooks/use-sessions'
+import { useKeyboardRootResize } from '@/hooks/use-keyboard-viewport'
 import { agentHueVars } from '@/lib/grok-agent-hue'
+import { markStateForSession } from '@/lib/mark-status'
 import { characterFromSeed } from '@/brand/marks'
 import { useTheme } from '@/components/theme-provider'
 import { BackIcon } from '@/components/chat/ui'
@@ -40,6 +42,12 @@ export function CompanyChat() {
   const navigate = useNavigate()
   const isPhone = useMediaQuery('(max-width: 767px)')
   const { resolvedTheme } = useTheme()
+  // Inherit the SAME iOS keyboard machinery the 1:1 chat fought hard for (the
+  // "mode 9" root-resize, packaged as this hook and already reused by the browser
+  // takeover panel). Without it the full-bleed channel's composer gets covered by
+  // the keyboard and the whole app scrolls up, re-exposing the home-indicator
+  // black band. Self-guards on `visualViewport`, so desktop is untouched.
+  useKeyboardRootResize(isPhone)
 
   // Read the skin ONCE (a skin flip is a reload-level change).
   const [grok] = React.useState(() =>
@@ -94,6 +102,11 @@ export function CompanyChat() {
           onSeenBottom={channel.feed.markRead}
           onSend={channel.send}
           routerLabel={channel.routerLabel}
+          // The Router's REAL session status drives the "is routing…" row (the
+          // same 'working' signal the roster and the 1:1 chat trust), so a human
+          // who just posted sees the assistant thinking, not silence.
+          routerWorking={channel.router ? markStateForSession(channel.router) === 'working' : false}
+          routerSeed={channel.router?.name}
           surface={isPhone ? 'phone' : 'desktop'}
           // The page, not a hero: no feed cap — the scroller grows to fill the
           // whole window (the channel's own flex chain owns the height).

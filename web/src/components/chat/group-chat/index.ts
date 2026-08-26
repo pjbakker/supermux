@@ -15,7 +15,7 @@ export {
   type CompanyChannel,
 } from './use-company-channel'
 export { useGroupChat, type GroupChatFeed } from './use-group-chat'
-export { mergeRows, parseRouting, toGroupChatRow, toGroupChatRows } from './wire'
+export { mergeRows, toGroupChatRow, toGroupChatRows } from './wire'
 export {
   GROUP_WINDOW_SECONDS,
   isGrouped,
