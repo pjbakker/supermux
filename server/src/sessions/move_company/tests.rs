@@ -690,3 +690,190 @@ fn verify_copy_rejects_a_truncated_copy() {
     assert!(super::verify_copy(&src, &dst).is_err(), "size mismatch is caught");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ── 18. workflows.company_id follows the bot on a move (0038 §1 derived cache) ─
+// A move re-stamps every workflow of the bot with the DESTINATION company, in
+// the SAME tx as the `sessions` flip, so the derived cache can never diverge.
+// Before this fix a moved bot's workflows kept their OLD scope and rendered
+// under the wrong company (`ipc` → company 4 but its flow stuck in HQ).
+
+/// Insert a workflow owned by `session`. `company_id` on the struct is IGNORED
+/// and re-derived from `sessions` (see [`db::workflows::insert`]), so seed the
+/// bot's company FIRST — the workflow then lands with the bot's company.
+async fn seed_workflow(state: &AppState, id: &str, session: &str, trigger_kind: &str) {
+    // `recurring`/`once` require a non-null schedule_expr (CHECK in 0038);
+    // `manual` requires a null one.
+    let (schedule_expr, next_run) = if trigger_kind == "manual" {
+        (None, None)
+    } else {
+        (
+            Some("0 9 * * *".to_string()),
+            Some("2026-01-01T09:00:00Z".to_string()),
+        )
+    };
+    db::workflows::insert(
+        &state.pool,
+        &db::workflows::Workflow {
+            id: id.to_string(),
+            title: "flow".into(),
+            session: session.to_string(),
+            company_id: Some(9999), // a lie; re-derived from sessions on insert
+            enabled: 1,
+            trigger_kind: trigger_kind.to_string(),
+            schedule_expr,
+            next_run,
+            last_run: None,
+            run_count: 0,
+            on_complete: r#"{"kind":"none"}"#.into(),
+            created: 1000,
+            updated: 1000,
+            deleted: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// The `company_id` a single workflow currently carries.
+async fn wf_company(state: &AppState, session: &str, id: &str) -> Option<i64> {
+    db::workflows::list_for_session(&state.pool, session)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|w| w.id == id)
+        .unwrap_or_else(|| panic!("workflow {id} not found for {session}"))
+        .company_id
+}
+
+// (a) company → company re-stamps the workflow's cache to the destination.
+#[tokio::test]
+async fn move_restamps_workflow_company_id_company_to_company() {
+    let _g = env_lock();
+    let env = Env::new();
+    let state = mk_state(&env.base).await;
+    let (acme, acme_root) = seed_company(&state, &env.base, "acme").await;
+    let (beta, _) = seed_company(&state, &env.base, "beta").await;
+
+    let old_dir = Path::new(&acme_root).join("bot").display().to_string();
+    seed_bot(&state, "bot", &old_dir, Some(acme)).await;
+    seed_workflow(&state, "WF-aaaaaaaa", "bot", "manual").await;
+    // Precondition: the workflow inherited the bot's company at insert.
+    assert_eq!(wf_company(&state, "bot", "WF-aaaaaaaa").await, Some(acme));
+
+    super::move_to_company(&state, "bot", Some(beta)).await.unwrap();
+
+    assert_eq!(
+        wf_company(&state, "bot", "WF-aaaaaaaa").await,
+        Some(beta),
+        "workflow cache re-stamped to the destination"
+    );
+    // Atomic invariant: the cache equals the committed `sessions.company_id`.
+    assert_eq!(row(&state, "bot").await.company_id, Some(beta));
+}
+
+// (b) company → HQ re-stamps the workflow's cache to NULL.
+#[tokio::test]
+async fn move_restamps_workflow_company_id_company_to_hq() {
+    let _g = env_lock();
+    let env = Env::new();
+    let state = mk_state(&env.base).await;
+    let (acme, acme_root) = seed_company(&state, &env.base, "acme").await;
+
+    let old_dir = Path::new(&acme_root).join("bot").display().to_string();
+    seed_bot(&state, "bot", &old_dir, Some(acme)).await;
+    seed_workflow(&state, "WF-bbbbbbbb", "bot", "manual").await;
+    assert_eq!(wf_company(&state, "bot", "WF-bbbbbbbb").await, Some(acme));
+
+    super::move_to_company(&state, "bot", None).await.unwrap();
+
+    assert_eq!(
+        wf_company(&state, "bot", "WF-bbbbbbbb").await,
+        None,
+        "moving to HQ nulls the workflow cache"
+    );
+    assert_eq!(row(&state, "bot").await.company_id, None);
+}
+
+// (c) HQ → company re-stamps the workflow's cache from NULL to the company.
+#[tokio::test]
+async fn move_restamps_workflow_company_id_hq_to_company() {
+    let _g = env_lock();
+    let env = Env::new();
+    let state = mk_state(&env.base).await;
+    let (beta, _) = seed_company(&state, &env.base, "beta").await;
+
+    let old_dir = env.home().join("bot").display().to_string();
+    seed_bot(&state, "bot", &old_dir, None).await;
+    seed_workflow(&state, "WF-cccccccc", "bot", "manual").await;
+    assert_eq!(wf_company(&state, "bot", "WF-cccccccc").await, None);
+
+    super::move_to_company(&state, "bot", Some(beta)).await.unwrap();
+
+    assert_eq!(
+        wf_company(&state, "bot", "WF-cccccccc").await,
+        Some(beta),
+        "an HQ bot's workflow gains the destination company"
+    );
+    assert_eq!(row(&state, "bot").await.company_id, Some(beta));
+}
+
+// (d) MULTI-workflow (incl. a schedule-kind row) all re-stamp; another bot's
+//     workflow is untouched (keying is `WHERE session = ?`, not company-wide).
+#[tokio::test]
+async fn move_restamps_all_of_the_bots_workflows_only() {
+    let _g = env_lock();
+    let env = Env::new();
+    let state = mk_state(&env.base).await;
+    let (acme, acme_root) = seed_company(&state, &env.base, "acme").await;
+    let (beta, _) = seed_company(&state, &env.base, "beta").await;
+
+    let old_dir = Path::new(&acme_root).join("bot").display().to_string();
+    seed_bot(&state, "bot", &old_dir, Some(acme)).await;
+    seed_workflow(&state, "WF-d0000001", "bot", "manual").await;
+    seed_workflow(&state, "WF-d0000002", "bot", "recurring").await; // schedule-kind
+    seed_workflow(&state, "WF-d0000003", "bot", "once").await;
+
+    // A DIFFERENT bot in the same company, which does NOT move.
+    let other_dir = Path::new(&acme_root).join("other").display().to_string();
+    seed_bot(&state, "other", &other_dir, Some(acme)).await;
+    seed_workflow(&state, "WF-other01", "other", "manual").await;
+
+    super::move_to_company(&state, "bot", Some(beta)).await.unwrap();
+
+    for id in ["WF-d0000001", "WF-d0000002", "WF-d0000003"] {
+        assert_eq!(
+            wf_company(&state, "bot", id).await,
+            Some(beta),
+            "{id} re-stamped (schedule-kind rows included)"
+        );
+    }
+    assert_eq!(
+        wf_company(&state, "other", "WF-other01").await,
+        Some(acme),
+        "a bystander bot's workflow is never touched by another bot's move"
+    );
+}
+
+// (e) A bot with ZERO workflows moves cleanly — the UPDATE is a no-op.
+#[tokio::test]
+async fn move_with_no_workflows_is_a_clean_no_op() {
+    let _g = env_lock();
+    let env = Env::new();
+    let state = mk_state(&env.base).await;
+    let (acme, acme_root) = seed_company(&state, &env.base, "acme").await;
+    let (beta, _) = seed_company(&state, &env.base, "beta").await;
+
+    let old_dir = Path::new(&acme_root).join("bot").display().to_string();
+    seed_bot(&state, "bot", &old_dir, Some(acme)).await;
+    assert_eq!(db::workflows::count_for_session(&state.pool, "bot").await.unwrap(), 0);
+
+    let res = super::move_to_company(&state, "bot", Some(beta)).await.unwrap();
+    assert!(res.restart_required);
+
+    assert_eq!(row(&state, "bot").await.company_id, Some(beta), "the move still commits");
+    assert_eq!(
+        db::workflows::count_for_session(&state.pool, "bot").await.unwrap(),
+        0,
+        "no workflows conjured"
+    );
+}

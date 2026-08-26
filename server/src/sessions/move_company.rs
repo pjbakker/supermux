@@ -459,6 +459,21 @@ async fn commit_move(
         .execute(&mut *tx)
         .await?;
 
+    // 1b. Re-derive the workflows company_id cache (0038 §1). It is a derived
+    //     copy of `sessions.company_id`, set at insert / rename and re-synced at
+    //     boot, but a company MOVE never touched it — so a moved bot's workflows
+    //     kept their OLD scope and rendered under the wrong company. Re-stamp
+    //     every workflow of this session with the new company (a number, or NULL
+    //     for a move to HQ), inside THIS tx so the cache can never diverge from
+    //     the sessions flip above. `target` is byte-identical to what step 1 just
+    //     wrote to `sessions.company_id`. Keyed by `session` = the bot's slug,
+    //     which a move does not change; a no-op when the bot has zero workflows.
+    sqlx::query("UPDATE workflows SET company_id = ? WHERE session = ?")
+        .bind(target)
+        .bind(slug)
+        .execute(&mut *tx)
+        .await?;
+
     // 2. Sweep leaking own-slug CONNECTOR grants. A grant keyed on the bot's own
     //    slug whose account is company-scoped (`connector_accounts.company_id`
     //    NOT NULL) to a company OTHER THAN the destination would inject the old
