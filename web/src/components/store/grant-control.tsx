@@ -42,6 +42,7 @@ export function GrantControl({
   api,
   companyOverride,
   allowAll = true,
+  allowBot = true,
 }: {
   connectorId: string
   /** The bot this control grants to. `null` = library view (only All agents). */
@@ -70,6 +71,10 @@ export function GrantControl({
   /** Offer the all-agents tier. `false` where `*` cannot be a legal target — a
    *  company-owned resource, since `*` resolves to NO company server-side. */
   allowAll?: boolean
+  /** Offer the "This bot" tier. `false` where there is NO single-bot context to
+   *  target — the shared browser is never opened "as" one bot, so a per-bot
+   *  grant there is made by picking a bot from the roster, not by this tier. */
+  allowBot?: boolean
 }) {
   const actions = useConnectorActions()
   const [busy, setBusy] = React.useState<'bot' | 'company' | 'all' | 'revoke' | null>(null)
@@ -143,14 +148,16 @@ export function GrantControl({
         aria-label="Grant scope"
         className="inline-flex items-stretch gap-0.5 self-start rounded-xl bg-secondary p-1"
       >
-        <ScopeButton
-          selected={scope === 'bot'}
-          disabled={!botName || busy !== null}
-          busy={busy === 'bot'}
-          onClick={() => grantTo('bot')}
-          label={botName ? `This bot` : 'This bot'}
-          sub={botName ?? undefined}
-        />
+        {allowBot && (
+          <ScopeButton
+            selected={scope === 'bot'}
+            disabled={!botName || busy !== null}
+            busy={busy === 'bot'}
+            onClick={() => grantTo('bot')}
+            label="This bot"
+            sub={botName ?? undefined}
+          />
+        )}
         {company && (
           <ScopeButton
             selected={scope === 'company'}

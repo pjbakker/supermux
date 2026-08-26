@@ -35,7 +35,7 @@
 // same reason.
 import * as React from 'react'
 
-import { Aperture, ClipboardPaste, KeyRound, MoreHorizontal, Power, Users } from 'lucide-react'
+import { ClipboardPaste, KeyRound, MoreHorizontal, Power, UserPlus, Users } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import { activeGrantees, tabState, type BrowserTab } from '@/lib/api/browser'
@@ -92,11 +92,6 @@ export interface BrowserChromeProps {
   onBack?: () => void
   onForward?: () => void
   onStop?: () => void
-  /** Ask the socket for a fresh full frame — the picture, not the page. Shown
-   *  in the toolbar only while WATCHING; while driving the slot holds Paste +
-   *  Sign-in instead (a canvas cannot be autofilled, so they reach the page
-   *  from the toolbar rather than floating over — and covering — the page). */
-  onResync?: () => void
   /** Type the clipboard into the focused page field (driving only). */
   onPaste?: () => void
   /** Open the field-aware sign-in sheet (driving only). */
@@ -132,7 +127,6 @@ export function BrowserChrome({
   onBack,
   onForward,
   onStop,
-  onResync,
   onPaste,
   onSignIn,
   signInDisabledReason,
@@ -249,9 +243,10 @@ export function BrowserChrome({
               Sign-in — a canvas cannot be autofilled (the human's clipboard and
               password manager cannot see fields that live in a picture), so they
               reach the page from HERE rather than floating over — and covering —
-              the page's own buttons. WHILE WATCHING it holds resync ("refresh the
-              picture"), which repairs a drifted canvas and matters more when you
-              are only looking. */}
+              the page's own buttons. WHILE WATCHING it holds the SHARE affordance:
+              the toolbar's own way in to "Who may use this tab", so handing a bot
+              this tab is one tap from the surface you are already looking at
+              (and reachable on a phone, where the desktop-only lent-count is not). */}
           {driving ? (
             <>
               <ChromeButton
@@ -275,11 +270,11 @@ export function BrowserChrome({
             </>
           ) : (
             <ChromeButton
-              label="Refresh the picture"
-              icon={Aperture}
-              disabled={!live || !onResync}
-              onClick={() => onResync?.()}
-              data-chrome-resync=""
+              label="Give a bot access to this tab"
+              icon={UserPlus}
+              disabled={!tab}
+              onClick={onMenu}
+              data-chrome-grant=""
             />
           )}
           {/* No flex-1 spacer here: in a WRAPPING row a growing spacer eats

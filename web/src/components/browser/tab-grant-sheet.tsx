@@ -19,7 +19,6 @@ import * as React from 'react'
 
 import { Loader2, Pin, PinOff, Plus, X } from 'lucide-react'
 
-import { cn } from '@/lib/utils'
 import { ALL_AGENTS, companyGrantKey } from '@/lib/api/connectors'
 import {
   activeGrantees,
@@ -33,6 +32,7 @@ import {
 } from '@/lib/api/browser'
 import { GrantControl, type GrantScope } from '@/components/store/grant-control'
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
+import { SessionPicker } from '@/components/session/session-picker'
 import { useCompanies } from '@/hooks/use-companies'
 
 export interface TabGrantSheetProps {
@@ -76,26 +76,39 @@ export function TabGrantSheet({
     () => (tab ? grantCandidates(bots, tab) : []),
     [bots, tab],
   )
-  const [picked, setPicked] = React.useState<string | null>(null)
-  // DERIVED, not reset in an effect: a bot picked on one tab is not necessarily
-  // a legal target on the next, and the selection must never outlive the tab
-  // whose containment made it legal.
-  const bot = picked !== null && candidates.some((c) => c.name === picked) ? picked : null
   const [busy, setBusy] = React.useState<string | null>(null)
 
   const granted = React.useMemo(() => (tab ? activeGrantees(tab) : []), [tab])
 
-  // The SAME precedence the store uses: own > company > all. A bot that is
-  // covered by `*` shows as `all`, which is what makes the shared-grant line
-  // and the disabled per-bot revoke correct rather than merely tidy.
+  // The bots the human can still HAND this tab — the tab's company-mates minus
+  // whoever already holds it. This is the roster the picker offers; picking one
+  // grants it on the spot (no separate "confirm" tier), which is the "one easy
+  // search-and-tap" the cramped chip row could not be.
+  const addable = React.useMemo(
+    () => candidates.filter((c) => !granted.includes(c.name)),
+    [candidates, granted],
+  )
+
+  // Only the BROAD scopes live in GrantControl now — All agents (and, for a
+  // company-owned tab, that company). There is no single-bot context in the
+  // shared browser, so the "This bot" tier is gone; a per-bot grant is made by
+  // picking a bot above, not by a tier here.
   const scope: GrantScope = React.useMemo(() => {
     if (granted.includes(ALL_AGENTS)) return 'all'
     if (company && granted.includes(companyGrantKey(company.id))) return 'company'
-    if (bot && granted.includes(bot)) return 'bot'
     return null
-  }, [granted, company, bot])
+  }, [granted, company])
 
   const state = tab ? tabState(tab) : null
+
+  const grant = async (grantee: string) => {
+    setBusy(grantee)
+    try {
+      await onGrant(grantee)
+    } finally {
+      setBusy(null)
+    }
+  }
 
   const revoke = async (grantee: string) => {
     setBusy(grantee)
@@ -163,39 +176,44 @@ export function TabGrantSheet({
             )}
           </button>
 
-          {/* Pick the bot the "This bot" tier targets. Without one, only the
-              company / all-agents tiers are reachable — GrantControl already
-              disables its own bot tier when `botName` is null. */}
+          {/* GIVE A BOT ACCESS — the easy path. The same roster picker the
+              workflows composer uses (chic pill + faces, a DropdownMenu on a
+              mouse and a Vaul half-sheet on a phone), fed the tab's eligible
+              company-mates. Picking one lends the tab immediately; it then shows
+              in "Currently lent to" below, with its own Revoke. */}
           {candidates.length > 0 && (
-            <div className="flex flex-col gap-2">
+            <div className="flex flex-col gap-2" data-grant-picker="">
               <div className="text-[11.5px] font-medium uppercase tracking-wide text-muted-foreground">
-                Bot
+                Give a bot access
               </div>
-              <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                {candidates.map((c) => (
-                  <button
-                    key={c.name}
-                    type="button"
-                    onClick={() => setPicked(bot === c.name ? null : c.name)}
-                    aria-pressed={bot === c.name}
-                    data-grant-candidate={c.name}
-                    className={cn(
-                      'min-h-11 shrink-0 rounded-xl border px-3 text-[12.5px] font-medium transition-colors motion-reduce:transition-none',
-                      bot === c.name
-                        ? 'border-transparent bg-secondary text-foreground'
-                        : 'border-border text-muted-foreground hover:text-foreground',
-                    )}
-                  >
-                    {c.name}
-                  </button>
-                ))}
-              </div>
+              {addable.length > 0 ? (
+                <SessionPicker
+                  value=""
+                  onChange={(name) => {
+                    if (name) void grant(name)
+                  }}
+                  sessions={addable}
+                  allowEmpty={false}
+                  placeholder="Pick a bot to lend this tab"
+                  ariaLabel="Give a bot access to this tab"
+                  menuLabel="Lend this tab to"
+                />
+              ) : (
+                <p className="text-[12.5px] text-muted-foreground">
+                  Every eligible bot already has this tab.
+                </p>
+              )}
             </div>
           )}
 
+          {/* The BROAD scopes only — All agents, and (for a company-owned tab)
+              that company. "This bot" is gone: the shared browser is never
+              opened "as" one bot, so a per-bot grant is the picker above, not a
+              tier here. */}
           <GrantControl
             connectorId={`tab:${tab.id}`}
-            botName={bot}
+            botName={null}
+            allowBot={false}
             scope={scope}
             resourceLabel="this tab"
             companyOverride={company}

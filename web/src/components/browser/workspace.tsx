@@ -618,7 +618,6 @@ export function BrowserWorkspace({
             () => onStop?.(active.id),
           )
         }
-        onResync={() => ctl.current?.resync()}
         onPaste={() => ctl.current?.paste()}
         onSignIn={() => ctl.current?.openSignIn()}
         signInDisabledReason={
