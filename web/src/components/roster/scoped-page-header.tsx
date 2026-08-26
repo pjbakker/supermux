@@ -1,54 +1,78 @@
 // `<ScopedPageHeader>` — the shared header for the scoped full-page surfaces
-// (store / workflows / browser), designed as an iOS-style LARGE TITLE.
+// (store / workflows / browser), an iOS-style LARGE TITLE with a balanced scope
+// bar on top.
 //
-// The core tension: the `<CompanySwitcher>` is a QUIET 34px scope chip (on the
-// overview it IS the whole title), so pairing it in one row with a loud page
-// title made the chip look lost and the title dwarf it. The fix is hierarchy by
-// STACKING, the Settings/App-Store pattern:
+// The tension: the `<CompanySwitcher>` is a QUIET 34px scope chip. Alone on a wide
+// row it floats, unbalanced (a "New" pill on the right fixed it on Workflows but
+// Connectors/Browser had nothing to anchor the other edge). The overview solves
+// this by ending its header row with the account affordance — so this bar mirrors
+// that: switcher on the LEFT, a Settings gear on the RIGHT (grok hides Settings
+// from the nav, so this doubles as the doorway), and any page action (a "New"
+// pill) sits between them. The row is always balanced, on every page.
 //
-//   ┌ scope row ─────────────────────────────┐   the switcher as a nav/context
-//   │  [◈ HQ ⌄]                    <actions>  │   control; page actions balance
-//   ├────────────────────────────────────────┤   it on the right
-//   │  Connectors                             │   the large title owns its line
-//   │  Give your bots the tools they need.    │   subtitle beneath
-//   └────────────────────────────────────────┘
+//   ┌ scope bar ─────────────────────────────────────┐
+//   │  [◈ HQ ⌄]              <actions>   ⚙            │   balanced both edges
+//   ├────────────────────────────────────────────────┤
+//   │  Connectors                                     │   large title owns its line
+//   │  Give your bots the tools they need.            │
+//   └────────────────────────────────────────────────┘
 //
-// The switcher never competes with the title; it reads as "which space am I in",
-// exactly its role on the overview. Full-width page controls (a search FIELD,
-// tabs, filter chips) are NOT passed here — they belong to the page, rendered
-// BELOW this header. `actions` is only for COMPACT controls that sit on the scope
-// row (a "New" pill, an icon button).
+// `compact` (the browser, a full-bleed live canvas that a big title would break)
+// renders ONLY the scope bar — the switcher stays visible + switchable without a
+// title eating the workspace.
 //
-// Presentational + reusable: it owns no scope state (the switcher writes
-// `activeCompany` itself; surfaces read it via `useCompanyScope`). The switcher
-// chip picks up its grok skin from the broadened `[data-grok] .gr-company` rule
-// wherever it mounts.
+// Full-width page controls (a search FIELD, tabs, chips) are NOT passed here; they
+// belong to the page, rendered BELOW. `actions` is for COMPACT scope-bar controls.
+//
+// Presentational: it owns no scope state (the switcher writes `activeCompany`; the
+// gear navigates). The switcher chip picks up its grok skin from the broadened
+// `[data-grok] .gr-company` rule wherever it mounts.
 import * as React from 'react'
+import { useNavigate } from 'react-router-dom'
 
 import { CompanySwitcher } from '@/components/roster/company-switcher'
+import { SettingsGlyph } from '@/components/nav-glyphs'
 
 export function ScopedPageHeader({
   title,
   subtitle,
   actions,
+  compact,
 }: {
   title: string
   subtitle?: string
-  /** COMPACT controls for the scope row's right edge (a "New" pill, an icon).
-   *  Full-width controls (search field, tabs) render below this header, not here. */
+  /** COMPACT controls for the scope bar (a "New" pill). Full-width controls
+   *  (search, tabs) render below this header, not here. */
   actions?: React.ReactNode
+  /** Scope bar only, no title — for the browser's full-bleed canvas. */
+  compact?: boolean
 }) {
+  const navigate = useNavigate()
   return (
     <div className="flex flex-col">
-      <div className="flex min-h-9 items-center justify-between gap-2">
+      <div className="flex min-h-9 items-center gap-2">
         <CompanySwitcher />
-        {actions && <div className="flex flex-none items-center gap-2">{actions}</div>}
+        <div className="flex-1" />
+        {actions}
+        <button
+          type="button"
+          onClick={() => navigate('/settings')}
+          aria-label="Settings"
+          title="Settings"
+          className="grid size-9 flex-none place-items-center rounded-full text-muted-foreground transition-colors hover:bg-fill-soft hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <SettingsGlyph className="size-[19px]" />
+        </button>
       </div>
-      <h1 className="mt-3 text-[26px] font-semibold leading-[1.1] tracking-[-0.02em] text-foreground sm:text-[30px]">
-        {title}
-      </h1>
-      {subtitle && (
-        <p className="mt-1 text-[14px] leading-snug text-muted-foreground">{subtitle}</p>
+      {!compact && (
+        <>
+          <h1 className="mt-3 text-[26px] font-semibold leading-[1.1] tracking-[-0.02em] text-foreground sm:text-[30px]">
+            {title}
+          </h1>
+          {subtitle && (
+            <p className="mt-1 text-[14px] leading-snug text-muted-foreground">{subtitle}</p>
+          )}
+        </>
       )}
     </div>
   )

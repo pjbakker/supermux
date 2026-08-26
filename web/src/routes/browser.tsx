@@ -50,15 +50,18 @@ export function BrowserRoute() {
     // frame instead of the viewport (the black-band bug). `h-full` takes 100% of
     // main's definite height, giving the flex chain below a real box to fill.
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      {/* The scope chip + title, like Overview and the store — mounted in the
-          route (not the presentational workspace, which the bench drives with
-          fixtures) so the switcher is visible and switchable above the rail. */}
-      <div className="px-4 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))] sm:px-6">
-        <ScopedPageHeader
-          title="Browser"
-          subtitle="The shared browser — tabs, sign-ins and grants for this space."
-        />
+      {/* A COMPACT scope bar only — the browser is a full-bleed live canvas, so a
+          large-title header would eat the workspace and break the takeover box's
+          height. `flex-none` keeps it out of the flex-grow chain; the switcher
+          stays visible + switchable above the rail, balanced by the Settings gear
+          like every other scoped page. */}
+      <div className="flex-none px-4 pb-1.5 pt-[max(0.75rem,env(safe-area-inset-top))] sm:px-6">
+        <ScopedPageHeader title="Browser" compact />
       </div>
+      {/* `flex-1 min-h-0` gives the workspace a DEFINITE box to fill under the bar
+          (its takeover canvas sizes to `h-full` of this) — without it the canvas
+          collapses to the 512² seed frame (the black-band bug). */}
+      <div className="min-h-0 flex-1">
       <BrowserWorkspace
         tabs={scopedTabs}
         activeId={active}
@@ -96,6 +99,7 @@ export function BrowserRoute() {
         // make the server refuse, rather than offering a control that 400s.
         bots={sessions.map((s) => ({ name: s.name, company_id: s.company_id ?? null }))}
       />
+      </div>
     </div>
   )
 }
