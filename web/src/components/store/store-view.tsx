@@ -259,7 +259,13 @@ export function StoreView({
             switchable; the subtitle already reflects it. The bot-scoped SHEET keeps
             its bespoke title — it is already scoped to one bot, so no switcher. */}
         {variant === 'page' ? (
-          <ScopedPageHeader title="Connectors" subtitle={subtitle} actions={<SearchBox value={q} onChange={setQ} />} />
+          <>
+            {/* Scope chip + large title (ScopedPageHeader); the full-width search
+                is a page control, so it sits BELOW the header, not on the scope
+                row. The wrapper's own gap spaces them. */}
+            <ScopedPageHeader title="Connectors" subtitle={subtitle} />
+            <SearchBox value={q} onChange={setQ} />
+          </>
         ) : (
           <div className="flex flex-wrap items-end justify-between gap-3">
             <div className="min-w-0">
