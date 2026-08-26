@@ -986,7 +986,17 @@ async fn run(state: AppState, name: String, handle: Arc<TailerHandle>) {
         // poll: stamp the ground-truth liveness the status classifier + roster
         // read via `AppState::subagents_live`. This survives the main `Stop`, so a
         // left-open session whose workflow is still churning keeps reading WORKING.
-        if pass.subagent_appended {
+        //
+        // BUT NOT on a re-seed. A `resync`/`rebuilt` pass re-drains the file from a
+        // cold cursor (retarget, rotation/truncation, the ≥512KiB-ring re-seed) and
+        // re-reads OLD sidechain lines — those are history, not fresh forward
+        // activity, and stamping them refreshes the 10s liveness window for
+        // subagents that finished long ago, pinning the session WORKING over an
+        // idle `❯` (the owner's stuck-"working" report). A genuinely-live subagent
+        // appends a NEW line on the next NON-reseed poll and is stamped then, at
+        // most one poll late — so this fails toward honest-idle, never stuck-active.
+        // (Mirrors the ring-reset condition just above.)
+        if pass.subagent_appended && !pass.resync && !rebuilt {
             state.mark_subagent_active(&name);
         }
         store.publish_sealed(pass.entries);
