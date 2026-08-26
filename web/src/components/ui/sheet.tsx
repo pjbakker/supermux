@@ -30,7 +30,11 @@ const sheetVariants = cva(
   {
     variants: {
       side: {
-        top: 'inset-x-0 top-0 border-b data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top',
+        // Top-anchored: the additive status-bar reservation (see globals.css top-route-header
+        // contract). `--safe-top`/env(safe-area-inset-top) is 0 off-device, so this keeps the
+        // base p-6 padding on desktop/no-notch and only GROWS the top pad under a notch, so a
+        // top sheet's first content clears the Dynamic Island instead of running under it.
+        top: 'inset-x-0 top-0 border-b pt-[calc(1.5rem_+_var(--safe-top,0px))] data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top',
         bottom:
           'inset-x-0 bottom-0 border-t data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom',
         left: 'inset-y-0 left-0 h-full w-3/4 border-r data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm',
