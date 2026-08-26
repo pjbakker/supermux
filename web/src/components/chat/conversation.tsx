@@ -50,6 +50,7 @@ import type { ChatGone } from './chat-socket'
 import { CHAT_GONE } from './connection'
 import type { DialogCardView } from './dialog-answer'
 import { ChatSurface } from './chat-surface'
+import { ChatLoadingSkeleton } from './chat-loading-skeleton'
 import { ComposerShell } from './composer-shell'
 import type { ChatItem } from './entries'
 import { buildTranscript } from './grouping'
@@ -431,6 +432,26 @@ export function ChatConversation({
     !handoff &&
     !(session?.status === 'active' && turnStart != null)
 
+  // THE ANTI-FLASH GATE. `nodes` is `buildTranscript(items, events)`, and the
+  // two feeds arrive out of order: the harness event ledger (a fast REST GET)
+  // routinely lands before the message tail's slow WS seed. With `items` still
+  // empty, `buildTranscript` emits an EVENTS-ONLY stream — the screenful of
+  // repeated "Ran schedule · …" rows that used to flash for ~500ms on open.
+  // While the seed is still in flight AND no message has arrived, we suppress
+  // that stream entirely and show a calm skeleton instead; the instant the seed
+  // lands, `isLoading` clears and the real (correctly merged) rows render.
+  const noItemsYet = isLoading && items.length === 0
+  // Show the skeleton through the whole load window — but NOT over an optimistic
+  // echo (a just-sent message) or a live/attention overlay, which are the reader's
+  // own content and belong on screen instead. Deliberately NOT gated on the
+  // active-turn branch of `isBlank`: an active session whose history is still
+  // seeding is exactly when the loader is wanted (the working row renders below).
+  const showSkeleton =
+    noItemsYet &&
+    (pending?.length ?? 0) === 0 &&
+    (overlay?.length ?? 0) === 0 &&
+    !provisional
+
   // The room the floating composer needs, MEASURED (daily-driver QA #12).
   const [footerRef, footerH] = useMeasuredHeight()
 
@@ -649,24 +670,34 @@ export function ChatConversation({
 
           {/* Confirmed content (fase A3 T3). Vertical rhythm belongs to the rows
               themselves — `MessageRow` spends 14px between speakers and 8px
-              inside a run — so this column adds no gap of its own. */}
-          {nodes.map((node) => (
-            <TranscriptItem
-              key={node.key}
-              node={node}
-              name={name}
-              surface={phone ? 'phone' : 'desktop'}
-              labels={labels}
-              mentions={mentions}
-              names={names}
-              rawUrl={rawUrl}
-              pinFor={pinFor}
-              showActions={showActions}
-              onOpenSession={onOpenSession}
-              onOpenSchedule={onOpenSchedule}
-              onOpenTerminal={onOpenTerminal}
-            />
-          ))}
+              inside a run — so this column adds no gap of its own.
+
+              While the message seed is still landing (`noItemsYet`), the node
+              list would be the events-only flash, so we render the loading
+              skeleton in its place — but only when the track is otherwise blank
+              (an optimistic echo or a live turn already carries the UI, and the
+              layers below draw it). */}
+          {showSkeleton ? (
+            <ChatLoadingSkeleton />
+          ) : noItemsYet ? null : (
+            nodes.map((node) => (
+              <TranscriptItem
+                key={node.key}
+                node={node}
+                name={name}
+                surface={phone ? 'phone' : 'desktop'}
+                labels={labels}
+                mentions={mentions}
+                names={names}
+                rawUrl={rawUrl}
+                pinFor={pinFor}
+                showActions={showActions}
+                onOpenSession={onOpenSession}
+                onOpenSchedule={onOpenSchedule}
+                onOpenTerminal={onOpenTerminal}
+              />
+            ))
+          )}
 
           {/* P10 (fase A4 T4) — what this client has SENT but the transcript
               has not confirmed yet. It sits between the confirmed layer and the

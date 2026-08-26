@@ -1031,6 +1031,21 @@
     opacity: 1;
   }
 }
+
+/* Chat loading skeleton — fades in on a DELAY so a fast/cached message seed
+   replaces it before it is ever visible (no flash of the skeleton, no added
+   delay on the conversation itself). `both` holds opacity 0 through the delay. */
+.sm-chat-skel {
+  animation: sm-mount-fade 0.22s ease-out 0.14s both;
+}
+/* Reduce Motion: keep the ANTI-FLASH delay (hold hidden ~140ms) but drop the
+   fade — a single opacity step, not a sweep. A skeleton is decoration around an
+   absence, so it owes the reader no motion, only the courtesy of not blinking. */
+@media (prefers-reduced-motion: reduce) {
+  .sm-chat-skel {
+    animation: sm-mount-fade 0.14s step-end both;
+  }
+}
 @keyframes sm-typing-dot {
   0%,
   55%,
