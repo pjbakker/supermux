@@ -10,17 +10,22 @@
 //!   * `POST /api/companies`        — create ({slug, display_name, root_dir}); mkdir root_dir.
 //!   * `GET  /api/companies/{id}`   — fetch one (404 on miss).
 //!   * `PATCH /api/companies/{id}`  — set display_name and/or archived.
-//!   * `DELETE /api/companies/{id}` — hard-delete; refuses (409) if active sessions remain.
+//!   * `DELETE /api/companies/{id}` — DESTRUCTIVE cascade (see below).
 //!
 //! **Slug soft-reject.** A company slug lives in its own namespace and can never
 //! collide with a `sessions.name` at the PK level, but for folder/URL legibility
 //! the create handler additionally rejects (409) a slug equal to an existing
 //! session slug.
 //!
-//! **Delete guard.** `DELETE` refuses while the company has any active
-//! (non-archived) session; the `trg_company_delete_sessions` trigger then NULLs
-//! any lingering (archived) sessions, but the `root_dir` folder on disk is NOT
-//! removed — the response returns the retained path.
+//! **Delete cascade.** `DELETE` removes EVERYTHING the company owns and never
+//! refuses on a running bot (killing it IS the stop): every session in the company
+//! (the Main Assistant included) via the reused single-bot delete, its
+//! `@company:<id>` + own-slug connector grants, its company-scoped browser tabs and
+//! connected accounts, its group-chat sidecar log, and its `root_dir` folder on
+//! disk — then the row LAST. It is best-effort with honest partial-failure
+//! reporting: a step that cannot complete is named in the `warnings` list rather
+//! than silently orphaned, and the response returns `{ deleted, deleted_bots,
+//! warnings }`. A missing company is a clean 404.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -152,13 +157,21 @@ pub struct PatchCompanyInput {
     pub archived: Option<bool>,
 }
 
-/// DELETE response body: the row is gone, but the `root_dir` folder is retained
-/// on disk — hand the owner the path so they can remove it deliberately.
+/// DELETE response body: the cascade removed EVERYTHING that belonged to the
+/// company. `deleted_bots` lists every session slug torn down (the Main Assistant
+/// included); `warnings` carries any non-fatal problem the cascade rode through
+/// (a bot that would not fully delete, a folder that would not remove) — the
+/// company row is deleted regardless, so an orphan can never outlive the row
+/// silently: it is named here instead.
 #[derive(Debug, Serialize)]
 struct DeleteResult {
+    /// Always `true` — the `companies` row is gone.
     deleted: bool,
-    /// The retained on-disk `root_dir` (NOT removed by this delete).
-    retained_root_dir: String,
+    /// Slugs of every bot (session) removed as part of the cascade, incl.
+    /// `<slug>-assistant`.
+    deleted_bots: Vec<String>,
+    /// Non-fatal problems the cascade rode through (empty on a clean delete).
+    warnings: Vec<String>,
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
@@ -437,31 +450,122 @@ async fn delete_handler(
     State(state): State<AppState>,
     ctx: crate::scope::OptCtx,
     Path(id): Path<i64>,
-) -> Result<impl IntoResponse, AppError> {
-    // P3d: deleting a company is owner/admin-only company-management.
+) -> Result<Json<Envelope<DeleteResult>>, AppError> {
+    // P3d: deleting a company is owner/admin-only company-management. A member
+    // gets the uniform hide-existence 404.
     crate::scope::require_admin(ctx.0.as_ref(), &format!("/api/companies/{id}"))?;
+    // A missing company is a clean 404 — never a partial cascade.
     let company = companies::get(&state.pool, id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("company id={id}")))?;
 
-    // Guard: refuse while any active (non-archived) session still belongs to
-    // this company (parallels the archived-only purge guard on sessions).
-    let active = companies::active_session_count(&state.pool, id).await?;
-    if active > 0 {
-        return Err(AppError::Conflict(format!(
-            "company '{}' still has {active} active session(s) — archive or delete them first",
-            company.slug
-        )));
-    }
-
-    // The trigger NULLs any lingering (archived) sessions. The `root_dir` folder
-    // on disk is deliberately NOT removed (data safety) — hand back the retained
-    // path.
-    companies::delete(&state.pool, id).await?;
+    // The FULL, DESTRUCTIVE cascade. No active-session guard: killing a busy bot
+    // IS the stop, so delete never refuses on a running pane — the caller has
+    // already type-confirmed the company name in the UI.
+    let (deleted_bots, warnings) = cascade_delete(&state, &company).await?;
     Ok(ok(DeleteResult {
         deleted: true,
-        retained_root_dir: company.root_dir,
+        deleted_bots,
+        warnings,
     }))
+}
+
+/// Tear down EVERYTHING a company owns, then the row — in an FK-safe order, with
+/// honest partial-failure reporting (a step that cannot complete records a
+/// warning and the cascade rides on; the row is deleted regardless, so nothing
+/// orphans silently). Reuses the EXISTING single-bot delete so a company bot is
+/// removed byte-identically to a hand-deleted one.
+///
+/// Order matters for two FKs: company-scoped `browser_tabs` are removed BEFORE the
+/// row (their FK is `ON DELETE SET NULL` — dropping the company first would
+/// re-scope them to HQ instead of deleting them); the `root_dir` remove runs while
+/// the row still exists (the files-jail `is_company_root` guard resolves against
+/// it), and the row is deleted LAST.
+async fn cascade_delete(
+    state: &AppState,
+    company: &Company,
+) -> Result<(Vec<String>, Vec<String>), AppError> {
+    let id = company.id;
+    let mut deleted_bots: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // 1. BOTS FIRST — every session in the company, the Main Assistant
+    //    (`<slug>-assistant`) included (it is just one of these rows). The reused
+    //    single-bot delete kills a busy/running pane (`rt.kill()`), reclaims the
+    //    native spool, deletes the row, audits, and broadcasts removal. Best-effort
+    //    per bot: a failure is a warning, not a stop.
+    let bots = companies::names_in_company(&state.pool, id).await?;
+    for name in &bots {
+        match crate::sessions::delete(state, name).await {
+            Ok(()) => deleted_bots.push(name.clone()),
+            Err(e) => warnings.push(format!("bot '{name}' not fully deleted: {e}")),
+        }
+    }
+
+    // 2. CONNECTOR GRANTS the single-bot path leaves behind — `session_connectors`
+    //    has no FK on `session_name`, so each bot's own-slug grants (and the
+    //    company `@company:<id>` tier every bot inherited) must be swept explicitly.
+    let mut grant_keys: Vec<String> = bots.clone();
+    grant_keys.push(format!("{}{}", crate::db::connectors::COMPANY_PREFIX, id));
+    if let Err(e) =
+        crate::db::connectors::delete_grants_for_sessions(&state.pool, &grant_keys).await
+    {
+        warnings.push(format!("connector grants not fully revoked: {e}"));
+    }
+    // Company-scoped connected accounts + their sealed vault secrets (no FK on
+    // `connector_accounts.company_id`) — a removed company must leave no live
+    // credential behind.
+    if let Err(e) = crate::db::connectors::delete_accounts_for_company(&state.pool, id).await {
+        warnings.push(format!("connector accounts not fully removed: {e}"));
+    }
+
+    // 3. SHARED-BROWSER TABS scoped to this company (before the row — their FK is
+    //    ON DELETE SET NULL). Their per-tab grants cascade with them.
+    if let Err(e) = crate::db::browser_tabs::delete_for_company(&state.pool, id).await {
+        warnings.push(format!("browser tabs not fully removed: {e}"));
+    }
+
+    // 4. GROUP-CHAT SIDECAR — the whole `<data_dir>/companies/<id>/` dir (the
+    //    `groupchat.log.jsonl` and its parent). Best-effort; a missing dir is a
+    //    skip, not a warning.
+    let chat_dir = state
+        .config
+        .data_dir
+        .join("companies")
+        .join(id.to_string());
+    if chat_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&chat_dir) {
+            warnings.push(format!(
+                "group-chat log dir {} not removed: {e}",
+                chat_dir.display()
+            ));
+        }
+    }
+
+    // 5. FILES ROOT on disk — the destructive, irreversible step (subsumes every
+    //    bot's `<root_dir>/<name>/`). Best-effort: a missing dir is a skip, an fs
+    //    error is a warning; the row still goes.
+    let root = std::path::Path::new(&company.root_dir);
+    if root.exists() {
+        if let Err(e) = std::fs::remove_dir_all(root) {
+            warnings.push(format!("files root {} not removed: {e}", company.root_dir));
+        }
+    }
+
+    // 6. THE COMPANIES ROW — LAST. The `trg_company_delete_sessions` trigger
+    //    (0032) NULLs any straggler session. Then a forensic audit row, matching
+    //    the hard-destructive convention on `sessions::delete`.
+    companies::delete(&state.pool, id).await?;
+    crate::db::audit::log(
+        &state.pool,
+        "user",
+        "company.delete",
+        &company.slug,
+        serde_json::json!({ "deleted_bots": deleted_bots, "warnings": warnings }),
+    )
+    .await?;
+
+    Ok((deleted_bots, warnings))
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -695,29 +799,209 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Seed a member session in a company (the shape `names_in_company` returns).
+    async fn seed_bot(state: &AppState, name: &str, company_id: i64) {
+        crate::db::sessions::insert_minimal(&state.pool, name, "/tmp", "shell")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET company_id = ? WHERE name = ?")
+            .bind(company_id)
+            .bind(name)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Insert a bare connector row so a grant's `connector_id` FK resolves.
+    async fn seed_connector(state: &AppState, id: &str) {
+        sqlx::query(
+            "INSERT INTO connectors (id, kind, display_name, icon, description, created_at) \
+             VALUES (?, 'mcp', ?, '', '', 0)",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    fn member_ctx(company_id: i64) -> crate::scope::OptCtx {
+        crate::scope::OptCtx(Some(crate::auth_human::AuthContext::Human {
+            user_id: 1,
+            company_id: Some(company_id),
+            role: "member".into(),
+        }))
+    }
+
+    /// The full cascade: a company with N bots (incl. the Main Assistant), a files
+    /// root on disk, `@company:` + own-slug connector grants, a company-scoped
+    /// browser tab, and a group-chat sidecar log is removed COMPLETELY — bots gone,
+    /// dir gone, grants gone, tab gone, chat log gone, row gone.
     #[tokio::test]
-    async fn delete_company_refused_when_active_sessions_present() {
+    async fn delete_company_cascade_removes_everything() {
+        let (state, dir) = test_state().await;
+        // Files root on disk (with content, to prove the recursive wipe).
+        let root = dir.join("acme-root");
+        std::fs::create_dir_all(root.join("bot-a")).unwrap();
+        std::fs::write(root.join("bot-a").join("f.txt"), b"x").unwrap();
+        let c = companies::create(&state.pool, "acme", "Acme", &root.display().to_string())
+            .await
+            .unwrap();
+
+        // Bots: two members + the Main Assistant `<slug>-assistant`.
+        seed_bot(&state, "bot-a", c.id).await;
+        seed_bot(&state, "bot-b", c.id).await;
+        seed_bot(&state, "acme-assistant", c.id).await;
+
+        // Grants: an own-slug grant on bot-a and the `@company:<id>` tier.
+        seed_connector(&state, "conn1").await;
+        let company_key = format!("{}{}", crate::db::connectors::COMPANY_PREFIX, c.id);
+        crate::db::connectors::grant(&state.pool, "bot-a", "conn1", None, true)
+            .await
+            .unwrap();
+        crate::db::connectors::grant(&state.pool, &company_key, "conn1", None, true)
+            .await
+            .unwrap();
+
+        // A company-scoped browser tab (+ a grant on it).
+        let tab = crate::db::browser_tabs::new_tab_id();
+        crate::db::browser_tabs::create(
+            &state.pool,
+            &tab,
+            "https://acme.test",
+            Some(c.id),
+            &["acme.test".to_string()],
+        )
+        .await
+        .unwrap();
+        crate::db::browser_tabs::grant(&state.pool, &tab, "bot-a", true)
+            .await
+            .unwrap();
+
+        // A group-chat sidecar log under <data_dir>/companies/<id>/.
+        let chat_dir = state.config.data_dir.join("companies").join(c.id.to_string());
+        std::fs::create_dir_all(&chat_dir).unwrap();
+        std::fs::write(chat_dir.join("groupchat.log.jsonl"), b"{}\n").unwrap();
+
+        let resp = delete_handler(State(state.clone()), crate::scope::OptCtx(None), Path(c.id))
+            .await
+            .expect("cascade delete should succeed")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Row gone.
+        assert!(companies::get(&state.pool, c.id).await.unwrap().is_none());
+        // Every bot gone.
+        for name in ["bot-a", "bot-b", "acme-assistant"] {
+            assert!(
+                crate::db::sessions::get(&state.pool, name).await.unwrap().is_none(),
+                "bot {name} should be deleted"
+            );
+        }
+        // Files root gone.
+        assert!(!root.exists(), "files root should be removed");
+        // Group-chat sidecar gone.
+        assert!(!chat_dir.exists(), "group-chat log dir should be removed");
+        // Grants gone (own-slug + @company tier).
+        let left = crate::db::connectors::grants_for_connector(&state.pool, "conn1")
+            .await
+            .unwrap();
+        assert!(left.is_empty(), "no connector grants should survive, got {left:?}");
+        // Browser tab gone (and its grant cascaded).
+        assert!(
+            crate::db::browser_tabs::get(&state.pool, &tab).await.unwrap().is_none(),
+            "company tab should be removed"
+        );
+        assert!(
+            crate::db::browser_tabs::grants_for_tab(&state.pool, &tab).await.unwrap().is_empty(),
+            "tab grants should cascade away"
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A scoped MEMBER cannot delete a company — the uniform hide-existence 404
+    /// (`require_admin`), and the company row survives untouched.
+    #[tokio::test]
+    async fn delete_company_forbidden_for_member() {
         let (state, dir) = test_state().await;
         let c = companies::create(&state.pool, "acme", "Acme", &root_under(&dir, "acme"))
             .await
             .unwrap();
-        // An active (archived=0) member session.
-        crate::db::sessions::insert_minimal(&state.pool, "bot-a", "/tmp/bot-a", "shell")
+        let r = delete_handler(State(state.clone()), member_ctx(c.id), Path(c.id)).await;
+        match r {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected NotFound (member forbidden), got {:?}", other.err()),
+        }
+        assert!(
+            companies::get(&state.pool, c.id).await.unwrap().is_some(),
+            "the row must survive a forbidden delete"
+        );
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A running/busy bot is not a refusal: the reused single-bot delete stops the
+    /// pane (`rt.kill()`) as part of the delete, and the bot row is removed.
+    #[tokio::test]
+    async fn delete_company_stops_then_deletes_a_bot() {
+        let (state, dir) = test_state().await;
+        let c = companies::create(&state.pool, "acme", "Acme", &root_under(&dir, "acme"))
             .await
             .unwrap();
-        sqlx::query("UPDATE sessions SET company_id = ? WHERE name = 'bot-a'")
-            .bind(c.id)
-            .execute(&state.pool)
+        seed_bot(&state, "busy-bot", c.id).await;
+
+        let resp = delete_handler(State(state.clone()), crate::scope::OptCtx(None), Path(c.id))
+            .await
+            .expect("delete should not refuse a running bot");
+        // The bot appears in deleted_bots and its row is gone.
+        let env = resp.0;
+        assert!(env.data.deleted_bots.contains(&"busy-bot".to_string()));
+        assert!(crate::db::sessions::get(&state.pool, "busy-bot").await.unwrap().is_none());
+        assert!(companies::get(&state.pool, c.id).await.unwrap().is_none());
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A files-root removal that fails (here: `root_dir` is a regular FILE, so
+    /// `remove_dir_all` errors) still deletes the row and reports a warning — the
+    /// orphan is NAMED, never silent.
+    #[tokio::test]
+    async fn delete_company_partial_fs_failure_still_deletes_row_and_warns() {
+        let (state, dir) = test_state().await;
+        // Point root_dir at a regular file — remove_dir_all will fail on it.
+        let root_file = dir.join("not-a-dir");
+        std::fs::write(&root_file, b"x").unwrap();
+        let c = companies::create(&state.pool, "acme", "Acme", &root_file.display().to_string())
             .await
             .unwrap();
 
-        let r = delete_handler(State(state.clone()), crate::scope::OptCtx(None), Path(c.id)).await;
+        let resp = delete_handler(State(state.clone()), crate::scope::OptCtx(None), Path(c.id))
+            .await
+            .expect("delete should ride through an fs failure");
+        let env = resp.0;
+        assert!(env.data.deleted, "row is deleted despite the fs failure");
+        assert!(
+            env.data.warnings.iter().any(|w| w.contains("files root")),
+            "the fs failure is reported as a warning, got {:?}",
+            env.data.warnings
+        );
+        assert!(companies::get(&state.pool, c.id).await.unwrap().is_none());
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Deleting a company that does not exist is a clean 404 — never a partial
+    /// cascade.
+    #[tokio::test]
+    async fn delete_nonexistent_company_is_404() {
+        let (state, dir) = test_state().await;
+        let r = delete_handler(State(state.clone()), crate::scope::OptCtx(None), Path(9999)).await;
         match r {
-            Err(AppError::Conflict(_)) => {}
-            other => panic!("expected Conflict, got {:?}", other.err()),
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {:?}", other.err()),
         }
-        // The row survives the refused delete.
-        assert!(companies::get(&state.pool, c.id).await.unwrap().is_some());
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
     }

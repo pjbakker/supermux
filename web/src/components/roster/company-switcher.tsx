@@ -33,7 +33,7 @@
  * focus to the trigger (the combobox pattern).
  */
 import * as React from 'react'
-import { ChevronsUpDown, Plus, UserPlus } from 'lucide-react'
+import { ChevronsUpDown, Plus, Trash2, UserPlus } from 'lucide-react'
 
 import { useCompanies } from '@/hooks/use-companies'
 import { useUI } from '@/stores/ui-store'
@@ -54,6 +54,15 @@ const CreateCompanySheet = React.lazy(() =>
 const InviteWizardSheet = React.lazy(() =>
   import('@/components/companies/invite-wizard-sheet').then((m) => ({
     default: m.InviteWizardSheet,
+  })),
+)
+
+// The destructive delete flow is lazy for the same reason — its type-to-confirm
+// sheet and the `useSessions` bot-count it reads never touch the cold-load path;
+// the danger row is the only entry edge, opened at most once per delete.
+const DeleteCompanySheet = React.lazy(() =>
+  import('@/components/roster/delete-company-sheet').then((m) => ({
+    default: m.DeleteCompanySheet,
   })),
 )
 
@@ -109,6 +118,7 @@ export function CompanySwitcher({
   const [open, setOpen] = React.useState(false)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [inviteOpen, setInviteOpen] = React.useState(false)
+  const [deleteOpen, setDeleteOpen] = React.useState(false)
   // The roving highlight index into the flat option list (0 = HQ, then each
   // company, then the New-company action last). −1 = nothing highlighted yet.
   // Only used by the desktop menu; the touch sheet ignores it.
@@ -329,6 +339,38 @@ export function CompanySwitcher({
           </span>
           Start a company…
         </button>
+
+        {/* Delete the ACTIVE company — a LOW-emphasis danger action (destructive
+            ink on a plain row, never a filled button), separated from the safe
+            actions and pinned last. Owner/admin-only server-side; a scoped
+            member gets the hide-existence 404, so this row never fires for them.
+            Shown only when a company is in scope, since it deletes THAT company.
+            Tapping only OPENS the type-to-confirm sheet — the destroy itself is
+            gated behind typing the company name. */}
+        {active && (
+          <>
+            <div className="my-1 h-px bg-border" role="separator" />
+            <button
+              type="button"
+              role="menuitem"
+              className={`${rowBase} ${rowSkin} text-destructive hover:bg-destructive/10 active:bg-destructive/10`}
+              onMouseEnter={() => !sheet && setCursor(-1)}
+              onClick={() => {
+                setOpen(false)
+                setDeleteOpen(true)
+              }}
+            >
+              <span
+                className="grid place-items-center"
+                aria-hidden
+                style={{ width: markSize, height: markSize, flex: 'none' }}
+              >
+                <Trash2 size={sheet ? 18 : 15} />
+              </span>
+              Delete this company…
+            </button>
+          </>
+        )}
       </>
     )
   }
@@ -460,6 +502,23 @@ export function CompanySwitcher({
             open={inviteOpen}
             onOpenChange={setInviteOpen}
             company={{ id: active.id, slug: active.slug, display_name: active.display_name }}
+          />
+        </React.Suspense>
+      )}
+
+      {deleteOpen && active && (
+        <React.Suspense fallback={null}>
+          <DeleteCompanySheet
+            open={deleteOpen}
+            onOpenChange={setDeleteOpen}
+            company={{ id: active.id, slug: active.slug, display_name: active.display_name }}
+            onDeleted={() => {
+              // The row is gone — leave its now-dead scope for HQ immediately
+              // (a lingering id would fail open to HQ on the next refetch anyway;
+              // this makes the switch instant). The sheet decides whether to
+              // then close itself or hold open on its honest warnings view.
+              setActiveCompany(null)
+            }}
           />
         </React.Suspense>
       )}

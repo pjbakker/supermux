@@ -1144,6 +1144,32 @@ export const companiesApi = {
       method: 'PATCH',
       body: JSON.stringify({ display_name }),
     }),
+
+  /** `DELETE /api/companies/{id}` — DESTRUCTIVE, irreversible cascade. Owner/
+   *  admin-only (a scoped member gets a hide-existence 404). The server tears
+   *  down EVERYTHING the company owns, best-effort in FK-safe order: every bot
+   *  (reusing the single-bot delete path — a running pane is KILLED, not
+   *  refused, then the row/spool/audit go), its `@company` + own-slug connector
+   *  grants and company-scoped accounts, its browser tabs, the group-chat
+   *  sidecar log, its files root on disk, then the companies row LAST. The row
+   *  is deleted regardless, so any item the cascade could not fully remove is
+   *  named in `warnings` rather than failing silently. Resolves to
+   *  {@link DeleteCompanyResult}. */
+  delete: (id: number): Promise<DeleteCompanyResult> =>
+    sessReq(`/api/companies/${id}`, { method: 'DELETE' }),
+}
+
+/** Result of `DELETE /api/companies/{id}` (the unwrapped `data` payload). */
+export interface DeleteCompanyResult {
+  /** Always `true` — the companies row was removed. */
+  deleted: boolean
+  /** Every session torn down as part of the cascade, the Main Assistant
+   *  (`<slug>-assistant`) included. Names, not ids. */
+  deleted_bots: string[]
+  /** Non-fatal problems the cascade rode through — a bot that would not fully
+   *  delete, a dir that would not remove. Empty on a clean sweep. Shown to the
+   *  owner honestly so an orphan is named, never silent. */
+  warnings: string[]
 }
 
 // ── Project repos endpoint ───────────────────────────────────────────────────

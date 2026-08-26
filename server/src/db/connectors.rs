@@ -323,6 +323,56 @@ pub async fn revoke(pool: &SqlitePool, session_name: &str, connector_id: &str) -
     Ok(res.rows_affected() > 0)
 }
 
+/// Delete EVERY grant row keyed on any of `session_names` — the company-delete
+/// cascade primitive. `sessions::delete` tears down a bot's runtime + row but
+/// leaves its `session_connectors` grants behind (the table has NO FK on
+/// `session_name` — migration 0031), so those own-slug grants (and the company
+/// `@company:<id>` tier, passed in the same list) must be swept explicitly or they
+/// orphan pointing at a session that no longer exists. One `DELETE` per name (no
+/// dynamic `IN (...)` assembly); returns the total grant rows removed.
+pub async fn delete_grants_for_sessions(
+    pool: &SqlitePool,
+    session_names: &[String],
+) -> sqlx::Result<u64> {
+    let mut removed = 0u64;
+    for name in session_names {
+        let res = sqlx::query("DELETE FROM session_connectors WHERE session_name = ?")
+            .bind(name)
+            .execute(pool)
+            .await?;
+        removed += res.rows_affected();
+    }
+    Ok(removed)
+}
+
+/// Delete every connected [`Account`] scoped to `company_id`, along with each
+/// account's sealed vault secret — the company-delete cascade primitive so a
+/// removed company leaves no LIVE credential behind. `connector_accounts.company_id`
+/// carries no FK (migration 0037), so deleting the company row alone would orphan
+/// these rows with their secret still openable. The vault has no FK from the
+/// account either, so the sealed secrets are reclaimed first (best-effort per
+/// secret), then the account rows. Returns the number of account rows removed.
+pub async fn delete_accounts_for_company(pool: &SqlitePool, company_id: i64) -> sqlx::Result<u64> {
+    let refs: Vec<(Option<String>,)> =
+        sqlx::query_as("SELECT secret_ref FROM connector_accounts WHERE company_id = ?")
+            .bind(company_id)
+            .fetch_all(pool)
+            .await?;
+    for (secret_ref,) in &refs {
+        if let Some(id) = secret_ref {
+            let _ = sqlx::query("DELETE FROM vault WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+    let res = sqlx::query("DELETE FROM connector_accounts WHERE company_id = ?")
+        .bind(company_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// Revoke every grant of `connector_id` that uses `account_ref` — the DISCONNECT
 /// primitive. The [`Account`] row and its sealed secret are LEFT INTACT (the caller
 /// flips its status), so a later reconnect reuses the secret. Returns the count of

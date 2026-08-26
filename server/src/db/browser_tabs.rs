@@ -217,6 +217,20 @@ pub async fn delete(pool: &SqlitePool, tab_id: &str) -> sqlx::Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
+/// Delete every tab owned by `company_id` — the company-delete cascade primitive.
+/// Each tab's `browser_tab_grants` rows cascade away with it (FK `ON DELETE
+/// CASCADE`, migration 0039). This must run BEFORE the `companies` row is deleted:
+/// `browser_tabs.company_id` is `ON DELETE SET NULL`, so dropping the company first
+/// would silently RE-SCOPE these tabs to HQ/global instead of removing them.
+/// Returns the number of tab rows removed.
+pub async fn delete_for_company(pool: &SqlitePool, company_id: i64) -> sqlx::Result<u64> {
+    let res = sqlx::query("DELETE FROM browser_tabs WHERE company_id = ?")
+        .bind(company_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 // ── per-tab grants ────────────────────────────────────────────────────────────
 
 /// Every grant on a tab (the human's grant sheet).

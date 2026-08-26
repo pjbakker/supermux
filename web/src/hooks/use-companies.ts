@@ -5,8 +5,13 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { companiesApi, type Company, type NewCompany } from '@/lib/api'
-import { devMockActive } from '@/hooks/use-sessions'
+import {
+  companiesApi,
+  type Company,
+  type DeleteCompanyResult,
+  type NewCompany,
+} from '@/lib/api'
+import { devMockActive, SESSIONS_KEY } from '@/hooks/use-sessions'
 
 export const COMPANIES_KEY = ['companies'] as const
 
@@ -43,6 +48,24 @@ export function useCreateCompany() {
     mutationFn: (input: NewCompany): Promise<Company> => companiesApi.create(input),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: COMPANIES_KEY })
+    },
+  })
+}
+
+/** `DELETE /api/companies/{id}` — the DESTRUCTIVE cascade delete. Invalidates
+ *  BOTH `['companies']` (the row is gone → drop it from the switcher) AND
+ *  `['sessions']` (every bot the cascade tore down — the Main Assistant
+ *  included — must leave the roster). Resolves to the server's
+ *  {@link DeleteCompanyResult} so the caller can surface `warnings` honestly.
+ *  The confirm sheet gates this behind type-to-confirm; the hook itself is a
+ *  plain mutation with no client-side guard of its own. */
+export function useDeleteCompany() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number): Promise<DeleteCompanyResult> => companiesApi.delete(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: COMPANIES_KEY })
+      void qc.invalidateQueries({ queryKey: SESSIONS_KEY })
     },
   })
 }
