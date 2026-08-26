@@ -1,16 +1,18 @@
 // The `/browser` route — the shared-browser workspace (Doorway 1 for the human).
 //
-// Thin by design: it owns the ACTIVE-TAB selection and nothing else. The tabs,
-// the grants and every mutation come from `use-browser-tabs`; the surface is
-// `<BrowserWorkspace/>`, which the `/dev/browser-workspace` bench mounts with
-// fixtures instead. Same component both sides, so the screenshots cannot drift
-// from the product.
+// Thin by design: it owns the ACTIVE-TAB selection and the company SCOPE, and
+// nothing else. The tabs, the grants and every mutation come from
+// `use-browser-tabs`; the surface is `<BrowserWorkspace/>`, which the
+// `/dev/browser-workspace` bench mounts with fixtures instead. Same component
+// both sides, so the screenshots cannot drift from the product.
 //
 // Lazy under <Layout> (the settings/store pattern) — the workspace pulls in the
 // takeover canvas + socket, which no other route needs.
 import * as React from 'react'
 
 import { BrowserWorkspace } from '@/components/browser/workspace'
+import { ScopedPageHeader } from '@/components/roster/scoped-page-header'
+import { useCompanyScope } from '@/components/roster/use-company-scope'
 import { useBrowserTabActions, useBrowserTabs } from '@/hooks/use-browser-tabs'
 import { useSessions } from '@/hooks/use-sessions'
 
@@ -18,11 +20,26 @@ export function BrowserRoute() {
   const { tabs } = useBrowserTabs()
   const actions = useBrowserTabActions()
   const { sessions } = useSessions()
+  const { activeCompany, inScope } = useCompanyScope()
   const [activeId, setActiveId] = React.useState<string | null>(null)
 
-  // Follow the list rather than pinning a dead id: a tab closed elsewhere (or
-  // reaped) must not leave the route pointing at a row that no longer exists.
-  const active = tabs.some((t) => t.id === activeId) ? activeId : tabs[0]?.id ?? null
+  // Scope to the active company: HQ (null) shows only the global tabs, a company
+  // shows its own. The human owns the whole jar (the server hands back every
+  // row); the switcher just narrows which of them this workspace draws — the
+  // list filter, exactly as the overview roster does it. No search box here, so
+  // nothing lifts scope.
+  const scopedTabs = React.useMemo(
+    () => tabs.filter((t) => inScope(t.company_id)),
+    [tabs, inScope],
+  )
+
+  // Follow the SCOPED list rather than pinning a dead id: a tab closed elsewhere,
+  // reaped, or left out of scope by a company switch must not leave the route
+  // pointing at a row this workspace no longer shows — fall to the first in-scope
+  // tab, or the empty state.
+  const active = scopedTabs.some((t) => t.id === activeId)
+    ? activeId
+    : scopedTabs[0]?.id ?? null
 
     return (
     // `h-full`, not `flex-1`: the shell's `<main#shell-content>` is a BLOCK
@@ -33,14 +50,24 @@ export function BrowserRoute() {
     // frame instead of the viewport (the black-band bug). `h-full` takes 100% of
     // main's definite height, giving the flex chain below a real box to fill.
     <div className="flex h-full min-h-0 min-w-0 flex-col">
+      {/* The scope chip + title, like Overview and the store — mounted in the
+          route (not the presentational workspace, which the bench drives with
+          fixtures) so the switcher is visible and switchable above the rail. */}
+      <div className="px-4 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))] sm:px-6">
+        <ScopedPageHeader
+          title="Browser"
+          subtitle="The shared browser — tabs, sign-ins and grants for this space."
+        />
+      </div>
       <BrowserWorkspace
-        tabs={tabs}
+        tabs={scopedTabs}
         activeId={active}
         onActivate={setActiveId}
         onNew={(url) => {
           // `null` = the server refused it and the human already saw why; do
-          // NOT select a tab that was never created.
-          void actions.create(url).then((tab) => {
+          // NOT select a tab that was never created. Stamped into the active
+          // company so a tab opened in a scope belongs to it.
+          void actions.create(url, activeCompany).then((tab) => {
             if (tab) setActiveId(tab.id)
           })
         }}

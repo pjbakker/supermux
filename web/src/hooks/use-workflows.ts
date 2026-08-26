@@ -31,15 +31,18 @@ import { useSse, type SseEventType } from '@/hooks/use-sse'
 const WORKFLOWS_KEY = ['workflows'] as const
 const COMMANDS_KEY = ['workflows', 'commands'] as const
 const ACTIVITY_KEY = ['workflows', 'activity'] as const
-const listKey = (session?: string | null) => ['workflows', 'list', session ?? '*'] as const
+const listKey = (session?: string | null, companyId?: number | null) =>
+  ['workflows', 'list', session ?? '*', companyId ?? 'hq'] as const
 const oneKey = (id: string) => ['workflows', 'one', id] as const
 const runsKey = (id: string) => ['workflows', 'runs', id] as const
 
-/** Every workflow the viewer may see, or one bot's when `session` is given. */
-export function useWorkflows(session?: string | null) {
+/** Every workflow the viewer may see, or one bot's when `session` is given, or
+ *  one company's when `companyId` is a number (the company dimension is in the
+ *  key, so switching scope refetches). */
+export function useWorkflows(session?: string | null, companyId?: number | null) {
   return useQuery<WorkflowWithSteps[]>({
-    queryKey: listKey(session),
-    queryFn: () => workflowsApi.list(session ?? null),
+    queryKey: listKey(session, companyId),
+    queryFn: () => workflowsApi.list(session ?? null, companyId ?? null),
     staleTime: 30_000,
     retry: false,
   })

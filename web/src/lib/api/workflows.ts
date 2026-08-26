@@ -260,9 +260,17 @@ const enc = encodeURIComponent
 
 export const workflowsApi = {
   /** `GET /api/workflows` — everything the viewer may see, newest first.
-   *  `session` narrows to one bot (the BotPanel scope). */
-  list: (session?: string | null): Promise<WorkflowWithSteps[]> =>
-    wfRequest(session ? `/api/workflows?session=${enc(session)}` : '/api/workflows'),
+   *  `session` narrows to one bot (the BotPanel scope). `companyId` narrows to
+   *  one company server-side; HQ (`null`) can't be expressed as a param (a
+   *  missing one is ALL companies for an owner), so the page filters HQ with
+   *  `inScope` on top. */
+  list: (session?: string | null, companyId?: number | null): Promise<WorkflowWithSteps[]> => {
+    const qs = new URLSearchParams()
+    if (session) qs.set('session', session)
+    if (typeof companyId === 'number') qs.set('company_id', String(companyId))
+    const s = qs.toString()
+    return wfRequest(s ? `/api/workflows?${s}` : '/api/workflows')
+  },
 
   /** `GET /api/workflows/{id}` — the workflow, its steps, and its last run. */
   get: (id: string): Promise<WorkflowDetailPayload> => wfRequest(`/api/workflows/${enc(id)}`),

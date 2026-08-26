@@ -119,9 +119,10 @@ export function useBrowserTabs(): UseBrowserTabsResult {
 export interface BrowserTabActions {
   pending: boolean
   /** Mint a tab AND open it (`?open=true`), because a human who typed an
-   *  address meant "load this", not "insert a row". `null` = it failed, and the
-   *  human has already been told why. */
-  create: (url: string) => Promise<BrowserTab | null>
+   *  address meant "load this", not "insert a row". Stamped into the active
+   *  company (`null`/omitted = HQ), so a tab opened while a company is in scope
+   *  belongs to it. `null` return = it failed, and the human has been told why. */
+  create: (url: string, companyId?: number | null) => Promise<BrowserTab | null>
   /** Point an EXISTING tab at a url — waking it first if it is asleep. This is
    *  the address bar's Enter. */
   navigate: (id: string, url: string) => Promise<BrowserTab | null>
@@ -171,7 +172,9 @@ export function useBrowserTabActions(): BrowserTabActions {
 
   const createM = useMutation({
     // `open: true` — see [[createTab]]. The lazy path stays the agent's.
-    mutationFn: (url: string) => createTab(url, null, true),
+    // `companyId` stamps the row into the active scope (see `create` below).
+    mutationFn: (v: { url: string; companyId: number | null }) =>
+      createTab(v.url, v.companyId, true),
     onSuccess: (tab) => {
       qc.setQueryData<BrowserTab[]>(BROWSER_TABS_KEY, (prev) =>
         prev ? [...prev.filter((t) => t.id !== tab.id), tab] : prev,
@@ -233,7 +236,7 @@ export function useBrowserTabActions(): BrowserTabActions {
       closeM.isPending ||
       grantM.isPending ||
       revokeM.isPending,
-    create: (url) => settled(createM.mutateAsync(url)),
+    create: (url, companyId = null) => settled(createM.mutateAsync({ url, companyId })),
     navigate: (id, url) => settled(navigateM.mutateAsync({ id, url })),
     wake: (id) => settled(wakeM.mutateAsync(id)),
     navControl: async (id, verb) => {

@@ -31,6 +31,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { SessionFace } from '@/components/roster/session-face'
+import { ScopedPageHeader } from '@/components/roster/scoped-page-header'
+import { useCompanyScope } from '@/components/roster/use-company-scope'
 import type { WorkflowWithSteps } from '@/lib/api/workflows'
 import {
   useCancelRun,
@@ -80,30 +82,44 @@ export function WorkflowsView({
   const navigate = useNavigate()
   const { toast } = useToast()
   const [filter, setFilter] = React.useState<Filter>('all')
+  const isPage = variant === 'page'
+
+  // The /workflows page follows the active company; the bot-panel variant is
+  // already single-bot scoped, so it never touches company scope. The id is in
+  // the query key (switching refetches), and `inScope` is the same client-side
+  // fence the roster uses — the one thing that can express HQ-only, which the
+  // server param can't.
+  const { activeCompany, inScope } = useCompanyScope()
+  const companyScope = isPage ? activeCompany : null
 
   useWorkflowsStream()
   const liveProgress = useWorkflowProgress()
   const progress = mockProgress ?? liveProgress
-  const live = useWorkflows(scope)
+  const live = useWorkflows(scope, companyScope)
   const rows = mock ?? live.data ?? []
   const loading = mockState === 'loading' || (!mock && live.isLoading)
   const failed = mockState === 'error' || (!mock && !!live.error)
 
-  const shown = React.useMemo(
-    () =>
-      rows.filter(
-        (w) =>
-          // A "send later" is an ephemeral delay-send, not a routine — it belongs
-          // to the composer's own countdown chip, not this list (the owner's
-          // report: the list ballooned with them). Fired ones are soft-deleted
-          // server-side; this hides the still-pending ones.
-          !isDelaySendShape(w) &&
-          (filter === 'all' ? true : filter === 'active' ? w.enabled === 1 : w.enabled === 0),
-      ),
-    [rows, filter],
+  // Everything that belongs in THIS scope, before the active/paused pill: a
+  // "send later" is an ephemeral delay-send, not a routine — it belongs to the
+  // composer's own countdown chip, not this list (the owner's report: the list
+  // ballooned with them; fired ones are soft-deleted server-side, this hides the
+  // still-pending ones). The company fence (page only) sits here too, so the
+  // pills, the empty state and the count all read the scoped set — switch to a
+  // company with no routines and you get its "nothing scheduled yet" starter,
+  // not "nothing active".
+  const scoped = React.useMemo(
+    () => rows.filter((w) => !isDelaySendShape(w) && (!isPage || inScope(w.company_id))),
+    [rows, isPage, inScope],
   )
 
-  const isPage = variant === 'page'
+  const shown = React.useMemo(
+    () =>
+      scoped.filter((w) =>
+        filter === 'all' ? true : filter === 'active' ? w.enabled === 1 : w.enabled === 0,
+      ),
+    [scoped, filter],
+  )
 
   return (
     <div className={cn('flex min-h-0 flex-1 flex-col', isPage && 'mx-auto w-full max-w-[880px]')}>
@@ -113,28 +129,29 @@ export function WorkflowsView({
           isPage ? 'sticky top-0 z-10 bg-background/80 px-4 pb-3 pt-4 backdrop-blur sm:px-6' : 'pb-2',
         )}
       >
-        <div className="flex items-end justify-between gap-3">
-          <div className="min-w-0">
-            <h1
-              className={cn(
-                'font-semibold tracking-tight text-foreground',
-                isPage ? 'text-[24px] sm:text-[28px]' : 'text-[15px]',
-              )}
-            >
+        {isPage ? (
+          // Same scope chip the overview roster leads with, so the company
+          // switcher is visible + switchable right here (the bot-panel variant is
+          // already single-bot scoped, so it keeps its own compact title).
+          <ScopedPageHeader
+            title="Workflows"
+            subtitle={
+              scope
+                ? `What ${scope} does on its own.`
+                : 'Give a bot a job and a time. It does the rest.'
+            }
+            actions={<NewButton to={workflowNewHref(scope)} />}
+          />
+        ) : (
+          <div className="flex items-end justify-between gap-3">
+            <h1 className="min-w-0 text-[15px] font-semibold tracking-tight text-foreground">
               Workflows
             </h1>
-            {isPage && (
-              <p className="mt-0.5 text-[13.5px] text-muted-foreground">
-                {scope
-                  ? `What ${scope} does on its own.`
-                  : 'Give a bot a job and a time. It does the rest.'}
-              </p>
-            )}
+            <NewButton compact to={workflowNewHref(scope)} />
           </div>
-          <NewButton compact={!isPage} to={workflowNewHref(scope)} />
-        </div>
+        )}
 
-        {rows.length > 0 && (
+        {scoped.length > 0 && (
           <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-0.5">
             {FILTERS.map((f) => (
               <button
@@ -161,7 +178,7 @@ export function WorkflowsView({
           <ListSkeleton />
         ) : failed ? (
           <Unreachable onRetry={() => live.refetch()} />
-        ) : rows.length === 0 ? (
+        ) : scoped.length === 0 ? (
           <EmptyState scope={scope} onPick={(key) => navigate(`${workflowNewHref(scope)}${scope ? '&' : '?'}template=${key}`)} />
         ) : shown.length === 0 ? (
           <p className="px-1 py-8 text-center text-[13px] text-muted-foreground">

@@ -26,6 +26,7 @@ import { cn } from '@/lib/utils'
 import { springs } from '@/lib/springs'
 import { useToast } from '@/components/ui/use-toast'
 import { SessionPicker } from '@/components/session/session-picker'
+import { useCompanyScope } from '@/components/roster/use-company-scope'
 import { displayLabel } from '@/lib/api/sessions'
 import { useSessions } from '@/hooks/use-sessions'
 import {
@@ -216,7 +217,7 @@ export interface ComposerBodyProps {
   initial: ComposerDraft
   /** Offline bench: the preview endpoint, and the session list. */
   previewFn?: (expression: string) => Promise<{ next_runs: string[] }>
-  sessionsOverride?: { name: string; display_name?: string; status?: string }[]
+  sessionsOverride?: { name: string; display_name?: string; status?: string; company_id?: number | null }[]
   /** Offline bench: start with this step expanded (0-based). */
   initialExpanded?: number | null
 }
@@ -240,16 +241,39 @@ export function ComposerBody({
   const [saving, setSaving] = React.useState(false)
 
   const liveSessions = useSessions()
+  const { activeCompany, inScope } = useCompanyScope()
+  // The bot choices, fenced to the active company. Carrying `company_id` through
+  // the mapped shape is the whole trick: this ONE list feeds both the "Run by"
+  // picker and the completion "Message another bot" picker, so a single fence
+  // scopes both (the owner's report: creating a workflow showed ALL bots).
   const sessions = React.useMemo(
     () =>
-      sessionsOverride ??
-      liveSessions.sessions.map((s) => ({
-        name: s.name,
-        display_name: s.display_name,
-        status: s.status,
-      })),
-    [sessionsOverride, liveSessions.sessions],
+      (
+        sessionsOverride ??
+        liveSessions.sessions.map((s) => ({
+          name: s.name,
+          display_name: s.display_name,
+          status: s.status,
+          company_id: s.company_id,
+        }))
+      ).filter((s) => inScope(s.company_id)),
+    [sessionsOverride, liveSessions.sessions, inScope],
   )
+
+  // Re-home the picked bot when the user switches company mid-compose: a "Run by"
+  // that belongs to the company you just left has no business staying selected.
+  // Render-phase previous-value-in-state — the roster's exact re-home idiom
+  // (`grok-roster.tsx`), so the stale bot is never painted for a frame. On mount
+  // `scopeAt` equals the current scope, so opening an edit for an out-of-scope
+  // workflow never clobbers its bot — only an actual switch re-homes, to this
+  // scope's first bot or clear.
+  const [scopeAt, setScopeAt] = React.useState(activeCompany)
+  if (activeCompany !== scopeAt) {
+    setScopeAt(activeCompany)
+    if (draft.session && !sessions.some((s) => s.name === draft.session)) {
+      setDraft((d) => ({ ...d, session: sessions[0]?.name ?? '' }))
+    }
+  }
   const commands = useWorkflowCommands()
 
   const create = useCreateWorkflow()

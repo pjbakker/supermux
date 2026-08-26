@@ -1575,7 +1575,7 @@
 /* The trigger — an always-visible scope chip in `.gr-head`, matching the
    `.gr-search` / `.gr-seg` hairline family (34px, `--sm-r-md`, surf2, 0.5px
    line). It reads as one of the header's quiet controls, not a loud button. */
-[data-grok] .grok-roster .gr-company {
+[data-grok] .gr-company {
   flex: none;
   display: inline-flex;
   align-items: center;
@@ -1591,15 +1591,15 @@
   color: var(--sm-text-primary);
   transition: background-color 0.12s, border-color 0.12s;
 }
-[data-grok] .grok-roster .gr-company:hover {
+[data-grok] .gr-company:hover {
   background: var(--gr-surf);
 }
-[data-grok] .grok-roster .gr-company:focus-visible {
+[data-grok] .gr-company:focus-visible {
   outline: none;
   border-color: transparent;
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--sm-accent) 45%, transparent);
 }
-[data-grok] .grok-roster .gr-company .gr-company-lbl {
+[data-grok] .gr-company .gr-company-lbl {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: -0.01em;
@@ -1608,7 +1608,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-[data-grok] .grok-roster .gr-company .gr-company-cv {
+[data-grok] .gr-company .gr-company-cv {
   color: var(--sm-text-tertiary);
   flex: none;
 }

@@ -1126,7 +1126,14 @@ const BUDGET_ENTRY_JS = 161 * KB
 // /browser + roster chunks (takeover-panel-*.js is its own 15.68 KB chunk), not
 // on cold load — the ENTRY gate held at 153.46 / 161 KB (95%). ceil(measured 405.25)
 // + a little headroom = 412, same argue-in-the-PR rule as every bump above.
-const BUDGET_APP_JS = 412 * KB
+//
+// RATCHETED 412 → 416 by company-scoping the full-page surfaces: the shared
+// `<ScopedPageHeader>` mounts the `<CompanySwitcher>` (a ~3 KB shared chunk) on
+// /workflows, /store and /browser as well as the roster, so the switcher moved
+// from one lazy chunk into the shared app graph (+2.4 KB). The HERO PATH still did
+// not move (entry JS 158 / 161 KB); this is pages a bot-mode user navigates to,
+// not cold load. ceil(measured 414.43) + headroom = 416.
+const BUDGET_APP_JS = 416 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating
