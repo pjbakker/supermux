@@ -474,6 +474,26 @@ pub async fn set_runtime(pool: &SqlitePool, name: &str, runtime: &str) -> sqlx::
     Ok(())
 }
 
+/// Durably set (or clear, with `None` = HQ/main) the session's `company_id`
+/// (migration 0032). Mirrors [`set_runtime`] as the narrow single-column writer
+/// the bot-MOVE service (`sessions::move_to_company`) uses. Nullable, so it
+/// follows the [`set_mark_pin`] `bind(Option<_>)` shape rather than the
+/// text-field helper. Callers must ALSO invalidate the AppState runtime /
+/// isolation caches and re-derive the session's `dir`, connector/tab grants and
+/// group-chat channel — this touches ONE column and nothing derived from it.
+pub async fn set_company_id(
+    pool: &SqlitePool,
+    name: &str,
+    company_id: Option<i64>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE sessions SET company_id = ? WHERE name = ?")
+        .bind(company_id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn runtime_kind(pool: &SqlitePool, name: &str) -> sqlx::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as("SELECT runtime FROM sessions WHERE name = ?")
         .bind(name)

@@ -33,13 +33,14 @@
  * focus to the trigger (the combobox pattern).
  */
 import * as React from 'react'
-import { Check, ChevronsUpDown, Plus, UserPlus } from 'lucide-react'
+import { ChevronsUpDown, Plus, UserPlus } from 'lucide-react'
 
 import { useCompanies } from '@/hooks/use-companies'
 import { useUI } from '@/stores/ui-store'
 import { companyForDigit } from '@/lib/companies'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { CompanyMark, HqMark } from '@/components/roster/company-mark'
+import { CompanyPicker } from '@/components/roster/company-picker'
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
 
 const CreateCompanySheet = React.lazy(() =>
@@ -63,20 +64,6 @@ function isCmdOrCtrl(e: KeyboardEvent | React.KeyboardEvent): boolean {
 
 /** A stable empty attention set so the default prop is referentially constant. */
 const EMPTY_ATTENTION: ReadonlySet<number | null> = new Set()
-
-/** A subtle ~6px attention dot in the status token (`--gr-need`), NOT an
- *  identity hue — the firewall's status half. Static (no pulse), so it is
- *  reduced-motion-safe by construction; it carries no text, so it owes no AA
- *  contrast, and the accessible signal rides an `sr-only` word on the row. */
-function NeedDot() {
-  return (
-    <span
-      aria-hidden
-      className="size-1.5 shrink-0 rounded-full"
-      style={{ background: 'var(--gr-need)' }}
-    />
-  )
-}
 
 /** The ⌘⇧O open-shortcut hint, shared verbatim between the menu footer and the
  *  sheet footer slot so the two shells read identically. */
@@ -272,93 +259,23 @@ export function CompanySwitcher({
       : 'gap-2.5 px-3 py-2 text-[13px] hover:bg-accent/50'
     const hl = (on: boolean) => (!sheet && on ? 'bg-accent/50' : '')
     const markSize = sheet ? 28 : 24
-    // HQ mark matches the company-mark scale in each shell (sheet 28 / menu 24).
-    const sparkSize = sheet ? 28 : 24
 
     return (
       <>
-        {/* HQ — pinned top, its own cell (the "above all companies" home). */}
-        <button
-          type="button"
-          role="menuitemradio"
-          aria-checked={activeCompany === null}
-          data-hl={cursor === 0 || undefined}
-          className={`${rowBase} ${rowSkin} ${hl(cursor === 0)}`}
-          onMouseEnter={() => !sheet && setCursor(0)}
-          onClick={() => select(null)}
-        >
-          <HqMark size={sparkSize} />
-          <span className="flex min-w-0 flex-col">
-            <span className="font-semibold text-foreground">HQ</span>
-            <span
-              className={`text-muted-foreground ${sheet ? 'text-[12.5px]' : 'text-[11.5px]'}`}
-            >
-              PA · tech-admin · sees everything
-            </span>
-          </span>
-          {attention.has(null) && <span className="sr-only"> — needs you</span>}
-          <span className="ml-auto flex items-center gap-2 pl-2">
-            {attention.has(null) && <NeedDot />}
-            {!sheet && (
-              <kbd className="hidden text-[11px] tabular-nums text-muted-foreground sm:inline">
-                ⌘1
-              </kbd>
-            )}
-            {activeCompany === null && (
-              <Check size={16} style={{ color: 'var(--sm-accent)' }} aria-hidden />
-            )}
-          </span>
-        </button>
-
-        <div className="my-1 h-px bg-border" role="separator" />
-
-        {/* companies — CompanyMark + name + a faint slug meta + active check */}
-        {companies.map((c, i) => {
-          const idx = i + 1
-          const on = activeCompany === c.id
-          const needs = attention.has(c.id)
-          return (
-            <button
-              key={c.id}
-              type="button"
-              role="menuitemradio"
-              aria-checked={on}
-              data-hl={cursor === idx || undefined}
-              className={`${rowBase} ${rowSkin} ${hl(cursor === idx)}`}
-              onMouseEnter={() => !sheet && setCursor(idx)}
-              onClick={() => select(c.id)}
-            >
-              <CompanyMark
-                slug={c.slug}
-                name={c.display_name}
-                size={markSize}
-                className="shrink-0"
-              />
-              <span className="flex min-w-0 flex-col">
-                <span className="truncate font-semibold text-foreground">
-                  {c.display_name}
-                </span>
-                <span
-                  className={`truncate text-muted-foreground ${sheet ? 'text-[12.5px]' : 'text-[12px]'}`}
-                >
-                  {c.slug}
-                </span>
-              </span>
-              {needs && <span className="sr-only"> — needs you</span>}
-              <span className="ml-auto flex items-center gap-2 pl-2">
-                {needs && <NeedDot />}
-                {!sheet && i < 8 && (
-                  <kbd className="hidden text-[11px] tabular-nums text-muted-foreground sm:inline">
-                    ⌘{i + 2}
-                  </kbd>
-                )}
-                {on && (
-                  <Check size={16} style={{ color: 'var(--sm-accent)' }} aria-hidden />
-                )}
-              </span>
-            </button>
-          )
-        })}
+        {/* HQ row + company rows + marks — the shared `<CompanyPicker>` list.
+            The switcher keeps its roving cursor, ⌘1..9 hints, attention dots and
+            the active check by feeding them in; the move sheet reuses the SAME
+            list without any of that. */}
+        <CompanyPicker
+          variant={variant}
+          companies={companies}
+          onPick={select}
+          activeId={activeCompany}
+          attention={attention}
+          cursor={cursor}
+          onCursor={setCursor}
+          showShortcutHints
+        />
 
         {companies.length > 0 && (
           <div className="my-1 h-px bg-border" role="separator" />

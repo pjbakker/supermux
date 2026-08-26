@@ -27,6 +27,7 @@ pub mod host_pool;
 pub mod lifecycle;
 pub mod login;
 pub mod memory;
+pub mod move_company;
 pub mod pty;
 pub mod pty_state;
 pub mod recall;
@@ -119,6 +120,11 @@ pub fn router_for(state: AppState) -> Router {
         .route("/api/sessions/{name}/purge", axum::routing::delete(purge_handler))
         .route("/api/sessions/{name}/duplicate", post(duplicate_handler))
         .route("/api/sessions/{name}/config", patch(config_handler))
+        // Move a bot between companies (HQ ↔ company ↔ company). Owner/admin only
+        // — the guard is INSIDE the handler (403 for a scoped member), on top of
+        // the P3b funnel below. Sits next to `config` because it, too, returns
+        // `restart_required`.
+        .route("/api/sessions/{name}/company", post(move_company::handler))
         // ── tmux lifecycle ──
         .route("/api/sessions/{name}/start", post(start_handler))
         .route("/api/sessions/{name}/stop", post(stop_handler))

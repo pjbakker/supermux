@@ -600,6 +600,47 @@ export interface SessionConfigPatch {
  *  `BRAND.md` §6g carries the tier × policy table. */
 export type NotifPolicy = 'inherit' | 'all' | 'attention' | 'off'
 
+/** One own-slug connector grant the move REVOKED because it pointed at the OLD
+ *  company's credentials — a credential-leak guard, surfaced explicitly (spec §4)
+ *  so a dropped grant is never silent. `connector_name` is the human label for
+ *  the post-move receipt; `connector_id` its stable slug. */
+export interface MoveDroppedGrant {
+  connector_id: string
+  connector_name: string
+}
+
+/** One own-slug shared-browser tab grant the move removed because its tab
+ *  belonged to the OLD company (a dead grant once the bot has left). Listed in
+ *  the receipt (spec §4) — never dropped silently. */
+export interface MoveDeadTabGrant {
+  tab_id: string
+  title: string
+}
+
+/** Result of `POST /api/sessions/{name}/company` — the bot-move receipt (spec
+ *  §2.5). The move is FS-first with a single atomic DB tx; this is the honest
+ *  account of what followed the bot and what broke, rendered in the confirm
+ *  result and a post-move toast.
+ *
+ *  `restart_required` is ALWAYS true for a real move: confinement + the live pty
+ *  cwd are read at spawn, so a running pane keeps the old inode until restart.
+ *  `moved_files` is the FS outcome — the string `"moved"` (single rename),
+ *  `"skipped"` (a no-op / already-homed dir), or `{ copied: <n> }` on the
+ *  cross-filesystem copy-tree fallback. `warnings[]` carries the human,
+ *  ordered breakage lines (server-authored, shown verbatim). */
+export interface MoveCompanyResult {
+  ok: boolean
+  restart_required: boolean
+  /** `"moved"` | `"skipped"` | `{ copied: number }` — the FS move outcome. */
+  moved_files: 'moved' | 'skipped' | { copied: number }
+  /** Own-slug connector grants revoked as a credential-leak guard. */
+  dropped_grants: MoveDroppedGrant[]
+  /** Own-slug tab grants removed on old-company tabs. */
+  dead_tab_grants: MoveDeadTabGrant[]
+  /** Honest, ordered breakage lines — server-authored, shown verbatim. */
+  warnings: string[]
+}
+
 /** Result of `POST /api/sessions/{name}/mode` (mode-shift). `mode` is the mode
  *  ACTUALLY in effect after the op (the UI reflects truth, never an optimistic
  *  guess). `converged` is false when the Shift+Tab cycle couldn't reach the
@@ -823,6 +864,21 @@ export const sessionsApi = {
     sessReq(`/api/sessions/${encodeURIComponent(name)}/duplicate`, {
       method: 'POST',
       body: JSON.stringify({ new_name }),
+    }),
+
+  /** `POST /api/sessions/{name}/company { company_id }` — move a bot between
+   *  companies (`null` = HQ / main). Owner/admin only (403 for a scoped member).
+   *  FS-first with a single atomic DB tx server-side: the session's files, its
+   *  connector/tab grants and its group-chat membership all follow the bot, and
+   *  own-slug grants that would leak the OLD company's credentials are revoked.
+   *  Resolves to the honest [`MoveCompanyResult`] receipt; 409 (`archived` /
+   *  `dest_exists`) is refused BEFORE any write, so a collision never merges or
+   *  overwrites. The move never force-kills a busy pane — `restart_required` is
+   *  always true. */
+  moveCompany: (name: string, companyId: number | null): Promise<MoveCompanyResult> =>
+    sessReq(`/api/sessions/${encodeURIComponent(name)}/company`, {
+      method: 'POST',
+      body: JSON.stringify({ company_id: companyId }),
     }),
 
   /** `POST /api/sessions/{name}/external-edit/submit` — resolve an in-flight
