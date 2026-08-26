@@ -505,3 +505,188 @@ async fn busy_pane_moves_and_requires_restart_without_kill() {
     // The isolation cache was invalidated (re-read on next spawn), not left stale.
     assert!(state.isolation_applied.get("bot").is_none(), "isolation cache invalidated");
 }
+
+// ── 14. a stopped bot whose dir was never created on disk ────────────────────
+// Regression: the dir is created lazily on first start, so a STOPPED bot can have
+// a row whose `dir` does not exist. The FS step must skip (not 500 on a cross-fs
+// copy of a missing tree) while the DB still flips.
+#[tokio::test]
+async fn stopped_bot_with_no_dir_on_disk_moves_cleanly() {
+    let _g = env_lock();
+    let env = Env::new();
+    let state = mk_state(&env.base).await;
+    let (acme, acme_root) = seed_company(&state, &env.base, "acme").await;
+    let (beta, beta_root) = seed_company(&state, &env.base, "beta").await;
+
+    // Row only — no `seed_bot`, so the directory is NEVER created on disk.
+    let old_dir = Path::new(&acme_root).join("ghost").display().to_string();
+    db::sessions::insert_minimal(&state.pool, "ghost", &old_dir, "claude").await.unwrap();
+    db::sessions::set_company_id(&state.pool, "ghost", Some(acme)).await.unwrap();
+    assert!(!Path::new(&old_dir).exists(), "precondition: nothing on disk");
+
+    let res = super::move_to_company(&state, "ghost", Some(beta)).await.unwrap();
+    assert!(res.ok && res.restart_required);
+    assert_eq!(res.moved_files, serde_json::json!("skipped"), "no fs work");
+    assert!(
+        res.warnings.iter().any(|w| w.contains("not on disk yet")),
+        "the skip is surfaced, never silent: {:?}",
+        res.warnings
+    );
+
+    // The DB still moved.
+    let r = row(&state, "ghost").await;
+    let want = Path::new(&beta_root).join("ghost").display().to_string();
+    assert_eq!(r.company_id, Some(beta));
+    assert_eq!(r.dir, want, "dir column points at the new company root");
+    assert!(!Path::new(&want).exists(), "no empty dir conjured at the destination");
+}
+
+// ── 15. cross-fs move + a FAILING commit must NOT lose the source ────────────
+// The data-loss bug: the old code removed the source right after the copy, so a
+// later DB failure left the directory gone. The source may only be removed AFTER
+// the commit; a failed commit rolls back by deleting the DESTINATION copy.
+#[tokio::test]
+async fn cross_fs_move_keeps_the_source_when_the_commit_fails() {
+    use std::sync::atomic::Ordering;
+    let _g = env_lock();
+    let env = Env::new();
+    let state = mk_state(&env.base).await;
+    let (acme, acme_root) = seed_company(&state, &env.base, "acme").await;
+    let (beta, beta_root) = seed_company(&state, &env.base, "beta").await;
+
+    let old_dir = Path::new(&acme_root).join("bot").display().to_string();
+    seed_bot(&state, "bot", &old_dir, Some(acme)).await;
+    std::fs::write(Path::new(&old_dir).join("work.txt"), b"precious").unwrap();
+
+    // Force the commit tx to fail mid-flight (the grant sweep needs this table),
+    // and force step 1 down the cross-filesystem (EXDEV) branch.
+    sqlx::query("DROP TABLE session_connectors").execute(&state.pool).await.unwrap();
+    super::FORCE_EXDEV.store(true, Ordering::SeqCst);
+    let out = super::move_to_company(&state, "bot", Some(beta)).await;
+    super::FORCE_EXDEV.store(false, Ordering::SeqCst);
+
+    let err = out.unwrap_err();
+    assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+
+    // THE REGRESSION: the source directory and its contents survive.
+    assert!(Path::new(&old_dir).is_dir(), "source dir NOT lost on a failed commit");
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&old_dir).join("work.txt")).unwrap(),
+        "precious",
+        "source contents intact"
+    );
+    // And the half-applied destination copy was rolled back.
+    assert!(
+        !Path::new(&beta_root).join("bot").exists(),
+        "destination copy removed on rollback"
+    );
+    // DB unchanged (the tx is all-or-nothing).
+    let r = row(&state, "bot").await;
+    assert_eq!(r.company_id, Some(acme), "DB not committed");
+    assert_eq!(r.dir, old_dir, "dir column unchanged");
+}
+
+// ── 16. cross-fs move that COMMITS removes the source (post-commit cleanup) ──
+#[tokio::test]
+async fn cross_fs_move_removes_the_source_after_a_successful_commit() {
+    use std::sync::atomic::Ordering;
+    let _g = env_lock();
+    let env = Env::new();
+    let state = mk_state(&env.base).await;
+    let (acme, acme_root) = seed_company(&state, &env.base, "acme").await;
+    let (beta, beta_root) = seed_company(&state, &env.base, "beta").await;
+
+    let old_dir = Path::new(&acme_root).join("bot").display().to_string();
+    seed_bot(&state, "bot", &old_dir, Some(acme)).await;
+    std::fs::write(Path::new(&old_dir).join("work.txt"), b"precious").unwrap();
+    std::fs::create_dir_all(Path::new(&old_dir).join("sub")).unwrap();
+    std::fs::write(Path::new(&old_dir).join("sub").join("nested.txt"), b"deep").unwrap();
+    let old_canonical = std::fs::canonicalize(&old_dir).unwrap().display().to_string();
+    let old_proj = seed_transcript(&old_dir, "conv1", &old_canonical);
+
+    super::FORCE_EXDEV.store(true, Ordering::SeqCst);
+    let out = super::move_to_company(&state, "bot", Some(beta)).await;
+    super::FORCE_EXDEV.store(false, Ordering::SeqCst);
+    let res = out.unwrap();
+
+    assert_eq!(res.moved_files, serde_json::json!({ "copied": 2 }), "both files copied");
+    let new_dir = Path::new(&beta_root).join("bot");
+    assert_eq!(
+        std::fs::read_to_string(new_dir.join("work.txt")).unwrap(),
+        "precious",
+        "contents landed at the destination"
+    );
+    assert!(new_dir.join("sub").join("nested.txt").exists(), "nested tree copied");
+    assert!(!Path::new(&old_dir).exists(), "source removed AFTER the commit");
+
+    // The transcript rehome stayed consistent with the copy path.
+    let new_proj = super::project_dir_for(&new_dir.display().to_string());
+    assert!(new_proj.join("conv1.jsonl").exists(), "transcript rehomed");
+    assert!(!old_proj.exists(), "old transcript dir gone");
+    assert_eq!(
+        read_cwd(&new_proj, "conv1"),
+        std::fs::canonicalize(&new_dir).unwrap().display().to_string(),
+        "cwd rewritten"
+    );
+
+    let r = row(&state, "bot").await;
+    assert_eq!(r.company_id, Some(beta));
+    assert_eq!(r.dir, new_dir.display().to_string());
+}
+
+// ── 17. the pieces the two fixes hang on, unit-tested directly ───────────────
+#[test]
+fn copy_tree_treats_a_missing_source_as_nothing_to_copy() {
+    let base = std::env::temp_dir().join(format!("supermux-move-unit-{}", uuid::Uuid::new_v4()));
+    let src = base.join("never-created");
+    let dst = base.join("dst");
+    // A source that isn't on disk copies zero files instead of erroring with
+    // ENOENT (the live 500: "cross-fs copy … No such file or directory").
+    assert_eq!(super::copy_tree(&src, &dst).unwrap(), 0);
+    assert!(super::verify_copy(&src, &dst).is_ok(), "0 == 0 verifies");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn cross_fs_source_is_removed_only_by_the_post_commit_finish() {
+    let base = std::env::temp_dir().join(format!("supermux-move-unit-{}", uuid::Uuid::new_v4()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"data").unwrap();
+    assert_eq!(super::copy_tree(&src, &dst).unwrap(), 1);
+    super::verify_copy(&src, &dst).unwrap();
+
+    // A FAILED commit: the destination copy goes, the source stays.
+    super::rollback_dir_move(super::DirMove::Copied, &dst, &src);
+    assert!(!dst.exists(), "destination copy removed");
+    assert!(src.join("f.txt").exists(), "source survives a failed commit");
+
+    // A SUCCESSFUL commit: only now is the source removed.
+    std::fs::create_dir_all(&dst).unwrap();
+    super::finish_dir_move(super::DirMove::Copied, &src).unwrap();
+    assert!(!src.exists(), "source removed post-commit");
+    // Finishing a plain rename (or a no-op) never deletes anything.
+    std::fs::create_dir_all(&src).unwrap();
+    super::finish_dir_move(super::DirMove::Renamed, &src).unwrap();
+    super::finish_dir_move(super::DirMove::None, &src).unwrap();
+    assert!(src.exists(), "a rename needs no post-commit removal");
+    // A double-finish (already-removed source) is not an error.
+    std::fs::remove_dir_all(&src).unwrap();
+    super::finish_dir_move(super::DirMove::Copied, &src).unwrap();
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn verify_copy_rejects_a_truncated_copy() {
+    let base = std::env::temp_dir().join(format!("supermux-move-unit-{}", uuid::Uuid::new_v4()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(src.join("f.txt"), b"full-size").unwrap();
+    std::fs::write(dst.join("f.txt"), b"trunc").unwrap();
+    assert!(super::verify_copy(&src, &dst).is_err(), "size mismatch is caught");
+    let _ = std::fs::remove_dir_all(&base);
+}

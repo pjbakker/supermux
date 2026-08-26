@@ -19,6 +19,17 @@
 //! move never half-commits. Re-running the same move after a partial success is
 //! safe (every step no-ops when already applied).
 //!
+//! The one step that cannot be a rename — a CROSS-FILESYSTEM move, where
+//! `rename(2)` returns `EXDEV` — copies into the destination pre-commit and
+//! removes the source only AFTER the commit (a cross-fs rename BACK would fail
+//! too, so removing the source early is how a directory gets lost when the DB tx
+//! then fails). Pre-commit it is reversed by deleting the destination copy; the
+//! source is never at risk. See [`DirMove`].
+//!
+//! A bot whose directory does not exist on disk yet (it is created lazily on the
+//! first start) skips the filesystem work entirely and still gets the DB flip —
+//! never a 500, and the skip is surfaced in `warnings[]`.
+//!
 //! # What is honest breakage, surfaced never silent
 //!
 //! Moving OUT of a company necessarily strands things that were *inherited*, not
@@ -70,8 +81,8 @@ pub struct MoveResult {
     /// NEXT start. `false` only for the no-op (nothing changed).
     pub restart_required: bool,
     /// `"moved"` (a plain rename), `"copied"` with a file count (cross-fs
-    /// fallback), or `"skipped"` (idempotent re-run — the dir was already at the
-    /// destination).
+    /// fallback), or `"skipped"` (nothing to move — an idempotent re-run, or a bot
+    /// whose dir is not on disk yet).
     pub moved_files: serde_json::Value,
     pub dropped_grants: Vec<DroppedGrant>,
     pub dead_tab_grants: Vec<DeadTabGrant>,
@@ -198,11 +209,23 @@ pub async fn move_to_company(
     let mut warnings: Vec<String> = Vec::new();
 
     // Step 1 — move the session directory.
-    let mut dir_moved = false; // did we actually rename in THIS call (for rollback)?
+    //
+    // `dir_move` records what THIS call actually did on disk: it is the input to
+    // both the pre-commit rollback (LIFO reverse) and the post-commit finish (a
+    // cross-fs source dir is removed only once the DB has committed).
+    let mut dir_move = DirMove::None;
     let moved_files: serde_json::Value = if same_path {
         json!("skipped")
-    } else if !old_exists && new_exists {
-        // Idempotent resume: the dir is already at the destination.
+    } else if !old_exists {
+        // Nothing to move. Either the dir was never created on disk (a stopped bot
+        // creates its dir lazily on first start) or a prior partial move already
+        // put it at the destination (idempotent resume). Both still need the DB tx
+        // so `company_id` + `dir` flip; neither is an error.
+        if !new_exists {
+            warnings.push(format!(
+                "session dir not on disk yet — nothing to move (it is created on the next start at {new_dir})"
+            ));
+        }
         json!("skipped")
     } else {
         if let Some(parent) = new_path.parent() {
@@ -210,30 +233,29 @@ pub async fn move_to_company(
                 AppError::Internal(anyhow::anyhow!("mkdir {}: {e}", parent.display()))
             })?;
         }
-        match std::fs::rename(&old_path, &new_path) {
+        match rename_dir(&old_path, &new_path) {
             Ok(()) => {
-                dir_moved = true;
+                dir_move = DirMove::Renamed;
                 json!("moved")
             }
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                // Cross-filesystem: rename(2) can't span mounts. Copy-tree, verify,
-                // then remove the source — the same net effect, non-atomically.
-                let n = copy_tree(&old_path, &new_path).map_err(|e| {
-                    // Best-effort: don't leave a half-copied destination behind.
-                    let _ = std::fs::remove_dir_all(&new_path);
-                    AppError::Internal(anyhow::anyhow!(
-                        "cross-fs copy {} → {}: {e}",
-                        old_path.display(),
-                        new_path.display()
-                    ))
-                })?;
-                std::fs::remove_dir_all(&old_path).map_err(|e| {
-                    AppError::Internal(anyhow::anyhow!(
-                        "cross-fs remove source {}: {e}",
-                        old_path.display()
-                    ))
-                })?;
-                dir_moved = true;
+                // Cross-filesystem: rename(2) can't span mounts. Copy-tree and
+                // VERIFY into the destination — but do NOT remove the source here.
+                // Removing it before the commit is what loses the directory when
+                // the DB tx later fails; it is a POST-COMMIT cleanup instead
+                // (`DirMove::Copied` → `finish_dir_move`).
+                let n = copy_tree(&old_path, &new_path)
+                    .and_then(|n| verify_copy(&old_path, &new_path).map(|()| n))
+                    .map_err(|e| {
+                        // Best-effort: don't leave a half-copied destination behind.
+                        let _ = std::fs::remove_dir_all(&new_path);
+                        AppError::Internal(anyhow::anyhow!(
+                            "cross-fs copy {} → {}: {e}",
+                            old_path.display(),
+                            new_path.display()
+                        ))
+                    })?;
+                dir_move = DirMove::Copied;
                 json!({ "copied": n })
             }
             Err(e) => {
@@ -247,6 +269,8 @@ pub async fn move_to_company(
     };
 
     // Step 2 — rehome the Claude transcript project dir and rewrite its `cwd`s.
+    // Skipped entirely when there is nothing to rehome — no transcript at the old
+    // encoded path, which is always the case for a bot that has no dir on disk yet.
     // On ANY failure, reverse step 1 (LIFO) and abort — history integrity is never
     // sacrificed silently.
     let mut proj_moved = false;
@@ -254,7 +278,7 @@ pub async fn move_to_company(
         if old_proj.exists() && !new_proj.exists() {
             if let Some(parent) = new_proj.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    reverse_dir_move(dir_moved, &new_path, &old_path);
+                    rollback_dir_move(dir_move, &new_path, &old_path);
                     return Err(AppError::Internal(anyhow::anyhow!(
                         "mkdir transcript parent {}: {e}",
                         parent.display()
@@ -262,7 +286,7 @@ pub async fn move_to_company(
                 }
             }
             if let Err(e) = std::fs::rename(&old_proj, &new_proj) {
-                reverse_dir_move(dir_moved, &new_path, &old_path);
+                rollback_dir_move(dir_move, &new_path, &old_path);
                 return Err(AppError::Internal(anyhow::anyhow!(
                     "rehome transcript {} → {}: {e}",
                     old_proj.display(),
@@ -278,7 +302,7 @@ pub async fn move_to_company(
             if let Err(e) = rewrite_transcript_cwd(&new_proj, &new_canonical) {
                 // Reverse LIFO: transcript rename back, then dir move back.
                 let _ = std::fs::rename(&new_proj, &old_proj);
-                reverse_dir_move(dir_moved, &new_path, &old_path);
+                rollback_dir_move(dir_move, &new_path, &old_path);
                 return Err(AppError::Internal(anyhow::anyhow!(
                     "rewrite transcript cwd in {}: {e}",
                     new_proj.display()
@@ -302,10 +326,24 @@ pub async fn move_to_company(
                 // leaving the rewritten value in the reversed dir is harmless (the
                 // paths point nowhere until a retry re-moves it).
             }
-            reverse_dir_move(dir_moved, &new_path, &old_path);
+            // A cross-fs copy is reversed by deleting the DESTINATION — its source
+            // is still intact precisely because it was never removed pre-commit.
+            rollback_dir_move(dir_move, &new_path, &old_path);
             return Err(AppError::Internal(anyhow::anyhow!("commit move: {e}")));
         }
     };
+
+    // ── Post-commit: finish the cross-fs move ────────────────────────────────
+    // The commit succeeded, so the destination copy is now the truth and the old
+    // directory is redundant. This is the ONLY place the cross-fs source is
+    // removed. Best-effort: a failure here leaves a stale copy behind — a warning,
+    // never a 500, because the move itself is already committed and correct.
+    if let Err(e) = finish_dir_move(dir_move, &old_path) {
+        warnings.push(format!(
+            "Copied across filesystems, but the old directory {} could not be removed ({e}) — remove it manually.",
+            old_path.display()
+        ));
+    }
 
     // ── Post-commit: caches, SSE, group-chat re-scope ────────────────────────
     // Invalidate every cache that was derived from the OLD company/dir so the
@@ -497,11 +535,58 @@ async fn commit_move(
     })
 }
 
-/// Reverse the step-1 directory move (only when THIS call performed it).
-fn reverse_dir_move(dir_moved: bool, new_path: &std::path::Path, old_path: &std::path::Path) {
-    if dir_moved {
-        let _ = std::fs::rename(new_path, old_path);
+/// What step 1 actually did on disk — the input to both the pre-commit rollback
+/// and the post-commit finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirMove {
+    /// Nothing was touched: same path, no source dir on disk, or the dir already
+    /// sits at the destination (idempotent resume).
+    None,
+    /// A same-filesystem `rename(2)` — atomic, and reversed by renaming back.
+    Renamed,
+    /// A cross-filesystem COPY into the destination. The SOURCE IS STILL THERE:
+    /// it is removed only by [`finish_dir_move`] AFTER the DB commits, so a failed
+    /// commit can never lose the directory.
+    Copied,
+}
+
+/// Reverse step 1 after a PRE-COMMIT failure. A rename goes back; a cross-fs copy
+/// is undone by deleting the DESTINATION (the source was never removed).
+fn rollback_dir_move(m: DirMove, new_path: &std::path::Path, old_path: &std::path::Path) {
+    match m {
+        DirMove::None => {}
+        DirMove::Renamed => {
+            // Same-fs by construction (it renamed forward), so this goes back.
+            let _ = rename_dir(new_path, old_path);
+        }
+        DirMove::Copied => {
+            let _ = std::fs::remove_dir_all(new_path);
+        }
     }
+}
+
+/// Finish step 1 after the commit SUCCEEDED: the now-redundant source of a
+/// cross-fs copy is removed. A `rename` needs no finishing, and there is nothing
+/// to remove when no copy happened.
+fn finish_dir_move(m: DirMove, old_path: &std::path::Path) -> std::io::Result<()> {
+    if m == DirMove::Copied && old_path.exists() {
+        std::fs::remove_dir_all(old_path)?;
+    }
+    Ok(())
+}
+
+/// Test hook for the cross-filesystem branch: forces `rename_dir` to report
+/// `EXDEV` so the copy path can be exercised without two real mounts.
+#[cfg(test)]
+static FORCE_EXDEV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `rename(2)` for the session dir (the test-only `EXDEV` hook lives here).
+fn rename_dir(old: &std::path::Path, new: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_EXDEV.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(std::io::Error::from_raw_os_error(libc::EXDEV));
+    }
+    std::fs::rename(old, new)
 }
 
 /// Are two paths the same target? Canonicalize when both exist; otherwise a plain
@@ -517,8 +602,15 @@ fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// only on the `EXDEV` cross-filesystem fallback for the session dir.
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<u64> {
     std::fs::create_dir_all(dst)?;
+    // A source that isn't there is "nothing to copy", never a hard failure — the
+    // dir may be created lazily on first start, or have vanished under us.
+    let entries = match std::fs::read_dir(src) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
     let mut count = 0u64;
-    for entry in std::fs::read_dir(src)? {
+    for entry in entries {
         let entry = entry?;
         let ft = entry.file_type()?;
         let from = entry.path();
@@ -535,6 +627,48 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<u6
         }
     }
     Ok(count)
+}
+
+/// Sum `(files, bytes)` over a tree. Symlinks are counted as neither (they are
+/// recreated, not copied, so their sizes never match). A missing tree is `(0, 0)`.
+fn tree_stat(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e),
+    };
+    let (mut files, mut bytes) = (0u64, 0u64);
+    for entry in entries {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            let (f, b) = tree_stat(&entry.path())?;
+            files += f;
+            bytes += b;
+        } else if !ft.is_symlink() {
+            files += 1;
+            bytes += entry.metadata()?.len();
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// Verify a cross-fs copy landed whole (same file count, same total bytes) BEFORE
+/// the source is ever eligible for removal. A mismatch is an error, so the caller
+/// tears the destination down and aborts with the source untouched.
+fn verify_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let a = tree_stat(src)?;
+    let b = tree_stat(dst)?;
+    if a != b {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "verify failed: source has {} file(s)/{} byte(s), copy has {}/{}",
+                a.0, a.1, b.0, b.1
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Rewrite the top-level `cwd` field of every JSON line in every `*.jsonl`
