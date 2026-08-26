@@ -93,7 +93,21 @@ function KindLabel({ kind }: { kind: GroupChatKind }) {
    `@all`, `@company`, a bot from another company — becomes a quiet highlight
    rather than a chip, because drawing a face for a session we cannot identify
    would be a confident lie about who is on it. */
-const MENTION_RE = /(@[A-Za-z0-9][A-Za-z0-9._-]*)/g
+// One tokenizer, three interactive vocabularies, all carried by the same split so
+// the parser never disagrees with itself about where a token begins:
+//   · `@name`                a member mention  → the app's `<MentionChip>`
+//   · `https://…`            a link            → a real anchor, `text-primary`
+//   · `#123` / `owner/repo#5` a PR / issue ref → `text-primary` highlight (no fetch)
+// Blue is the interactive tier (§7.2.4): a URL is navigable, a ref is a signpost,
+// and both READ as touchable without a bot hue ever leaking in.
+const LINKIFY_RE =
+  /(@[A-Za-z0-9][A-Za-z0-9._-]*|https?:\/\/[^\s<>]+|(?:[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*)?#\d+)/g
+
+/** The markdown `a` renderer's own rule for "is this a real link" — reused so the
+ *  two surfaces cannot disagree about what counts as navigable. */
+const isHttp = (s: string) => /^https?:/i.test(s)
+/** Trailing sentence punctuation is NOT part of the URL. */
+const TRAIL_RE = /[.,;:!?)\]]+$/
 
 function MessageText({
   body,
@@ -102,27 +116,58 @@ function MessageText({
   body: string
   members: ReadonlyMap<string, ChannelMember>
 }) {
-  const parts = React.useMemo(() => body.split(MENTION_RE), [body])
+  const parts = React.useMemo(() => body.split(LINKIFY_RE), [body])
   return (
     <>
       {parts.map((part, i) => {
-        if (!part.startsWith('@')) return <React.Fragment key={i}>{part}</React.Fragment>
-        const member = members.get(part.slice(1).toLowerCase())
-        if (member) {
+        if (!part) return null
+
+        if (part.startsWith('@')) {
+          const member = members.get(part.slice(1).toLowerCase())
+          if (member) {
+            return (
+              <MentionChip key={i} seed={member.seed} pin={member.pin} name={`@${member.name}`} />
+            )
+          }
           return (
-            <MentionChip
-              key={i}
-              seed={member.seed}
-              pin={member.pin}
-              name={`@${member.name}`}
-            />
+            <span key={i} className="font-medium text-primary">
+              {part}
+            </span>
           )
         }
-        return (
-          <span key={i} className="font-medium text-primary">
-            {part}
-          </span>
-        )
+
+        if (isHttp(part)) {
+          // Peel any trailing sentence punctuation back into plain prose so the
+          // href never carries the period that ended the sentence.
+          const tail = part.match(TRAIL_RE)?.[0] ?? ''
+          const href = tail ? part.slice(0, -tail.length) : part
+          return (
+            <React.Fragment key={i}>
+              <a
+                href={href}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="break-all font-medium text-primary underline decoration-primary/30 underline-offset-2 hover:decoration-primary"
+              >
+                {href}
+              </a>
+              {tail}
+            </React.Fragment>
+          )
+        }
+
+        if (part.includes('#')) {
+          // A PR / issue ref: a signpost, not a fetch. Highlighted, not linked —
+          // the surface has no repo context to resolve it against, and inventing
+          // a URL would be the confident lie the mention parser also refuses.
+          return (
+            <span key={i} className="font-medium text-primary">
+              {part}
+            </span>
+          )
+        }
+
+        return <React.Fragment key={i}>{part}</React.Fragment>
       })}
     </>
   )
@@ -151,19 +196,24 @@ function ChannelRow({
   members,
   ring,
   surface,
+  fresh,
 }: {
   row: GroupChatRow
   grouped: boolean
   members: ReadonlyMap<string, ChannelMember>
   ring: string
   surface: 'desktop' | 'phone'
+  /** This row LANDED after mount — give it the arrival pop. A row already
+   *  present at mount does not animate, or the whole history pops on every
+   *  mount. `.grok-entry` is inert (and reduced-motion-safe) off the grok skin. */
+  fresh?: boolean
 }) {
   return (
     <MessageRow
       surface={surface}
       grouped={grouped}
       gutter={grouped ? undefined : <RowFace row={row} ring={ring} />}
-      className="px-3.5"
+      className={cn('px-3.5', fresh && 'grok-entry')}
     >
       {/* `min-w-0` is what keeps a long word / a path inside 390px: the row is a
           flex container and a flex item's default `min-width:auto` would let the
@@ -268,6 +318,51 @@ function hhmm(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
 }
 
+/** Today / Yesterday / a full date — the day-divider's label. Relative words for
+ *  the two the reader lives in, an absolute date beyond that (Slack's grammar). */
+function dayLabel(ts: number): string {
+  const d = new Date(ts * 1000)
+  const key = d.toDateString()
+  const now = new Date()
+  if (key === now.toDateString()) return 'Today'
+  const yest = new Date(now)
+  yest.setDate(now.getDate() - 1)
+  if (key === yest.toDateString()) return 'Yesterday'
+  return d.toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' })
+}
+
+/** A centred hairline marking a change of calendar day. Pure chrome, built from
+ *  the surface's own `--gr-line` / `text-ink-3` — no new palette (spec §7.2.4). */
+function DayDivider({ ts }: { ts: number }) {
+  return (
+    <div className="flex items-center gap-3 px-3.5 py-2" role="separator">
+      <span className="h-px flex-1" style={{ background: 'var(--gr-line)' }} />
+      <span className="flex-none text-[11px] font-medium uppercase tracking-[0.04em] text-ink-3">
+        {dayLabel(ts)}
+      </span>
+      <span className="h-px flex-1" style={{ background: 'var(--gr-line)' }} />
+    </div>
+  )
+}
+
+/** Slack's most-missed-on-return affordance: one accent hairline with a "New"
+ *  cap, drawn above the first unseen row. The state is already computed by
+ *  `use-group-chat` (`firstUnreadSeq`), so this is nearly free. */
+function UnreadDivider() {
+  return (
+    <div
+      className="grok-entry flex items-center gap-2 px-3.5 py-1"
+      role="separator"
+      data-testid="group-chat-new-divider"
+    >
+      <span className="h-px flex-1 bg-primary/60" />
+      <span className="flex-none text-[10.5px] font-semibold uppercase tracking-[0.06em] text-primary">
+        New
+      </span>
+    </div>
+  )
+}
+
 /* ── the channel ─────────────────────────────────────────────────────────── */
 
 export interface ChatChannelProps {
@@ -296,6 +391,8 @@ export interface ChatChannelProps {
   onLoadMore?: () => void
   /** Rows that landed since the reader last saw the bottom. */
   unread?: number
+  /** The `seq` of the first unseen row — draws the "New" separator above it. */
+  firstUnreadSeq?: number | null
   /** The reader is looking at the newest row — clear the unread count. */
   onSeenBottom?: () => void
   /**
@@ -324,6 +421,7 @@ export function ChatChannel({
   loadingMore = false,
   onLoadMore,
   unread = 0,
+  firstUnreadSeq = null,
   onSeenBottom,
   onSend,
   routerLabel,
@@ -359,6 +457,21 @@ export function ChatChannel({
   const atBottomRef = React.useRef(true)
   const lastSeq = rows.length > 0 ? rows[rows.length - 1].seq : 0
 
+  // The arrival pop is for milestones that LAND, not for the history that was
+  // already here. The hero MOUNTS EMPTY (loading), so freezing at mount would
+  // capture seq 0 and pop the entire seed. Instead the baseline is frozen to the
+  // FIRST non-empty window — the seed's high-water mark — the once it appears
+  // (setting a ref during render is idempotent). Only rows past it get
+  // `.grok-entry`, so the seed rests and the next socket row pops.
+  const seqBaseline = React.useRef<number | null>(null)
+  if (seqBaseline.current === null && lastSeq > 0) seqBaseline.current = lastSeq
+
+  // A pill needs to know it is off the bottom, but the sticky-scroll logic must
+  // stay on a ref (it runs every flick frame — state there would re-render the
+  // feed for a number nothing draws). So: ref for the hot path, and a piece of
+  // state flipped ONLY on the transition, cheap enough to gate a pill.
+  const [atBottom, setAtBottom] = React.useState(true)
+
   const seen = React.useCallback(() => {
     if (atBottomRef.current) onSeenBottom?.()
   }, [onSeenBottom])
@@ -368,7 +481,18 @@ export function ChatChannel({
     if (!el) return
     // 24px of slack: a phone's rubber-band and a sub-pixel row height both leave
     // a scroller a hair short of its own bottom.
-    atBottomRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 24
+    const bottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 24
+    atBottomRef.current = bottom
+    setAtBottom((was) => (was === bottom ? was : bottom))
+    seen()
+  }, [seen])
+
+  const jumpToLatest = React.useCallback(() => {
+    const el = feedRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    atBottomRef.current = true
+    setAtBottom(true)
     seen()
   }, [seen])
 
@@ -407,8 +531,12 @@ export function ChatChannel({
           // on a badge that IS the "there is something below" affordance
           // (tapping the feed's bottom clears it). Never a bot hue.
           <span
+            // `key={unread}` REMOUNTS the badge on every increment, which is what
+            // re-fires `.grok-receipt`'s scale-up pop — a number that snaps reads
+            // as news. Inert (and reduced-motion-safe) off the grok skin.
+            key={unread}
             data-testid="group-chat-unread"
-            className="flex-none rounded-full bg-primary px-2 py-0.5 text-[11px] font-semibold tabular-nums text-primary-foreground"
+            className="grok-receipt flex-none rounded-full bg-primary px-2 py-0.5 text-[11px] font-semibold tabular-nums text-primary-foreground"
           >
             {unread > 99 ? '99+' : unread}
           </span>
@@ -425,11 +553,16 @@ export function ChatChannel({
       </header>
 
       {/* ── the feed ───────────────────────────────────────────────────────── */}
+      {/* A `relative` shell so the jump-to-latest pill can float over the
+          scroller's bottom-right without being clipped by its own overflow. */}
+      <div className="relative flex min-h-0 flex-1 flex-col">
       <div
         ref={feedRef}
         onScroll={onScroll}
         data-testid="group-chat-feed"
-        className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-2 pt-1"
+        // `overflow-anchor:auto` pins the reader's row when content grows above
+        // it (a paged-in block, a late avatar) — a one-line scroll-hardening.
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-2 pt-1 [overflow-anchor:auto]"
         style={{ maxHeight: feedMaxHeight }}
       >
         {error && rows.length === 0 && (
@@ -468,16 +601,53 @@ export function ChatChannel({
             </p>
           )
         ) : (
-          rows.map((row, i) => (
-            <ChannelRow
-              key={row.seq}
-              row={row}
-              grouped={isGrouped(row, rows[i - 1])}
-              members={byName}
-              ring={ring}
-              surface={surface}
-            />
-          ))
+          rows.map((row, i) => {
+            const prev = rows[i - 1]
+            // A calendar-day change draws a divider AND breaks grouping: a run
+            // must never straddle midnight, or the day label lands mid-run with
+            // no avatar under it.
+            const newDay =
+              !prev ||
+              new Date(row.ts * 1000).toDateString() !== new Date(prev.ts * 1000).toDateString()
+            const grouped = !newDay && isGrouped(row, prev)
+            return (
+              <React.Fragment key={row.seq}>
+                {newDay && <DayDivider ts={row.ts} />}
+                {firstUnreadSeq === row.seq && i > 0 && <UnreadDivider />}
+                <ChannelRow
+                  row={row}
+                  grouped={grouped}
+                  members={byName}
+                  ring={ring}
+                  surface={surface}
+                  fresh={seqBaseline.current !== null && row.seq > seqBaseline.current}
+                />
+              </React.Fragment>
+            )
+          })
+        )}
+      </div>
+
+        {/* ── jump-to-latest ─────────────────────────────────────────────────
+            Only when the reader is BOTH scrolled up AND behind: a milestone
+            landed below the fold. Taps to the newest row. Enters with the same
+            `.grok-entry` pop the rows use (inert / reduced-motion-safe off-skin). */}
+        {!atBottom && unread > 0 && (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            data-testid="group-chat-jump"
+            aria-label={`Jump to ${unread} new ${unread === 1 ? 'message' : 'messages'}`}
+            className={cn(
+              'grok-entry absolute bottom-3 right-3.5 z-10 flex items-center gap-1.5',
+              'rounded-full bg-primary py-1 pl-3 pr-2.5 text-primary-foreground',
+              'text-[12px] font-semibold tabular-nums shadow-lg shadow-black/20',
+              'sm-t-hover hover:brightness-105 active:scale-95',
+            )}
+          >
+            {unread > 99 ? '99+' : unread} New
+            <ArrowIcon className="rotate-90" />
+          </button>
         )}
       </div>
 
@@ -494,6 +664,9 @@ export function ChatChannel({
           onSend={onSend}
           routerLabel={routerLabel}
           disabledNote={composerNote}
+          // The newest row's seq — the composer's "routing…" pill clears itself
+          // when a later row (the router's reply) lands past the send.
+          lastSeq={lastSeq}
           className="px-3.5 pb-3"
         />
       </div>

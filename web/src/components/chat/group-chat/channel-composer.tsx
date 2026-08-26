@@ -32,7 +32,7 @@ import { cn } from '@/lib/utils'
 import type { ComposerField } from '../composer-draft'
 import { COARSE_TARGET, ComposerFrame } from '../composer-shell'
 import { readTrigger } from '../slash'
-import { ArrowIcon, Composer, MARK_SIZE, SpinnerIcon } from '../ui'
+import { ArrowIcon, CheckIcon, Composer, MARK_SIZE, SpinnerIcon } from '../ui'
 
 import type { ChannelMember } from './types'
 
@@ -55,6 +55,9 @@ export interface ChannelComposerProps {
   routerLabel?: string
   /** Why sending is unavailable. Shown in place of the read-only hint. */
   disabledNote?: string
+  /** The newest row's `seq`. When a row lands PAST the one in flight, the
+   *  "routing…" pill has been answered — it clears itself. */
+  lastSeq?: number
   className?: string
 }
 
@@ -65,6 +68,7 @@ export function ChannelComposer({
   onSend,
   routerLabel,
   disabledNote,
+  lastSeq = 0,
   className,
 }: ChannelComposerProps) {
   const phone = surface === 'phone'
@@ -75,6 +79,37 @@ export function ChannelComposer({
   const [byKey, setByKey] = React.useState(false)
   const [sending, setSending] = React.useState(false)
   const [notice, setNotice] = React.useState<string | null>(null)
+  // Is the standing notice the live "routing…" beat (dots animate) or a refusal
+  // (plain text)? The two look different and clear on different cues.
+  const [routing, setRouting] = React.useState(false)
+  // The brief ✓ that lands on the send button the instant the server accepts,
+  // before the routing pill takes over — a tactile finish on the send itself.
+  const [justSent, setJustSent] = React.useState(false)
+  // The seq the feed was at when THIS message was accepted. The next row past it
+  // is the router's answer, and the cue to retire the routing pill.
+  const sentSeqRef = React.useRef<number | null>(null)
+  const receiptTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  // A safety cap: if the send is accepted but nothing ever posts to the channel,
+  // the "routing…" pill must not hang forever.
+  const routeTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  React.useEffect(() => () => {
+    if (receiptTimer.current) clearTimeout(receiptTimer.current)
+    if (routeTimer.current) clearTimeout(routeTimer.current)
+  }, [])
+
+  // Close the send→route loop: once a row lands past the one we sent under, the
+  // router has spoken (or another message did) — drop the pill. Guarded on
+  // `routing` so a normal scroll of the feed never clears a refusal notice.
+  React.useEffect(() => {
+    if (!routing || sentSeqRef.current === null) return
+    if (lastSeq > sentSeqRef.current) {
+      if (routeTimer.current) clearTimeout(routeTimer.current)
+      setRouting(false)
+      setNotice(null)
+      sentSeqRef.current = null
+    }
+  }, [lastSeq, routing])
 
   // ── the `@` popover ───────────────────────────────────────────────────────
   // `readTrigger` is the chat composer's own rule for where a mention token
@@ -151,23 +186,40 @@ export function ChannelComposer({
     if (!onSend || sending || text.length === 0) return
     setSending(true)
     setNotice(null)
+    setRouting(false)
     void onSend(text)
       .then(() => {
         setDraft('')
         setCaret(0)
-        // The optimistic half of §P0.1's "Assistant is routing…" beat. It is a
-        // RECEIPT about delivery, not a claim the Router has decided anything —
-        // the routing row itself arrives on the socket like any other row.
-        setNotice(`Sent to ${routerLabel ?? 'the assistant'} — routing…`)
+        // 1) A tactile finish on the send itself: the arrow flips to a ✓ that
+        //    pops in (`.grok-receipt`) for a beat before the pill takes over.
+        setJustSent(true)
+        if (receiptTimer.current) clearTimeout(receiptTimer.current)
+        receiptTimer.current = setTimeout(() => setJustSent(false), 900)
+        // 2) The optimistic half of §P0.1's "Assistant is routing…" beat — live
+        //    anticipation, not dead text. It is a RECEIPT about delivery, not a
+        //    claim the Router decided anything; the routing row arrives on the
+        //    socket like any other, and clears this pill (the effect above).
+        sentSeqRef.current = lastSeq
+        setRouting(true)
+        setNotice(`Sent to ${routerLabel ?? 'the assistant'} — routing`)
+        if (routeTimer.current) clearTimeout(routeTimer.current)
+        routeTimer.current = setTimeout(() => {
+          setRouting(false)
+          setNotice(null)
+          sentSeqRef.current = null
+        }, 6000)
       })
       // THE DRAFT SURVIVES A FAILURE, the same rule `handoffResult` states for
       // the chat composer's hand-off: a message that did not go is still the
       // sender's, and re-typing it is not an acceptable recovery.
       .catch((err: unknown) => {
+        setRouting(false)
+        sentSeqRef.current = null
         setNotice(err instanceof Error && err.message ? err.message : 'That didn’t send — your message is still here.')
       })
       .finally(() => setSending(false))
-  }, [draft, onSend, routerLabel, sending])
+  }, [draft, lastSeq, onSend, routerLabel, sending])
 
   const onKeyDown = React.useCallback(
     (e: React.KeyboardEvent<Element>) => {
@@ -216,14 +268,27 @@ export function ChannelComposer({
           <p
             role={notice ? 'status' : undefined}
             className={cn(
-              'pointer-events-none absolute inset-x-0 -top-[22px] text-center',
+              'pointer-events-none absolute inset-x-0 -top-[22px] flex items-center justify-center gap-1.5 text-center',
               'text-[12.6px] tracking-[-0.05px] text-ink-2',
+              // The routing pill ENTERS with the arrival pop; a refusal and the
+              // read-only hint do not. `.grok-entry` is inert off the grok skin.
+              routing && 'grok-entry',
               // The read-only hint is a hover-reveal (it is a standing fact);
               // a send receipt or a refusal is shown at once (it is news).
               !notice && 'opacity-0 transition-opacity duration-200 group-focus-within:opacity-100',
             )}
           >
             {notice ?? hint}
+            {/* Three staggered dots — live anticipation while the router reads.
+                Reduced motion keeps the .25/.45/.7 static stagger (the twin in
+                grok-mode.css), so it still reads as three dots mid-wave. */}
+            {routing && (
+              <span className="grok-typing inline-flex items-center gap-[3px]" aria-hidden>
+                <i className="inline-block size-[3px] rounded-full bg-current" />
+                <i className="inline-block size-[3px] rounded-full bg-current" />
+                <i className="inline-block size-[3px] rounded-full bg-current" />
+              </span>
+            )}
           </p>
         )}
 
@@ -261,6 +326,7 @@ export function ChannelComposer({
               setDraft(e.target.value)
               setCaret(e.target.selectionStart ?? e.target.value.length)
               setNotice(null)
+              setRouting(false)
             },
             onSelect: (e) => setCaret(e.currentTarget.selectionStart ?? 0),
             onKeyDown,
@@ -287,6 +353,10 @@ export function ChannelComposer({
             >
               {sending ? (
                 <SpinnerIcon />
+              ) : justSent ? (
+                // A ✓ that pops in on accept (`.grok-receipt`, reduced-motion:
+                // shows without the pop) — the tactile finish, before the pill.
+                <CheckIcon className="grok-receipt" />
               ) : (
                 // The app's send is an UP arrow; `ArrowIcon` is the same stroke
                 // pointing right, so it is turned rather than redrawn.

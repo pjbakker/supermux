@@ -1161,7 +1161,10 @@ const BUDGET_ENTRY_JS = 161 * KB
 // The number is small because the socket, the picker, the composer pill and the
 // input plane are all REUSED — a second data plane here would have cost 20 KB.
 // ceil(measured 421.33) + headroom = 423, same rule as every bump above.
-const BUDGET_APP_JS = 423 * KB
+// RATCHETED 423 → 427 by the group-chat DELIGHT pass (jump-to-latest pill, day
+// dividers, unread separator, URL/PR-ref linkifier, animation wiring — reuses the
+// existing [data-grok] motion bank, no new deps): ceil(measured 425.10) + headroom.
+const BUDGET_APP_JS = 427 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

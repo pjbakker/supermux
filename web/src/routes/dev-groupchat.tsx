@@ -62,22 +62,44 @@ export default function DevGroupChat() {
 
   const onSend = React.useCallback(
     (text: string) =>
+      // Two beats, so the composer's "routing…" pill has room to breathe offline:
+      //   1) resolve at 400ms  → the server "accepted"; the pill arms.
+      //   2) at +1200ms        → the human's request lands AND the Main Assistant's
+      //      routed reply lands, which is the socket row that RETIRES the pill —
+      //      the full send → route loop, demonstrable with no server behind it.
       new Promise<void>((resolve) => {
         setTimeout(() => {
-          setSent((prev) => [
-            ...prev,
-            {
-              seq: 1000 + prev.length,
-              // Fixed, not `Date.now()`: a bench you screenshot is deterministic.
-              ts: CANARY_ROWS[CANARY_ROWS.length - 1]!.ts + 60 * (prev.length + 1),
-              kind: 'request',
-              authorKind: 'human',
-              authorSeed: 'user-sander',
-              authorName: 'Sander',
-              body: text,
-            },
-          ])
           resolve()
+          setTimeout(() => {
+            setSent((prev) => {
+              const base = CANARY_ROWS[CANARY_ROWS.length - 1]!.ts
+              const n = prev.length
+              return [
+                ...prev,
+                {
+                  seq: 1000 + n * 2,
+                  // Fixed offsets, not `Date.now()`: a bench you screenshot is
+                  // deterministic. Same calendar day as the seed rows.
+                  ts: base + 60 * (n + 1),
+                  kind: 'request',
+                  authorKind: 'human',
+                  authorSeed: 'user-sander',
+                  authorName: 'Sander',
+                  body: text,
+                },
+                {
+                  seq: 1001 + n * 2,
+                  ts: base + 60 * (n + 1) + 20,
+                  kind: 'routed',
+                  authorKind: 'router',
+                  authorSeed: 'canary-assistant',
+                  authorName: 'Main Assistant',
+                  tags: ['render-bug'],
+                  body: '@render-bug — you have the freshest context on this; taking a first pass.',
+                },
+              ]
+            })
+          }, 1200)
         }, 400)
       }),
     [],
@@ -117,6 +139,9 @@ export default function DevGroupChat() {
           loadingMore={loadingMore}
           onLoadMore={onLoadMore}
           unread={empty || loading ? 0 : 2}
+          // The two newest seed rows are "unseen" — draws the "New" separator
+          // above seq 5 and lets the jump-to-latest pill appear once scrolled up.
+          firstUnreadSeq={empty || loading ? null : 5}
           onSend={canSend ? onSend : undefined}
           routerLabel={canSend ? 'Main Assistant' : undefined}
           composerNote={

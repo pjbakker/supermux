@@ -56,6 +56,9 @@ export interface GroupChatFeed {
   loadMore: () => void
   /** Rows that landed since the reader last looked at the bottom of the feed. */
   unread: number
+  /** The `seq` of the FIRST row the reader has not seen — the anchor for the
+   *  "New" separator line. `null` when the feed is fully read. */
+  firstUnreadSeq: number | null
   markRead: () => void
   redial: () => void
 }
@@ -144,6 +147,15 @@ export function useGroupChat(companyId: number | null): GroupChatFeed {
 
   const markRead = React.useCallback(() => setReadSeq(highSeq), [highSeq])
 
+  // The FIRST unseen row's `seq` — the anchor Slack draws its "New" line above.
+  // Only meaningful once a read cursor exists AND the reader is actually behind;
+  // `null` otherwise so the surface draws no separator on a fully-read feed.
+  const firstUnreadSeq = React.useMemo(() => {
+    if (readSeq === null || highSeq <= readSeq) return null
+    for (const row of rows) if (row.seq > readSeq) return row.seq
+    return null
+  }, [rows, readSeq, highSeq])
+
   return {
     rows,
     isLoading: enabled && view.isLoading,
@@ -155,6 +167,7 @@ export function useGroupChat(companyId: number | null): GroupChatFeed {
     loadingMore,
     loadMore,
     unread: readSeq === null ? 0 : Math.max(0, highSeq - readSeq),
+    firstUnreadSeq,
     markRead,
     redial: view.redial,
   }
