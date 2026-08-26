@@ -210,8 +210,21 @@ async function defaultFetchFull(name: string, uuid: string): Promise<unknown> {
 }
 
 export interface ChatSocketOptions {
-  /** Session slug. */
+  /** Session slug. Also the store/link key, and the `fetch-full` subject. */
   name: string
+  /**
+   * The socket's PATH, when it is not a session's own chat.
+   *
+   * The company group chat (`/ws/companies/{id}/groupchat`) speaks a
+   * byte-identical frame contract — `auth_ok` / `seed` / `seed_done` / `entry` /
+   * `resync`, the same `WireEntry`, the same close codes — because the server
+   * mirrors `sessions::chat::ws` for it. So the ONE thing that differs is the
+   * URL, and that is what this seam is: everything the class does for a session
+   * (first-frame auth, the backoff ladder, the lagged re-seed, the staleness
+   * clock, the total dispose) is behaviour the second channel must not
+   * re-implement. Absent ⇒ the session path, byte-identical to before.
+   */
+  path?: string
   /** Called on every state change, with an immutable snapshot. */
   onSnapshot: (s: ChatSnapshot) => void
   // ── seams (defaults are the real thing; tests replace them) ───────────────
@@ -259,6 +272,9 @@ export class ChatSocket {
 
   constructor(options: ChatSocketOptions) {
     this.opts = {
+      // '' is the "no override" value, so `Required<>` holds and `url()`'s
+      // truthiness check reads the session path exactly as it always did.
+      path: '',
       connect: (url) => new WebSocket(url) as unknown as SocketLike,
       token: authToken,
       baseUrl: wsUrl,
@@ -364,6 +380,7 @@ export class ChatSocket {
 
   private url(): string {
     const base = this.opts.baseUrl().replace(/\/$/, '')
+    if (this.opts.path) return `${base}${this.opts.path}`
     return `${base}/ws/sessions/${encodeURIComponent(this.opts.name)}/chat`
   }
 

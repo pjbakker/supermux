@@ -109,9 +109,15 @@ interface SnapshotStore {
   redial: () => void
 }
 
-/** One session's socket, wrapped as an external store: the FIRST subscriber
- *  dials, the LAST one to leave disposes. */
-function chatStore(name: string, enabled: boolean): SnapshotStore {
+/** One socket, wrapped as an external store: the FIRST subscriber dials, the
+ *  LAST one to leave disposes.
+ *
+ *  `path` is the second channel's only difference (`/ws/companies/{id}/groupchat`,
+ *  which the server mirrors frame-for-frame off `sessions::chat::ws`). It is
+ *  threaded rather than branched on because everything else in here — the
+ *  foreground redial, the link aggregate, the dispose discipline — is behaviour
+ *  a second data plane must inherit, not copy. */
+function chatStore(name: string, enabled: boolean, path?: string): SnapshotStore {
   let snapshot: ChatSnapshot = EMPTY_SNAPSHOT
   let socket: ChatSocket | null = null
   const listeners = new Set<() => void>()
@@ -163,7 +169,9 @@ function chatStore(name: string, enabled: boolean): SnapshotStore {
     window.removeEventListener('online', onVisibility)
   }
 
-  const linkId = `chat:${name}`
+  // The aggregate key. A company channel and a session of the same name are
+  // different links, so the PATH is what identifies one when there is one.
+  const linkId = `chat:${path ?? name}`
 
   return {
     get: () => snapshot,
@@ -174,6 +182,7 @@ function chatStore(name: string, enabled: boolean): SnapshotStore {
       if (enabled && socket === null) {
         socket = new ChatSocket({
           name,
+          path,
           onSnapshot: (s) => {
             snapshot = s
             // A6 T2.4 — the chat socket joins the app-wide link aggregate, so
@@ -223,8 +232,8 @@ function chatStore(name: string, enabled: boolean): SnapshotStore {
   }
 }
 
-export function useChatWs(name: string, enabled: boolean): ChatWireView {
-  const store = React.useMemo(() => chatStore(name, enabled), [name, enabled])
+export function useChatWs(name: string, enabled: boolean, path?: string): ChatWireView {
+  const store = React.useMemo(() => chatStore(name, enabled, path), [name, enabled, path])
   const snap = React.useSyncExternalStore(store.subscribe, store.get)
 
   return {

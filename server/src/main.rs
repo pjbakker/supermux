@@ -194,6 +194,10 @@ async fn main() -> anyhow::Result<()> {
     // Seeding the row starts NO browser: chrome is spawned lazily, and only by a
     // granted session's first tool call.
     connectors::browser::mcp::seed(&state).await;
+    // The built-in Company Group Chat connector card (kind `builtin_groupchat`).
+    // Seeding the row grants nothing: a bot reaches the channel only through its
+    // company's `@company:<id>` grant, written when group chat is enabled.
+    connectors::groupchat::seed(&state).await;
     // Start the HostPool reaper. Sweeps every 60s,
     // tears down SSH ControlMasters that have been idle > 10min AND have no
     // live session row pointing at them. Cheap no-op while no remote hosts

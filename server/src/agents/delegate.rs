@@ -292,6 +292,33 @@ pub async fn deliver_delegation(
         return Err(AppError::NotFound(format!("session '{to}'")));
     }
 
+    // THE GROUP-CHAT LOOP GUARD (spec §4.3). A company-scoped bot may not
+    // delegate INTO its company's Router (Main Assistant) — that is the one edge
+    // that would let one bot's output cost every other bot a turn, because the
+    // Router's whole job is to fan a message out as `@tags`. Bot posts have
+    // their own path (`POST /api/companies/{id}/groupchat/post`), which appends
+    // to the sidecar log and wakes nobody, so nothing legitimate is lost.
+    //
+    // Only `actor == Some("human")` passes: the composer's human message is the
+    // ONE thing the Router is supposed to wake on (§3.3). That is the same
+    // honest-label contract [`audit_actor`] documents — an already-bearer-authed
+    // caller saying which path it is — and the bot-facing route
+    // (`agents::hook::delegate_handler`, hook-token authenticated) hard-codes
+    // `actor: None`, so a bot cannot reach for this exemption.
+    //
+    // A refusal is a SILENT 404 (byte-identical to a nonexistent slug) and
+    // returns BEFORE any delivery, edge or audit row — same discipline as the
+    // company gate above.
+    if actor != Some("human") && from_row.company_id.is_some() {
+        if let Some(cid) = to_row.company_id.filter(|c| Some(*c) == from_row.company_id) {
+            if let Some(company) = db::companies::get(&state.pool, cid).await? {
+                if crate::companies::groupchat::is_router(&company.slug, to) {
+                    return Err(AppError::NotFound(format!("session '{to}'")));
+                }
+            }
+        }
+    }
+
     // Deliver the prompt (auto-wakes a stopped target). Claude targets get the
     // `<supermux-delegation>` wrapper so their transcript knows the sender;
     // other providers get the raw prompt. Either way the *preview* stored in
@@ -558,6 +585,61 @@ mod tests {
         assert!(
             matches!(err, AppError::NotFound(_)),
             "company→main refusal must be a silent 404, got {err:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// GROUP CHAT §4.3 — a company bot may not wake its company's Router. The
+    /// Router fans one message out as `@tags`, so this single edge is what
+    /// would turn one bot's post into every bot's turn. Bot posts have their
+    /// own, pty-free path (`groupchat/post`), so nothing legitimate is lost.
+    #[tokio::test]
+    async fn company_bot_to_its_company_router_is_404() {
+        let (state, dir) = test_state().await;
+        let acme = seed_company(&state, "acme").await;
+        seed_session(&state, "acme-bot", Some(acme)).await;
+        // The Main Assistant, by the ONE naming convention (§3.1).
+        seed_session(&state, &crate::companies::groupchat::router_name("acme"), Some(acme)).await;
+
+        let err = delegate(
+            axum::extract::State(state.clone()),
+            crate::scope::OptCtx(None),
+            axum::Json(deleg_input("acme-bot", "acme-assistant")),
+        )
+        .await
+        .expect_err("a bot must not be able to wake the Router");
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "the refusal must be a silent 404, got {err:?}"
+        );
+        // Same discipline as the company gate: refused BEFORE any bookkeeping.
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM delegations").await, 0);
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM audit_log").await, 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The refusal is scoped to the ROUTER, not to company traffic: an ordinary
+    /// same-company peer still goes through, edge and all. Without this the
+    /// guard could be "refuse company traffic" and every existing test would
+    /// still pass.
+    #[tokio::test]
+    async fn a_company_peer_that_is_not_the_router_still_delivers() {
+        let (state, dir) = test_state().await;
+        let acme = seed_company(&state, "acme").await;
+        seed_session(&state, "acme-bot", Some(acme)).await;
+        seed_session(&state, "acme-backend", Some(acme)).await;
+
+        delegate(
+            axum::extract::State(state.clone()),
+            crate::scope::OptCtx(None),
+            axum::Json(deleg_input("acme-bot", "acme-backend")),
+        )
+        .await
+        .expect("a normal same-company peer must not hit the Router guard");
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM delegations").await,
+            1,
+            "the edge is recorded exactly as before"
         );
         std::fs::remove_dir_all(dir).ok();
     }

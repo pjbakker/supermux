@@ -114,6 +114,11 @@ const DevChatUi = import.meta.env.DEV
 const DevShell = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-shell'))
   : null
+// Company GROUP CHAT bench (spec §7): the `<ChatChannel>` hero at 390/402px with
+// an offline cast — every message kind at once, no socket behind it.
+const DevGroupChat = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-groupchat'))
+  : null
 // Chat RENDERER bench (fase A3): the real conversation component, fed the wire
 // shapes the server sends, in every state the surface can be in — the page the
 // A3 screenshots are taken from.
@@ -571,6 +576,16 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <DevShell />
+                    </Suspense>
+                  }
+                />
+              )}
+              {DevGroupChat && (
+                <Route
+                  path="/dev/groupchat"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevGroupChat />
                     </Suspense>
                   }
                 />

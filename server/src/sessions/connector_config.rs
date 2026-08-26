@@ -267,6 +267,25 @@ impl SessionConfig {
     /// `emit` is [`crate::connectors::browser::mcp::emit`] — `${VAR}` references
     /// only (the session name, its per-session hook token, the callback URL); no
     /// credential exists for this connector at all.
+    /// Wire the built-in GROUP CHAT server into this launch.
+    ///
+    /// Same shape as [`apply_browser_connector`](Self::apply_browser_connector)
+    /// — an in-binary MCP server, a fixed server key (`group_chat`, so tools are
+    /// `mcp__group_chat__*`) and its own allow rule. The one difference is that
+    /// its emit env is PER-SESSION: the company id is baked in by `assemble`,
+    /// which is the only layer that knows it.
+    pub fn apply_groupchat_connector(&mut self, emit: Value) {
+        self.active = true;
+        self.mcp_servers.insert(
+            crate::connectors::groupchat::SERVER_KEY.to_string(),
+            emit,
+        );
+        let rule = Value::String(crate::connectors::groupchat::ALLOW_RULE.to_string());
+        if !self.allow_rules.contains(&rule) {
+            self.allow_rules.push(rule);
+        }
+    }
+
     pub fn apply_browser_connector(&mut self, emit: Value) {
         self.active = true;
         self.mcp_servers.insert(
@@ -447,6 +466,10 @@ pub async fn assemble(state: &AppState, session_name: &str) -> Result<Option<Fin
     // connector whose MCP server is built from the binary rather than a stored
     // emit block (see the loop below).
     let mut wants_browser = false;
+    // Set when this session holds an enabled `group-chat` grant — the SECOND
+    // in-binary connector, and the only one whose emit env is per-session (the
+    // company id is baked below, the `MAIL_TO_FILTER` precedent).
+    let mut wants_groupchat = false;
 
     // ── connector tier ─────────────────────────────────────────────────────────
     let grants = connectors::grants_for_session(&state.pool, session_name).await?;
@@ -500,6 +523,15 @@ pub async fn assemble(state: &AppState, session_name: &str) -> Result<Option<Fin
                 wants_browser = true;
                 continue;
             }
+            // THE BUILT-IN GROUP CHAT is the same shape: materialized from the
+            // binary, fixed server key, and its company id baked into the env
+            // below (it is a per-session fact, so it cannot live on the card).
+            if connector.kind == crate::connectors::manifest::KIND_BUILTIN_GROUPCHAT
+                || g.connector_id == crate::connectors::groupchat::GROUPCHAT_ID
+            {
+                wants_groupchat = true;
+                continue;
+            }
             let mut emit: Value =
                 serde_json::from_str(&connector.emit_json).unwrap_or_else(|_| json!({}));
             // Inject the agent-inbox To-filter into a MAIL connector's emit env
@@ -534,6 +566,23 @@ pub async fn assemble(state: &AppState, session_name: &str) -> Result<Option<Fin
     if wants_browser {
         if let Some(path) = crate::connectors::browser::mcp::ensure(&state.config.data_dir).await {
             cfg.apply_browser_connector(crate::connectors::browser::mcp::emit(&path));
+        }
+    }
+
+    // ── group-chat tier ────────────────────────────────────────────────────────
+    // A granted bot gets the five channel tools. The company id is resolved HERE
+    // (the launch is the only layer that knows which session this is) and baked
+    // into the emit env — exactly the `MAIL_TO_FILTER` precedent above. It is
+    // display context: the tool endpoint re-reads the company from the session
+    // row and never trusts the env value.
+    if wants_groupchat {
+        if let Some(path) = crate::connectors::groupchat::ensure(&state.config.data_dir).await {
+            let company_id = crate::db::sessions::get(&state.pool, session_name)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.company_id);
+            cfg.apply_groupchat_connector(crate::connectors::groupchat::emit(&path, company_id));
         }
     }
 

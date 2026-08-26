@@ -1133,7 +1133,21 @@ const BUDGET_ENTRY_JS = 161 * KB
 // from one lazy chunk into the shared app graph (+2.4 KB). The HERO PATH still did
 // not move (entry JS 158 / 161 KB); this is pages a bot-mode user navigates to,
 // not cold load. ceil(measured 414.43) + headroom = 416.
-const BUDGET_APP_JS = 416 * KB
+//
+// RATCHETED 416 → 418 by the COMPANY GROUP CHAT hero (`components/chat/group-chat/`):
+// the Slack-style `<ChatChannel>` — channel header + member facepile, the three
+// differentiated message kinds, the router's routing row, `@mention` chips and the
+// composer — mounted at the top of the company overview. Measured app-JS total
+// 414.39 → 417.41 (+3.02 KB gz), and +2.02 KB of that is inside the LAZY
+// `grok-roster` chunk (7.39 → 9.41 KB), i.e. paid only by a bot-mode user who
+// lands on the overview. THE HERO PATH BARELY MOVED: entry JS 158.22 → 158.71 /
+// 161 KB (98.6%) — the +0.49 is shared leaves (`ui/composer`, `human-mark`,
+// `mark-status`) hoisting into the shared graph, not new cold-load code. The
+// feature reuses B0's shipped primitives (`MessageRow`, `SessionMark`,
+// `MentionChip`, `Facepile`, `Composer`) rather than shipping a second chat
+// surface, which is what keeps the delta at 3 KB instead of 15.
+// ceil(measured 417.41) + headroom = 418, same rule as every bump above.
+const BUDGET_APP_JS = 418 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

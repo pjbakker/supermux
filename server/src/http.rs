@@ -54,6 +54,10 @@ pub fn router(state: AppState) -> Router {
         // never hold the dashboard bearer), plus the grant check and the drive
         // lock inside the handler.
         .merge(crate::connectors::browser::tools::router_for(state.clone()))
+        // The group-chat tool endpoint. Same no-bearer, per-session-hook-token
+        // family as the browser's: the caller is an MCP server running inside a
+        // pane, which must never hold the dashboard bearer.
+        .merge(crate::connectors::groupchat::tools::router_for(state.clone()))
         // Claude hook ingestion — NO bearer layer; auth is the per-session
         // `X-Supermux-Hook-Token` validated in the handler.
         .merge(hooks::router_for(state.clone()))

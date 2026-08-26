@@ -92,6 +92,18 @@ export const SSE_NAMED_EVENTS = [
   // `SseEvent::for_company`, not the `SseEvent { event: "…" }` struct literal,
   // which is why `sse-events.test.ts` scrapes both forms.
   'files',
+  // A company group-chat row landed — payload `{company, seq, ts,
+  // author_session, author_kind}`, emitted through `SseEvent::for_company`
+  // (`companies/groupchat/mod.rs::append`), so a scoped member gets their own
+  // company's tick and nobody else's.
+  //
+  // A BADGE TICK, not the feed: the row's text is NOT in it, deliberately, so a
+  // surface that only needs "something happened in #acme" pays for a `seq`
+  // rather than for a socket. The hero holds the WS and reads its rows for
+  // content; it takes only `seq` from here, and the unread count is
+  // `max(seq seen) − lastRead`, which is idempotent whichever half arrives
+  // first. `components/chat/group-chat/use-group-chat.ts` subscribes.
+  'groupchat',
   // A 10s keep-alive — it only resets the staleness clock.
   'ping',
 ] as const

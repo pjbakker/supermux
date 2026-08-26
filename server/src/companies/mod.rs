@@ -34,6 +34,12 @@ use crate::db::companies::{self, Company};
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// The per-company GROUP CHAT channel (sidecar log + chat ring). Its two REST
+/// routes are registered below; the live socket lives in [`crate::ws`] with the
+/// other WebSockets, for the same reason the session chat socket does (a
+/// browser `WebSocket` cannot satisfy the bearer layer).
+pub mod groupchat;
+
 /// Build the companies sub-router (no auth layer — applied by `http::router`).
 pub fn router_for(state: AppState) -> Router {
     use axum::routing::get;
@@ -42,6 +48,19 @@ pub fn router_for(state: AppState) -> Router {
         .route(
             "/api/companies/{id}",
             get(get_handler).patch(patch_handler).delete(delete_handler),
+        )
+        // ── the company group chat (headless channel) ──
+        // History pages the sidecar LOG (the durable truth), not the ring, so a
+        // restart cannot lose the feed. `post` is its OWN path, physically
+        // separate from `deliver_delegation`: it appends + publishes and wakes
+        // nobody.
+        .route(
+            "/api/companies/{id}/groupchat/history",
+            get(groupchat::history_handler),
+        )
+        .route(
+            "/api/companies/{id}/groupchat/post",
+            axum::routing::post(groupchat::post_handler),
         )
         .with_state(state)
 }

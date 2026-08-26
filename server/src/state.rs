@@ -548,6 +548,17 @@ pub struct AppState {
     /// also dropped on delete and re-keyed on rename like every other
     /// per-session map here.
     pub chat_stores: Arc<DashMap<String, Arc<crate::sessions::chat::store::ChatStore>>>,
+    /// Per-COMPANY group-chat channels, keyed by `companies.id`.
+    ///
+    /// A separate map from [`chat_stores`](Self::chat_stores) on purpose: that
+    /// one is keyed by session name and is created/dropped/re-keyed by the
+    /// session lifecycle (the tailer's idle sweep, delete, rename), none of
+    /// which a company channel takes part in. Each entry owns the append lock
+    /// that makes the sidecar log single-writer, so it must NOT be evictable
+    /// while a write is in flight. Created on first access (a post or a socket)
+    /// by `companies::groupchat::channel`, which rehydrates the ring from the
+    /// log — the ring is a cache, the log is the truth.
+    pub groupchat_channels: Arc<DashMap<i64, Arc<crate::companies::groupchat::GroupChat>>>,
     /// Per-session latest Claude STATUSLINE payload (fase A2 Task 6), fed by the
     /// OPT-IN tap at `/api/_internal/statusline`. IN-MEMORY ONLY, exactly like
     /// [`session_activity`](Self::session_activity) — the payload carries the
@@ -697,6 +708,7 @@ impl AppState {
             pending_edits: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_runtimes: Arc::new(DashMap::new()),
             chat_stores: Arc::new(DashMap::new()),
+            groupchat_channels: Arc::new(DashMap::new()),
             statuslines: Arc::new(DashMap::new()),
             host_pool,
             updates: crate::updates::UpdatesState::new(),

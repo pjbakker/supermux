@@ -97,6 +97,13 @@ pub fn router_for(state: AppState) -> Router {
             "/ws/sessions/{name}/chat",
             get(crate::sessions::chat::ws::handle_chat_ws),
         )
+        // The per-COMPANY group-chat channel — same in-band first-frame auth,
+        // same seed→live boundary, fed by the company's sidecar log instead of
+        // a session transcript (there is no tailer: the server is the writer).
+        .route(
+            "/ws/companies/{id}/groupchat",
+            get(crate::companies::groupchat::handle_groupchat_ws),
+        )
         // Resolve `%id` from `~/.claude/teams/{team}/config.json` members[] and
         // validate it against the lead's window before streaming. The
         // frontend opens this; an optional `?pane_id=%id` query lets a caller that

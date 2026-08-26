@@ -24,6 +24,8 @@ pub mod browser;
 pub mod catalog;
 pub mod connect_server;
 /// Per-account "Test connection" probes + the honest health mapping (Slice 3).
+/// The per-company group-chat connector (card + embedded MCP server + tools).
+pub mod groupchat;
 pub mod health;
 pub mod icloud;
 /// The generic, table-driven IMAP/SMTP mail family (Gmail/Outlook/Fastmail) —
