@@ -716,19 +716,18 @@
     width: calc((100% - 16px) / var(--nav-n));
     transform: translateX(calc(var(--nav-i) * 100%));
     box-sizing: border-box;
-    /* Transparent 4px border = a 4px visual inset WITHOUT changing the 100% travel
-       unit (the wash fills only inside it via padding-box clip). */
-    border: 4px solid transparent;
-    /* A READABLE selection, not a whisper (owner: the 12% wash "wasn't clear when
-       selected"). ~20% accent fill reads as a deliberate tint chip on the dark
-       glass without going opaque, and a 1px accent ring at ~55% gives it a crisp,
-       Apple-tab-bar edge so the selected cell is unmistakable. */
-    background: color-mix(in srgb, var(--sm-accent) 20%, transparent);
+    /* Transparent 5px border = a 5px visual inset (the wash fills only inside it
+       via padding-box clip) WITHOUT changing the 100% travel unit — the padding
+       that gives the glyph + label room to breathe inside the chip. */
+    border: 5px solid transparent;
+    /* A soft, READABLE tint chip — the selection reads through FILL and SPACE, not
+       a ring. ~22% accent fill on the dark glass is unmistakable but never opaque;
+       NO border (a ring is a crutch, not design). One faint inner top-highlight is
+       the only edge — the glass tell, not a frame. */
+    background: color-mix(in srgb, var(--sm-accent) 22%, transparent);
     background-clip: padding-box;
-    box-shadow:
-      inset 0 0 0 1px color-mix(in srgb, var(--sm-accent) 55%, transparent),
-      0 1px 0 color-mix(in srgb, #fff 10%, transparent) inset;
-    border-radius: var(--sm-r-pill);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 12%, transparent);
+    border-radius: 16px;
     /* THE GLIDE: `transform` on an overshoot curve + a DIFFERENT (standard) curve
        on `width` → the pill stretches then settles as it lands, the iOS-26
        stretch-and-settle "liquid" signature in two CSS properties, no morph

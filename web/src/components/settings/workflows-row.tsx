@@ -12,7 +12,7 @@
 // fragment that scrolls nowhere is a broken link.
 
 import { ArrowRight } from 'lucide-react'
-import { TreeStructure } from '@phosphor-icons/react'
+import { WorkflowsGlyph } from '@/components/nav-glyphs'
 import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
 
@@ -35,7 +35,7 @@ export function WorkflowsRow() {
               to={WORKFLOWS_ROUTE}
               className="flex items-center gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <TreeStructure weight="bold" className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+              <WorkflowsGlyph className="size-4 shrink-0 text-muted-foreground" />
               Workflows
             </Link>
           }
