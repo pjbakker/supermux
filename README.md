@@ -65,8 +65,7 @@ Then stand up your first company:
 A bot has a name, an avatar, and a role you assign — *Ada the developer*, *Iris the marketer*, *Sol in sales*. Each one gets **its own folder** on the box (its filesystem, scoped to what it's allowed to touch) and **its own connectors**. It's a full Claude Code agent with a job, not a scratch chat window.
 
 <p align="center">
-  <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. -->
-  <!-- TODO(launch): bot-card.png — capture from /?mock or /dev (mock data only, no client PII). <a href="docs/screenshots/botmode/bot-card.png"><img src="docs/screenshots/botmode/bot-card.png" alt="Bot detail on mobile: avatar, name 'Ada', role 'Developer', its own folder path, its connectors (GitHub), and a Workflows tab" width="260"></a> -->
+  <a href="docs/screenshots/botmode/bot-card.png"><img src="docs/screenshots/botmode/bot-card.png" alt="A bot's detail panel: avatar, name, live status, provider/model and branch, an Overview / Setup / Workflows tab bar, context and token usage, and its latest line — all mock data" width="420"></a>
 </p>
 
 <p align="center"><em>A bot with a role, a folder, and its own tools — all mock data.</em></p>
