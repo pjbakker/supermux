@@ -80,12 +80,24 @@ process.env.CLAUDE_CONFIG_DIR ??= mkdtempSync(join(tmpdir(), 'a6t3-claude-cfg-')
 // PATH alone is not enough, because the pane's shell sources the developer's
 // `~/.bashrc`, which re-prepends `~/.local/bin` — where a REAL claude lives —
 // in front of the shim. No rc file, no shadowing.
+//
+// THE PROMPT IS `❯ `, AND THAT IS LOAD-BEARING. `POST /send` gates every send to
+// an AGENT-provider session on the CURRENT screen of the pty
+// (`lifecycle.rs::pty_ready_for_send`, wave-7 #111 + wave-8 #113): unless the
+// bottom rows carry the agent's own composer glyph (`❯`/`❱`, `agent_ui_visible`)
+// or a busy footer, the server answers 409 instead of typing a message into a
+// bare shell or a boot modal that would swallow it. That guard is right, and it
+// is not test-aware: a stand-in agent whose pane draws `t3$ ` is, to the server,
+// a shell the agent exited to, so a composer send from these specs came back
+// 409 and the row escalated to `undelivered`. The stand-in has to look like the
+// thing it stands in for. Bash keeps this glyph on the last row for the rest of
+// the pane's life, so a second send is admitted the same way the first is.
 const SHIM_DIR = mkdtempSync(join(tmpdir(), 'a6t3-shim-'))
 const SHIM_HOME = mkdtempSync(join(tmpdir(), 'a6t3-home-'))
 writeFileSync(
   join(SHIM_DIR, 'claude'),
   '#!/bin/sh\nprintf %s "$SUPERMUX_HOOK_TOKEN" > "$PWD/.hook-token"\n' +
-    "exec env PS1='t3$ ' bash --norc --noprofile -i\n",
+    "exec env PS1='❯ ' bash --norc --noprofile -i\n",
 )
 chmodSync(join(SHIM_DIR, 'claude'), 0o755)
 
