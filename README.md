@@ -13,10 +13,8 @@
   <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. The money shot:
        phone frame → company chat where Sol asks Ada for the changelog, Ada posts a file,
        a workflow step ticks green, a push notification slides in "Ada needs your approval." -->
-  <img src="docs/screenshots/botmode/hero.png" alt="supermux Bot Mode — Run a company of bots: named AI teammates (a developer, a marketer, a sales bot) organized into companies that talk to each other" width="760">
+  <a href="docs/screenshots/botmode/hero.mp4"><img src="docs/screenshots/botmode/hero.gif" alt="supermux Bot Mode — Run a company of bots: named AI teammates (a developer, a marketer, a sales bot) organized into companies that talk to each other" width="760"></a>
 </p>
-
-<!-- TODO(launch): replace hero.png with an animated hero GIF+HD mp4 (a company handing off work in the central chat → a workflow step ticks green → a push asks the owner for approval). Capture from /?mock — mock data only, no client PII. -->
 
 <p align="center"><sub>An open-source, self-hosted AI company you run yourself.</sub></p>
 
