@@ -16,9 +16,10 @@
  *             ink and by the mark, never by a fill (concept contract C7).
  *   @mention  `<MentionChip>` (`ui/system-line.tsx`) when the name resolves to a
  *             member — face + name in ITS pigment, the app's existing mention.
- *   routing   the Assistant's fan-out is a `Routed` row: "Routed to →" plus the
+ *   routing   the Assistant's fan-out is a `Nudged` row: "Nudged" plus the
  *             tagged members as chips, so it reads as an ACT, not as a post
- *             (spec §7.2.2).
+ *             (spec §7.2.2). One Router turn = ONE line; `nudges.ts` folds the
+ *             per-`tag_bot` rows so the chips sit behind each other.
  *   composer  `<ComposerShell>` (`composer-shell.tsx`) — the same glass pill,
  *             the same read-only honesty note, `Message #<company>`.
  *
@@ -55,6 +56,7 @@ import {
 import { ChatLoadingSkeleton } from '../chat-loading-skeleton'
 import { ChannelComposer } from './channel-composer'
 
+import { collapseNudges } from './nudges'
 import { isGrouped, type ChannelMember, type GroupChatKind, type GroupChatRow } from './types'
 
 // Full markdown for message bodies — bots post code fences, bullet lists and
@@ -108,7 +110,7 @@ function ChannelBody({
 const KIND_LABEL: Partial<Record<GroupChatKind, { text: string; tone: string | null }>> = {
   milestone: { text: 'Milestone', tone: 'var(--gr-work)' },
   workflow: { text: 'Workflow', tone: 'var(--gr-done)' },
-  routed: { text: 'Routed', tone: null },
+  routed: { text: 'Nudged', tone: null },
 }
 
 function KindLabel({ kind }: { kind: GroupChatKind }) {
@@ -238,8 +240,8 @@ function WorkflowCard({ row }: { row: GroupChatRow }) {
   )
 }
 
-/** Spec §7.2.2: the Assistant's fan-out reads as a routing ACT — "Routed to →"
- *  plus the tagged members as their own chips, then the one-sentence why. */
+/** Spec §7.2.2: the Assistant's fan-out reads as a routing ACT — "Nudged"
+ *  plus the tagged members as their own chips, chips behind each other. */
 function RoutedBody({
   row,
   members,
@@ -257,8 +259,7 @@ function RoutedBody({
   // on the turn shows a quiet "working" pulse, so you can see it acting.
   return (
     <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[14px] text-ink-2">
-      <span>Routed to</span>
-      <ArrowIcon className="flex-none text-ink-3" />
+      <span>Nudged</span>
       {tagged.map((m) => (
         <span key={m.seed} className="inline-flex items-center gap-1.5">
           <MentionChip seed={m.seed} pin={m.pin} name={`@${m.name}`} />
@@ -472,6 +473,9 @@ export function ChatChannel({
   const feedRef = React.useRef<HTMLDivElement | null>(null)
   const atBottomRef = React.useRef(true)
   const lastSeq = rows.length > 0 ? rows[rows.length - 1].seq : 0
+  // Merge each Router turn's one-per-bot `routed` rows into a single "Nudged
+  // @a @b" line for display; the raw `rows` still drive seq/baseline/paging.
+  const displayRows = React.useMemo(() => collapseNudges(rows), [rows])
 
   // The arrival pop is for milestones that LAND, not for the history that was
   // already here. The hero MOUNTS EMPTY (loading), so freezing at mount would
@@ -620,8 +624,8 @@ export function ChatChannel({
           )
         ) : (
           <>
-            {rows.map((row, i) => {
-              const prev = rows[i - 1]
+            {displayRows.map((row, i) => {
+              const prev = displayRows[i - 1]
               // A calendar-day change draws a divider AND breaks grouping: a run
               // must never straddle midnight, or the day label lands mid-run with
               // no avatar under it.

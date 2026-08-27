@@ -197,10 +197,15 @@ pub async fn run(
 /// wrapper guard: the reminder is plain English naming the `post_message` tool,
 /// never a `<supermux-…>` tag.
 fn delivered_prompt(company_display: &str, request: &str) -> String {
-    // Kept SHORT on purpose (token cost): one clause naming the tool. A bot whose
-    // live session predates the group-chat grant simply lacks the tool and the
-    // owner restarts it — cheaper than teaching every delegation a fallback.
-    format!("{request}\n\n(From {company_display} group chat — post your reply with mcp__group_chat__post_message.)")
+    // Kept SHORT on purpose (token cost): one clause naming the tool, one giving
+    // the bot permission to bow out in a line. A nudge is not an order to write an
+    // essay — a bot with nothing to add should say so briefly, not manufacture a
+    // long answer. A bot whose live session predates the group-chat grant simply
+    // lacks the tool and the owner restarts it — cheaper than a per-delegation
+    // fallback.
+    format!(
+        "{request}\n\n(From {company_display} group chat. Reply in-channel with mcp__group_chat__post_message — keep it short; if there's nothing here for you, a one-line \"nothing for me on this\" is fine.)"
+    )
 }
 
 /// `tag_bot` — the ONE tool that wakes another agent, and therefore the one
@@ -517,6 +522,10 @@ mod tests {
             "the bot is told how to answer back: {p}",
         );
         assert!(p.contains("Acme"), "the company is named: {p}");
+        assert!(
+            p.to_lowercase().contains("short") && p.to_lowercase().contains("nothing"),
+            "the bot is invited to be brief / bow out, not write an essay: {p}",
+        );
         assert!(
             !crate::agents::delegate::wrapper_markup(&p),
             "the suffix must not trip the wrapper guard",
