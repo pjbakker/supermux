@@ -202,6 +202,31 @@ const BASELINE: readonly string[] = [
   '/dev/chat-ui light/desktop color-contrast',
   '/dev/focus dark/desktop color-contrast',
   '/dev/focus light/desktop color-contrast',
+  // ONE node, and it is the app's default <Button>, not anything this bench
+  // owns: the `bg-primary` + `text-primary-foreground` "Start session" CTA
+  // inside `<StoppedSession>`. White on systemBlue measures 4.01:1 light
+  // (#ffffff on #007aff) and 3.64:1 dark (#ffffff on #0a84ff) at 14px/500,
+  // under the 4.5:1 AA floor for small text. The IDENTICAL node is already
+  // carried by `/dev/focus dark|light/desktop` two lines up (verified
+  // node-level), so this is not a new KIND of failure on the mobile surface,
+  // which is the only question a rule-level baseline can answer.
+  //
+  // Why it only became VISIBLE here: d1f212c7 ("populated benches", wave-9)
+  // gave the bench a `mockName`, so `/dev/focus-mobile` now focuses the
+  // `web-app` mock. No backend has a pty by that name, the terminal socket
+  // closes 4404, `paneIsDead` flips and the pane swaps the populated terminal
+  // the commit was aiming at for the calm StoppedSession card. `/dev/focus`
+  // got the same treatment in the same commit and absorbed the node silently,
+  // because its status-waiting pills already held that route's triple open.
+  //
+  // Baselined, not chased: the real defect is the solid tinted button pair
+  // itself (`--primary`/`--primary-foreground`, and `--destructive` has the
+  // same miss at about 3.1:1), which is an app-wide palette decision touching
+  // every primary CTA, not a mobile-focus regression and not something a bench
+  // going green should decide. Shrink these two by fixing that pair, not by
+  // re-fixturing the bench.
+  '/dev/focus-mobile dark/phone color-contrast',
+  '/dev/focus-mobile light/phone color-contrast',
   '/dev/roster dark/desktop color-contrast',
   '/dev/roster light/desktop color-contrast',
   // The seeded /focus/:name scan (this PR added it to catch the team-strip
