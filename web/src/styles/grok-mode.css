@@ -1768,6 +1768,22 @@
   );
   background-repeat: no-repeat;
 }
+/* …but when the company-chat dock sits ABOVE the list, that wash began BELOW the
+   doorway as a disconnected lighter band (owner IMG_2891 — "onprofi"). The dock
+   IS the head of the company scope, so carry the ≤6% pigment wash there instead
+   (it has `--sm-agent-tint` via the rail hue) and leave the list neutral, so the
+   tint reads as one calm thing starting at the doorway, not a floating stripe. */
+[data-grok] .grok-roster:has(.gc-dock) .gr-rail[data-company] .gr-list {
+  background-image: none;
+}
+[data-grok] .grok-roster .gc-dock {
+  background-image: linear-gradient(
+    to bottom,
+    color-mix(in oklab, var(--sm-agent-tint) 7%, transparent) 0,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+}
 
 /* ── two-pane body — rail (list) + detail pane ─────────────────────────────── */
 [data-grok] .grok-roster .gr-two {

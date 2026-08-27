@@ -342,7 +342,16 @@ export function usePendingSends({
         // "this didn't reach the session", with a Retry button, over a message
         // that had just landed (A4 review). The retry path always re-stamped;
         // this is the same rule, applied where the clock actually starts.
-        patch(name, id, { state: 'unconfirmed', atMs: serverNowMs() })
+        // RECEIPTED ON 2xx — the root cure for the intermittent false "this
+        // didn't reach the session" (owner IMG_2890). `POST /send` types the text
+        // into the pty AND stamps `last_send_text` BEFORE it returns Ok (server
+        // `send_harness_text`), so a resolved submit IS the proof `receipted`
+        // means — more reliable than waiting for that same `last_send_text` to
+        // arrive back over the socket and text-match (which loses to the 1 s
+        // `last_send_at` granularity on quick successive sends). Marking it here
+        // shows the honest "the session has it" at once and makes `watchdogState`
+        // never escalate a delivered send to the false "didn't reach".
+        patch(name, id, { state: 'unconfirmed', atMs: serverNowMs(), receipted: true })
       } catch (err) {
         patch(name, id, {
           state: 'undelivered',
@@ -410,6 +419,10 @@ export function usePendingSends({
           patch(name, id, {
             state: 'unconfirmed',
             atMs: serverNowMs(),
+            // Same as the first-send path: a resolved re-POST proves the pty has
+            // it, so mark it delivered and never let the watchdog cry "didn't
+            // reach" over a message that landed.
+            receipted: true,
             note: gate.notice ? refusalNote(gate.notice) : undefined,
           })
         } catch (err) {
