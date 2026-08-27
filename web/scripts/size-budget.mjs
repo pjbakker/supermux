@@ -24,7 +24,65 @@ const DIST = join(DIST_ROOT, 'assets')
 // Budgets in bytes (gzipped).
 // HERO-PATH gate (new, strict): the ENTRY chunk is what every cold load pays
 // before anything renders — hold it tight (~6% headroom over today's 151 KB).
-const BUDGET_ENTRY_JS = 160 * KB
+// 161 at feat/archived-sheet-filter: THE FIRST TIME THIS CEILING HAS MOVED, and
+// it is worth the paragraph that follows, because "code-split rather than spend" has
+// been the standing advice in the app-JS ledger below since 239, and it does
+// not work here. Measured on the branch, `bun run build` +
+// `bun run perf:size`, three trees:
+//
+//   the branch as written (static)      entry 160.80 KB / app JS 239.39 KB
+//   the sheet on a lazy chunk           entry 154.91 KB / app JS 242.16 KB
+//   the sheet deleted outright          entry 158.27 KB / app JS 236.88 KB
+//
+// What the archived sheet's filter field buys, first, because a ceiling move is
+// a claim that the bytes are worth it: production archives run to ~1100 rows,
+// and before this branch "restore the one I archived on Tuesday" was a scrolling
+// exercise with no other way to reach a row. The field is ~1.2 KB gz of the
+// 2.51 KB the whole sheet costs the entry chunk (160.80 against the deleted-
+// outright reference above).
+//
+// WHY THE SPLIT DOES NOT HELP, so nobody spends another afternoon on it:
+//
+//   1. `app JS total` sums EVERY app chunk, so a split can only RAISE it. The
+//      sheet costs 2.51 KB gz inside the entry and 3.56 KB as its own chunk,
+//      because the same code compresses worse alone. Best case for any split of
+//      this surface is ~240.4, still over the 239 below. Only a deletion moves
+//      that gate down.
+//   2. Splitting also makes rolldown hoist a 4.46 KB chunk out of the entry
+//      (`lib/springs`, `hooks/use-media-query`, `ui/responsive-sheet`,
+//      `shell/shell-overlay`, `ui/skeleton`: hero-path modules with ~40
+//      importers, shared between the entry and the new lazy chunk). That chunk
+//      is imported BY the entry, so it is still on the cold path. The brotli
+//      cold-load total at the bottom of this report barely moves: 579.44 KB
+//      static, 579.42 KB lazy, 577.78 KB with the sheet deleted. The split buys
+//      0.02 KB on the wire while the entry gate reads 5.89 KB better, which
+//      means the gate would have been measuring the entry CHUNK rather than the
+//      hero PATH. That is the reading this ledger exists to prevent.
+//
+// Four attempts to keep the split and stop the hoist, all on rolldown 1.0.2
+// (`output.codeSplitting`, the successor to `advancedChunks`), all measured:
+//
+//   `codeSplitting.groups` alone                  vendor grouping collapses,
+//                                                 entry 361.19 / app JS 998.09
+//   groups + `includeDependenciesRecursively:false`  hoist survives untouched,
+//                                                 entry 154.95 / app JS 243.09
+//   the same plus a global `minSize: 100 KB`      no effect on the automatic
+//                                                 chunk, byte-identical result
+//   a group named `index` for the five modules    a SECOND index-*.js chunk,
+//                                                 entry 136.55 / app JS 246.95,
+//                                                 cold-load up to 585.70
+//
+// The knob does not exist in this version: groups can only pull modules OUT of
+// the entry into a chunk of their own, never keep them in it, and rolldown has
+// no `minChunkSize` (rollup's `experimentalMinChunkSize`) to fold a small shared
+// chunk back into its dependent. Neither does vite 8. If a later rolldown gains
+// one, the lazy sheet becomes worth revisiting: it would then be worth ~2.5 KB
+// on the hero path for real.
+//
+// So the ceiling moves instead, to ceil(measured 160.80), and it moves by the
+// smallest step that is honest. It is still the hard gate: 0.20 KB of headroom,
+// and the next additive change to the hero path has to delete something.
+const BUDGET_ENTRY_JS = 161 * KB
 // TOTAL app JS (entry + lazy app chunks; vendor cached separately).
 //
 // RATCHETED 232 → 210 by fase B2, the PR that deletes the Board page. #70 set
@@ -282,7 +340,14 @@ const BUDGET_ENTRY_JS = 160 * KB
 //             serious `nested-interactive`) and one `data-testid`.
 // The turn announcer is on the hero path because the focus route is where a
 // turn happens and the chat chunk is lazy; the chip fix is unavoidable markup.
-const BUDGET_APP_JS = 239 * KB
+//
+// 240 at feat/archived-sheet-filter: measured 239.39 against 238.18 for the
+// parent, so +1.21 KB, the filter field described at the entry gate above.
+// ceil(measured), the rule every fase since B3 has used, and the tighter of the
+// two (measured x 1.02 would allow 244). The full argument, including why the
+// obvious code-split makes THIS number worse rather than better, is in the
+// entry-gate block at the top of this file rather than repeated here.
+const BUDGET_APP_JS = 240 * KB
 const BUDGET_CSS = 30 * KB
 
 function gzipSize(path) {
