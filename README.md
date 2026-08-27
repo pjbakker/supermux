@@ -85,7 +85,7 @@ Group bots into a **company** and they share connectors, a central **company cha
   <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. The Bot Mode mental model:
        phone (owner) → a Company holding named bots, a shared Connectors rail, a Shared Browser,
        a central Company Chat, arrows showing bots messaging each other + handing off files. -->
-  <!-- TODO(launch): company-diagram.png — capture from /?mock or /dev (mock data only, no client PII). <a href="docs/screenshots/botmode/company-diagram.png"><img src="docs/screenshots/botmode/company-diagram.png" alt="Diagram of the Bot Mode mental model: an owner's phone drives a Company container holding three named bots, a shared connectors rail, a shared browser, and a central company chat, with arrows showing bots handing work to each other" width="860"></a> -->
+  <a href="docs/screenshots/botmode/company-diagram.png"><img src="docs/screenshots/botmode/company-diagram.png" alt="Diagram of the Bot Mode mental model: an owner's phone drives a Company container holding three named bots, a shared connectors rail, a shared browser, and a central company chat, with arrows showing bots handing work to each other" width="860"></a>
 </p>
 
 ### Connectors
