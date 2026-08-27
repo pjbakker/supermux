@@ -197,11 +197,10 @@ pub async fn run(
 /// wrapper guard: the reminder is plain English naming the `post_message` tool,
 /// never a `<supermux-…>` tag.
 fn delivered_prompt(company_display: &str, request: &str) -> String {
-    format!(
-        "{request}\n\nThis request came from {company_display}'s group chat. When you have the \
-answer, post it back to the channel with `mcp__group_chat__post_message` (a short, clear reply \
-the whole company can read). Do the work, then post the result."
-    )
+    // Kept SHORT on purpose (token cost): one clause naming the tool. A bot whose
+    // live session predates the group-chat grant simply lacks the tool and the
+    // owner restarts it — cheaper than teaching every delegation a fallback.
+    format!("{request}\n\n(From {company_display} group chat — post your reply with mcp__group_chat__post_message.)")
 }
 
 /// `tag_bot` — the ONE tool that wakes another agent, and therefore the one

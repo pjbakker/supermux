@@ -250,24 +250,30 @@ function RoutedBody({
   const tagged = (row.tags ?? [])
     .map((t) => members.get(t.toLowerCase()))
     .filter((m): m is ChannelMember => Boolean(m))
+  if (tagged.length === 0) return null
+  // ONE calm line. The distilled request the Router handed the bot is the bot's
+  // PROMPT, not channel speech — it is delivered to the bot, never dumped here
+  // (that was the bloated wall the owner called out). A tagged bot that is live
+  // on the turn shows a quiet "working" pulse, so you can see it acting.
   return (
-    <div className="mt-0.5">
-      {tagged.length > 0 && (
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[14px] text-ink-2">
-          <span>Routed to</span>
-          <ArrowIcon className="flex-none text-ink-3" />
-          {tagged.map((m) => (
-            <MentionChip key={m.seed} seed={m.seed} pin={m.pin} name={`@${m.name}`} />
-          ))}
-        </div>
-      )}
-      {/* The routing ACT is the chips above; the body is the distilled request
-          the Router handed the bot — useful context, but the bot's PROMPT, not
-          channel speech. Keep it quiet and clamped so a route reads as one calm
-          line, not a wall of instruction. */}
-      <p className="mt-1 line-clamp-2 break-words text-[13px] leading-[1.4] text-ink-3">
-        {row.body}
-      </p>
+    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[14px] text-ink-2">
+      <span>Routed to</span>
+      <ArrowIcon className="flex-none text-ink-3" />
+      {tagged.map((m) => (
+        <span key={m.seed} className="inline-flex items-center gap-1.5">
+          <MentionChip seed={m.seed} pin={m.pin} name={`@${m.name}`} />
+          {m.state === 'working' && (
+            <span
+              className="grok-typing inline-flex items-center gap-[3px] text-ink-3"
+              aria-label="working"
+            >
+              <i className="inline-block size-[3px] rounded-full bg-current" />
+              <i className="inline-block size-[3px] rounded-full bg-current" />
+              <i className="inline-block size-[3px] rounded-full bg-current" />
+            </span>
+          )}
+        </span>
+      ))}
     </div>
   )
 }
