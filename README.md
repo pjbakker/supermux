@@ -94,7 +94,7 @@ Plug bots into the tools you already use — Gmail, GitHub, your database, anyth
 
 <p align="center">
   <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. Real catalog cards, no fake URLs. -->
-  <!-- TODO(launch): connectors.png — capture from /?mock or /dev (mock data only, no client PII). <a href="docs/screenshots/botmode/connectors.png"><img src="docs/screenshots/botmode/connectors.png" alt="Connector store card and a one-tap 'Sign in with GitHub' connect-concierge sheet on mobile" width="260"></a> -->
+  <a href="docs/screenshots/botmode/connectors.png"><img src="docs/screenshots/botmode/connectors.png" alt="Connector store card and a one-tap 'Sign in with GitHub' connect-concierge sheet on mobile" width="780"></a>
 </p>
 
 <p align="center"><em>Connect a bot to your tools in a tap — all mock data.</em></p>
@@ -105,7 +105,7 @@ A **workflow** is an ordered list of prompts a bot runs on a trigger: chain the 
 
 <p align="center">
   <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. -->
-  <!-- TODO(launch): workflows.png — capture from /?mock or /dev (mock data only, no client PII). <a href="docs/screenshots/botmode/workflows.png"><img src="docs/screenshots/botmode/workflows.png" alt="Workflow composer on mobile: a step rail with four steps, an 'every Mon 09:00' schedule, and a completion action 'email the summary'" width="260"></a> -->
+  <a href="docs/screenshots/botmode/workflows.png"><img src="docs/screenshots/botmode/workflows.png" alt="Workflow composer on mobile: a step rail with four steps, an 'every Mon 09:00' schedule, and a completion action 'email the summary'" width="420"></a>
 </p>
 
 <p align="center"><em>An ordered, scheduled multi-step workflow — all mock data.</em></p>
@@ -116,7 +116,7 @@ One real Chrome the company shares — **log in once**, then lend individual tab
 
 <p align="center">
   <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. -->
-  <!-- TODO(launch): shared-browser.png — capture from /?mock or /dev (mock data only, no client PII). <a href="docs/screenshots/botmode/shared-browser.png"><img src="docs/screenshots/botmode/shared-browser.png" alt="The shared browser route: a tab strip, a live page, a 'Watch / Drive · 2 agents' control, and a 'take the wheel — login needed' moment" width="860"></a> -->
+  <a href="docs/screenshots/botmode/shared-browser.png"><img src="docs/screenshots/botmode/shared-browser.png" alt="The shared browser route: a tab strip, a live page, a 'Watch / Drive · 2 agents' control, and a 'take the wheel — login needed' moment" width="780"></a>
 </p>
 
 <p align="center"><em>One browser the whole company logs into once — all mock data.</em></p>
