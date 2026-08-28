@@ -478,20 +478,87 @@ fn gather_in_proj(
 
 /// Resolve which JSONL files to open, in the order we should walk them.
 ///
-/// - `Session`: at most one file, `<proj>/<cc_id>.jsonl`. Missing → empty.
+/// - `Session`: every copy of `<cc_id>.jsonl` across the project folders,
+///   newest-mtime first (usually one; more when the cwd diverged — see
+///   [`conversation_files`]). None → empty.
 /// - `Project`: every `*.jsonl` under `<proj>`, newest-mtime first.
+/// Every copy of `<cc_id>.jsonl` across the Claude project folders, newest-mtime
+/// first (the order `gather_in_proj` walks and pages).
+///
+/// WHY THIS IS NOT JUST `proj/<cc_id>.jsonl`. Claude Code names the file after the
+/// globally-unique conversation UUID but parks it in a folder derived from its
+/// process CWD (`~/.claude/projects/<encoded-cwd>/`). That CWD can DIVERGE from
+/// the session's registered dir — the reported stuck chat (keuze-agent, 2026-08):
+/// a bot MOVED into a company keeps its live process's original cwd, and a `cd`
+/// that a sandbox resets can strand the cwd on a path that no longer exists. From
+/// that point Claude writes NEW turns under a different `<encoded-cwd>` folder,
+/// while `proj/<cc_id>.jsonl` freezes at the pre-divergence turn. Recall reading
+/// only that one file goes stale forever: new turns are invisible in chat, the
+/// optimistic send never reconciles ("waiting for the transcript to catch up"),
+/// and the answer only ever shows in the live-terminal (a separate transport).
+/// The pty is fine; only the transcript path was wrong.
+///
+/// WHY MERGE, NOT REPLACE. The copies are DISJOINT time-ranges of ONE conversation
+/// split by cwd changes (measured on the real stuck session: the registered-dir
+/// copy held turns through 08-26, the diverged copy 08-27→08-28, no overlap).
+/// Reading only the newest would drop the older scrollback; reading only the
+/// registered one drops the live turns. The union — keyed on the shared
+/// conversation UUID — is the true transcript, so we return every copy and let the
+/// existing newest-first walk merge them (the same way `Scope::Project` already
+/// tolerates mtime-ordered files). Turn UUIDs are unique, so the `(session_id,
+/// uuid)` cursor still resolves across copies.
+///
+/// The common (undiverged) case is unchanged: exactly one copy exists — `proj`'s
+/// own — so this returns `[proj/<cc_id>.jsonl]`, byte-identical to before.
+/// Siblings are filtered to real project folders (an encoded absolute path always
+/// starts with `-`), which also keeps unit tests — whose `proj` sits in a shared
+/// temp root — from matching each other's reused short cc_ids.
+fn conversation_files(proj: &Path, cc_id: &str) -> Vec<PathBuf> {
+    let file_name = format!("{cc_id}.jsonl");
+    let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut consider = |path: PathBuf| {
+        if let Ok(meta) = fs::metadata(&path) {
+            if meta.is_file() {
+                let mt = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                found.push((mt, path));
+            }
+        }
+    };
+    // The session's own project folder (also the common, undiverged case).
+    consider(proj.join(&file_name));
+    // Then every sibling project folder — a same-named file there is the same
+    // conversation written under a different cwd.
+    if let Some(root) = proj.parent() {
+        if let Ok(read) = fs::read_dir(root) {
+            for entry in read.flatten() {
+                let dir = entry.path();
+                if dir == *proj {
+                    continue;
+                }
+                // A Claude project folder is an encoded absolute path → leading `-`.
+                let is_project = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with('-'));
+                if !is_project || !dir.is_dir() {
+                    continue;
+                }
+                consider(dir.join(&file_name));
+            }
+        }
+    }
+    // Newest-mtime first — the live copy leads, older copies page in beneath it.
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
 fn files_for_scope(proj: &Path, cc_id: &str, scope: Scope) -> Vec<PathBuf> {
     match scope {
         Scope::Session => {
             if cc_id.is_empty() {
                 return Vec::new();
             }
-            let path = proj.join(format!("{cc_id}.jsonl"));
-            if path.is_file() {
-                vec![path]
-            } else {
-                Vec::new()
-            }
+            conversation_files(proj, cc_id)
         }
         Scope::Project => {
             let read = match fs::read_dir(proj) {
@@ -1740,6 +1807,109 @@ mod tests {
         let _ = path;
         let resp = gather_in_proj(&td, "s", Scope::Session, "needle-here", false, true, false, None, 10);
         assert_eq!(resp.entries.len(), 1, "needle past 8K must still match");
+    }
+
+    /// Stamp a file's mtime deterministically (no sleeps) so newest-first order
+    /// is under the test's control.
+    fn set_mtime(path: &Path, secs: u64) {
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn session_scope_is_one_file_when_the_cwd_never_diverged() {
+        // The common case: exactly one `<cc_id>.jsonl`, under the registered proj.
+        // Resolution is byte-identical to the old `proj.join(...)` — one file.
+        let root = temp_dir();
+        let proj = root.join("-opt-projects-companies-keuzenl-keuze-agent");
+        fs::create_dir_all(&proj).unwrap();
+        let cc = "conv-solo";
+        let f = write_jsonl(&proj, cc, &[&user_line("u1", "2026-08-28T06:00:00Z", "hoi", false)]);
+        assert_eq!(conversation_files(&proj, cc), vec![f]);
+    }
+
+    #[test]
+    fn session_scope_merges_a_conversation_split_by_a_cwd_change() {
+        // THE STUCK-CHAT BUG (keuze-agent, 2026-08). A bot moved into a company
+        // keeps its live process's original cwd, so Claude writes NEW turns under a
+        // different `<encoded-cwd>` folder while the registered-dir copy freezes.
+        // Recall must MERGE both copies (disjoint time-ranges of one conversation),
+        // newest-first — showing the live turn WITHOUT dropping the old history.
+        let root = temp_dir();
+        let proj = root.join("-opt-projects-companies-keuzenl-keuze-agent");
+        let diverged = root.join("-opt-projects-keuze-agent");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&diverged).unwrap();
+        let cc = "b4b00ea3";
+
+        // Frozen copy under the registered dir (older turn, older mtime).
+        let old = write_jsonl(
+            &proj,
+            cc,
+            &[
+                &user_line("u1", "2026-08-26T15:00:00Z", "oude vraag", false),
+                &assistant_line("a1", "2026-08-26T15:00:05Z", "oud antwoord", false),
+            ],
+        );
+        set_mtime(&old, 1_000);
+        // Live copy under the diverged cwd (new turn, newer mtime).
+        let new = write_jsonl(
+            &diverged,
+            cc,
+            &[
+                &user_line("u2", "2026-08-28T06:41:00Z", "Gisteren was ineens een goede dag", false),
+                &assistant_line("a2", "2026-08-28T06:41:05Z", "Ik pak het Sales Report", false),
+            ],
+        );
+        set_mtime(&new, 2_000);
+
+        // Files: live copy first (newest-mtime), frozen copy beneath it.
+        assert_eq!(conversation_files(&proj, cc), vec![new, old]);
+
+        // Chat view: the live turn is visible (the bug) AND the old history is
+        // still there (no downside).
+        let resp = gather_in_proj(&proj, cc, Scope::Session, "", false, true, false, None, 10);
+        let texts: Vec<&str> = resp.entries.iter().map(|e| e.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("Gisteren was ineens")),
+            "the diverged live turn must appear: {texts:?}",
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("oude vraag")),
+            "the frozen history must NOT be dropped: {texts:?}",
+        );
+        // Newest-first: the live turn leads the frozen one.
+        let live = texts.iter().position(|t| t.contains("Gisteren")).unwrap();
+        let hist = texts.iter().position(|t| t.contains("oude vraag")).unwrap();
+        assert!(live < hist, "live turn must sit above the old history: {texts:?}");
+    }
+
+    #[test]
+    fn session_scope_ignores_a_non_project_sibling_with_the_same_cc_id() {
+        // Isolation guard: a sibling that is NOT an encoded project folder (no
+        // leading `-`) is never merged, even with a same-named, newer file. This is
+        // what keeps parallel unit tests — whose temp `proj` shares a root and
+        // reuses short cc_ids — from reading each other's transcripts.
+        let root = temp_dir();
+        let proj = root.join("-opt-projects-real");
+        let impostor = root.join("supermux-recall-test-not-a-project");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&impostor).unwrap();
+        let cc = "shared";
+        let mine = write_jsonl(&proj, cc, &[&user_line("u1", "2026-08-28T06:00:00Z", "mine", false)]);
+        set_mtime(&mine, 1_000);
+        let theirs = write_jsonl(&impostor, cc, &[&user_line("u9", "2026-08-28T07:00:00Z", "theirs", false)]);
+        set_mtime(&theirs, 9_000); // newer, but must be ignored
+        assert_eq!(conversation_files(&proj, cc), vec![mine]);
+    }
+
+    #[test]
+    fn session_scope_is_empty_when_no_copy_exists_anywhere() {
+        let root = temp_dir();
+        let proj = root.join("-opt-projects-nothing");
+        fs::create_dir_all(&proj).unwrap();
+        assert!(conversation_files(&proj, "ghost").is_empty());
     }
 
     #[test]
