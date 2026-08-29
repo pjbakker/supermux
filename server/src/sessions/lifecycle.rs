@@ -1123,13 +1123,44 @@ fn at_resume_picker(capture: &str) -> bool {
 /// — `--dangerously-skip-permissions` does NOT skip it — so a freshly-cloned
 /// project dir (e.g. developing supermux on the server) would otherwise hang
 /// here forever, never reaching the `❯` prompt, and the panel shows "claude
-/// won't render". We detect it and auto-accept (Enter on the default "Yes, I
-/// trust this folder"), which also records the dir as trusted so it never
-/// reappears for that path.
+/// won't render". We detect it and auto-accept by navigating to "Yes, I trust
+/// this folder" (see [`keys_to_accept_trust`] — the option order is not fixed),
+/// which also records the dir as trusted so it never reappears for that path.
 fn at_trust_dialog(capture: &str) -> bool {
     let c = capture.to_lowercase();
     (c.contains("trust the files") || c.contains("trust this folder") || c.contains("do you trust"))
         || (c.contains("safety check") && c.contains("trust"))
+}
+
+/// The key sequence that lands on "Yes, I trust this folder" and confirms it —
+/// for whatever ORDER the trust dialog draws its options in.
+///
+/// A bare Enter was correct while Claude Code defaulted the cursor to
+/// "1. Yes, I trust this folder". A later Claude Code FLIPPED the dialog: it now
+/// lists "No, exit" FIRST and selects it by default (unnumbered), so a bare Enter
+/// picks "No, exit" and the session QUITS before it starts — the reported failure
+/// where booting a new company assistant "won't get past trust workspace, then
+/// quits", and a restart just repeats it. Never trust the default: locate the
+/// affirmative option and the cursor, then step onto the affirmative and confirm.
+///
+/// The dialog is a two-option menu, so a single arrow toward the affirmative
+/// always lands on it (blank/paragraph lines between options don't count as menu
+/// stops). Returns an EMPTY sequence when the affirmative option or the cursor
+/// can't be located, so a parse miss WAITS and retries — never a blind Enter that
+/// could confirm "No, exit".
+fn keys_to_accept_trust(capture: &str) -> Vec<&'static str> {
+    let lines: Vec<&str> = capture.lines().collect();
+    let yes = lines.iter().position(|l| {
+        let x = l.to_lowercase();
+        x.contains("trust this folder") || x.contains("trust the files")
+    });
+    let cursor = lines.iter().position(|l| l.contains('❯'));
+    match (yes, cursor) {
+        (Some(y), Some(c)) if c == y => vec!["Enter"], // already on "Yes"
+        (Some(y), Some(c)) if c < y => vec!["Down", "Enter"], // "Yes" is below
+        (Some(_), Some(_)) => vec!["Up", "Enter"],     // "Yes" is above
+        _ => Vec::new(),                               // can't measure → wait, never blind-Enter
+    }
 }
 
 /// Should `wait_for_agent_ready` ESCAPE the resume picker (Escape Escape C-c +
@@ -1207,9 +1238,9 @@ async fn settle_shell(rt: &dyn SessionRuntime) -> bool {
 
 /// Poll `capture-pane` for up to 10s for the agent UI; one resume-picker escape
 /// fallback (Escape Escape C-c + clear cc ids — FRESH starts only, see
-/// [`should_escape_resume_picker`]), and one trust-dialog auto-accept (Enter on
-/// the default "Yes, I trust this folder") so a first-launch in a never-seen
-/// project dir does not hang forever.
+/// [`should_escape_resume_picker`]), and one trust-dialog auto-accept (navigate to
+/// "Yes, I trust this folder" — [`keys_to_accept_trust`]) so a first-launch in a
+/// never-seen project dir does not hang forever OR quit on the "No, exit" default.
 ///
 /// `resume_intended` (from [`build_launch_command`]) is TRUE when the launch
 /// carried `--resume`. On an intended resume the picker escape is SUPPRESSED: it
@@ -1245,10 +1276,21 @@ async fn wait_for_agent_ready(
             // Ready — a heal that only reaches the picker is a FAILED heal.
             match classify_ready_tick(&cap, resume_intended, escaped, trusted) {
                 ReadyTick::AcceptTrust => {
-                    // Default option is "1. Yes, I trust this folder"; a bare Enter
-                    // accepts it (and persists the trust so it never reappears).
-                    let _ = rt.send_key("Enter").await;
-                    trusted = true;
+                    // NEVER a bare Enter: a newer Claude Code lists "No, exit" first
+                    // and selects it by default, so Enter alone quits the session.
+                    // Navigate to "Yes, I trust this folder" whatever order it is
+                    // drawn in; accepting also persists the trust so it never
+                    // reappears for this dir.
+                    let keys = keys_to_accept_trust(&cap);
+                    let confirmed = !keys.is_empty();
+                    for k in keys {
+                        let _ = rt.send_key(k).await;
+                    }
+                    // Only latch `trusted` once we actually sent the confirm — a
+                    // parse miss must retry next tick, not silently fall through.
+                    if confirmed {
+                        trusted = true;
+                    }
                 }
                 ReadyTick::EscapePicker => {
                     let _ = rt.send_key("Escape").await;
@@ -3201,6 +3243,48 @@ mod agent_ready_heuristics_tests {
             agent_ui_visible(cap),
             "the ❯ menu cursor trips agent_ui_visible — trust MUST be handled first",
         );
+    }
+
+    #[test]
+    fn accept_trust_navigates_to_yes_when_no_exit_is_the_default() {
+        // THE reported bug: a newer Claude Code lists "No, exit" FIRST and selects
+        // it by default, so the old bare Enter quit the session at boot. Verbatim
+        // shape from the report (IMG_2950): "No, exit" cursored, "Yes" beneath.
+        let cap = "/opt/projects/companies/persoonlijk/persoonlijk-assistant\n\n\
+                   Quick safety check: Is this a project you created or one you trust?\n\n\
+                   Claude Code'll be able to read, edit, and execute files here.\n\n\
+                   Security guide\n\n\
+                   ❯ No, exit\n  Yes, I trust this folder\n\n\
+                   Enter to confirm · Esc to cancel";
+        assert!(at_trust_dialog(cap));
+        assert_eq!(
+            keys_to_accept_trust(cap),
+            vec!["Down", "Enter"],
+            "must step down onto Yes, never confirm the No default",
+        );
+    }
+
+    #[test]
+    fn accept_trust_is_a_bare_enter_when_yes_is_already_the_default() {
+        // The older layout: "Yes" is option 1 and already cursored → just confirm.
+        let cap = "Is this a project you created or one you trust?\n \
+                   ❯ 1. Yes, I trust this folder\n   2. No, exit";
+        assert_eq!(keys_to_accept_trust(cap), vec!["Enter"]);
+    }
+
+    #[test]
+    fn accept_trust_steps_up_when_yes_is_above_the_cursor() {
+        let cap = "  Yes, I trust this folder\n❯ No, exit";
+        assert_eq!(keys_to_accept_trust(cap), vec!["Up", "Enter"]);
+    }
+
+    #[test]
+    fn accept_trust_waits_rather_than_blind_enter_when_yes_is_absent() {
+        // Parse miss (no affirmative line, or no cursor) → empty: wait & retry, so
+        // a stray Enter can never confirm "No, exit". `wait_for_agent_ready` leaves
+        // `trusted` false on an empty result and re-scans next tick.
+        assert!(keys_to_accept_trust("some unrelated capture with a ❯ prompt").is_empty());
+        assert!(keys_to_accept_trust("Yes, I trust this folder\n  No, exit").is_empty()); // no cursor glyph
     }
 
     #[test]
