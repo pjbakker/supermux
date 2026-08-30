@@ -54,11 +54,16 @@ export interface NotesResponse {
   role_count: number
   /** The role key whose shared tier was unioned in; empty for a private-only bot. */
   role: string
-  /** `false` ⇒ the memory tier is NOT enabled for this session (the route
-   *  404'd), as opposed to enabled-and-empty. Client-side only: the API already
-   *  draws this distinction with its status code, and flattening both into one
-   *  empty list is what let the panel say "this bot hasn't written any notes
-   *  yet" about a store that does not exist for it. */
+  /** `false` ⇒ this bot cannot write or recall a note right now. SERVER-SENT:
+   *  it reports whether the recall hook is actually in the session's launch
+   *  overlay, not whether the route answered.
+   *
+   *  Reading a `200` as "wired" was the bug. The route's gate is ELIGIBILITY
+   *  (`session_has_memory` — a company or a role sentence is enough), and the
+   *  hook is wired at LAUNCH, so every bot that gained a role since its last
+   *  start answers 200 while having no hook, no `Bash(supermux-memory *)` grant
+   *  and no store. The panel told exactly those bots they simply hadn't written
+   *  anything yet. */
   wired: boolean
 }
 
@@ -66,9 +71,9 @@ const EMPTY: NotesResponse = { notes: [], bot_count: 0, role_count: 0, role: '',
 
 /** A `404` here means "this session is not a bot" (no company, no role, no core
  *  notes, no store) — the tier is off, not broken, so it is not an error to
- *  surface. It comes back `wired: false` so the panel can say THAT rather than
- *  claiming an empty archive; a real bot that simply hasn't written anything yet
- *  answers `200` with an empty list and `wired: true`. Anything else propagates. */
+ *  surface. It comes back `wired: false`, the same flag an eligible-but-not-yet-
+ *  restarted bot gets from the server on a `200`: both need the same restart
+ *  before the bot can write. Anything else propagates. */
 function emptyOn404(e: unknown): NotesResponse {
   if (e instanceof ApiError && e.status === 404) return EMPTY
   throw e
@@ -80,8 +85,7 @@ const base = (name: string) => `/api/sessions/${encodeURIComponent(name)}/memory
  *  (private ∪ role), freshest first. */
 export async function listNotes(name: string): Promise<NotesResponse> {
   try {
-    // The server does not send `wired` — reaching a 200 IS the flag.
-    return { ...(await settingsRequest<NotesResponse>(`${base(name)}/notes`)), wired: true }
+    return await settingsRequest<NotesResponse>(`${base(name)}/notes`)
   } catch (e) {
     return emptyOn404(e)
   }
@@ -97,7 +101,7 @@ export async function searchNotes(
   const params = new URLSearchParams({ q })
   if (limit) params.set('limit', String(limit))
   try {
-    return { ...(await settingsRequest<NotesResponse>(`${base(name)}/search?${params}`)), wired: true }
+    return await settingsRequest<NotesResponse>(`${base(name)}/search?${params}`)
   } catch (e) {
     return emptyOn404(e)
   }

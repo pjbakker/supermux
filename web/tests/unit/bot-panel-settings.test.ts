@@ -23,12 +23,15 @@ import {
   coreNotesBudget,
   CORE_MAX_CHARS,
   CORE_MAX_LINES,
+  handoffView,
   lastExchange,
   normalizeTab,
   TABS,
   type AppliedPreset,
 } from '../../src/components/roster/bot-panel'
 import { insertPreset, makeDescHandle } from '../../src/components/focus-mode/session-info-panel'
+import type { LastSend } from '../../src/components/focus-mode/last-send-recall'
+import type { DelegationEdge } from '../../src/lib/api/agents'
 import type { RecallEntry } from '../../src/lib/api/sessions'
 
 const PRESET = 'You review changes for correctness and clarity.'
@@ -344,17 +347,102 @@ describe('lastExchange', () => {
     expect(out.receipts[1].ok).toBe(true)
   })
 
-  test('an inbound delegation surfaces the sender', () => {
-    const out = lastExchange([entry({ kind: 'delegation', text: 'review the diff', label: 'mena' })])
-    expect(out.from).toBe('mena')
-  })
-
-  test('kinds the panel does not render are ignored', () => {
+  test('kinds the panel does not render are ignored — a delegation included', () => {
+    // The sender of an inbound delegation is NOT read out of the recall page any
+    // more: the graph owns that fact (see `handoffView` below), so one source
+    // answers "who asked" and the panel cannot state it twice.
     const out = lastExchange([
       entry({ kind: 'prompt', text: 'do the thing' }),
       entry({ kind: 'system', text: 'noise' }),
+      entry({ kind: 'delegation', text: 'review the diff', label: 'mena' }),
     ])
     expect(out).toEqual({ receipts: [] })
+  })
+})
+
+/**
+ * 3b — One edge, said once.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * A bot-delegated turn used to be printed three times on one screen: the card's
+ * "You asked" headline over the sender's text, a "↳ from X" line under it, and
+ * the top Handoffs row carrying the same partner, prompt and timestamp. Worse,
+ * "You asked" was simply false — `last_send_text` is the last prompt written
+ * INTO the session no matter who wrote it.
+ *
+ * `handoffView` is the join that fixes both: it recognises the edge the card is
+ * already showing, hands its sender up as the card's label, and drops that row
+ * from the list.
+ */
+describe('handoffView', () => {
+  const edge = (over: Partial<DelegationEdge> & { id: number }): DelegationEdge => ({
+    from_session: 'Invulboekjes',
+    to_session: 'mena',
+    prompt: 'Hoi Mena — due diligence op invulboekjes.nl.',
+    ts: 1_788_079_360,
+    ...over,
+  })
+  const sent = (text: string): LastSend => ({ text, sentAt: new Date(1_788_079_360_000) })
+
+  test('no graph, no rows and no sender', () => {
+    expect(handoffView(undefined, sent('anything'))).toEqual({ askedBy: undefined, rows: [] })
+  })
+
+  test('the edge behind the last send names the card and leaves the list', () => {
+    const carrier = edge({ id: 1 })
+    const older = edge({ id: 2, prompt: 'kijk even naar de bol-analyse', ts: 1_788_000_000 })
+    const view = handoffView({ incoming: [carrier, older], outgoing: [] }, sent(carrier.prompt))
+    expect(view.askedBy).toBe('Invulboekjes')
+    expect(view.rows.map((r) => r.edge.id)).toEqual([2])
+  })
+
+  test('a send the owner typed leaves every edge standing', () => {
+    const view = handoffView({ incoming: [edge({ id: 1 })], outgoing: [] }, sent('run the tests'))
+    expect(view.askedBy).toBeUndefined()
+    expect(view.rows).toHaveLength(1)
+  })
+
+  test('an OUTBOUND edge never becomes "who asked me"', () => {
+    // Same prompt string, wrong direction: this bot sent it, so the card must
+    // keep saying "You asked" and the row must stay in the list.
+    const out = edge({ id: 1, from_session: 'mena', to_session: 'Invulboekjes' })
+    const view = handoffView({ incoming: [], outgoing: [out] }, sent(out.prompt))
+    expect(view.askedBy).toBeUndefined()
+    expect(view.rows).toHaveLength(1)
+  })
+
+  test('both directions are merged newest-first and capped at three', () => {
+    const view = handoffView(
+      {
+        incoming: [edge({ id: 1, ts: 40 }), edge({ id: 2, ts: 10 })],
+        outgoing: [edge({ id: 3, ts: 30 }), edge({ id: 4, ts: 20 })],
+      },
+      null,
+    )
+    expect(view.rows.map((r) => r.edge.id)).toEqual([1, 3, 4])
+    expect(view.rows[0].inbound).toBe(true)
+    expect(view.rows[1].inbound).toBe(false)
+    expect(view.rows[1].partner).toBe('mena')
+  })
+
+  test('a send stored at the server cap still matches the whole prompt', () => {
+    // `last_send_text` is cut at 8000 chars; the edge keeps the prompt entire.
+    const whole = `${'x'.repeat(8_000)} …and the rest of it`
+    const view = handoffView(
+      { incoming: [edge({ id: 1, prompt: whole })], outgoing: [] },
+      sent(whole.slice(0, 8_000)),
+    )
+    expect(view.askedBy).toBe('Invulboekjes')
+    expect(view.rows).toHaveLength(0)
+  })
+
+  test('a SHORT send is matched exactly — never as a prefix', () => {
+    // Otherwise "ok" would claim every edge whose prompt starts with it.
+    const view = handoffView(
+      { incoming: [edge({ id: 1, prompt: 'ok, ship it and tell me when it is live' })], outgoing: [] },
+      sent('ok'),
+    )
+    expect(view.askedBy).toBeUndefined()
+    expect(view.rows).toHaveLength(1)
   })
 })
 

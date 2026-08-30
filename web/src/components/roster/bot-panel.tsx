@@ -103,7 +103,7 @@ import { useSession } from '@/hooks/use-sessions'
 import { useSessionConfig } from '@/hooks/use-session-config'
 import { useCloneSession } from '@/components/focus-mode/use-clone-session'
 import { useToast } from '@/components/ui/use-toast'
-import { agentsApi } from '@/lib/api/agents'
+import { agentsApi, type DelegationEdge, type DelegationsView } from '@/lib/api/agents'
 import { displayLabel, sessionsApi, type ApiSession, type RecallEntry } from '@/lib/api'
 
 /* ── tiny pure helpers (mirrors of grok-roster's; kept local so this module is
@@ -156,16 +156,14 @@ export function coreNotesBudget(notes: string): CoreNotesBudget {
 
 /* ── the last exchange, selected out of a recall page ──────────────────────── */
 
-/** What the Overview shows of the bot's last turn: the reply, the receipts under
- *  it, and — the fact that is ABOUT being a company of bots — who delegated the
- *  work in. */
+/** What the Overview shows of the bot's last turn: the reply and the receipts
+ *  under it. Who delegated the work in comes from the delegation GRAPH
+ *  ([`handoffView`]) instead — one source for that fact, not two that disagree. */
 export interface LastExchange {
   /** The newest assistant prose. */
   answer?: string
   /** Up to [`RECEIPT_MAX`] tool receipts, newest first. */
   receipts: { label: string; ok: boolean }[]
-  /** The session whose delegation started this exchange. */
-  from?: string
 }
 
 /** More than three receipts is a transcript, and the transcript is one tap away. */
@@ -190,11 +188,75 @@ export function lastExchange(entries: RecallEntry[]): LastExchange {
       if (label && out.receipts.length < RECEIPT_MAX) {
         out.receipts.push({ label, ok: e.ok !== false })
       }
-    } else if (e.kind === 'delegation') {
-      if (!out.from && e.label) out.from = e.label
     }
   }
   return out
+}
+
+/* ── the delegation graph, read once for both Overview blocks ──────────────── */
+
+/** Server cap on the stored send preview (`LAST_SEND_TEXT_MAX_CHARS`,
+ *  `server/src/db/sessions.rs`). Below it the row holds the prompt verbatim;
+ *  above it, a prefix of the one the edge kept whole. */
+const LAST_SEND_MAX_CHARS = 8_000
+
+/** Is this edge the very send the Last-exchange card is already showing?
+ *
+ *  `last_send_text` is the last prompt written INTO the session no matter who
+ *  wrote it, and `agents::delegate` records the SAME unwrapped string on the edge
+ *  (the `<supermux-delegation>` wrapper is machinery and is stripped from both).
+ *  So when a bot handed the work in, the row field and the graph edge are ONE
+ *  fact — which the panel printed three times: "You asked", "↳ from X", and the
+ *  top Handoffs row, same prompt, same timestamp.
+ *
+ *  Exact by default; a prefix only counts once the preview is at the cap, so a
+ *  short send can never collide with a longer prompt that happens to start with
+ *  it. */
+export function isLastSend(edge: DelegationEdge, lastSend: LastSend | null): boolean {
+  const sent = lastSend?.text.trim() ?? ''
+  if (!sent) return false
+  const prompt = edge.prompt.trim()
+  return prompt === sent || (sent.length >= LAST_SEND_MAX_CHARS && prompt.startsWith(sent))
+}
+
+/** One row of the Handoffs list: the edge, the bot on the other end, and which
+ *  way the work went. */
+export interface HandoffRow {
+  edge: DelegationEdge
+  partner: string
+  inbound: boolean
+}
+
+/** What the Overview makes of the delegation graph. */
+export interface HandoffView {
+  /** The bot that sent the prompt the Last-exchange card is showing, when a bot
+   *  sent it. `undefined` ⇒ the owner did, and the card says "You asked". */
+  askedBy?: string
+  /** The handoffs worth listing — newest first, MINUS the edge the card is
+   *  already rendering as its headline. */
+  rows: HandoffRow[]
+}
+
+/** More than three is a graph view, and this is a glance. */
+const HANDOFF_MAX = 3
+
+export function handoffView(
+  data: DelegationsView | undefined,
+  lastSend: LastSend | null,
+): HandoffView {
+  const edges: HandoffRow[] = [
+    ...(data?.incoming ?? []).map((e) => ({ edge: e, partner: e.from_session, inbound: true })),
+    ...(data?.outgoing ?? []).map((e) => ({ edge: e, partner: e.to_session, inbound: false })),
+  ].sort((a, b) => b.edge.ts - a.edge.ts)
+
+  // The INBOUND edge carrying the last send IS the card's headline. It stands
+  // down here rather than repeat the partner, the prompt and the timestamp two
+  // sections apart; the card names the sender in its own label instead.
+  const asked = edges.find((r) => r.inbound && isLastSend(r.edge, lastSend))
+  return {
+    askedBy: asked?.partner,
+    rows: edges.filter((r) => r !== asked).slice(0, HANDOFF_MAX),
+  }
 }
 
 /** Role presets that ADD a durable job to the role/desc textarea. Picking one
@@ -510,10 +572,15 @@ function LiveState({
   session: ApiSession | null
   lastSend: LastSend | null
 }) {
-  // `<ActivityLine>` self-nulls without a live tool label, and the idle tail
-  // fills the same slot — so both key off the same fact rather than a second
-  // copy of the component's subagent threshold.
-  const working = Boolean(session?.activity?.trim())
+  // Gated on a WORKING status, exactly as this component's two other call sites
+  // do (`session-tile/tile.tsx`, `focus-mode/focus-header.tsx`). The backend
+  // clears `activity` on Stop/SessionEnd, but a stale label survives often
+  // enough that the ungated version printed "Idle · ✎ hooks.rs" — two
+  // contradicting facts on one line — and, worse, took the slot from the honest
+  // `last prompted` tail on exactly the rows that need it.
+  const working =
+    (session?.status === 'active' || session?.status === 'starting') &&
+    Boolean(session?.activity?.trim())
   if (!session) return null
 
   return (
@@ -563,10 +630,13 @@ function LiveState({
 function LastExchangeBlock({
   name,
   lastSend,
+  askedBy,
   onOpenThread,
 }: {
   name: string
   lastSend: LastSend | null
+  /** The bot that delegated this send, from the graph ([`handoffView`]). */
+  askedBy?: string
   onOpenThread: () => void
 }) {
   const recall = useQuery({
@@ -576,7 +646,7 @@ function LastExchangeBlock({
     retry: false,
   })
   const exchange = React.useMemo(() => lastExchange(recall.data?.entries ?? []), [recall.data])
-  const replied = Boolean(exchange.answer || exchange.receipts.length > 0 || exchange.from)
+  const replied = Boolean(exchange.answer || exchange.receipts.length > 0)
 
   // Nothing on the row AND nothing on the wire. One muted line — an empty card
   // with a heading is the shape this redesign exists to remove. Unreachable is
@@ -601,8 +671,13 @@ function LastExchangeBlock({
       >
         {lastSend && (
           <div className="flex w-full flex-col gap-0.5">
+            {/* "You asked" is FALSE for bot→bot work, and this panel is about a
+                company of bots: `last_send_text` is the last prompt written into
+                the session whoever wrote it. When the graph says a bot handed it
+                in, that bot is named here — which is also where the card's old
+                "↳ from X" footer went, so the fact is stated once. */}
             <span className="text-[11.5px] font-medium text-muted-foreground">
-              You asked · {formatRecallTime(lastSend.sentAt)}
+              {askedBy ? `${askedBy} asked` : 'You asked'} · {formatRecallTime(lastSend.sentAt)}
             </span>
             <span className="line-clamp-3 text-[13px] leading-relaxed text-foreground">
               {lastSend.text}
@@ -639,11 +714,6 @@ function LastExchangeBlock({
                   <span className="min-w-0 truncate">{r.label}</span>
                 </span>
               ))}
-              {exchange.from && (
-                <span className="truncate text-[12.5px] text-muted-foreground">
-                  ↳ from {exchange.from}
-                </span>
-              )}
             </div>
           )
         )}
@@ -661,34 +731,24 @@ function LastExchangeBlock({
  *
  *  Strictly conditional: no edges ⇒ no section, no empty card, no zero count.
  *  A failed read renders nothing too — an error banner about a graph the user
- *  did not ask for is noise. */
+ *  did not ask for is noise.
+ *
+ *  The graph is fetched by `<OverviewTab>` and selected by [`handoffView`],
+ *  because the Last-exchange card above needs the same edges: it names the bot
+ *  that handed the work in, and the row it names stands down here. */
 function Handoffs({
-  name,
+  rows,
   onNavigate,
 }: {
-  name: string
+  rows: HandoffRow[]
   onNavigate: (name: string) => void
 }) {
-  const { data } = useQuery({
-    queryKey: ['bot-handoffs', name],
-    queryFn: () => agentsApi.delegations(name),
-    staleTime: 60_000,
-    retry: false,
-  })
-  const rows = React.useMemo(() => {
-    const edges = [
-      ...(data?.incoming ?? []).map((e) => ({ e, partner: e.from_session, inbound: true })),
-      ...(data?.outgoing ?? []).map((e) => ({ e, partner: e.to_session, inbound: false })),
-    ]
-    return edges.sort((a, b) => b.e.ts - a.e.ts).slice(0, 3)
-  }, [data])
-
   if (rows.length === 0) return null
 
   return (
     <Field label="Handoffs" hint="Work passed to this bot, and work it passed on.">
       <div className="flex flex-col">
-        {rows.map(({ e, partner, inbound }) => (
+        {rows.map(({ edge: e, partner, inbound }) => (
           <button
             key={e.id}
             type="button"
@@ -731,6 +791,16 @@ function OverviewTab({
   // silently rendered nothing.
   const lastSend = useLastSend(session ?? undefined)
   const asking = session?.status === 'waiting' && Boolean(session.waiting_message?.trim())
+  // ONE read of the delegation graph for the two blocks that need it — the card
+  // (who asked) and the list (everything else). Two components each fetching it
+  // would be two chances to disagree about the same edge.
+  const graph = useQuery({
+    queryKey: ['bot-handoffs', name],
+    queryFn: () => agentsApi.delegations(name),
+    staleTime: 60_000,
+    retry: false,
+  })
+  const handoffs = React.useMemo(() => handoffView(graph.data, lastSend), [graph.data, lastSend])
 
   return (
     // TWO REGIONS, not one column of loose things: what this bot is DOING (live,
@@ -751,9 +821,14 @@ function OverviewTab({
         </Field>
       )}
 
-      <LastExchangeBlock name={name} lastSend={lastSend} onOpenThread={onOpenThread} />
+      <LastExchangeBlock
+        name={name}
+        lastSend={lastSend}
+        askedBy={handoffs.askedBy}
+        onOpenThread={onOpenThread}
+      />
 
-      <Handoffs name={name} onNavigate={onNavigate} />
+      <Handoffs rows={handoffs.rows} onNavigate={onNavigate} />
 
       <div className="flex flex-col gap-6 border-t border-border pt-5">
         <Field label="Tags" hint="Searchable across the roster.">
@@ -1028,9 +1103,11 @@ function SetupTab({
       </Group>
 
       <Group>
-        <Field label="Connectors" hint="What this bot can reach — its per-bot grants.">
-          <GrantedConnectors name={name} />
-        </Field>
+        {/* Bare, not wrapped in a `<Field label="Connectors">`: the component
+            draws its own "Connectors" heading and hint, and the wrapper stacked
+            a second copy of the word above them — four lines of chrome for one
+            section, and the tab's worst spacing moment at 390px. */}
+        <GrantedConnectors name={name} />
       </Group>
 
       <Group>
@@ -1197,13 +1274,18 @@ function BotPanelBody({
             />
           )}
         </div>
-        <div className="flex items-center justify-between gap-3">
+        {/* The standing job gets its OWN line. Sharing a row with the action
+            pill left it ~188px at 390px, so a 160-character role rendered as
+            "You keep things running. Wa…" on the device this panel is designed
+            for — the one thing the header was rebuilt to say, cut to a fragment.
+            Two clamped lines carry a real sentence; the action moves below. */}
+        <div className="flex flex-col items-start gap-2.5">
           {role ? (
             // No `capitalize` here: `desc` is a sentence the owner wrote, not a
             // status word, and title-casing it reads as a bug.
             <span
               data-vr="bot-role-line"
-              className="min-w-0 flex-1 truncate text-[13px] text-muted-foreground"
+              className="line-clamp-2 w-full text-[13px] leading-snug text-muted-foreground"
             >
               {role}
             </span>
@@ -1212,7 +1294,7 @@ function BotPanelBody({
               type="button"
               onClick={() => setTab('instructions')}
               data-vr="bot-role-cta"
-              className="-ml-1 inline-flex min-h-9 min-w-0 flex-1 items-center justify-start truncate rounded-md px-1 text-left text-[13px] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="-ml-1 inline-flex min-h-9 items-center rounded-md px-1 text-left text-[13px] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               Say what this bot does →
             </button>

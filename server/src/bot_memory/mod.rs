@@ -101,6 +101,51 @@ pub fn memory_params(s: &Session, data_dir: &Path) -> MemoryParams {
     }
 }
 
+/// Whether this session's launch overlay ACTUALLY fires the recall hook — i.e.
+/// memory is wired into the agent that is running (or that the next start will
+/// resume), not merely eligible for it.
+///
+/// [`session_has_memory`] answers ELIGIBILITY, and the two diverge for the whole
+/// life of a bot that became eligible after its last start: it has no hook, no
+/// `Bash(supermux-memory *)` grant and no `BOT_MEMORY_*` env, so it physically
+/// cannot save a note. The panel used to read the browse route's `200` as "wired"
+/// and told those bots they simply hadn't written anything yet — the opposite of
+/// the truth, and the one sentence that keeps the tier looking dead.
+///
+/// The overlay is rewritten by [`crate::sessions::connector_config::finish`] on
+/// every launch, so its current content IS the running agent's wiring. A missing
+/// or unreadable file is "not wired": nothing was ever launched with memory.
+pub fn recall_hook_wired(data_dir: &Path, session_name: &str) -> bool {
+    let path = crate::sessions::connector_config::settings_path(data_dir, session_name);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let hook = recall_hook_bin(data_dir);
+    let hook = hook.to_string_lossy();
+    // `apply_memory` writes `hooks.UserPromptSubmit = [{ hooks: [{ command }] }]`;
+    // match on the command PATH rather than "has any hook", so a session wired
+    // with some other hook is not mistaken for a memory-wired one.
+    settings
+        .get("hooks")
+        .and_then(|h| h.get("UserPromptSubmit"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|g| {
+                g.get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command").and_then(serde_json::Value::as_str)
+                                == Some(hook.as_ref())
+                        })
+                    })
+            })
+        })
+}
+
 /// Install (idempotently) the two wrapper scripts into `<data_dir>/bin`, each an
 /// `exec` of the currently-running server binary with its hidden subcommand — so
 /// the wrappers are always version-matched to the server (no separate artifact),

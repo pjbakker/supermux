@@ -49,6 +49,23 @@ use crate::db::connectors::{self, Grant};
 use crate::state::AppState;
 use crate::vault::Vault;
 
+/// The overlay filename inside a session's private config dir.
+const SETTINGS_FILE: &str = "settings.json";
+
+/// `<data_dir>/session-config/<name>` — a session's private launch-config dir.
+pub fn settings_dir(data_dir: &Path, session_name: &str) -> PathBuf {
+    data_dir.join("session-config").join(session_name)
+}
+
+/// The `settings.json` overlay inside it — what `--settings` points the launch at.
+/// Exposed because a READER needs the same path the writer uses:
+/// [`crate::bot_memory::recall_hook_wired`] answers "is memory actually wired into
+/// this bot's launch?" by looking for the hook in this very file, and re-spelling
+/// the layout there is how the two would drift.
+pub fn settings_path(data_dir: &Path, session_name: &str) -> PathBuf {
+    settings_dir(data_dir, session_name).join(SETTINGS_FILE)
+}
+
 /// One granted connector, resolved to what the launch needs: its inline
 /// `mcpServers` entry (`emit`) and any decrypted secret field-map to inject.
 #[derive(Debug, Clone)]
@@ -119,9 +136,8 @@ pub struct SessionConfig {
 impl SessionConfig {
     /// A fresh, inactive config for `session_name` under `data_dir`.
     pub fn new(data_dir: &Path, session_name: &str) -> Self {
-        let settings_dir = data_dir.join("session-config").join(session_name);
         Self {
-            settings_dir,
+            settings_dir: settings_dir(data_dir, session_name),
             settings: Map::new(),
             env: HashMap::new(),
             launch_flags: Vec::new(),
@@ -430,7 +446,7 @@ impl SessionConfig {
 
         // Every active launch gets the kill switch, decoupled from grants.
         self.apply_account_connector_killswitch();
-        let settings_path = self.settings_dir.join("settings.json");
+        let settings_path = self.settings_dir.join(SETTINGS_FILE);
         write_json_atomic(&settings_path, &Value::Object(self.settings)).await?;
         // Layer the overlay OVER ~/.claude via --settings (Claude Code merges it),
         // instead of repointing CLAUDE_CONFIG_DIR at a near-empty dir.

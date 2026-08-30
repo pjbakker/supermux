@@ -104,6 +104,13 @@ pub struct NotesResponse {
     pub role_count: usize,
     /// The role key whose shared tier was unioned in, if any.
     pub role: String,
+    /// Whether the recall hook is ACTUALLY in this bot's launch overlay
+    /// ([`bot_memory::recall_hook_wired`]) — i.e. it can write and recall notes
+    /// right now. Eligible-but-never-restarted bots reach this route (they pass
+    /// the gate above) yet have no hook, no write grant and no store; the panel
+    /// must tell them to restart rather than claim they simply haven't written
+    /// anything. Reaching a `200` is NOT the flag; this is.
+    pub wired: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -136,7 +143,7 @@ pub async fn list_handler(
     let data = tokio::task::spawn_blocking(move || {
         let found = recall::visible_notes(&tiers.bot, tiers.role.as_deref(), LIST_CAP);
         let notes: Vec<NoteSummary> = found.iter().map(|s| summary(&s.note, s.bot_private, None)).collect();
-        response(notes, tiers.role_key)
+        response(notes, tiers.role_key, tiers.wired)
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
@@ -216,7 +223,7 @@ pub async fn search_handler(
             .take(limit)
             .map(|s| summary(&s.note, s.bot_private, Some(s.score)))
             .collect();
-        response(notes, tiers.role_key)
+        response(notes, tiers.role_key, tiers.wired)
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
@@ -231,6 +238,9 @@ struct Tiers {
     /// `None` for a private-only bot (no `role_id`).
     role: Option<PathBuf>,
     role_key: String,
+    /// Whether the last launch actually wired the recall hook (see
+    /// [`NotesResponse::wired`]).
+    wired: bool,
 }
 
 /// Look the session up and resolve its tier dirs, or `404`: the row must exist
@@ -260,6 +270,7 @@ fn tiers_of(session: &Session, data_dir: &FsPath) -> Tiers {
         bot: bot_memory::bot_dir(&root, &session.name),
         role: (!role_key.is_empty()).then(|| bot_memory::role_dir(&root, &role_key)),
         role_key,
+        wired: bot_memory::recall_hook_wired(data_dir, &session.name),
     }
 }
 
@@ -283,13 +294,14 @@ fn summary(note: &store::Note, bot_private: bool, score: Option<f64>) -> NoteSum
     }
 }
 
-fn response(notes: Vec<NoteSummary>, role_key: String) -> NotesResponse {
+fn response(notes: Vec<NoteSummary>, role_key: String, wired: bool) -> NotesResponse {
     let bot_count = notes.iter().filter(|n| n.tier == "bot").count();
     NotesResponse {
         role_count: notes.len() - bot_count,
         bot_count,
         notes,
         role: role_key,
+        wired,
     }
 }
 
@@ -542,6 +554,40 @@ mod tests {
         .await
         .expect_err("traversal");
         assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+        teardown(state, dir);
+    }
+
+    /// ELIGIBLE is not WIRED. A session that became a bot after its last start
+    /// passes the gate (200) while its launch carries no recall hook — it cannot
+    /// save a note, and `wired: false` is what lets the panel say "restart it"
+    /// instead of "this bot hasn't written any notes yet".
+    #[tokio::test]
+    async fn wired_reads_the_launch_overlay_not_mere_eligibility() {
+        let (state, dir, name) = fixture(Some("reviewer")).await;
+        let out = list_handler(State(state.clone()), AxumPath(name.clone()))
+            .await
+            .expect("list")
+            .0
+            .data;
+        assert!(!out.wired, "nothing has ever been launched for this bot");
+
+        // Write the overlay through the REAL launch writer, so the check is
+        // pinned against what `apply_memory` actually emits rather than a
+        // hand-built shape that could drift from it.
+        let session = db::sessions::get(&state.pool, &name)
+            .await
+            .expect("get")
+            .expect("row");
+        let mut cfg = crate::sessions::connector_config::SessionConfig::new(&dir, &name);
+        cfg.apply_memory(bot_memory::memory_params(&session, &dir));
+        cfg.finish().await.expect("write overlay");
+
+        let out = list_handler(State(state.clone()), AxumPath(name.clone()))
+            .await
+            .expect("list")
+            .0
+            .data;
+        assert!(out.wired, "the overlay fires the recall hook");
         teardown(state, dir);
     }
 

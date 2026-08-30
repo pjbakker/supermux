@@ -1429,7 +1429,9 @@ export default function GrokRoster() {
             <div className="gr-pane-empty">
               <div>
                 <Sparkles size={22} style={{ opacity: 0.5, marginBottom: 10 }} aria-hidden />
-                <div>Select a colleague to see cost, context and their latest.</div>
+                {/* Names what the panel now shows. It used to advertise "cost,
+                  context" — the two fields the rebuild deleted as unproducible. */}
+              <div>Select a colleague to see what they’re doing and set them up.</div>
               </div>
             </div>
           </div>

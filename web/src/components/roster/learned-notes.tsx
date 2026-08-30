@@ -13,11 +13,13 @@
  * search that would quietly disagree with its memory. An empty box lists the
  * whole union (private ∪ role), freshest first.
  *
- * Three states, not two. "The tier is OFF for this session" (the route 404s) and
- * "the bot is in the tier and has written nothing yet" (200 + `[]`) are different
- * facts, and printing the second for the first is what made memory look built and
- * dead. The off state names the switch — a role or a company, then a restart —
- * and carries the restart button, because the hook is wired at LAUNCH.
+ * Three states, not two. "This bot cannot write notes" and "it can, and has
+ * written none yet" are different facts, and printing the second for the first is
+ * what made memory look built and dead. The server answers the first with
+ * `wired: false` — it reports whether the recall hook is really in the session's
+ * launch overlay, so an eligible bot that has not been restarted since gaining
+ * its role is unwired too, not merely note-less. The off state carries the
+ * restart button, because the hook is wired at LAUNCH.
  *
  * Markdown sits behind `React.lazy`, exactly as `transcript-item.tsx` does it:
  * the `react-markdown` stack stays in its own chunk and never lands in this
@@ -79,11 +81,10 @@ export function LearnedNotes({ name }: { name: string }) {
   })
 
   const notes = data?.notes ?? []
-  // Three states, not two. The route 404s while the memory tier is OFF for this
-  // session, and folding that into the same empty list made the panel say "this
-  // bot hasn't written any notes yet" about a store that does not exist — the
-  // one sentence that made the whole feature look built-but-dead. `wired` is the
-  // client's reading of 200-vs-404 (`lib/api/memory.ts`).
+  // Three states, not two. `wired` is the SERVER's answer to "can this bot write
+  // a note at all?" (is the recall hook in its launch overlay), not the client's
+  // reading of 200-vs-404 — that reading called every eligible-but-unrestarted
+  // bot wired and told it it simply hadn't written anything yet.
   const notWired = Boolean(data) && !data?.wired
   // Derived, not synced: a row the current result set no longer contains simply
   // renders collapsed. Storing that in an effect would be a second source of
@@ -119,11 +120,14 @@ export function LearnedNotes({ name }: { name: string }) {
             <>No note matches “{debounced}”.</>
           ) : notWired ? (
             <>
-              {/* The tier is wired at LAUNCH (the recall hook rides the session's
-                  config overlay), so a bot that just got its role gains memory on
-                  its next start — which is exactly what this button does. */}
-              Memory isn’t on for this bot yet. Give it a role or a company above, then restart
-              it — after that it writes what it learns here.
+              {/* The hook rides the session's launch overlay, so RESTART is the
+                  action for both unwired shapes — the bot that isn't a bot yet
+                  (no role, no company: the route 404s) and the far commoner one
+                  that became eligible after its last start. Naming the restart
+                  first keeps it honest for the second without misreading the
+                  first as already done. */}
+              Memory isn’t on for this bot yet — the recall hook is wired when it starts.
+              Restart it to switch memory on; a bot with no role or company gets one above first.
               <RestartToApply name={name} />
             </>
           ) : (

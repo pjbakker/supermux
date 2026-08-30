@@ -1,14 +1,18 @@
 /**
- * "The tier is OFF" and "the bot has written nothing yet" are different facts.
+ * "This bot cannot write notes" and "it has written none yet" are different facts.
  * ═════════════════════════════════════════════════════════════════════════════
- * `GET /api/sessions/{name}/memory/notes` answers **404** while the memory tier
- * is not enabled for a session, and **200 + []** for a real bot that simply
- * hasn't saved a note yet. The client used to flatten both into the same empty
- * response, so the panel printed "This bot hasn't written any notes yet" over a
- * store that does not exist for it — the one sentence that made a fully built
- * feature look permanently dead.
+ * `GET /api/sessions/{name}/memory/notes` answers **404** when the session is not
+ * a bot at all, and **200** otherwise — carrying `wired`, the server's reading of
+ * whether the recall hook is really in this session's launch overlay.
  *
- * The server already draws the distinction; `wired` is the client keeping it.
+ * The client used to synthesise `wired` from the status code (a 200 meant wired).
+ * That was wrong in the commonest case there is: the route's gate is ELIGIBILITY
+ * (a company or a role sentence), the hook is wired at LAUNCH, so every bot that
+ * became eligible since its last start answers 200 with no hook and no way to
+ * save — and got told it simply hadn't written anything yet.
+ *
+ * So: the flag comes off the wire, and a 404 still folds into the same unwired
+ * empty (both need a restart before the bot can write).
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
@@ -51,8 +55,8 @@ afterEach(() => {
   }
 })
 
-describe('the memory client keeps 404 apart from 200-with-nothing', () => {
-  test('a 404 is the tier being OFF — empty AND unwired', async () => {
+describe('the memory client reports whether the bot can write, not whether it answered', () => {
+  test('a 404 is "not a bot" — empty AND unwired', async () => {
     serve(404)
     const out = await listNotes('plain-pane')
     expect(out.wired).toBe(false)
@@ -60,8 +64,17 @@ describe('the memory client keeps 404 apart from 200-with-nothing', () => {
     expect(out.bot_count).toBe(0)
   })
 
-  test('a 200 with an empty list is a real bot that has learned nothing yet', async () => {
-    serve(200, { notes: [], bot_count: 0, role_count: 0, role: '' })
+  test('an ELIGIBLE bot with no hook answers 200 and is still unwired', async () => {
+    // The regression this file exists for: the panel must say "restart it", not
+    // "it hasn't written anything yet", for a bot whose launch predates its role.
+    serve(200, { notes: [], bot_count: 0, role_count: 0, role: '', wired: false })
+    const out = await listNotes('mena')
+    expect(out.wired).toBe(false)
+    expect(out.notes).toEqual([])
+  })
+
+  test('a 200 with an empty list AND the hook is a bot that has learned nothing yet', async () => {
+    serve(200, { notes: [], bot_count: 0, role_count: 0, role: '', wired: true })
     const out = await listNotes('mena')
     expect(out.wired).toBe(true)
     expect(out.notes).toEqual([])
@@ -82,6 +95,7 @@ describe('the memory client keeps 404 apart from 200-with-nothing', () => {
       bot_count: 1,
       role_count: 0,
       role: '',
+      wired: true,
     })
     const out = await listNotes('mena')
     expect(out.wired).toBe(true)
@@ -92,7 +106,7 @@ describe('the memory client keeps 404 apart from 200-with-nothing', () => {
   test('search answers on the same two axes — the panel branches on one flag', async () => {
     serve(404)
     expect((await searchNotes('plain-pane', 'migrations')).wired).toBe(false)
-    serve(200, { notes: [], bot_count: 0, role_count: 0, role: 'reviewer' })
+    serve(200, { notes: [], bot_count: 0, role_count: 0, role: 'reviewer', wired: true })
     const hit = await searchNotes('mena', 'migrations')
     expect(hit.wired).toBe(true)
     expect(hit.role).toBe('reviewer')
