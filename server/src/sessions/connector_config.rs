@@ -336,9 +336,19 @@ impl SessionConfig {
         // permissions.allow: MERGE the write-CLI grant into the shared allow list
         // (the connector globs + the connect tool live there too); `finish` writes
         // the array once, so no tier clobbers another's rules.
-        let entry = Value::String("Bash(supermux-memory *)".to_string());
-        if !self.allow_rules.contains(&entry) {
-            self.allow_rules.push(entry);
+        //
+        // BOTH prefix forms, on purpose. This shipped the space form; Claude
+        // Code's documented prefix form is `Bash(cmd:*)`, and which one a given
+        // build matches is not something the server can know. A grant that does
+        // not match costs a permission PROMPT on every `supermux-memory save` —
+        // and in an unattended pane that prompt is never answered, so the note
+        // silently never lands and the whole tier reads as broken. A duplicate
+        // allow entry is inert, so emit both rather than bet on one.
+        for rule in ["Bash(supermux-memory *)", "Bash(supermux-memory:*)"] {
+            let entry = Value::String(rule.to_string());
+            if !self.allow_rules.contains(&entry) {
+                self.allow_rules.push(entry);
+            }
         }
 
         // env: the hook + CLI read these to resolve the store + identity.
@@ -1644,7 +1654,11 @@ mod tests {
         // permissions.allow carries BOTH the connector tool + the write-CLI grant.
         let allow = v["permissions"]["allow"].as_array().unwrap();
         assert!(allow.contains(&json!("mcp__github__*")), "connector allow kept: {allow:?}");
+        // BOTH prefix forms ride along — see `apply_memory`: a form the running
+        // Claude Code build does not match turns every self-save into an
+        // unanswered permission prompt.
         assert!(allow.contains(&json!("Bash(supermux-memory *)")), "memory grant merged: {allow:?}");
+        assert!(allow.contains(&json!("Bash(supermux-memory:*)")), "prefix-form grant merged: {allow:?}");
         // Connector kill switch survives the memory merge.
         assert_eq!(v["disableClaudeAiConnectors"], json!(true));
         // Recall hooks fire on both context-injecting events.

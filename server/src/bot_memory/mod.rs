@@ -55,15 +55,24 @@ pub struct MemoryParams {
 }
 
 /// Whether this session participates in bot memory — i.e. it is a "bot", not a
-/// plain pane. True when it has a role identity, curated CORE notes, or an
-/// existing archival store. A plain session returns false so its launch stays
-/// byte-identical (no private config dir, no hook). Once true at launch, the
-/// recall hook is present, so mid-session saves go live next turn with no
-/// relaunch.
+/// plain pane. True when it has a standing job (a company, or a role sentence),
+/// a role identity, curated CORE notes, or an existing archival store. A plain
+/// session returns false so its launch stays byte-identical (no private config
+/// dir, no hook). Once true at launch, the recall hook is present, so
+/// mid-session saves go live next turn with no relaunch.
 pub fn session_has_memory(s: &Session, data_dir: &Path) -> bool {
     let has_role = s.role_id.as_deref().map(str::trim).is_some_and(|r| !r.is_empty());
     let has_core = !s.memory.trim().is_empty();
-    if has_role || has_core {
+    // A bot is a session with a STANDING JOB — one that belongs to a company, or
+    // one the owner gave a role. Gating ONLY on "does it already have memory"
+    // made the tier unreachable by construction: `role_id` has no production
+    // setter, core notes start empty, and the on-disk store can only be written
+    // by `supermux-memory`, whose `BOT_MEMORY_*` env is exported by
+    // `apply_memory` — which runs only once this returns true. Nothing could
+    // bootstrap in. Company-or-role is the product's own definition of bot-ness
+    // and it gives the owner a REACHABLE switch: write the role, restart.
+    let is_bot = s.company_id.is_some() || !s.desc.trim().is_empty();
+    if has_role || has_core || is_bot {
         return true;
     }
     let root = root(data_dir);
@@ -250,5 +259,87 @@ pub fn slugify(title: &str) -> String {
         "note".to_string()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row with every field at its zero value — the shape the gate reads.
+    fn plain(name: &str) -> Session {
+        Session {
+            name: name.into(),
+            display_name: name.into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "claude".into(),
+            flags: String::new(),
+            pinned: 0,
+            archived: 0,
+            auto_continue: 0,
+            auto_continue_msg: String::new(),
+            rate_limit_resume_text: String::new(),
+            tags: "[]".into(),
+            creator: String::new(),
+            branch: String::new(),
+            worktree: 0,
+            worktree_repo: String::new(),
+            mcp: String::new(),
+            created_at: 0,
+            start_count: 0,
+            last_started: 0,
+            last_send: 0,
+            last_send_text: String::new(),
+            task_summary: String::new(),
+            cc_session_name: String::new(),
+            cc_conversation_id: String::new(),
+            codex_session_id: String::new(),
+            start_error: String::new(),
+            team_name: None,
+            host_id: None,
+            company_id: None,
+            mark_pin: None,
+            runtime: "native".into(),
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
+        }
+    }
+
+    /// The gate's whole point: a session with a STANDING JOB is a bot, and a bare
+    /// pane is not. Before the widening neither branch could ever be reached from
+    /// a fresh install — `role_id` has no setter, core notes start empty, and the
+    /// disk branch needs env only `apply_memory` exports — so a new bot could
+    /// never enter the tier at all.
+    #[test]
+    fn a_company_or_a_role_sentence_makes_a_session_a_bot() {
+        let data_dir = std::path::Path::new("/nonexistent-supermux-data-dir");
+
+        // No company, no role sentence, no notes → a plain pane, launch untouched.
+        let bare = plain("pane");
+        assert!(!session_has_memory(&bare, data_dir), "a plain pane stays out of the tier");
+
+        // Belongs to a company → a bot, even with `role_id` and `memory` empty.
+        let mut in_company = plain("mena");
+        in_company.company_id = Some(7);
+        assert!(session_has_memory(&in_company, data_dir), "a company bot is memory-eligible");
+
+        // The owner wrote what it does → a bot. This is the REACHABLE switch: the
+        // panel's own "What this bot does" field turns memory on at next start.
+        let mut with_role = plain("reviewer");
+        with_role.desc = "You review changes for correctness and clarity.".into();
+        assert!(session_has_memory(&with_role, data_dir), "a role sentence is a standing job");
+
+        // Whitespace is not a job — the field is trimmed, exactly like the core
+        // notes branch beside it.
+        let mut blank_role = plain("pane2");
+        blank_role.desc = "   \n ".into();
+        assert!(!session_has_memory(&blank_role, data_dir), "whitespace desc is not a role");
     }
 }
