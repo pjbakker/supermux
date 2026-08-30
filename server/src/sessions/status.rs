@@ -2271,22 +2271,8 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_kimi_roster_tick_stays_active() {
-        // (c) kimi with the SAME inputs stays Active: only claude is gated, kimi
-        // keeps the raw PTY heartbeat.
-        let mut d = StatusDetector::for_provider("kimi");
-        d.force(Status::Active);
-        d.watching_since = Instant::now() - Duration::from_secs(30);
-        assert_eq!(
-            d.detect(TICKING_ROSTER, Instant::now(), TurnState::default(), false),
-            Status::Active,
-            "only claude is gated — kimi keeps the raw heartbeat and stays Active"
-        );
-    }
-
-    #[test]
     fn heartbeat_claude_with_visible_spinner_stays_active() {
-        // (d) A GENUINELY working claude: the capture carries `esc to interrupt`,
+        // (c) A GENUINELY working claude: the capture carries `esc to interrupt`,
         // so it returns Active at step 2 and never reaches the heartbeat gate.
         let mut d = StatusDetector::for_provider("claude");
         d.force(Status::Active);

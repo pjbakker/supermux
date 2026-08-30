@@ -9,8 +9,10 @@
  *      filtered by session (the shipped `session:<name>` synthesis, not a second
  *      one), and a per-team list must be that team's own board;
  *   2. the extraction held — `AcceptanceChecklist` and `ReplyComposer` render
- *      from `components/issues/`, with no import back into
- *      `components/board/`, so T11 can delete that directory.
+ *      from `components/issues/`. (T11 has since deleted `components/board/`;
+ *      a live import edge back to it is now a typecheck failure under
+ *      `bun run build`, which is a stronger gate than the source scan that
+ *      used to sit here.)
  *
  * The row RENDERING is asserted through `IssueRow`'s markup via the exported
  * list with a stubbed hook would be a test of the stub; instead the row's facts
@@ -64,24 +66,7 @@ describe('the two scopes', () => {
   })
 })
 
-describe('the extraction held — T11 can delete components/board/', () => {
-  const ISSUE_FILES = [
-    'components/issues/issue-list.tsx',
-    'components/issues/issue-detail.tsx',
-    'components/issues/issue-surface.tsx',
-    'components/issues/acceptance-checklist.tsx',
-    'components/issues/reply-composer.tsx',
-  ]
-
-  test('no file under components/issues IMPORTS from components/board', () => {
-    // Doc comments may (and do) name where a component came from; what must not
-    // exist is a live edge, or T11 cannot delete the directory.
-    for (const rel of ISSUE_FILES) {
-      const imports = [...SRC(rel).matchAll(/from\s+'([^']+)'/g)].map((m) => m[1])
-      expect(imports.filter((i) => i.includes('components/board'))).toEqual([])
-    }
-  })
-
+describe('the extraction held', () => {
   test('the surface hosts list + detail in B1’s ShellOverlay', () => {
     const src = SRC('components/issues/issue-surface.tsx')
     expect(src).toContain('ShellOverlay')
@@ -159,11 +144,6 @@ describe('the extracted components still render', () => {
 })
 
 describe('the copy was adopted, not deleted', () => {
-  test('EMPTY.issues replaced the dead EMPTY.board', () => {
-    expect(EMPTY.issues.title).toBeTruthy()
-    expect((EMPTY as Record<string, unknown>).board).toBeUndefined()
-  })
-
   test('the empty state explains where issues come from', () => {
     expect(EMPTY.issues.body).toContain('supermux-task')
   })

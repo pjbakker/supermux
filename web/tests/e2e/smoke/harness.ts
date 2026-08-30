@@ -320,10 +320,46 @@ export async function startBackend(opts?: {
 }
 
 /**
+ * THE ONE-SHOT FIRST-RUN OVERLAY NO SPEC IS TESTING, STAMPED AS ANSWERED.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `BotModeIntro` is a `fixed inset-0` OPAQUE modal that `OnboardingHost` puts on
+ * `/` for any profile that has not turned Bot Mode on and has not yet answered
+ * it (`src/lib/botmode-onboarding.ts`). Every spec in this suite boots a fresh
+ * data dir in a fresh browser context, so every spec IS a first run: the intro
+ * covered the overview, ate the taps in `palette-phone` and swallowed the "Take
+ * the tour" click in `tour-step3-anchor`. And because the intro is `React.lazy`,
+ * a fast spec could finish its first assertions before the chunk landed — so it
+ * passed locally and failed on a slower CI runner. A real overlay that is
+ * intermittently invisible is the worst shape a suite can have.
+ *
+ * Stamping the seen-key is the fixture saying WHICH first-run surface is under
+ * test, not a weakening of the product: a real first-run user still gets the
+ * intro, and `tests/unit/botmode-onboarding.test.ts` covers the gate itself.
+ *
+ * Only if the key is ABSENT, so a spec that wants to drive the intro can seed
+ * its own value (or clear the key after this script) and still win.
+ *
+ * `supermux-first-launch` is deliberately NOT stamped here — `tour-step3-anchor`
+ * needs that branch ARMED, and the specs that want it sealed already say so.
+ */
+const FIRST_RUN_ANSWERED = `
+    try {
+      if (localStorage.getItem('supermux-botmode-intro-seen') === null) {
+        localStorage.setItem('supermux-botmode-intro-seen', 'e2e');
+      }
+    } catch {
+      /* storage unavailable — the intro cannot show either */
+    }`
+
+/**
  * Inject the runtime config the server normally writes into index.html as
  * `window._SUPERMUX_*` globals (env.ts). Base + WS stay relative (same-origin Vite,
  * proxied to the backend); only the token must be supplied. MUST be called via
  * `page.addInitScript` BEFORE the first navigation so it's set before main.tsx.
+ *
+ * It also carries `FIRST_RUN_ANSWERED`: this is the ONE init script every smoke
+ * spec installs before its first navigation, which is exactly where that stamp
+ * belongs if the next spec is not to re-forget it.
  */
 export function injectGlobals(token: string): string {
   return `
@@ -331,6 +367,7 @@ export function injectGlobals(token: string): string {
     // Base + WS default to same-origin in env.ts; leave them unset so requests
     // hit the Vite dev server, which proxies to the backend.
     window._SUPERMUX_VERSION = 'e2e';
+${FIRST_RUN_ANSWERED}
   `
 }
 

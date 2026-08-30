@@ -25,8 +25,23 @@
 //     creates no transition pseudo-element (globals.css disables
 //     `::view-transition-*` wholesale, and `navigateMorph` skips the API).
 
-import { expect, test } from '@playwright/test'
+import { expect, test, type Locator } from '@playwright/test'
 import { injectGlobals, startBackend, type Backend } from './harness'
+
+/** The rail link for a nav label, matched on its LABEL PREFIX rather than on the
+ *  whole accessible name.
+ *
+ *  `exact: true` was used here and it broke the moment the update badge shipped:
+ *  `useUpdateBadge` appends " (update available)" to the Settings item's
+ *  accessible name, and the smoke harness injects `_SUPERMUX_VERSION = 'e2e'`,
+ *  which never matches the server's sha — so in THIS suite the badge is not an
+ *  edge case, it is permanently on. The click waited out the whole timeout on a
+ *  nav that was rendering perfectly.
+ *
+ *  Anchored at the start (`^Files$|^Files \(`) rather than a bare substring, so
+ *  it still cannot match a different item that merely contains the word. */
+const navLink = (rail: Locator, label: string) =>
+  rail.getByRole('link', { name: new RegExp(`^${label}( \\(|$)`) })
 
 test.describe('nav: the active pill is one view-transition group', () => {
   let backend: Backend
@@ -131,7 +146,7 @@ test.describe('nav: the active pill is one view-transition group', () => {
         return out
       })
 
-    // ── At rest on `/`: exactly one pill, under the active Overview link ─────
+    // ── At rest on `/`: exactly one pill, under the active Home link ────────
     let found = await pills()
     expect(found.length, 'exactly one element carries the pill name').toBe(1)
     expect(found[0].href).toBe('/')
@@ -143,8 +158,11 @@ test.describe('nav: the active pill is one view-transition group', () => {
     // the morph deliberately degrades to a hard cut. That degradation is a
     // separate, documented behaviour; measuring it here would make the progress
     // assertion below a coin flip on how fast the dev server serves a chunk.
-    for (const label of ['Files', 'Settings', 'Overview'] as const) {
-      await rail.getByRole('link', { name: label, exact: true }).click()
+    // 'Home', not 'Overview': the root rail item is labelled `Home` in
+    // `layout.tsx:105`. The spec asked for a link that has not existed under
+    // that name since the rename, and spent 90 s finding out.
+    for (const label of ['Files', 'Settings', 'Home'] as const) {
+      await navLink(rail, label).click()
       await page.waitForTimeout(500)
     }
     await expect(page).toHaveURL(/\/$/)
@@ -159,7 +177,7 @@ test.describe('nav: the active pill is one view-transition group', () => {
       ['Files', '/files'],
       ['Settings', '/settings'],
     ] as const) {
-      await rail.getByRole('link', { name: label, exact: true }).click()
+      await navLink(rail, label).click()
       await expect(page).toHaveURL(new RegExp(`${href}$`))
       await expect(async () => {
         found = await pills()
@@ -222,7 +240,8 @@ test.describe('nav: the active pill is one view-transition group', () => {
       .waitForEvent('page', { timeout: 8_000 })
       .catch(() => null)
     await rail
-      .getByRole('link', { name: 'Overview', exact: true })
+      // See the rename note above — the root rail item is `Home`.
+      .getByRole('link', { name: new RegExp('^Home( \\(|$)') })
       .click({ modifiers: ['ControlOrMeta'] })
     const popup = await popupPromise
     // Either a real new page appeared, or the browser at minimum did NOT
@@ -243,7 +262,7 @@ test.describe('nav: the active pill is one view-transition group', () => {
     const startedBefore = await page.evaluate(
       () => (window as unknown as { __vtStarted: number }).__vtStarted,
     )
-    await rail.getByRole('link', { name: 'Files', exact: true }).click()
+    await navLink(rail, 'Files').click()
     await expect(page, 'the route still changes under reduced motion').toHaveURL(
       /\/files$/,
     )

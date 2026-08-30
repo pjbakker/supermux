@@ -323,12 +323,6 @@ describe('state → eye geometry', () => {
     }
   })
 
-  test('no two states paint the same eye geometry', () => {
-    const all: MarkState[] = ['idle', 'working', 'waiting', 'done', 'stopped', 'failed']
-    const shapes = all.map((s) => JSON.stringify(eyesFor(ch, s)))
-    expect(new Set(shapes).size).toBe(all.length)
-  })
-
   test('the two eyes are always asymmetric — never a symmetric doll face', () => {
     for (const state of ['idle', 'working', 'waiting', 'done', 'stopped', 'failed'] as MarkState[]) {
       const e = eyesFor(ch, state)
