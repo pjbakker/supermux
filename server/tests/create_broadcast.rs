@@ -77,6 +77,7 @@ fn create_input(name: &str, dir: &std::path::Path) -> CreateInput {
         model: None,
         company_id: None,
         archive_on_stop: None,
+        config_dir: None,
         ..Default::default()
     }
 }

@@ -1173,6 +1173,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -1221,6 +1222,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -1293,6 +1295,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -1363,6 +1366,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -1443,6 +1447,7 @@ mod tests {
             model: None,
             company_id: None,
             archive_on_stop: None,
+            config_dir: None,
             ..Default::default()
         };
         crate::sessions::create(&state, mk("old-host", "/old")).await.unwrap();
@@ -1984,6 +1989,7 @@ mod tests {
                 model: String::new(),
                 company_id: None,
                 archive_on_stop: false,
+                config_dir: String::new(),
             },
         )
         .await

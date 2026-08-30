@@ -129,6 +129,7 @@ async fn make_session(h: &Harness, name: &str, provider: &str, host_id: Option<i
             model: String::new(),
             company_id: None,
             archive_on_stop: false,
+            config_dir: String::new(),
         },
     )
     .await

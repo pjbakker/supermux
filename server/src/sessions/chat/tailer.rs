@@ -938,7 +938,7 @@ async fn run(state: AppState, name: String, handle: Arc<TailerHandle>) {
             };
         }
 
-        let project = resumable::project_dir_for(&row.dir);
+        let project = resumable::project_dir_for(&row.config_dir, &row.dir);
         let conv = row.cc_conversation_id.clone();
         let rebuilt = rebuild(&mut core, &project, &conv);
 

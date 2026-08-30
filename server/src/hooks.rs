@@ -1265,6 +1265,7 @@ mod tests {
                 model: String::new(),
                 company_id: Some(company.id),
                 archive_on_stop: false,
+                config_dir: String::new(),
             },
         )
         .await

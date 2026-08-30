@@ -104,7 +104,7 @@ async fn seed_bot(state: &AppState, name: &str, dir: &str, company_id: Option<i6
 /// Write a one-line transcript for `dir` under the current `CLAUDE_CONFIG_DIR`,
 /// with the given `cwd`. Returns the project dir it landed in.
 fn seed_transcript(dir: &str, sid: &str, cwd: &str) -> PathBuf {
-    let proj = super::project_dir_for(dir);
+    let proj = super::project_dir_for("", dir);
     std::fs::create_dir_all(&proj).unwrap();
     let line = serde_json::json!({ "type": "user", "cwd": cwd, "msg": "hi" });
     std::fs::write(proj.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
@@ -145,7 +145,7 @@ async fn hq_to_company_moves_dir_and_stamps_company() {
     assert!(Path::new(&want).is_dir(), "the dir moved on disk");
     assert!(!Path::new(&old_dir).exists(), "old dir is gone");
     // Transcript rehomed under the NEW encoded path.
-    let new_proj = super::project_dir_for(&want);
+    let new_proj = super::project_dir_for("", &want);
     assert!(new_proj.join("s1.jsonl").exists(), "transcript rehomed");
     assert_eq!(res.moved_files, serde_json::json!("moved"));
 }
@@ -357,7 +357,7 @@ async fn transcript_is_rehomed_and_cwd_rewritten() {
     super::move_to_company(&state, "bot", Some(beta)).await.unwrap();
 
     let new_dir = Path::new(&beta_root).join("bot").display().to_string();
-    let new_proj = super::project_dir_for(&new_dir);
+    let new_proj = super::project_dir_for("", &new_dir);
     assert!(new_proj.join("conv1.jsonl").exists(), "transcript at new encoded path");
     assert!(!old_proj.exists(), "old transcript dir gone");
     let new_canonical = std::fs::canonicalize(&new_dir).unwrap().display().to_string();
@@ -621,7 +621,7 @@ async fn cross_fs_move_removes_the_source_after_a_successful_commit() {
     assert!(!Path::new(&old_dir).exists(), "source removed AFTER the commit");
 
     // The transcript rehome stayed consistent with the copy path.
-    let new_proj = super::project_dir_for(&new_dir.display().to_string());
+    let new_proj = super::project_dir_for("", &new_dir.display().to_string());
     assert!(new_proj.join("conv1.jsonl").exists(), "transcript rehomed");
     assert!(!old_proj.exists(), "old transcript dir gone");
     assert_eq!(

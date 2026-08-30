@@ -179,7 +179,11 @@ pub fn scrub_inherited_agent_env() -> Vec<&'static str> {
 /// all, `codex` launches its own binary and ignores `CLAUDE_CODE_*`, and the
 /// RETIRED `kimi` (see [`crate::sessions::RETIRED_PROVIDERS`]) can never be
 /// launched again — none of the three is a Claude pane.
-fn launches_claude(provider: &str) -> bool {
+///
+/// This is also the rule for a session's `config_dir` (migration 0041): the
+/// launch line's `CLAUDE_CONFIG_DIR` export, the Resume picker and recall all
+/// read this predicate, so all three agree on whose transcripts a session owns.
+pub(crate) fn launches_claude(provider: &str) -> bool {
     !matches!(provider, "codex" | "kimi" | "shell")
 }
 
@@ -564,6 +568,28 @@ fn build_env(
     env
 }
 
+/// The `export CLAUDE_CONFIG_DIR=...` prefix for a session that launches claude
+/// (migration 0041), or the empty string when the session carries no config dir
+/// (the daemon default, byte-identical to the pre-0041 launch line). The value
+/// is charset-validated at the HTTP boundary (`sessions::valid_config_dir`) and
+/// single-quoted here as well, so nothing can break out of the line.
+///
+/// Gated on [`launches_claude`], which is the same gate the Claude-only env in
+/// [`build_env`] uses. It matters for the RETIRED `kimi`: since that provider's
+/// launch arm was removed, a legacy kimi row reaching this builder would fall
+/// through to the claude arm, and a row that gets no `CLAUDE_CODE_*` env and
+/// whose picker reads the daemon's transcripts must not get the export either.
+/// `start` refuses a retired provider long before this, so no live row is
+/// affected either way.
+fn config_dir_export(s: &Session) -> String {
+    let dir = s.config_dir.trim();
+    if dir.is_empty() || !launches_claude(&s.provider) {
+        String::new()
+    } else {
+        format!("export CLAUDE_CONFIG_DIR='{dir}'; ")
+    }
+}
+
 /// Build the agent launch command sent into the freshly-spawned shell. Profiles
 /// are sourced first so `claude`/`codex` are on PATH in a non-login pane.
 /// Claude resumes via `cc_session_name` → `cc_conversation_id` → fresh `--name`.
@@ -589,7 +615,10 @@ fn build_launch_command(
     s: &Session,
     mcp_flags: &[String],
 ) -> (String, bool) {
-    let (agent, resume_intended) = match s.provider.as_str() {
+    // Third element: the `CLAUDE_CONFIG_DIR` export (migration 0041), built by
+    // the arm that actually launches the agent so the command and the export can
+    // never disagree about which account this session boots on.
+    let (agent, resume_intended, config_dir_export) = match s.provider.as_str() {
         "codex" => {
             // Keep Codex in the normal terminal buffer so the browser terminal
             // retains scrollback. This is Codex CLI's documented TUI flag.
@@ -662,7 +691,8 @@ fn build_launch_command(
             );
             // Codex has no supermux-driven resume: the command never carries
             // `--resume`, so `wait_for_agent_ready` treats it as a fresh start.
-            (agent, false)
+            // No config-dir export either: Codex does not read CLAUDE_CONFIG_DIR.
+            (agent, false, String::new())
         }
         // `shell` never reaches this builder, and a RETIRED provider is refused
         // in `start` long before it gets here (see `is_retired_provider`), so
@@ -741,7 +771,9 @@ fn build_launch_command(
             for word in mcp_flags {
                 parts.push(shell_escape::unix::escape(std::borrow::Cow::Borrowed(word)).into_owned());
             }
-            (parts.join(" "), resume_intended)
+            // This arm runs `claude`, so this is where the session's own Claude
+            // login applies (migration 0041).
+            (parts.join(" "), resume_intended, config_dir_export(s))
         }
     };
     // "Edit in native editor": point `$EDITOR`/
@@ -761,10 +793,15 @@ fn build_launch_command(
     // BOT_MEMORY_* is unset.
     let bin_dir = config.data_dir.join("bin");
     let bin_dir = bin_dir.display();
+    // Per-session Claude login (migration 0041). A session can be pointed at a
+    // second account's config dir. The export was built by the launch arm
+    // above; it lands AFTER the profile sources so a user `~/.zprofile` that
+    // sets its own CLAUDE_CONFIG_DIR cannot override it, and BEFORE `{agent}`
+    // so the launched provider inherits it.
     let command = format!(
         "source ~/.zprofile 2>/dev/null; source ~/.bash_profile 2>/dev/null; \
          source ~/.profile 2>/dev/null; export EDITOR='{bridge}' VISUAL='{bridge}'; \
-         export PATH='{bin_dir}':\"$PATH\"; {agent}"
+         export PATH='{bin_dir}':\"$PATH\"; {config_dir_export}{agent}"
     );
     (command, resume_intended)
 }
@@ -4200,6 +4237,7 @@ mod build_env_tests {
             skills: "[]".into(),
             role_id: None,
             archive_on_stop: 0,
+            config_dir: String::new(),
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session, &[]);
@@ -4267,6 +4305,7 @@ mod build_env_tests {
             skills: "[]".into(),
             role_id: None,
             archive_on_stop: 0,
+            config_dir: String::new(),
         };
 
         // Fresh: no cc handles → `--name`, not resume-intended.
@@ -4290,6 +4329,150 @@ mod build_env_tests {
         let (cmd, resume) = build_launch_command(&config, &by_name, &[]);
         assert!(cmd.contains("--resume 'my-chat'"));
         assert!(resume);
+    }
+
+    /// A session with a `config_dir` boots Claude under that account: the export
+    /// lands AFTER the profile sources (so a user `~/.zprofile` cannot win) and
+    /// BEFORE the agent (so `claude` inherits it). Claude-only, single-quoted,
+    /// and absent entirely when the session has no config dir.
+    #[test]
+    fn claude_launch_exports_the_session_config_dir() {
+        let config = cfg();
+        let base = Session {
+            name: "acct".into(),
+            display_name: "Acct".into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "claude".into(),
+            flags: String::new(),
+            pinned: 0,
+            archived: 0,
+            auto_continue: 0,
+            auto_continue_msg: String::new(),
+            rate_limit_resume_text: String::new(),
+            tags: "[]".into(),
+            creator: String::new(),
+            branch: String::new(),
+            worktree: 0,
+            worktree_repo: String::new(),
+            mcp: String::new(),
+            created_at: 0,
+            start_count: 0,
+            last_started: 0,
+            last_send: 0,
+            last_send_text: String::new(),
+            task_summary: String::new(),
+            cc_session_name: String::new(),
+            cc_conversation_id: String::new(),
+            codex_session_id: String::new(),
+            start_error: String::new(),
+            team_name: None,
+            host_id: None,
+            company_id: None,
+            runtime: "native".into(),
+            mark_pin: None,
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
+            config_dir: "/home/agent/.claude-second".into(),
+        };
+
+        let (command, _resume) = build_launch_command(&config, &base, &[]);
+        assert!(
+            command.contains("export CLAUDE_CONFIG_DIR='/home/agent/.claude-second';"),
+            "missing single-quoted export: {command}"
+        );
+        let profile_at = command.find("source ~/.profile").expect("profile sourced");
+        let export_at = command.find("export CLAUDE_CONFIG_DIR=").expect("export present");
+        let agent_at = command.find("claude --name acct").expect("agent launched");
+        assert!(
+            profile_at < export_at && export_at < agent_at,
+            "export must sit between the profile sources and the agent: {command}"
+        );
+        // The whole line still parses as shell.
+        let status = std::process::Command::new("bash")
+            .args(["-n", "-c", &command])
+            .status()
+            .expect("bash must be available to validate the launch command");
+        assert!(status.success(), "launch line must parse as shell: {command}");
+
+        // No config dir -> byte-identical to today: nothing exported at all.
+        let plain = Session { config_dir: String::new(), ..base.clone() };
+        let (command, _resume) = build_launch_command(&config, &plain, &[]);
+        assert!(!command.contains("CLAUDE_CONFIG_DIR"), "{command}");
+    }
+
+    /// The export decision lives in the launch arms, so it cannot disagree with
+    /// the command it prefixes. Codex and Kimi run their own CLI and never get
+    /// it, even when the row carries a config dir (a duplicate of a Claude
+    /// session, say). An unknown/legacy provider falls through to the claude arm
+    /// and DOES get it, because that row really does boot claude.
+    /// [`launches_claude`] is the same rule for the Resume picker and recall, so
+    /// assert the two stay in step.
+    #[test]
+    fn the_config_dir_export_follows_the_arm_that_launches_claude() {
+        let config = cfg();
+        let base = Session {
+            name: "acct".into(),
+            display_name: "Acct".into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "codex".into(),
+            flags: String::new(),
+            pinned: 0,
+            archived: 0,
+            auto_continue: 0,
+            auto_continue_msg: String::new(),
+            rate_limit_resume_text: String::new(),
+            tags: "[]".into(),
+            creator: String::new(),
+            branch: String::new(),
+            worktree: 0,
+            worktree_repo: String::new(),
+            mcp: String::new(),
+            created_at: 0,
+            start_count: 0,
+            last_started: 0,
+            last_send: 0,
+            last_send_text: String::new(),
+            task_summary: String::new(),
+            cc_session_name: String::new(),
+            cc_conversation_id: String::new(),
+            codex_session_id: String::new(),
+            start_error: String::new(),
+            team_name: None,
+            host_id: None,
+            company_id: None,
+            runtime: "tmux".into(),
+            mark_pin: None,
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
+            config_dir: "/home/agent/.claude-second".into(),
+        };
+        // `shell` is deliberately absent: `start` settles a shell session
+        // without ever calling this builder, so there is no launch line to
+        // assert. The predicate still answers false for it.
+        for provider in ["claude", "legacy-agent", "codex", "kimi"] {
+            let session = Session { provider: provider.into(), ..base.clone() };
+            let (command, _resume) = build_launch_command(&config, &session, &[]);
+            assert_eq!(
+                command.contains("export CLAUDE_CONFIG_DIR='/home/agent/.claude-second';"),
+                launches_claude(provider),
+                "provider '{provider}': the export must follow the launch arm: {command}"
+            );
+        }
+        assert!(!launches_claude("shell"), "shell never launches claude");
     }
 
     #[test]
@@ -4337,6 +4520,7 @@ mod build_env_tests {
             skills: "[]".into(),
             role_id: None,
             archive_on_stop: 0,
+            config_dir: String::new(),
         };
 
         let (command, _resume) = build_launch_command(&config, &session, &[]);
@@ -4571,6 +4755,7 @@ mod build_env_tests {
             skills: "[]".into(),
             role_id: None,
             archive_on_stop: 0,
+            config_dir: String::new(),
         }
     }
 
@@ -4926,7 +5111,7 @@ mod stale_resume_tests {
     fn with_transcript(session_dir: &str, conv: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("supermux-cc-lc-{}", uuid::Uuid::new_v4()));
         std::env::set_var("CLAUDE_CONFIG_DIR", &root);
-        let proj = crate::sessions::resumable::project_dir_for(session_dir);
+        let proj = crate::sessions::resumable::project_dir_for("", session_dir);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join(format!("{conv}.jsonl")), b"{}\n").unwrap();
         root

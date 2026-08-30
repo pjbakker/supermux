@@ -93,6 +93,7 @@ async fn make_session(state: &AppState, name: &str, company: Option<i64>, dir: &
             model: String::new(),
             company_id: company,
             archive_on_stop: false,
+            config_dir: String::new(),
         },
     )
     .await
@@ -126,6 +127,7 @@ async fn make_remote_session(
             model: String::new(),
             company_id: company,
             archive_on_stop: false,
+            config_dir: String::new(),
         },
     )
     .await

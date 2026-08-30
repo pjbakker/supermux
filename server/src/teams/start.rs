@@ -293,6 +293,8 @@ pub async fn start_team(
             prompt: None,
             unless_live_prefix: None,
             max_quiet_secs: None,
+            // Boots on the daemon default Claude login.
+            config_dir: None,
         },
     )
     .await?;
@@ -716,6 +718,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -769,6 +772,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -811,6 +815,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                config_dir: None,
                 ..Default::default()
             },
         )
@@ -860,6 +865,7 @@ mod tests {
                 model: None,
                 company_id: None,
                 archive_on_stop: None,
+                config_dir: None,
                 ..Default::default()
             },
         )

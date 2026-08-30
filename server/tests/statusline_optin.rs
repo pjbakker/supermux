@@ -103,6 +103,7 @@ async fn session_create_and_start_never_install_the_statusline() {
             model: None,
             company_id: None,
             archive_on_stop: None,
+            config_dir: None,
             ..Default::default()
         },
     )

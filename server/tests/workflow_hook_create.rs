@@ -103,6 +103,7 @@ async fn make_session(h: &Harness, name: &str) -> String {
             model: String::new(),
             company_id: None,
             archive_on_stop: false,
+            config_dir: String::new(),
         },
     )
     .await
