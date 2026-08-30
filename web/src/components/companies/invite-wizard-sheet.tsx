@@ -305,8 +305,58 @@ function inboxChipFor(status?: ExternalStatus): { state: ChipState; label: strin
 
 // ── Step 1 — Domain / external access ─────────────────────────────────────────
 
-const CF_SCOPES =
-  'Account · Cloudflare Tunnel: Edit\nZone · DNS: Edit\nZone · Zone: Read\nZone · Email Routing Rules: Edit'
+/** The permission rows to add in Cloudflare's token editor. Each row is that
+ *  editor's three dropdowns — group, permission, level — so they are LISTED for
+ *  the operator to pick, never offered as text to paste (there is nowhere to
+ *  paste them). `why` says what supermux does with each one; the last row is
+ *  only needed for the optional agent email address.
+ *
+ *  Kept in lockstep with what the code actually calls: Tunnel:Edit for
+ *  `POST /accounts/{id}/cfd_tunnel` (external_access/cf.rs), DNS:Edit for the
+ *  wildcard CNAME, Zone:Read to find the zone, Email Routing Rules:Edit for the
+ *  agent inbox. */
+/** The taps, in order. `*…*` marks what the operator reads off the Cloudflare UI
+ *  (a menu item, a button, a field) so the eye can find it — one authored list
+ *  instead of seven hand-built paragraphs. */
+const CF_TOKEN_STEPS: string[] = [
+  'Open *dash.cloudflare.com* in another tab and sign in.',
+  'Go to *My Profile → API Tokens*, or *Manage Account → API Tokens*. Both kinds of token work here.',
+  'Tap *Create Token*, then *Create Custom Token*.',
+  'Under *Permissions*, add these rows. Each row is three dropdowns:',
+  'Under *Zone Resources*, choose *Include → Specific zone* and pick your domain.',
+  'Tap *Continue to summary*, then *Create Token*.',
+  'Copy the token straight away — Cloudflare shows it one time — and paste it below.',
+]
+/** Which step the permission rows hang under (0-based). */
+const PERMISSIONS_STEP = 3
+
+/** Render one step, lifting `*marked*` fragments to foreground weight. */
+function Steps({ text }: { text: string }) {
+  return (
+    <>
+      {text.split('*').map((part, i) =>
+        i % 2 === 1 ? (
+          <span key={i} className="text-foreground">
+            {part}
+          </span>
+        ) : (
+          <React.Fragment key={i}>{part}</React.Fragment>
+        ),
+      )}
+    </>
+  )
+}
+
+const CF_PERMISSIONS: { row: string; why: string; optional?: boolean }[] = [
+  { row: 'Account · Cloudflare Tunnel · Edit', why: 'creates the tunnel to your box' },
+  { row: 'Zone · DNS · Edit', why: 'points your domain at that tunnel' },
+  { row: 'Zone · Zone · Read', why: 'lists your domains so you can pick one' },
+  {
+    row: 'Zone · Email Routing Rules · Edit',
+    why: 'only for the agent email address',
+    optional: true,
+  },
+]
 
 function DomainStep({
   status,
@@ -383,6 +433,13 @@ function DomainStep({
   }
 
   // Sub-step 1a — no token yet.
+  //
+  // The copy here is the whole feature for a non-expert: the owner followed the
+  // previous version into a zone's menu looking for a "Cloudflare Tunnel" item
+  // that does not live there (tunnels are ACCOUNT-level — dash.cloudflare.com →
+  // Networking → Tunnels). supermux creates the tunnel over the API, so the
+  // honest instruction is simply "make a token", spelled as numbered taps with
+  // the real 2026 menu names.
   if (!cfValid) {
     return (
       <div className="flex flex-col gap-4">
@@ -394,33 +451,58 @@ function DomainStep({
           <ArrowLeft className="size-3.5" /> Other options
         </button>
         <p className="text-sm text-muted-foreground">
-          Give your colleagues a web address to reach this supermux. First connect the Cloudflare
-          account that manages your domain.
+          Your colleagues will reach this supermux at an address on your own domain, like{' '}
+          <span className="font-mono text-foreground">team.acme.com</span>. supermux builds the
+          Cloudflare tunnel and the DNS record for you. The one thing it needs from you is an API
+          token.
         </p>
+
+        <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
+          <p className="text-sm font-medium text-foreground">Make the token in Cloudflare</p>
+          <ol className="flex flex-col gap-2 text-[12.5px] leading-snug text-muted-foreground">
+            {CF_TOKEN_STEPS.map((step, i) => (
+              <li key={step}>
+                <span className="font-medium text-foreground">{i + 1}.</span>{' '}
+                <Steps text={step} />
+                {/* The permission rows belong inside the step that asks for them. */}
+                {i === PERMISSIONS_STEP && (
+                  <ul className="mt-1.5 flex flex-col gap-1.5">
+                    {CF_PERMISSIONS.map((p) => (
+                      <li key={p.row} className="rounded-lg bg-[var(--gr-sel)] px-2.5 py-1.5">
+                        <span className="font-mono text-[12px] text-foreground">{p.row}</span>
+                        <span className="block text-[11.5px] text-muted-foreground">
+                          {p.optional ? 'Optional — ' : ''}
+                          {p.why}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+
         <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
           <label htmlFor="cf-token" className="text-sm font-medium text-foreground">
-            Cloudflare API token
+            Paste your Cloudflare API token
           </label>
-          <p className="text-[12.5px] leading-snug text-muted-foreground">
-            Create a token scoped to the zone for your domain with these permissions, then paste it
-            here. Cloudflare shows the token once — copy it before you close that page.
-          </p>
-          <CopyField value={CF_SCOPES.replace(/\n/g, '  ·  ')} label="Copy the required scopes" />
           <SecretInput id="cf-token" value={token} onChange={setToken} placeholder="Paste the token" invalid={cf.isError} />
           {cf.isError && <p className="text-sm text-destructive">{errText(cf.error)}</p>}
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[12px] text-muted-foreground">
-              dash.cloudflare.com → My Profile → API Tokens
-            </span>
+          <div className="flex items-center justify-end gap-2">
             <Button
               type="button"
               size="sm"
               onClick={() => cf.mutate(token)}
               disabled={token.trim().length < 8 || cf.isPending}
             >
-              {cf.isPending ? 'Verifying…' : 'Verify token'}
+              {cf.isPending ? 'Checking…' : 'Check the token'}
             </Button>
           </div>
+          <p className="text-[12px] leading-snug text-muted-foreground">
+            supermux stores the token on your own box, readable only by supermux, and never shows it
+            again.
+          </p>
         </div>
       </div>
     )

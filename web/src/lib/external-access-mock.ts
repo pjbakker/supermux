@@ -242,7 +242,10 @@ export const externalAccessMock = {
       throw new SessionError('That token looks too short — paste the full Cloudflare API token.', 400)
     }
     if (token.trim().toLowerCase().startsWith('bad')) {
-      throw new SessionError('Token active but missing DNS · Edit — recreate it with the listed scopes.', 400)
+      throw new SessionError(
+        'This Cloudflare token is missing a permission: Zone · DNS: Edit — add that row to the token and create it again.',
+        400,
+      )
     }
     state.cfToken = 'valid'
     return { valid: true, account_id: 'a1b2c3d4e5f6a7b8c9d0' }
