@@ -24,6 +24,8 @@
 // never a surprise reload). It is a strict SUPERSET trigger for the bar, never a
 // second reload mechanism that could fight the SW path.
 
+import { isOwnerPlane } from '@/lib/viewer'
+import { useViewer } from '@/stores/viewer-store'
 import { markCurrent, markWaiting } from '@/lib/sw-update'
 
 /** How often the running bundle asks the server for its live build sha. Matches
@@ -215,6 +217,17 @@ export function startVersionGuard(): void {
   started = true
 
   const check = async () => {
+    // OWNER PLANE ONLY. `/api/version` is not member-reachable
+    // (`server/src/scope.rs`), and an anonymous visitor has no credentials at
+    // all — so for either of them this heartbeat can only ever produce a 401.
+    // That 401 is not harmless: the global fetch instrumentation classifies
+    // 401/403 as `auth_invalid`, which is STICKY and raises the full-screen
+    // `<ConnectionOverlay>` ("Your session expired") — over a login gate on
+    // which nobody has signed in yet, or over a colleague whose cookie is
+    // perfectly valid. The probe is an owner-facing deploy-freshness tell; it
+    // is checked per TICK (not once at boot) because the viewer resolves
+    // asynchronously on a cookie shell.
+    if (!isOwnerPlane(useViewer.getState().viewer)) return
     reconcileServedSha(await fetchServedSha(), __APP_BUILD_SHA__)
   }
 

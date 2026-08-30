@@ -35,6 +35,7 @@ import { cn } from '@/lib/utils'
 import { springs } from '@/lib/springs'
 import { isIOS } from '@/lib/ios-splash'
 import { isStandalone } from '@/hooks/use-standalone-mode'
+import { useOverlayOpen } from '@/stores/overlay-gate-store'
 
 const DISMISS_KEY = 'supermux-a2hs-dismissed'
 
@@ -102,6 +103,15 @@ export function A2HSInstructionsSheet() {
   // (navigator + localStorage), so it is safe at first render and needs no
   // effect. A non-iOS / standalone / already-dismissed load starts closed.
   const [open, setOpen] = React.useState(isIOSSafariNotStandalone)
+  // STAND DOWN UNDER A BLOCKING OVERLAY. This is a bottom sheet at `z-[70]`, so
+  // on an invited colleague's very first iPhone load it painted straight over
+  // the one question that load exists to ask ("Welcome to <Company>" + their
+  // name). The shared overlay gate — the same counter the onboarding
+  // WelcomeBanner already respects — is the app's answer to "a coachmark must
+  // not cover a modal". Only the RENDER is suppressed: the internal `open` and
+  // the dismissal memory are untouched, so the coaching arrives intact the
+  // moment the overlay clears.
+  const suppressed = useOverlayOpen()
 
   function handleOpenChange(next: boolean) {
     setOpen(next)
@@ -115,7 +125,7 @@ export function A2HSInstructionsSheet() {
   // Non-modal keeps the dimmed overlay but lets taps reach the buttons — the same
   // decision the focus `MobileSheet` already makes ("don't lock the rest of app").
   return (
-    <Drawer.Root open={open} onOpenChange={handleOpenChange} modal={false}>
+    <Drawer.Root open={open && !suppressed} onOpenChange={handleOpenChange} modal={false}>
       <Drawer.Portal>
         <Drawer.Overlay className="fixed inset-0 z-[70] bg-black/40" />
         <Drawer.Content

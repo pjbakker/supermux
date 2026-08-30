@@ -3,6 +3,12 @@
 // localStorage) preserves a clean Capacitor wrap path — the native WebView
 // injects these via a bootstrap script.
 
+// Relative, not `@/lib/viewer`: env.ts is on the import path of modules whose bun
+// unit tests resolve tsconfig paths from the ROOT config, which is a solution
+// file with no `paths` (see the same note in lib/api/client.ts). Vite resolves
+// both forms identically — this is spelling, not behaviour.
+import { storedAccessKey } from './lib/viewer'
+
 declare global {
   interface Window {
     _SUPERMUX_AUTH_TOKEN?: string
@@ -14,9 +20,23 @@ declare global {
   }
 }
 
-/** Bearer token for HTTP requests + the WS first-frame auth message. */
+/** Bearer token for HTTP requests + the WS first-frame auth message.
+ *
+ *  Two sources, in this order:
+ *    1. `window._SUPERMUX_AUTH_TOKEN` — the shell splice. Present on a TRUSTED
+ *       owner transport only (loopback / `*.ts.net` / a configured owner host);
+ *       see `static_assets::should_splice_admin_token`. This is the owner path
+ *       and it is unchanged.
+ *    2. An access key the owner pasted into the login gate on a host that (by
+ *       design) is never given the splice — a company / quick-tunnel host. It is
+ *       verified against `/auth/me` BEFORE it is stored, so a stored key is a
+ *       key the server accepted.
+ *
+ *  An invited colleague has neither: they authenticate by the `supermux_hsess`
+ *  cookie, which rides same-origin requests on its own. `''` then, exactly as
+ *  before. */
 export function authToken(): string {
-  return window._SUPERMUX_AUTH_TOKEN ?? ''
+  return window._SUPERMUX_AUTH_TOKEN ?? storedAccessKey()
 }
 
 /** API base URL. Falls back to same-origin via `import.meta.env.BASE_URL`. */

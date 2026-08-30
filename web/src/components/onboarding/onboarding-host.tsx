@@ -37,6 +37,7 @@ import {
 } from '@/lib/onboarding'
 import { useOverlayOpen } from '@/stores/overlay-gate-store'
 import { useUI } from '@/stores/ui-store'
+import { useViewer } from '@/stores/viewer-store'
 import { shouldShowBotModeIntro } from '@/lib/botmode-onboarding'
 import { WelcomeBanner } from './welcome-banner'
 import { TourOverlay } from './tour-overlay'
@@ -72,8 +73,18 @@ export function OnboardingHost() {
   // mount (non-reactive `getState()` — turning Bot Mode on inside the flow
   // reloads the app, so this never needs to re-run live). Shown on the overview
   // only, like the rest of the unboxing.
-  const [showBotIntro, setShowBotIntro] = React.useState(() =>
-    shouldShowBotModeIntro(useUI.getState().botMode),
+  //
+  // A MEMBER NEVER SEES IT (owner bug #2). The intro's whole purpose is to sell
+  // a mode SWITCH, and an invited colleague has no switch to make — they are
+  // always in bot mode (the member lock forces `botMode` on before this mounts,
+  // which alone would suppress it; the explicit `kind !== 'member'` conjunct
+  // makes the intent legible rather than incidental). Their one-time arrival
+  // surface is the name sheet in `<ViewerBoundary>` instead.
+  const isMember = useViewer((s) => s.viewer.kind === 'member')
+  const [showBotIntro, setShowBotIntro] = React.useState(
+    () =>
+      useViewer.getState().viewer.kind !== 'member' &&
+      shouldShowBotModeIntro(useUI.getState().botMode),
   )
 
   // Decide first-launch eligibility ONCE, at mount — a later write of the flag
@@ -135,7 +146,7 @@ export function OnboardingHost() {
 
   // The Bot Mode intro is a full-screen modal on the overview — show it first
   // and let it own the screen (it suppresses the v2 banner while up).
-  if (showBotIntro && onOverview) {
+  if (showBotIntro && !isMember && onOverview) {
     return (
       // `fallback={null}`: the intro is the first thing this user sees, and a
       // spinner-then-story reads worse than the story arriving a frame later.

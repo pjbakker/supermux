@@ -21,6 +21,7 @@ import { botModeOn, BOT_KILL_SWITCH_KEY } from '@/lib/bot-mode-flag'
 import { GROK_KILL_SWITCH_KEY } from '@/lib/grok-mode-flag'
 import { agentHueVarsFor } from '@/lib/grok-agent-hue'
 import { useUI } from '@/stores/ui-store'
+import { useIsOwnerPlane } from '@/stores/viewer-store'
 import {
   ShellOverlayProvider,
   useShellOverlayProvider,
@@ -99,6 +100,12 @@ interface NavItem {
    *  app is byte-identical (the store/terminal stay reachable there via the
    *  command palette + Settings, exactly as before). */
   grokOnly?: boolean
+  /** OWNER PLANE. Dropped from BOTH nav surfaces for an invited colleague, whose
+   *  server scope (`server/src/scope.rs`) admits none of what the destination
+   *  carries — the updater, the remote-host registry, external access + invite
+   *  management, company create/delete. Absent on every other item, so the
+   *  owner's rail and tab bar are byte-identical. */
+  ownerOnly?: boolean
 }
 
 const NAV: NavItem[] = [
@@ -143,6 +150,12 @@ const NAV: NavItem[] = [
     icon: SettingsGlyph,
     tour: 'settings',
     badgeKind: 'updates',
+    // Settings is the owner plane's front door — Updates, Remote hosts,
+    // External access, the company lifecycle. A member is refused every one of
+    // them server-side, so the item never renders for them. (Under grok it is
+    // `grokHidden` anyway; this makes it true off grok too, so a kill-switched
+    // skin cannot hand a colleague the door.)
+    ownerOnly: true,
     // Under grok the roster's top-right `.gr-me` avatar IS the Settings doorway
     // (grok-roster.tsx — `onClick navigate('/settings')`), and the Settings
     // route grows its own close-X, so a redundant nav slot only crowds the
@@ -182,12 +195,14 @@ export function NavBadgeDot({ state }: { state: UpdateBadgeState }) {
  *  entry, so the rail carries only Overview / Files / Settings. */
 function SideNav({ grok }: { grok: boolean }) {
   const { state: updateBadge } = useUpdateBadge()
+  const ownerPlane = useIsOwnerPlane()
   // grok: drop `grokHidden` (base Focus) and keep the `grokOnly` doorways
   // (Terminal + Connectors). base: drop the `grokOnly` doorways so the default
   // rail is byte-identical (Overview / Focus / Files / Settings).
-  const items = grok
+  const items = (grok
     ? NAV.filter((item) => !item.grokHidden)
     : NAV.filter((item) => !item.grokOnly)
+  ).filter((item) => ownerPlane || !item.ownerOnly)
   return (
     <nav
       aria-label="Primary"
@@ -286,9 +301,12 @@ function MobileTopBar(_props: { overview: boolean }) {
  *  drops (`desktopOnly` always; `grokHidden` under grok, `grokOnly` off grok).
  *  Exported so the pill-truth test can assert the path→cell mapping against the
  *  SAME array the render + `--nav-n` use (see `bottom-nav-pill.test.ts`). */
-export function bottomNavItems(grok: boolean): NavItem[] {
+export function bottomNavItems(grok: boolean, ownerPlane = true): NavItem[] {
   return NAV.filter(
-    (item) => !item.desktopOnly && (grok ? !item.grokHidden : !item.grokOnly),
+    (item) =>
+      !item.desktopOnly &&
+      (grok ? !item.grokHidden : !item.grokOnly) &&
+      (ownerPlane || !item.ownerOnly),
   )
 }
 
@@ -333,13 +351,14 @@ export function reconcileNavPill(
  *  natural way into a focused session is tapping a tile in Overview. */
 function BottomNav({ grok }: { grok: boolean }) {
   const { state: updateBadge } = useUpdateBadge()
+  const ownerPlane = useIsOwnerPlane()
   // Always drop `desktopOnly` (base Focus). Under grok, keep the `grokOnly`
   // doorway (Connectors) and drop `grokHidden`; under base, drop the `grokOnly`
   // doorways so the default tab bar is byte-identical (Overview / Files /
   // Settings). The `data-tab-count` (the route cells) + `--nav-n` let
   // grok-mode.css place the sliding pill. (The bottom-nav Search button was
   // removed — Overview carries the roster search and ⌘K the command palette.)
-  const items = bottomNavItems(grok)
+  const items = bottomNavItems(grok, ownerPlane)
   // ── The sliding-pill driver (grok phone nav, "Liquid Rail") ────────────────
   //  The active-indicator is ONE persistent pill (`data-nav-pill`, painted below
   //  the cells) translated by whole cells via a single `--nav-i` custom prop and

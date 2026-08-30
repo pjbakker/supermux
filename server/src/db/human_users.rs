@@ -177,3 +177,17 @@ pub async fn insert(
     .await?;
     Ok(res.last_insert_rowid())
 }
+
+/// Set a human's own `display_name` (the P3a self-service profile write behind
+/// `POST /auth/profile`). The caller has ALREADY resolved `id` from its own
+/// session cookie, so this never takes a name from the request — only the value
+/// for the row the session belongs to. `display_name` is validated (trimmed,
+/// 1..=64 chars) at the handler boundary. Returns `true` if a row was updated.
+pub async fn set_display_name(pool: &SqlitePool, id: i64, display_name: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query("UPDATE human_users SET display_name = ? WHERE id = ?")
+        .bind(display_name)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}

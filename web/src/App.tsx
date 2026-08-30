@@ -18,6 +18,8 @@ import { PushBridge } from '@/components/pwa/push-bridge'
 import { SWUpdatePrompt } from '@/components/pwa/sw-update-prompt'
 import { ConfirmDialogProvider } from '@/components/ui/confirm-dialog'
 import { OnboardingHost } from '@/components/onboarding/onboarding-host'
+import { ViewerBoundary } from '@/components/auth/viewer-boundary'
+import { useIsOwnerPlane } from '@/stores/viewer-store'
 import { useRendererPrefsSync } from '@/hooks/use-renderer-prefs-sync'
 import { ConnectionOverlay } from '@/components/connection/connection-overlay'
 import { MorphCommitProbe } from '@/components/view-transitions/morph'
@@ -219,6 +221,15 @@ const queryClient = new QueryClient({
   },
 })
 
+/** Guard for a route that belongs to the OWNER plane. A member is redirected to
+ *  their own roster (`/`) rather than shown a page whose every panel the server
+ *  refuses. `replace` so the back button does not bounce them into it again. */
+function OwnerPlaneRoute({ children }: { children: React.ReactNode }) {
+  const ownerPlane = useIsOwnerPlane()
+  if (!ownerPlane) return <Navigate to="/" replace />
+  return <>{children}</>
+}
+
 /** The renderer-preference sync, as a null component — a hook needs a mount
  *  point and `App` itself sits OUTSIDE `QueryClientProvider`. */
 function RendererPrefsSync() {
@@ -270,6 +281,17 @@ export default function App() {
                 go: an OS confirm can only render a string, which is why the
                 consequence enumeration was impossible before. */}
             <ConfirmDialogProvider>
+            {/* THE VIEWER IDENTITY GATE (fix/invite-viewer-identity). Everything
+                below renders only once we know WHO is looking: an anonymous
+                visitor on a company host gets the branded login screen instead of
+                the app (and, critically, instead of the Bot-Mode onboarding
+                intro, which used to be the first thing they saw); an invited
+                colleague gets the app locked to their own company plus a
+                one-time name sheet. The OWNER path is unchanged and synchronous —
+                a shell carrying the spliced admin bearer resolves to `owner` in
+                the store's initial state, so children paint on the first frame
+                exactly as before. */}
+            <ViewerBoundary>
             {/* "Add to Home Screen" coaching sheet — self-gates to the
                 first iOS-Safari (non-standalone) load, then remembers dismiss. */}
             <A2HSInstructionsSheet />
@@ -376,12 +398,20 @@ export default function App() {
                   path="/hosts"
                   element={<Navigate to="/settings#hosts" replace />}
                 />
+                {/* Settings is the OWNER PLANE's front door — Updates, Remote
+                    hosts, External access, the company lifecycle. It is dropped
+                    from nav and from ⌘K for an invited colleague; this closes
+                    the last way in (a typed URL / an old bookmark) by landing
+                    them on their own roster instead of a page of surfaces the
+                    server would refuse one by one. */}
                 <Route
                   path="/settings"
                   element={
-                    <Suspense fallback={null}>
-                      <Settings />
-                    </Suspense>
+                    <OwnerPlaneRoute>
+                      <Suspense fallback={null}>
+                        <Settings />
+                      </Suspense>
+                    </OwnerPlaneRoute>
                   }
                 />
                 <Route
@@ -686,6 +716,7 @@ export default function App() {
               )}
               </Route>
             </Routes>
+            </ViewerBoundary>
             </ConfirmDialogProvider>
             </ToastProvider>
           </TooltipProvider>

@@ -27,6 +27,7 @@
 import * as React from 'react'
 
 import { updatesApi, type PreflightStatus } from '@/lib/api'
+import { useIsOwnerPlane } from '@/stores/viewer-store'
 
 const POLL_INTERVAL_MS = 30_000
 const DISMISSED_TAG_KEY = 'supermux:updates:dismissed_tag'
@@ -133,8 +134,15 @@ function readMockSnapshot(): PreflightStatus | null {
   }
 }
 
-/** Mounted in `Layout`. Polls every 30s for the lightweight badge state. */
+/** Mounted in `Layout`. Polls every 30s for the lightweight badge state.
+ *
+ *  SILENT FOR A NON-OWNER. The updater is owner plane: `/api/updates/*` is not
+ *  member-reachable (`server/src/scope.rs`), so for an invited colleague this
+ *  poll could only ever produce a 30-second heartbeat of refusals behind a dot
+ *  they must not see anyway. The viewer store answers synchronously for the
+ *  owner, so this changes nothing on the owner path. */
 export function useUpdateBadge(): UseUpdateBadge {
+  const ownerPlane = useIsOwnerPlane()
   const [snap, setSnap] = React.useState<PreflightStatus | null>(() => readMockSnapshot())
   const [dismissedTag, setDismissedTag] = React.useState<string | null>(() => readDismissedTag())
 
@@ -156,10 +164,11 @@ export function useUpdateBadge(): UseUpdateBadge {
   }, [])
 
   React.useEffect(() => {
+    if (!ownerPlane) return
     void fetchSnap()
     const t = window.setInterval(() => void fetchSnap(), POLL_INTERVAL_MS)
     return () => window.clearInterval(t)
-  }, [fetchSnap])
+  }, [fetchSnap, ownerPlane])
 
   // Watch localStorage from other tabs (a "Mark as seen" in tab B should also
   // clear the dot in tab A within ~event-loop time).

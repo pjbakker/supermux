@@ -37,6 +37,11 @@ export interface SpaceCrumbProps {
   onShowSpaces: () => void
   /** Jump to a bot's working dir. */
   onPickSession: (name: string) => void
+  /** Is the HQ space offered at all? `false` for an invited colleague, who is
+   *  fenced to exactly one company server-side and has no HQ — the trigger then
+   *  never falls back to the "HQ" label either. Defaults to `true`, so the
+   *  owner's Files header is unchanged. */
+  allowHq?: boolean
 }
 
 export function SpaceCrumb({
@@ -46,10 +51,11 @@ export function SpaceCrumb({
   onPickSpace,
   onShowSpaces,
   onPickSession,
+  allowHq = true,
 }: SpaceCrumbProps) {
   const [open, setOpen] = React.useState(false)
   const current = companies.find((c) => c.id === activeCompany) ?? null
-  const label = current ? current.display_name : 'HQ'
+  const label = current ? current.display_name : allowHq ? 'HQ' : ''
 
   const close = () => setOpen(false)
 
@@ -66,9 +72,9 @@ export function SpaceCrumb({
       >
         {current ? (
           <CompanyMark slug={current.slug} name={current.display_name} logo={current} size={22} />
-        ) : (
+        ) : allowHq ? (
           <HqMark size={22} />
-        )}
+        ) : null}
         <span className="max-w-[5.5rem] truncate font-medium sm:max-w-[9rem]">
           {label}
         </span>
@@ -98,15 +104,17 @@ export function SpaceCrumb({
 
           <div className="my-1 h-px bg-border" />
 
-          <SheetRow
-            active={activeCompany === null}
-            onClick={() => {
-              close()
-              onPickSpace(null)
-            }}
-            icon={<HqMark size={28} />}
-            label="HQ"
-          />
+          {allowHq && (
+            <SheetRow
+              active={activeCompany === null}
+              onClick={() => {
+                close()
+                onPickSpace(null)
+              }}
+              icon={<HqMark size={28} />}
+              label="HQ"
+            />
+          )}
           {companies.map((c) => (
             <SheetRow
               key={c.id}
