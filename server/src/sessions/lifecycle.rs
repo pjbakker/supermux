@@ -2285,7 +2285,10 @@ async fn start_locked_inner(
         //
         // LOCAL ROWS ONLY: a remote session's `dir` lives on the far side of the
         // SSH ControlMaster, where this `is_dir()` would measure the wrong box.
-        // Gated on `host_id`, not runtime, so a local tmux row is covered too.
+        // Gated on `host_id`, not runtime, so a local tmux row is covered too —
+        // and it needs to be: the same opaque 500 was reachable on a local tmux
+        // row as well, where the ENOENT surfaces as a "spawn pty holder" or a
+        // bare tmux error rather than as anything the user can act on.
         //
         // INSIDE `freshly_spawned` deliberately: a start on an already-alive
         // session (resume, or a plain no-op) never spawns and stays
@@ -4374,6 +4377,65 @@ mod agent_ready_heuristics_tests {
         let cap = "❯ 1. check the queue, 2. answer the oldest issue\n\
                    Do you want to proceed?\n❯ 1. Yes\n  2. No, keep going";
         assert_eq!(submit_state(cap, prompt), SubmitState::Submitted);
+    }
+
+    /// Codex coverage, ported from pjbakker/feat/prompt-delivery-verification.
+    /// Codex draws its approval selector under a `›` cursor and confirms with
+    /// "Press enter to confirm", so the selector arm has to fire on a glyph the
+    /// Claude fixtures never exercise — that arm is the only thing stopping a
+    /// retry Enter from confirming a highlighted destructive default.
+    #[test]
+    fn submit_state_reads_a_codex_approval_selector_as_submitted() {
+        assert_eq!(
+            submit_state(
+                "› run the deploy script\n› 1. Yes\n› 2. No\nPress enter to confirm",
+                "run the deploy script",
+            ),
+            SubmitState::Submitted,
+        );
+    }
+
+    /// The regression Paul's own version failed: a codex composer echoing a
+    /// NUMBERED prompt draws `› 1. …`, which is shaped exactly like his codex
+    /// selector fixture. `line_is_prompt_echo` has to strip `›` as well as `❯`,
+    /// or a stuck codex boot reports a confident Submitted with zero retries.
+    /// His fixture passed only because it had no digit after the cursor.
+    #[test]
+    fn a_numbered_codex_prompt_echo_is_not_mistaken_for_a_selector() {
+        assert_eq!(
+            submit_state("› 1. check the queue 2. drain it\n? for shortcuts", "1. check the queue 2. drain it"),
+            SubmitState::Stuck,
+        );
+    }
+
+    /// The accepted ambiguity, pinned rather than left in a doc comment (ported
+    /// from Paul's branch). A fast turn that already finished can echo the prompt
+    /// into the TRANSCRIPT above an empty composer, which is indistinguishable
+    /// from a swallowed Enter. It reads Stuck, so the session collects up to
+    /// three harmless extra Enters on an idle composer — the safe direction.
+    #[test]
+    fn submit_state_transcript_echo_reads_stuck_not_unknown() {
+        assert_eq!(
+            submit_state(
+                "❯ You are the operator, boot now\nDone. Summary posted.\n❯ ",
+                "You are the operator, boot now",
+            ),
+            SubmitState::Stuck,
+        );
+    }
+
+    /// The short-prompt path through `prompt_tail`'s `.unwrap_or(0)`: a prompt
+    /// under PROMPT_TAIL_CHARS is matched whole rather than by its tail. Ported
+    /// from Paul's branch, with the busy fixture rewritten — ours classifies off
+    /// `agent_busy`, which requires the literal "esc to interrupt", not off the
+    /// looser status ACTIVE_BANK his version reused.
+    #[test]
+    fn submit_state_short_prompt_is_matched_whole() {
+        assert_eq!(submit_state("❯ hi there", "hi there"), SubmitState::Stuck);
+        assert_eq!(
+            submit_state("✻ Pondering… (esc to interrupt · 2s)", "hi there"),
+            SubmitState::Submitted,
+        );
     }
 
     /// `start()` holds the per-session lock across delivery, so the verify window is
