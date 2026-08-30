@@ -26,7 +26,7 @@
  * the working-only breathe all come from `<SessionFace>` (WS4) for free.
  */
 import * as React from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   Archive,
@@ -58,7 +58,7 @@ import { SessionFace } from '@/components/roster/session-face'
 import { TeamCrewChip } from '@/components/team/team-crew-chip'
 import { SessionMark } from '@/brand/marks'
 import { attentionFor, markStateForSession } from '@/lib/mark-status'
-import { smartSort, nameSort } from '@/lib/overview-layout'
+import { compactAgo, smartSort, nameSort } from '@/lib/overview-layout'
 import { useArmedConfirm } from '@/hooks/use-armed-confirm'
 import { useToast } from '@/components/ui/use-toast'
 import { TEAMS_KEY } from '@/hooks/use-teams'
@@ -84,7 +84,13 @@ import {
   inCompanyScope,
   companyFirstOrder,
 } from '@/lib/companies'
-import { GroupChatEntry, routerName } from '@/components/chat/group-chat'
+import {
+  CompanyChannelRow,
+  GroupChatEntry,
+  groupChatSurface,
+  routerName,
+  useCompanyChannel,
+} from '@/components/chat/group-chat'
 import { ScopeTitle } from '@/components/roster/company-switcher'
 import { NavBadgeDot } from '@/components/layout'
 import { useUpdateBadge } from '@/hooks/use-update-badge'
@@ -110,6 +116,16 @@ const BotPanel = React.lazy(() =>
 // once a chat-eligible bot is opened.
 const ThreadPane = React.lazy(() =>
   import('@/components/chat/thread-pane').then((m) => ({ default: m.ThreadPane })),
+)
+
+// THE COMPANY CHANNEL, in the SAME right pane a bot's thread uses. Reused
+// verbatim — this is the presentational `<ChatChannel>` the full-bleed
+// `/company/:id/chat` page mounts, given the pane's box instead of the window's,
+// so there is exactly one channel surface in the app. Lazy for the same reason
+// `ThreadPane` is: a roster that never opens the channel must not pay for the
+// markdown/transcript stack.
+const ChatChannel = React.lazy(() =>
+  import('@/components/chat/group-chat/channel').then((m) => ({ default: m.ChatChannel })),
 )
 
 // The per-TEAM page — the crew half of "talk to the lead". Lazy for the same
@@ -138,6 +154,11 @@ type Sel =
   | { kind: 'bot'; name: string }
   | { kind: 'team'; team: string }
   | { kind: 'member'; team: string; agent: string }
+  // The COMPANY CHANNEL is a row too (desktop): it is scoped to the active
+  // company, so it carries no id of its own — switching company switches which
+  // channel this means, which is exactly the scope semantics the rail already
+  // has for every other row.
+  | { kind: 'channel' }
   | null
 
 /** The bot-panel's tab keys — mirrors `BotPanelProps['initialTab']` so a deep-link
@@ -154,6 +175,7 @@ type BotTab = BotPanelTabKey
 function selKey(sel: Sel): string {
   if (!sel) return ''
   if (sel.kind === 'bot') return `bot:${sel.name}`
+  if (sel.kind === 'channel') return 'channel'
   return `team:${sel.team}`
 }
 
@@ -170,15 +192,7 @@ function relativeTime(iso?: string): string {
   if (!iso) return ''
   const then = Date.parse(iso)
   if (Number.isNaN(then)) return ''
-  const secs = Math.max(0, Math.round((Date.now() - then) / 1000))
-  if (secs < 45) return 'now'
-  const mins = Math.round(secs / 60)
-  if (mins < 60) return `${mins}m`
-  const hrs = Math.round(mins / 60)
-  if (hrs < 24) return `${hrs}h`
-  const days = Math.round(hrs / 24)
-  if (days === 1) return 'Yesterday'
-  return `${days}d`
+  return compactAgo((Date.now() - then) / 1000)
 }
 
 /** The last non-blank line of the roster-wide ANSI-stripped tail — the honest
@@ -685,6 +699,23 @@ export default function GrokRoster() {
     [allSessions, activeCompany],
   )
 
+  // The viewport fork, read ONCE for the whole roster: it decides the phone
+  // scroll-away header AND which group-chat doorway this surface gets.
+  const isPhone = useMediaQuery('(max-width: 767px)')
+
+  // ── The company channel, resolved ONCE for the rail and the pane ────────────
+  // Both the pinned row (its facepile, preview line and unread badge) and the
+  // right pane (`<ChatChannel>`) read this ONE `useCompanyChannel`, so the row
+  // you click and the conversation it opens can never disagree — and there is
+  // exactly one `/ws/companies/{id}/groupchat` socket, not two.
+  //
+  // PHONE PASSES `null` ON PURPOSE. The phone doorway is still `<GroupChatEntry>`,
+  // which mounts its own copy of this hook; handing this one a company as well
+  // would open a second socket on a phone that has no pane to show it in. `null`
+  // makes the hook inert (no socket, `enabled === false`), so mobile pays
+  // nothing and behaves exactly as it did.
+  const channel = useCompanyChannel(isPhone ? null : activeCompanyRow, companySessions)
+
   const [rawQuery, setRawQuery] = React.useState('')
   const [sort, setSort] = React.useState<'smart' | 'alpha'>('smart')
   const [density, setDensity] = React.useState<Density>(readDensity)
@@ -796,7 +827,13 @@ export default function GrokRoster() {
       const stillInScope =
         selected.kind === 'bot'
           ? filtered.some((s) => s.name === selected.name)
-          : filteredTeams.some((t) => t.team_name === selected.team)
+          : selected.kind === 'channel'
+            ? // The channel selection is SCOPE-RELATIVE: switching into another
+              // company that also has a channel keeps the pane on "the company
+              // chat" — now that company's. Only a scope with no channel at all
+              // (HQ, or a company that never opted in) re-homes to its top bot.
+              channel.enabled
+            : filteredTeams.some((t) => t.team_name === selected.team)
       if (!stillInScope) {
         const top =
           groups.needs[0] ?? groups.active[0] ?? groups.done[0] ?? groups.idle[0] ?? null
@@ -849,7 +886,7 @@ export default function GrokRoster() {
   // the SSE snapshot closes its own pane instead of stranding it.
   const selectedTeam = React.useMemo(
     () =>
-      selected && selected.kind !== 'bot'
+      selected && (selected.kind === 'team' || selected.kind === 'member')
         ? teams.find((t) => t.team_name === selected.team) ?? null
         : null,
     [selected, teams],
@@ -939,7 +976,8 @@ export default function GrokRoster() {
   // Phone-only affordance: the desktop two-pane keeps its static header (a
   // scroll-away over the rail would strand the fixed detail pane), matching the
   // CSS, which scopes the overlay + transform to `(max-width: 767px)`.
-  const isPhone = useMediaQuery('(max-width: 767px)')
+  // (`isPhone` is resolved once, near the top — the group-chat doorway needs it
+  // before this point.)
   const {
     hidden: headHiddenRaw,
     onScroll: onScrollAway,
@@ -1010,6 +1048,32 @@ export default function GrokRoster() {
       prev?.kind === 'member' ? { kind: 'team', team: prev.team } : prev,
     )
   }, [])
+  // THE COMPANY CHANNEL, in the same pane a bot's thread uses (desktop only —
+  // the phone doorway still routes to the full-bleed page). No URL change, for
+  // the same reason opening a bot or a team makes none: on desktop the PANE is
+  // the surface, and the roster keeps its scroll, selection and entry animations.
+  const openChannel = React.useCallback(() => {
+    setSelected({ kind: 'channel' })
+    setPaneView('thread')
+  }, [])
+
+  // …but the channel still has a SHAREABLE url. `/company/:id/chat` stays the
+  // link; on desktop that route redirects to the overview carrying this marker
+  // in the router state (see `routes/company-chat.tsx`), so a shared link lands
+  // in the split with the channel open instead of on a full-bleed page. Consumed
+  // once, then wiped, so a re-render or a back/forward cannot re-open it.
+  const location = useLocation()
+  const deepLinkChannel = (
+    location.state as { openCompanyChannel?: number } | null
+  )?.openCompanyChannel
+  React.useEffect(() => {
+    if (typeof deepLinkChannel !== 'number') return
+    setSelected({ kind: 'channel' })
+    setPaneView('thread')
+    navigate(location.pathname, { replace: true, state: null })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkChannel])
+
   // A dismissed team has no pane left to show.
   const clearSelection = React.useCallback(() => setSelected(null), [])
   // DESKTOP: the pane swaps in place — no /focus hop, no second shell. The rail
@@ -1044,7 +1108,29 @@ export default function GrokRoster() {
   // search-aware), so the two stay in lockstep while searching too. All-HQ (no
   // companies) ⇒ `filtered` is every session and `filteredTeams` every team, so
   // this is byte-identical to the old unfiltered census — behaviour-neutral.
-  const hasDetail = !!selectedSession || !!selectedTeam
+  // The channel EXISTS when its Router session is in the company's roster — the
+  // same read `useCompanyChannel` makes, spelled out here because the phone hook
+  // is deliberately inert (it was handed `null`) and the dock still needs it.
+  const channelExists = !!(
+    activeCompanyRow && companySessions.some((s) => s.name === routerName(activeCompanyRow.slug))
+  )
+  // Which doorway this viewport gets — the ONE pure rule (`group-chat/surface.ts`,
+  // unit-tested): 'dock' on a phone (today's compact card → full-bleed page),
+  // 'row' on desktop (a pinned roster row → the right pane), 'none' for HQ, an
+  // un-opted company, or a desktop search this row does not answer.
+  const gcSurface = groupChatSurface({
+    enabled: channelExists,
+    isPhone,
+    query: rawQuery,
+    displayName: activeCompanyRow?.display_name,
+    slug: activeCompanyRow?.slug,
+  })
+  // The channel owns the right pane. Guarded on `channel.enabled` (not just the
+  // selection) so a stale selection after a company switch cannot paint an empty
+  // channel for a frame.
+  const channelOpen = selected?.kind === 'channel' && channel.enabled && !!activeCompanyRow
+
+  const hasDetail = !!selectedSession || !!selectedTeam || channelOpen
 
   const SECTIONS: { key: GroupKey; label: string }[] = [
     { key: 'needs', label: 'Needs you' },
@@ -1183,27 +1269,24 @@ export default function GrokRoster() {
         </span>
       </header>
 
-      {/* ── THE COMPANY GROUP CHAT DOORWAY (spec §7.3, rev) ──────────────────
-          One COMPACT row between the header and the two-pane body — NOT the
-          embedded hero it used to be. The channel is a destination now: this row
-          shows `#slug`, the member count and the latest line with an unread
-          badge, and tapping it opens the full-bleed `/company/:id/chat` page
-          where the chat has the whole screen. That ends the "worst of both
-          worlds": the overview keeps its room, and the chat gets its own.
+      {/* ── THE COMPANY GROUP CHAT DOORWAY — PHONE (spec §7.3, rev) ──────────
+          One COMPACT card between the header and the list, opening the
+          full-bleed `/company/:id/chat` page: a phone has no right pane, so the
+          channel still wants the whole screen. UNCHANGED behaviour — it is now
+          simply scoped to the phone, because desktop got the better doorway (a
+          pinned roster row + the right pane, below).
 
-          Gated on the Router's existence (the same enablement read the entry
-          makes) so HQ and a company that never opted in add ZERO DOM — no empty
-          padded strip above the roster. */}
-      {activeCompanyRow &&
-        companySessions.some((s) => s.name === routerName(activeCompanyRow.slug)) && (
-          <div className="gc-dock flex-none px-3 pb-2" style={railHueStyle}>
-            <GroupChatEntry
-              company={activeCompanyRow}
-              sessions={companySessions}
-              onOpen={() => navigate(`/company/${activeCompanyRow.id}/chat`)}
-            />
-          </div>
-        )}
+          Gated on the Router's existence so HQ and a company that never opted in
+          add ZERO DOM — no empty padded strip above the roster. */}
+      {gcSurface === 'dock' && activeCompanyRow && (
+        <div className="gc-dock flex-none px-3 pb-2" style={railHueStyle}>
+          <GroupChatEntry
+            company={activeCompanyRow}
+            sessions={companySessions}
+            onOpen={() => navigate(`/company/${activeCompanyRow.id}/chat`)}
+          />
+        </div>
+      )}
 
       <div className="gr-two">
         <div
@@ -1219,6 +1302,29 @@ export default function GrokRoster() {
             data-fade-top={fade.top ? '' : undefined}
             data-fade-bottom={fade.bottom ? '' : undefined}
           >
+            {/* ── THE COMPANY CHAT, PINNED (desktop) ──────────────────────────
+                The owner's ask: on desktop the group chat behaves like a normal
+                bot chat — a row at the TOP of the roster, and the conversation in
+                the right pane. It is deliberately ABOVE the section headers and
+                outside the sort/group machinery: it is not a bot competing for
+                attention order, it is the room they are all in. Its identity is
+                the entry card's facepile (WHO is in the room), in a normal row's
+                clothes so it never reads as a banner. */}
+            {gcSurface === 'row' && (
+              <CompanyChannelRow
+                members={channel.members}
+                latest={
+                  channel.feed.rows.length > 0
+                    ? channel.feed.rows[channel.feed.rows.length - 1]!
+                    : null
+                }
+                loading={channel.feed.isLoading}
+                unread={channel.feed.unread}
+                active={selected?.kind === 'channel'}
+                onOpen={openChannel}
+              />
+            )}
+
             {/* The persistent "Hire a new bot" ghost row was removed (owner): with
                 bots present the header's own New-bot button is the single create
                 affordance, and the zero-bots empty state below still carries its
@@ -1304,7 +1410,41 @@ export default function GrokRoster() {
           </div>
         </div>
 
-        {selectedTeam && selectedMember ? (
+        {channelOpen && activeCompanyRow ? (
+          // THE CHANNEL, IN THE BOT-CHAT PANE. Same box, same header slot, same
+          // composer as a bot's thread — the SAME `<ChatChannel>` the full-bleed
+          // phone page mounts, only handed the pane's height instead of the
+          // window's (`feedMaxHeight="none"` lets its own flex chain fill).
+          // No `headerLeading` back button: the roster it came from is on screen.
+          <React.Suspense fallback={<div className="gr-pane" data-shell-pane aria-hidden />}>
+            <div className="gr-pane" data-shell-pane style={railHueStyle}>
+              <ChatChannel
+                company={activeCompanyRow}
+                members={channel.members}
+                rows={channel.feed.rows}
+                loading={channel.feed.isLoading}
+                error={channel.feed.isError}
+                hasMore={channel.feed.hasMore}
+                loadingMore={channel.feed.loadingMore}
+                onLoadMore={channel.feed.loadMore}
+                unread={channel.feed.unread}
+                firstUnreadSeq={channel.feed.firstUnreadSeq}
+                onSeenBottom={channel.feed.markRead}
+                onSend={channel.send}
+                routerLabel={channel.routerLabel}
+                // The Router's REAL session status drives the "is routing…" row,
+                // exactly as the full-bleed page reads it.
+                routerWorking={
+                  channel.router ? markStateForSession(channel.router) === 'working' : false
+                }
+                routerSeed={channel.router?.name}
+                surface="desktop"
+                feedMaxHeight="none"
+                className="min-h-0 flex-1"
+              />
+            </div>
+          </React.Suspense>
+        ) : selectedTeam && selectedMember ? (
           // A TEAMMATE, IN THE SAME PANE (Phase 3). Read-only by construction —
           // the teammate WS drops input — and the pane says so with a pill, not
           // with a composer that cannot be typed into.

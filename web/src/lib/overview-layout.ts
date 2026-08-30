@@ -56,6 +56,27 @@
 
 import type { ApiSession } from './api'
 
+/**
+ * "now / 5m / 3h / Yesterday / 4d" — the ROSTER COLUMN's clock.
+ *
+ * Pure (the caller reads `Date.now()`), and shared because two things now sit in
+ * the same timestamp column: a bot row's age and the pinned company-chat row's
+ * latest message. A second ladder there would print "3 d ago" one line above
+ * "3d", which is exactly the kind of drift a shared function prevents.
+ */
+export function compactAgo(secondsAgo: number): string {
+  if (!Number.isFinite(secondsAgo)) return ''
+  const secs = Math.max(0, Math.round(secondsAgo))
+  if (secs < 45) return 'now'
+  const mins = Math.round(secs / 60)
+  if (mins < 60) return `${mins}m`
+  const hrs = Math.round(mins / 60)
+  if (hrs < 24) return `${hrs}h`
+  const days = Math.round(hrs / 24)
+  if (days === 1) return 'Yesterday'
+  return `${days}d`
+}
+
 /** Global sort modes — same wire shape as before for back-compat with the
  *  existing server pref ("alpha" stays valid). */
 export type SortMode = 'smart' | 'alpha' | 'custom'

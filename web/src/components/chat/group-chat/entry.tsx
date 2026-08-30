@@ -27,7 +27,7 @@ import { cn } from '@/lib/utils'
 
 import { Facepile, type FacepileMember } from '../ui'
 import { useCompanyChannel } from './use-company-channel'
-import type { GroupChatRow } from './types'
+import { channelPreview } from './surface'
 
 /** "3m ago" for the newest row. The clock is read HERE rather than in the
  *  render body: a component that calls `Date.now()` while rendering is impure
@@ -35,13 +35,6 @@ import type { GroupChatRow } from './types'
  *  `relativeTime` uses for a session's age. */
 function agoOf(tsSeconds: number): string {
   return ago(Math.floor(Date.now() / 1000) - tsSeconds)
-}
-
-/** One line of preview for the latest row — "author: body", the routing/
- *  milestone verbs left to the full channel. Kept short; the row truncates. */
-function previewOf(row: GroupChatRow): string {
-  const body = row.body.replace(/\s+/g, ' ').trim()
-  return row.authorName ? `${row.authorName}: ${body}` : body
 }
 
 export interface GroupChatEntryProps {
@@ -69,11 +62,9 @@ export function GroupChatEntry({ company, sessions, onOpen, style, className }: 
   // ChannelMember IS a FacepileMember (seed/pin/name/state/attention); the cluster
   // draws the first three, so a big company shows a tidy 3-face badge, not 41.
   const pile: readonly FacepileMember[] = members
-  const preview = latest
-    ? previewOf(latest)
-    : feed.isLoading
-      ? 'Opening the channel…'
-      : 'No messages yet — start the conversation'
+  // One shared sentence for both doorways (`surface.ts`) — the dock card and the
+  // desktop pinned row must never describe the same feed differently.
+  const preview = channelPreview(latest, feed.isLoading)
 
   return (
     <button

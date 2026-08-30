@@ -6,10 +6,18 @@
  * channel is finally a page and not a peek — a real channel that has room to
  * feel better than the embedded hero ever could.
  *
- * Both phone and desktop route here (the channel wants the screen; a bottom
- * pane cramps it). `<Layout>` treats `/company/*` as chromeless — no top bar, no
- * bottom nav, `<main>` `overflow-hidden` — so this route paints the whole window
- * and the channel's own flex chain fills and scrolls internally.
+ * PHONE routes here (the channel wants the screen; a bottom pane cramps it).
+ * `<Layout>` treats `/company/*` as chromeless — no top bar, no bottom nav,
+ * `<main>` `overflow-hidden` — so this route paints the whole window and the
+ * channel's own flex chain fills and scrolls internally.
+ *
+ * DESKTOP does NOT render here. The owner's ask is that the channel behave like
+ * a normal bot chat there: a row at the top of the roster, and the conversation
+ * in the right pane — which is exactly what a desktop bot chat is, and it has no
+ * URL of its own either. So the url stays SHAREABLE and this route becomes the
+ * redirect that honours it: it seats the company scope and bounces to the
+ * overview carrying `openCompanyChannel` in the router state, which
+ * `<GrokRoster>` consumes once to open the channel in its pane.
  *
  * Bot mode OFF, or a company with no channel (its Router never existed), or an
  * unknown id ⇒ redirect to `/`. The channel is not a surface the base app has.
@@ -41,6 +49,7 @@ export function CompanyChat() {
   const id = Number(companyId)
   const navigate = useNavigate()
   const isPhone = useMediaQuery('(max-width: 767px)')
+  const setActiveCompany = useUI((s) => s.setActiveCompany)
   const { resolvedTheme } = useTheme()
   // Inherit the SAME iOS keyboard machinery the 1:1 chat fought hard for (the
   // "mode 9" root-resize, packaged as this hook and already reused by the browser
@@ -70,8 +79,25 @@ export function CompanyChat() {
 
   const goHome = React.useCallback(() => navigate('/'), [navigate])
 
+  // DESKTOP: seat the scope the link names, then hand off to the roster. Done in
+  // an effect (never in render — it writes a store other components read) and
+  // BEFORE the companies query resolves on purpose: waiting would flash the
+  // full-bleed page for a tick, and the roster already reconciles an id that
+  // maps to no company back to HQ (`resolveActiveCompany`).
+  const desktop = !isPhone
+  React.useEffect(() => {
+    if (desktop && !Number.isNaN(id)) setActiveCompany(id)
+  }, [desktop, id, setActiveCompany])
+
   // Base app (bot mode off) or a bad id ⇒ never render the channel.
   if (!grok || Number.isNaN(id)) return <Navigate to="/" replace />
+
+  // Desktop: the channel lives in the roster's right pane, not on a page of its
+  // own. `replace` so Back returns where the link was opened from, not to a URL
+  // that immediately bounces again.
+  if (desktop) {
+    return <Navigate to="/" replace state={{ openCompanyChannel: id }} />
+  }
 
   // Wait for the roster before deciding a company "has no channel" — otherwise a
   // hard reload onto this URL would bounce to `/` before the data has landed.
