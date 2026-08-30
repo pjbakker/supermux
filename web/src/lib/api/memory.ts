@@ -48,7 +48,8 @@ export interface LearnedNoteDetail {
   body: string
 }
 
-export interface NotesResponse {
+/** What the route sends. */
+interface NotesPayload {
   notes: LearnedNote[]
   bot_count: number
   role_count: number
@@ -67,13 +68,35 @@ export interface NotesResponse {
   wired: boolean
 }
 
-const EMPTY: NotesResponse = { notes: [], bot_count: 0, role_count: 0, role: '', wired: false }
+/** What this module hands the panel: the payload plus whether the route answered
+ *  at all.
+ *
+ *  Both unwired shapes need a restart before the bot can write, but only ONE of
+ *  them can be restarted INTO memory. A `200` with `wired: false` is the common
+ *  eligible-but-not-yet-restarted bot — restart it and the hook lands. A `404`
+ *  is a session that is not a bot at all (no company, no role, no core notes):
+ *  `session_has_memory` stays false, so restarting it changes nothing and the
+ *  panel must ask for a role or a company FIRST. Only this module can tell the
+ *  two apart, so it says which it saw instead of flattening both into `wired`. */
+export interface NotesResponse extends NotesPayload {
+  /** `false` ⇒ the route 404'd: this session is not a bot yet. */
+  eligible: boolean
+}
+
+const EMPTY: NotesResponse = {
+  notes: [],
+  bot_count: 0,
+  role_count: 0,
+  role: '',
+  wired: false,
+  eligible: false,
+}
 
 /** A `404` here means "this session is not a bot" (no company, no role, no core
  *  notes, no store) — the tier is off, not broken, so it is not an error to
- *  surface. It comes back `wired: false`, the same flag an eligible-but-not-yet-
- *  restarted bot gets from the server on a `200`: both need the same restart
- *  before the bot can write. Anything else propagates. */
+ *  surface. It comes back `wired: false` AND `eligible: false`; see
+ *  [`NotesResponse`] for why the panel needs both bits. Anything else
+ *  propagates. */
 function emptyOn404(e: unknown): NotesResponse {
   if (e instanceof ApiError && e.status === 404) return EMPTY
   throw e
@@ -85,7 +108,7 @@ const base = (name: string) => `/api/sessions/${encodeURIComponent(name)}/memory
  *  (private ∪ role), freshest first. */
 export async function listNotes(name: string): Promise<NotesResponse> {
   try {
-    return await settingsRequest<NotesResponse>(`${base(name)}/notes`)
+    return { ...(await settingsRequest<NotesPayload>(`${base(name)}/notes`)), eligible: true }
   } catch (e) {
     return emptyOn404(e)
   }
@@ -101,7 +124,10 @@ export async function searchNotes(
   const params = new URLSearchParams({ q })
   if (limit) params.set('limit', String(limit))
   try {
-    return await settingsRequest<NotesResponse>(`${base(name)}/search?${params}`)
+    return {
+      ...(await settingsRequest<NotesPayload>(`${base(name)}/search?${params}`)),
+      eligible: true,
+    }
   } catch (e) {
     return emptyOn404(e)
   }

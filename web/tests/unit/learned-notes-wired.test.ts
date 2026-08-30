@@ -11,8 +11,11 @@
  * became eligible since its last start answers 200 with no hook and no way to
  * save — and got told it simply hadn't written anything yet.
  *
- * So: the flag comes off the wire, and a 404 still folds into the same unwired
- * empty (both need a restart before the bot can write).
+ * So: the flag comes off the wire. A 404 lands in the same UNWIRED empty, but it
+ * is not the same state — `eligible` keeps the two apart, because only the 200
+ * one can be restarted INTO memory. Restarting a session the route 404'd wires
+ * nothing (`session_has_memory` stays false), so that empty state names the step
+ * that actually comes first and offers no restart button.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
@@ -56,10 +59,13 @@ afterEach(() => {
 })
 
 describe('the memory client reports whether the bot can write, not whether it answered', () => {
-  test('a 404 is "not a bot" — empty AND unwired', async () => {
+  test('a 404 is "not a bot" — empty, unwired AND not eligible', async () => {
     serve(404)
     const out = await listNotes('plain-pane')
     expect(out.wired).toBe(false)
+    // The second bit: a restart cannot wire THIS session, so the panel must ask
+    // for a role or a company first instead of offering the restart button.
+    expect(out.eligible).toBe(false)
     expect(out.notes).toEqual([])
     expect(out.bot_count).toBe(0)
   })
@@ -70,6 +76,8 @@ describe('the memory client reports whether the bot can write, not whether it an
     serve(200, { notes: [], bot_count: 0, role_count: 0, role: '', wired: false })
     const out = await listNotes('mena')
     expect(out.wired).toBe(false)
+    // …and this one CAN be restarted into memory, which is what earns the button.
+    expect(out.eligible).toBe(true)
     expect(out.notes).toEqual([])
   })
 
@@ -105,10 +113,13 @@ describe('the memory client reports whether the bot can write, not whether it an
 
   test('search answers on the same two axes — the panel branches on one flag', async () => {
     serve(404)
-    expect((await searchNotes('plain-pane', 'migrations')).wired).toBe(false)
+    const miss = await searchNotes('plain-pane', 'migrations')
+    expect(miss.wired).toBe(false)
+    expect(miss.eligible).toBe(false)
     serve(200, { notes: [], bot_count: 0, role_count: 0, role: 'reviewer', wired: true })
     const hit = await searchNotes('mena', 'migrations')
     expect(hit.wired).toBe(true)
+    expect(hit.eligible).toBe(true)
     expect(hit.role).toBe('reviewer')
   })
 

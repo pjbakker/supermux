@@ -201,8 +201,10 @@ BENCH_QC.setQueryData<NotesResponse>(['learned-notes', BOT_PANEL_BENCH_NAME, '']
   bot_count: 2,
   role_count: 1,
   role: 'implementer',
-  // `wired` = the route answered 200 — i.e. the memory tier is ON for this bot.
-  // The bench frames the populated list, not the "memory isn't on yet" state.
+  // `eligible` = the route answered at all; `wired` = the recall hook is really
+  // in this bot's launch overlay. Both true here: the bench frames the populated
+  // list, not either "memory isn't on yet" state.
+  eligible: true,
   wired: true,
   notes: [
     {
@@ -248,6 +250,7 @@ BENCH_QC.setQueryData<NotesResponse>(['learned-notes', BOT_PANEL_BENCH_NAME, 'mi
   bot_count: 1,
   role_count: 0,
   role: 'implementer',
+  eligible: true,
   wired: true,
   notes: [
     {

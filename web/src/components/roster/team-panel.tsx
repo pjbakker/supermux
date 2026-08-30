@@ -695,6 +695,14 @@ function TeamPanelBody({
   const [restartAdvised, setRestartAdvised] = React.useState(false)
   const onRestartAdvised = React.useCallback(() => setRestartAdvised(true), [])
 
+  // A tab is a new body and starts at its own top — the same reset `bot-panel`
+  // does, and for the same reason: one scroller behind three tabs otherwise
+  // hands the next tab the previous one's offset.
+  const body = React.useRef<HTMLDivElement | null>(null)
+  React.useLayoutEffect(() => {
+    if (body.current) body.current.scrollTop = 0
+  }, [tab])
+
   const needs = needsYouCount(team)
   const progress = taskProgress(team)
   const sub = [
@@ -800,6 +808,7 @@ function TeamPanelBody({
 
       {/* scrolling tab body */}
       <div
+        ref={body}
         className={cn(
           'min-h-0 flex-1 overflow-y-auto px-5 py-5 [scrollbar-width:thin]',
           variant === 'sheet' && 'max-h-[70vh]',

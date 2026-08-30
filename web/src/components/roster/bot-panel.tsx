@@ -955,6 +955,7 @@ function RoleField({ name, session }: { name: string; session: ApiSession | null
  *  wearing the costume of data. Flags and Runtime are real on every row. */
 function LaunchInternals({ session }: { session: ApiSession | null }) {
   const mcp = session?.mcp?.trim() || ''
+  const flags = session?.flags?.trim() || ''
   return (
     <details className="group rounded-xl border border-border bg-card px-4 py-3">
       <summary className="cursor-pointer list-none text-[13px] font-medium text-foreground [&::-webkit-details-marker]:hidden">
@@ -971,11 +972,19 @@ function LaunchInternals({ session }: { session: ApiSession | null }) {
             </dd>
           </div>
         )}
-        <div className="flex items-baseline justify-between gap-3">
+        {/* The SAME stacked shape as MCP above, for the same reason: a launch
+            line is long. It also has to be a BLOCK box — on `<code>`'s default
+            `display: inline` both `truncate` and `max-w-full` are inert, and the
+            longest real flag lines (`--dangerously-skip-permissions
+            --permission-mode bypassPermissions`) then pushed the whole tab panel
+            sideways at 390px instead of clipping inside it. */}
+        <div className="flex flex-col gap-1">
           <dt className="text-muted-foreground">Flags</dt>
-          <dd className="min-w-0 text-right">
-            {session?.flags?.trim() ? (
-              <code className="max-w-full truncate rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[11px]">{session.flags}</code>
+          <dd className="min-w-0">
+            {flags ? (
+              <code className="block max-w-full truncate rounded-md bg-muted/60 px-2 py-1.5 font-mono text-[12px] text-foreground">
+                {flags}
+              </code>
             ) : (
               <span className="text-muted-foreground">None</span>
             )}
@@ -1216,6 +1225,17 @@ function BotPanelBody({
   const [restartAdvised, setRestartAdvised] = React.useState(false)
   const onRestartAdvised = React.useCallback(() => setRestartAdvised(true), [])
 
+  // ONE scroller serves all three tabs, so a tab switch used to keep the
+  // previous tab's offset: from a scrolled Overview, the header's own "Say what
+  // this bot does →" opened Setup at Notifications/Advanced — past the field it
+  // names, which for an unconfigured bot is the whole point of the tap. A tab is
+  // a new body; it starts at its own top. Layout effect, so the reset lands in
+  // the same paint as the new body rather than as a visible jump.
+  const body = React.useRef<HTMLDivElement | null>(null)
+  React.useLayoutEffect(() => {
+    if (body.current) body.current.scrollTop = 0
+  }, [tab])
+
   const label = displayLabel(session ?? { name })
   // The sub-line is the bot's STANDING JOB, not `status · model · branch` — two
   // of those three are empty on every live row, so it collapsed to "idle ·
@@ -1382,6 +1402,7 @@ function BotPanelBody({
 
       {/* scrolling tab body */}
       <div
+        ref={body}
         className={cn(
           'min-h-0 flex-1 overflow-y-auto px-5 py-5 [scrollbar-width:thin]',
           variant === 'sheet' && 'max-h-[70vh]',

@@ -192,6 +192,67 @@ describe('the tab bar fits a 390 / 320px phone', () => {
 })
 
 /**
+ * 2c — Advanced clips its long values instead of panning the panel sideways.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The Flags value was a bare `<code className="max-w-full truncate …">`. `<code>`
+ * is `display: inline`, and on an inline box BOTH of those are inert — so a real
+ * launch line (`--dangerously-skip-permissions --permission-mode …`) measured
+ * 474px inside a 390px column and took the whole `#bot-tabpanel` with it
+ * (scrollWidth 557 vs clientWidth 390). The sibling MCP row had it right.
+ *
+ * Structural proof again — bun has no layout engine — but a precise one: every
+ * `<code>` inside `<LaunchInternals>` must be a BLOCK box before `truncate` can
+ * mean anything.
+ */
+describe('the Advanced disclosure cannot overflow its column', () => {
+  test('every code value in LaunchInternals is a block box, so truncate applies', () => {
+    const src = readFileSync(
+      new URL('../../src/components/roster/bot-panel.tsx', import.meta.url),
+      'utf8',
+    )
+    const start = src.indexOf('function LaunchInternals(')
+    expect(start).toBeGreaterThan(-1)
+    const body = src.slice(start, src.indexOf('\n}', start))
+    const codes = body.match(/<code className="[^"]*"/g) ?? []
+    // MCP and Flags — the two values long enough to overflow a phone.
+    expect(codes.length).toBe(2)
+    for (const c of codes) {
+      expect(c).toContain('block')
+      expect(c).toContain('truncate')
+      expect(c).toContain('max-w-full')
+    }
+  })
+})
+
+/**
+ * 2d — A tab opens at its own top.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * One scroller serves all three tabs, so switching carried the previous tab's
+ * offset over: from a scrolled Overview, the header's "Say what this bot does →"
+ * landed on Setup at scrollTop 869 of 869 — Notifications/Advanced, with the
+ * field the button names entirely off-screen. Asserted structurally on both
+ * panels: the scrolling body takes a ref, and an effect keyed on `tab` zeroes it.
+ */
+describe('switching tabs does not carry the previous tab’s scroll', () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8')
+
+  for (const file of ['bot-panel.tsx', 'team-panel.tsx']) {
+    test(`${file}: the tab body is reset when \`tab\` changes`, () => {
+      const src = read(`../../src/components/roster/${file}`)
+      const at = src.indexOf('const body = React.useRef<HTMLDivElement | null>(null)')
+      expect(at).toBeGreaterThan(-1)
+      const effect = src.slice(at, at + 300)
+      expect(effect).toContain('if (body.current) body.current.scrollTop = 0')
+      // Keyed on the tab, not on mount — a mount-only reset is the bug itself.
+      expect(effect).toContain('}, [tab])')
+      // …and the ref is actually attached to the scroller.
+      const panel = src.slice(src.indexOf('{/* scrolling tab body */}'))
+      expect(panel.slice(0, panel.indexOf('>'))).toContain('ref={body}')
+    })
+  }
+})
+
+/**
  * 3 — The glance stopped rendering fields no server writes.
  * ─────────────────────────────────────────────────────────────────────────────
  * The Overview opened on a 2×2 grid — Context ring / Tokens / Provider / Status

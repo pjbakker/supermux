@@ -19,7 +19,9 @@
  * `wired: false` — it reports whether the recall hook is really in the session's
  * launch overlay, so an eligible bot that has not been restarted since gaining
  * its role is unwired too, not merely note-less. The off state carries the
- * restart button, because the hook is wired at LAUNCH.
+ * restart button, because the hook is wired at LAUNCH — but only where a restart
+ * would change anything: a session that is not a bot yet (the route 404s) is
+ * asked for a role or a company first, with no button to mislead it.
  *
  * Markdown sits behind `React.lazy`, exactly as `transcript-item.tsx` does it:
  * the `react-markdown` stack stays in its own chunk and never lands in this
@@ -81,11 +83,16 @@ export function LearnedNotes({ name }: { name: string }) {
   })
 
   const notes = data?.notes ?? []
-  // Three states, not two. `wired` is the SERVER's answer to "can this bot write
+  // `wired` is the SERVER's answer to "can this bot write
   // a note at all?" (is the recall hook in its launch overlay), not the client's
   // reading of 200-vs-404 — that reading called every eligible-but-unrestarted
   // bot wired and told it it simply hadn't written anything yet.
   const notWired = Boolean(data) && !data?.wired
+  // Not the same bit as `wired`: `eligible` is whether the route answered at all
+  // (see `NotesResponse`). A restart wires the hook for an ELIGIBLE bot; for a
+  // session that is not a bot yet it does nothing, so that state names the step
+  // that comes first instead of offering the restart.
+  const eligible = Boolean(data?.eligible)
   // Derived, not synced: a row the current result set no longer contains simply
   // renders collapsed. Storing that in an effect would be a second source of
   // truth for the same fact, one render behind.
@@ -119,17 +126,25 @@ export function LearnedNotes({ name }: { name: string }) {
           {searching ? (
             <>No note matches “{debounced}”.</>
           ) : notWired ? (
-            <>
-              {/* The hook rides the session's launch overlay, so RESTART is the
-                  action for both unwired shapes — the bot that isn't a bot yet
-                  (no role, no company: the route 404s) and the far commoner one
-                  that became eligible after its last start. Naming the restart
-                  first keeps it honest for the second without misreading the
-                  first as already done. */}
-              Memory isn’t on for this bot yet — the recall hook is wired when it starts.
-              Restart it to switch memory on; a bot with no role or company gets one above first.
-              <RestartToApply name={name} />
-            </>
+            /* The hook rides the session's launch overlay, so RESTART is the
+               action — but ONLY for a bot a restart can actually change. A
+               session the route 404'd is not a bot yet (`session_has_memory` is
+               false: no company, no role, no core notes), so restarting it wires
+               nothing; offering the button there is a control that cannot do
+               what the sentence beside it promises. That bot gets the reachable
+               action instead, and no button. */
+            eligible ? (
+              <>
+                Memory isn’t on for this bot yet — the recall hook is wired when it starts.
+                Restart it to switch memory on.
+                <RestartToApply name={name} />
+              </>
+            ) : (
+              <>
+                Memory isn’t on for this bot yet. Give it a role or a company above, then
+                restart it — after that it writes what it learns here.
+              </>
+            )
           ) : (
             <>
               This bot hasn’t written any notes yet — the core notes above are its curated index.
