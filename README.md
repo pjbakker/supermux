@@ -10,10 +10,7 @@
   <!-- Bot Mode hero. Embedded as <img> so it autoplays everywhere GitHub renders
        (web logged-out, iOS Safari, the GitHub mobile app, IDE previews) and
        degrades to a clean static first frame. Click-through opens the HD MP4. -->
-  <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. The money shot:
-       phone frame → company chat where Sol asks Ada for the changelog, Ada posts a file,
-       a workflow step ticks green, a push notification slides in "Ada needs your approval." -->
-  <a href="docs/screenshots/botmode/hero.mp4"><img src="docs/screenshots/botmode/hero.gif" alt="supermux Bot Mode — Run a company of bots: named AI teammates (a developer, a marketer, a sales bot) organized into companies that talk to each other" width="760"></a>
+  <a href="docs/hero.mp4"><img src="docs/hero.gif" alt="supermux Bot Mode — Run a company of bots: named AI teammates (a developer, a marketer, a sales bot) organized into companies that talk to each other" width="760"></a>
 </p>
 
 <p align="center"><sub>An open-source, self-hosted AI company you run yourself.</sub></p>
@@ -61,12 +58,6 @@ Then stand up your first company:
 ### A bot is a teammate with a role
 
 A bot has a name, an avatar, and a role you assign — *Ada the developer*, *Iris the marketer*, *Sol in sales*. Each one gets **its own folder** on the box (its filesystem, scoped to what it's allowed to touch) and **its own connectors**. It's a full Claude Code agent with a job, not a scratch chat window.
-
-<p align="center">
-  <a href="docs/screenshots/botmode/bot-card.png"><img src="docs/screenshots/botmode/bot-card.png" alt="A bot's detail panel: avatar, name, live status, provider/model and branch, an Overview / Setup / Workflows tab bar, context and token usage, and its latest line — all mock data" width="420"></a>
-</p>
-
-<p align="center"><em>A bot with a role, a folder, and its own tools — all mock data.</em></p>
 
 ### Companies
 
