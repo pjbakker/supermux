@@ -43,6 +43,7 @@ async fn test_app() -> (axum::Router, AppState, std::path::PathBuf) {
         push_sub: None,
         github_token: None,
         statusline_tap: false,
+        swarm_reaper: Default::default(),
         isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
         human_auth: Default::default(),
     };
