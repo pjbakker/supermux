@@ -7,9 +7,12 @@
  * tiers at all, because it trains the user to ignore the signal.
  *
  * So most of what follows asserts a NEGATIVE: a session with no chat store still
- * gets a tier but does not light up; a remote-host session behaves like a local
- * one; a fresh install lights up nothing; a store that was dropped and rebuilt
- * yields no number rather than a wrong one.
+ * gets a tier but does not light up; a fresh install lights up nothing; a store
+ * that was dropped and rebuilt yields no number rather than a wrong one.
+ *
+ * Host-neutrality is NOT tested here and cannot be: `AttentionSession` carries no
+ * host field at all, so "remote behaves like local" is a property of the type,
+ * not of an assertion. Testing it would need a host-carrying field first.
  */
 import { describe, expect, test } from 'bun:test'
 
@@ -52,12 +55,6 @@ describe('every row gets a tier — whatever it is', () => {
   test('a session with no store and nothing recent is quiet, not undefined', () => {
     const s = session({ status: 'idle', activity_at: NOW - 86_400_000 })
     expect(tierFor(s, seen(), NOW)).toBe('quiet')
-  })
-
-  test('a remote-host session behaves exactly like a local one', () => {
-    const local = session({ status: 'waiting' })
-    const remote = session({ status: 'waiting' })
-    expect(tierFor(local, seen(), NOW)).toBe(tierFor(remote, seen(), NOW))
   })
 
   test('a session with NO stamps at all still gets a tier', () => {

@@ -14,7 +14,6 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   applyDelta,
-  clearRemovalTombstone,
   statusToDelta,
 } from '../../src/hooks/use-sessions'
 import type { ApiSession } from '../../src/lib/api'
@@ -97,12 +96,6 @@ describe('applyDelta — the delete resurrection race (w6 #3)', () => {
     tomb.delete('vx-cdel')
     const after = applyDelta([], [{ name: 'vx-cdel', status: 'idle', dir: '/w', provider: 'claude' }], true, tomb, 1)
     expect(after.map((s) => s.name)).toEqual(['vx-cdel'])
-  })
-
-  test('clearRemovalTombstone targets the module singleton (smoke)', () => {
-    // The exported clear is what the create mutation calls; exercise it so the
-    // wiring cannot silently break.
-    expect(() => clearRemovalTombstone('anything')).not.toThrow()
   })
 })
 

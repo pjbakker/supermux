@@ -39,6 +39,9 @@ describe('two presses, not one', () => {
     m.dispose()
   })
 
+  // Also covers the fast double-click: two presses inside one render pass.
+  // Deriving the decision from the state SETTER rather than from a stale `armed`
+  // closure is what makes this one call rather than two.
   test('the second press fires and disarms', () => {
     const onConfirm = mock(() => {})
     const m = make(onConfirm)
@@ -127,21 +130,6 @@ describe('the bugs the three variants shipped', () => {
     // No disarm notification after disposal, and nothing fired.
     expect(seen).toEqual([true])
     expect(onConfirm).toHaveBeenCalledTimes(0)
-  })
-
-  test('a fast double-click fires exactly once', () => {
-    // Two presses inside one render pass. Deriving the decision from the state
-    // SETTER rather than from a stale `armed` closure is what makes this one
-    // rather than two.
-    const onConfirm = mock(() => {})
-    const m = make(onConfirm)
-
-    m.press()
-    m.press()
-
-    expect(onConfirm).toHaveBeenCalledTimes(1)
-    expect(m.armed).toBe(false)
-    m.dispose()
   })
 
   test('re-arming clears the previous timer instead of stacking them', async () => {

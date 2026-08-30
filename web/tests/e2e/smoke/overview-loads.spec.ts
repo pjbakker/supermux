@@ -106,6 +106,33 @@ test.describe('overview loads', () => {
     // — so from the first file load on, every backend reads teams from THAT
     // dir. Seeding under `dataDir` wrote somewhere the server never looks, and
     // this test passed alone and failed in a full run for that reason alone.
+    // A TEAM ONLY SURFACES IF ITS HOST SESSION OPTED IN, and this fixture did
+    // not have one — so `GET /api/teams` returned `[]`, no card rendered, and
+    // the spec sat out its whole timeout on a page that was working. Two server
+    // rules decide it, both in `server/src/teams/watcher.rs`:
+    //
+    //   · `retain_opted_in_team_hosts` keeps a team only when its resolved host
+    //     session carries the `team` tag (or `creator == "team"`). Without that,
+    //     every ordinary Claude session with Task subagents would surface as a
+    //     team card named `session-<id8>`.
+    //   · the host is RESOLVED, and with no live tmux panes here the only
+    //     resolver that can fire is `match_host_by_cwd`: the LEAD row's `cwd`
+    //     matched against a `provider: 'claude'` session's `dir`.
+    //
+    // Hence a tagged claude session on `dataDir`, and a lead row whose `cwd` is
+    // the same dir. Measured: `/api/teams` goes from `[]` to the seeded team.
+    expect(
+      (
+        await api(backend).createSession({
+          name: 'smoke-lead',
+          provider: 'claude',
+          dir: backend.dataDir,
+          tags: ['team'],
+        })
+      ).status,
+      'the team card needs an opted-in host session to hang off',
+    ).toBe(201)
+
     const teamDir = join(backend.claudeConfigDir, 'teams', 'smoke-squad')
     mkdirSync(teamDir, { recursive: true })
     writeFileSync(
@@ -114,7 +141,13 @@ test.describe('overview loads', () => {
         name: 'smoke-squad',
         leadAgentId: 'team-lead@smoke-squad',
         members: [
-          { agentId: 'team-lead@smoke-squad', name: 'team-lead', agentType: 'team-lead' },
+          {
+            agentId: 'team-lead@smoke-squad',
+            name: 'team-lead',
+            agentType: 'team-lead',
+            // The authoritative host directory — see the block comment above.
+            cwd: backend.dataDir,
+          },
           // A teammate needs a pane + backend + colour or `scan.rs`'s
           // structural blank-row rule reads it as the lead's own roster entry,
           // the roster empties, and `drop_rosterless` hides the whole team.
@@ -126,6 +159,7 @@ test.describe('overview loads', () => {
             tmuxPaneId: '%9',
             backendType: 'claude',
             isActive: true,
+            cwd: backend.dataDir,
           },
         ],
       }),

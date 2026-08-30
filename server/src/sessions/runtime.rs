@@ -876,20 +876,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The type is re-exported from `sessions::tmux` for source compatibility —
-    /// `Tmux::capture_history_window` still returns it and existing
-    /// `use crate::sessions::tmux::HistoryWindow` imports keep resolving.
-    #[test]
-    fn history_window_is_re_exported_from_tmux() {
-        fn takes(_: crate::sessions::tmux::HistoryWindow) {}
-        takes(HistoryWindow {
-            rows: vec![],
-            history_size: 0,
-            start_offset: 0,
-            end_offset: 0,
-            hit_top: true,
-            cols: 0,
-            at_limit: false,
-        });
-    }
+    // NOTE: `HistoryWindow` is re-exported from `sessions::tmux` for source
+    // compatibility. That is enforced by the compiler, not by a test:
+    // `sessions/native/runtime.rs` imports it through exactly that path, and
+    // `Tmux::capture_history_window` returns it unqualified from inside
+    // `sessions/tmux.rs`. Dropping the `pub use` breaks the build in both places.
 }

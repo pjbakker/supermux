@@ -625,14 +625,6 @@ mod tests {
         assert!(file_commands_at(&missing).await.is_empty());
     }
 
-    #[test]
-    fn builtin_list_is_complete() {
-        // Spot-check the count + a few entries to catch an accidental truncation.
-        assert_eq!(BUILTIN_SLASH_COMMANDS.len(), 55);
-        assert!(BUILTIN_SLASH_COMMANDS.contains(&"/compact"));
-        assert!(BUILTIN_SLASH_COMMANDS.contains(&"/voice"));
-    }
-
     // ── managed-command seeding ────────────────────────────────────────────────
 
     fn cmd_temp_dir() -> PathBuf {

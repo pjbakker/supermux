@@ -10,8 +10,10 @@
 //    must never touch the real ~/.claude/settings.json.
 // 2. The claude-provider tests skip when the CLI isn't on the runner's PATH
 //    (a missing binary would stop the session and fail the seam assertion
-//    for an unrelated reason). The shell-provider ineligibility test always
-//    runs; the flag decision table itself is covered by bun unit tests.
+//    for an unrelated reason). 'A5: ineligibility beats a stale pin' uses a
+//    shell session, so that one always runs and keeps a CLI-less runner
+//    honest about the eligibility gate; the flag decision table itself is
+//    covered by bun unit tests.
 //
 // Needs server/target/debug/supermux-server — `cd server && cargo build`
 // first (debug; never --release).
@@ -117,28 +119,6 @@ test.describe('chat renderer switch (fase A1)', () => {
     await expect(page.locator('.xterm')).toBeVisible()
     await expect(page.getByTestId('chat-panel')).toHaveCount(0)
     await expect(page.getByTestId('renderer-chat')).toHaveCount(0)
-  })
-
-  test('ineligible provider (shell) never gets the chat renderer', async ({
-    page,
-  }) => {
-    await page.setViewportSize({ width: 1280, height: 800 }) // desktop focus seam
-    await page.addInitScript(injectGlobals(backend.token))
-    await page.addInitScript((flag: string) => {
-      window.localStorage.setItem('supermux-ui', flag)
-    }, FLAG_ON)
-
-    const res = await api(backend).createSession({
-      name: 'a1-shell',
-      provider: 'shell',
-      dir: backend.dataDir,
-    })
-    expect([200, 201]).toContain(res.status)
-    expect((await api(backend).startSession('a1-shell')).ok).toBeTruthy()
-
-    await page.goto(`${backend.baseUrl}/focus/a1-shell`)
-    await expect(page.locator('.xterm')).toBeVisible()
-    await expect(page.getByTestId('chat-panel')).toHaveCount(0)
   })
 
   /**
