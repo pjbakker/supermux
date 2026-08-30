@@ -41,12 +41,17 @@ export interface TileSession extends SessionSummary {
   activity_kind?: string
   /** Live count of outstanding Task sub-agents for the current turn. Still on the
    *  wire (the server reads it for status + notifications) but NOT rendered: a
-   *  lost `SubagentStop` pins it, and it names no child. `agents` replaced it. */
+   *  lost `SubagentStop` pins it, and it names no child. `agents_live` replaced it. */
   subagents?: number
-  /** The subagents the server has FIRST-HAND evidence of, keyed by Claude's own
-   *  `agent_id`. Display-only parallelism signal: the activity line gains a calm
-   *  `· N agents` clause when the agent is working and there are ≥ 2. Absent or
-   *  empty → no clause, and unlike the count it cannot outlive the children. */
+  /** How many subagents the server has FIRST-HAND evidence of. Display-only
+   *  parallelism signal: the activity line gains a calm `· N agents` clause when
+   *  the agent is working and this is ≥ 2. Absent/0 → no clause, and unlike the
+   *  count it cannot outlive the children (`SessionSummary.agents_live`). */
+  agents_live?: number
+  /** Those same children as ROWS, keyed by Claude's own `agent_id`. Declared
+   *  here rather than on every session type because exactly ONE surface lists
+   *  them: the chat's working row, which opens them from its `· N agents`
+   *  control. Everything else reads `agents_live`. */
   agents?: AgentRow[]
   /** The latest unrecovered agent error from a StopFailure hook (hooks-10x).
    *  Cleared when the agent resumes — drives the amber error badge. */

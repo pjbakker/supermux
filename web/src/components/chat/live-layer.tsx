@@ -288,7 +288,7 @@ export function LiveLayer({
           // The STATIC half only — the agent-row count, which changes on an SSE
           // frame. The elapsed half is `turnStartMs` below: a node the running
           // line renders itself, so a second passing re-renders nothing here.
-          status: liveStatus(session?.agents, surface),
+          status: liveStatus(session?.agents_live, surface),
           turnStartMs: turnStart,
         }
       : undefined
@@ -998,18 +998,14 @@ function shortDir(dir: string): string {
  * from the SEND on the server clock, and it stays off screen for the first 5s
  * because a fast turn that prints 1s, 2s, 3s feels slow).
  */
-function liveStatus(
-  agents?: readonly { id: string }[],
-  surface?: 'desktop' | 'phone',
-): string | undefined {
+function liveStatus(agentsLive?: number, surface?: 'desktop' | 'phone'): string | undefined {
   // The clock shares the line with the tool label now, and on the phone that
   // line has a 266px bubble to live in. `3 agents` costs a third of it, and
   // WHAT is running matters more than how many helpers it has — so the count is
   // a desktop clause and the clock is everywhere. (The phone gets the same
   // answer from the working row's own expander, which is where a small screen
   // should be asked for a tap rather than given a permanent clause.)
-  const n = agents?.length ?? 0
-  return surface !== 'phone' && n >= 2 ? `${n} agents` : undefined
+  return surface !== 'phone' && agentsLive && agentsLive >= 2 ? `${agentsLive} agents` : undefined
 }
 
 /**

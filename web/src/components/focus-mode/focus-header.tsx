@@ -62,9 +62,10 @@ export interface DesktopFocusHeaderProps {
   /** Live "what the agent is doing now" label (hooks-10x) — shown next to the
    *  status while the agent is working; falls back to the status label otherwise. */
   activity?: string
-  /** The subagents the server has first-hand evidence of → the calm `· N agents`
-   *  clause. Rows, not the raw count (see `SessionSummary.agents`). */
-  agents?: readonly { id: string }[]
+  /** How many subagents the server has first-hand evidence of → the calm
+   *  `· N agents` clause. Evidence-bearing rows, not the raw `subagents` count
+   *  (see `SessionSummary.agents_live`). */
+  agentsLive?: number
   /** Unrecovered agent error (hooks-10x) — drives the amber blocked badge. */
   error?: { type: string; message: string }
   /** The session cannot do the next turn — a usage-limit banner or a startup
@@ -113,7 +114,7 @@ export function DesktopFocusHeader({
   title,
   status,
   activity,
-  agents,
+  agentsLive,
   error,
   blocked,
   rateLimits,
@@ -181,7 +182,7 @@ export function DesktopFocusHeader({
         {(status === 'active' || status === 'starting') && activity?.trim() ? (
           <ActivityLine
             activity={activity}
-            agents={agents}
+            agentsLive={agentsLive}
             className="min-w-0 shrink basis-auto text-[11px]"
           />
         ) : (
@@ -298,9 +299,10 @@ export interface FocusHeaderProps {
   /** Live "what the agent is doing now" label (hooks-10x) — shown under the name
    *  while the agent is working. */
   activity?: string
-  /** The subagents the server has first-hand evidence of → the calm `· N agents`
-   *  clause. Rows, not the raw count (see `SessionSummary.agents`). */
-  agents?: readonly { id: string }[]
+  /** How many subagents the server has first-hand evidence of → the calm
+   *  `· N agents` clause. Evidence-bearing rows, not the raw `subagents` count
+   *  (see `SessionSummary.agents_live`). */
+  agentsLive?: number
   /** Unrecovered agent error (hooks-10x) — drives the amber blocked badge. */
   error?: { type: string; message: string }
   /** The session cannot do the next turn — a usage-limit banner or a startup
@@ -336,7 +338,7 @@ export function FocusHeader({
   title,
   status,
   activity,
-  agents,
+  agentsLive,
   error,
   blocked,
   rateLimits,
@@ -437,7 +439,7 @@ export function FocusHeader({
         {showActivity && (
           <ActivityLine
             activity={activity}
-            agents={agents}
+            agentsLive={agentsLive}
             className="max-w-full text-center text-[11px] leading-tight"
           />
         )}

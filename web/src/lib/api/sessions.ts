@@ -356,15 +356,16 @@ export interface ApiSession {
    *  `SubagentStart`/`SubagentStop` hooks). Still on the wire because the server
    *  reads it for status + the finish notification — but NOT rendered anywhere
    *  any more: a lost `SubagentStop` pins it, and it says nothing about WHICH
-   *  children exist. `agents` is what the UI shows instead. */
+   *  children exist. `agents_live` is what the UI shows instead. */
   subagents?: number
-  /** **Which subagents are actually running, and what each is doing** — one row
-   *  per child supermux has first-hand evidence of, keyed by Claude's own
-   *  `agent_id`. A row exists only because a hook carrying that exact id
-   *  arrived, so unlike `subagents` it cannot be a ghost. Absent (not `[]`) on a
-   *  session with no children; the SSE delta always sends the array so an empty
-   *  one clears the client's list. */
-  agents?: AgentRow[]
+  /** **How many subagents are actually running** — the count of children
+   *  supermux has first-hand evidence of (`AgentRow`), each counted only because
+   *  a hook carrying that child's own `agent_id` arrived, so unlike `subagents`
+   *  it cannot be a ghost. What every clause site renders. Absent (not `0`) on a
+   *  session with no children; the SSE delta always sends the key so a drop back
+   *  to 0 clears the clause. The ROWS ride the same payload under `agents`,
+   *  declared on `TileSession` for the chat working row that lists them. */
+  agents_live?: number
   /** TRUE when a BACKGROUND workflow is provably running RIGHT NOW — a
    *  `subagents/agent-*.jsonl` append (the tailer ground truth) OR an open
    *  subagent hook within ~10s. Unlike `subagents` (the raw count, historically

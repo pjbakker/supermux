@@ -15,11 +15,6 @@ export const MOCK_COMPANIES: Company[] = [
   { id: 3, slug: 'initech', display_name: 'Initech', root_dir: '/opt/projects/companies/initech', archived: 0 },
 ]
 
-/** An agent row's stamps are ABSOLUTE server-clock ms, so a fixture states the
- *  age it wants and lets the clock resolve it — a hard-coded stamp would age
- *  into `no tool call for 9h` the first time this file is a day old. */
-const ago = (ms: number) => Date.now() - ms
-
 const claudeBoot = (task: string): string[] => [
   '● Read package.json (1 file)',
   `● ${task}`,
@@ -114,13 +109,10 @@ export const MOCK_TILES: TileSession[] = [
     tokens: 48200,
     branch: 'feat/sse-merge',
     activity: '✎ use-sessions.ts',
-    // Rows, not a count — the mock has to be able to say WHICH children and
-    // what each is doing, because that is what the tile now renders.
-    agents: [
-      { id: 'm1', type: 'general-purpose', label: '📖 use-sessions.ts', started_ms: ago(41_000), last_evidence_ms: ago(1_200) },
-      { id: 'm2', type: 'general-purpose', label: '🔍 mergeDelta', started_ms: ago(38_000), last_evidence_ms: ago(9_400) },
-      { id: 'm3', type: 'Explore', label: '⚡ run the unit tests', started_ms: ago(12_000), last_evidence_ms: ago(800) },
-    ],
+    // The tile draws the CLAUSE, so the mock only owes it the number the clause
+    // reads — the rows behind it belong to the chat's working row, which this
+    // fixture does not render.
+    agents_live: 3,
     preview_lines: claudeBoot('Implementing the delta-merge updater'),
     preview_ansi: claudeBootAnsi('Implementing the delta-merge updater'),
     // FASE A5 — a chat-eligible session WITH a tail. With the experiment on
@@ -164,14 +156,7 @@ export const MOCK_TILES: TileSession[] = [
     tokens: 6400,
     branch: 'main',
     activity: '🤖 dispatching review agents',
-    agents: [
-      { id: 'r1', type: 'general-purpose', label: '📖 tile.tsx', started_ms: ago(96_000), last_evidence_ms: ago(2_100) },
-      { id: 'r2', type: 'general-purpose', label: '📖 activity-status.tsx', started_ms: ago(94_000), last_evidence_ms: ago(400) },
-      { id: 'r3', type: 'general-purpose', label: '✎ notes.md', started_ms: ago(90_000), last_evidence_ms: ago(5_600) },
-      // Quiet: inside one long command, so the row dims and states the fact.
-      { id: 'r4', type: 'workflow-subagent', started_ms: ago(88_000), last_evidence_ms: ago(187_000) },
-      { id: 'r5', type: 'workflow-subagent', label: '⚡ bun run build', started_ms: ago(61_000), last_evidence_ms: ago(3_300) },
-    ],
+    agents_live: 5,
     preview_lines: claudeBoot('Writing acceptance notes for the tile component'),
     preview_ansi: claudeBootAnsi('Writing acceptance notes for the tile component'),
     updated_at: new Date().toISOString(),

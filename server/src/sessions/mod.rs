@@ -387,6 +387,12 @@ pub struct SessionView {
     /// resting session's wire shape is unchanged.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub agents: Vec<crate::state::AgentRow>,
+    /// `agents.len()`, pre-derived: every surface that only draws the calm
+    /// `· N agents` clause (tile, roster, focus header, quick-peek) reads this
+    /// integer, and only the chat's working row — which LISTS the children —
+    /// takes the rows. Same display-only posture, omitted when 0.
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub agents_live: u32,
     /// The LIVE permission dialog, from the `PermissionRequest` hook: Claude is
     /// displaying a permission prompt for this tool call and is blocked on a
     /// human. In-memory only; cleared as soon as anything proves the dialog
@@ -677,6 +683,7 @@ fn view(
         activity_kind: act.as_ref().and_then(|a| a.activity_kind.clone()),
         subagents: act.as_ref().map(|a| a.subagents).unwrap_or(0),
         subagents_live,
+        agents_live: agents.len() as u32,
         agents,
         permission_request: act.as_ref().and_then(|a| {
             a.permission.as_ref().map(|ask| PermissionRequestInfo {

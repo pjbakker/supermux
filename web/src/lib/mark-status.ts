@@ -137,17 +137,14 @@ export function attentionFor(s: AttentionInput | null | undefined): AttentionTie
  *  Empty below 2 — one agent is not "parallel", and the clause is a parallelism
  *  tell, not a count.
  *
- *  It counts ROWS, not the raw `subagents` number, and that is the whole change:
- *  a row exists only because a hook carrying that agent's own id arrived, so the
- *  clause can no longer say `3 subagents` at a session that has none. The word
- *  moved with the quantity — "agents" now means "children with a live tool
- *  call", which is not what users were being shown before.
- *
- *  Structural parameter so any row-ish shape satisfies it (the tile, the roster
- *  and the chat all hold slightly different session types). */
-export function subagentsClause(agents?: readonly { id: string }[] | null): string {
-  const n = agents?.length ?? 0
-  return n >= 2 ? ` · ${n} agents` : ''
+ *  The argument is `agents_live`, not the raw `subagents`, and that is the whole
+ *  change: `agents_live` counts the ROWS the server has first-hand evidence of
+ *  (each exists only because a hook carrying that agent's own id arrived), so
+ *  the clause can no longer say `3 subagents` at a session that has none. The
+ *  word moved with the quantity — "agents" now means "children with a live tool
+ *  call", which is not what users were being shown before. */
+export function subagentsClause(agentsLive?: number | null): string {
+  return agentsLive && agentsLive >= 2 ? ` · ${agentsLive} agents` : ''
 }
 
 /** Live hints a caller may know that the status field cannot spell. */

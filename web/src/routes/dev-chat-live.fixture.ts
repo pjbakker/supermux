@@ -714,14 +714,10 @@ export function liveStates(nowMs: number): LiveState[] {
         name: RELEASE_TRAIN,
         display_name: 'Release Train',
         status: 'active',
-        activity: '⚡ cargo test --lib money',
-        // Three children with real evidence — the expander's own fixture: two
-        // live with their current tool, one quiet inside a long command.
-        agents: [
-          { id: 'w1', type: 'general-purpose', label: '📖 ledger.rs', started_ms: ago(31_000), last_evidence_ms: ago(900) },
-          { id: 'w2', type: 'general-purpose', label: '⚡ cargo check', started_ms: ago(24_000), last_evidence_ms: ago(4_200) },
-          { id: 'w3', type: 'workflow-subagent', started_ms: ago(18_000), last_evidence_ms: ago(190_000) },
-        ],
+        // This state has an overlay, so the running RECEIPT takes the live slot
+        // and the clause is the header pill's — which reads the number, never
+        // the rows. The rows have their own bench in `fanout` below.
+        agents_live: 3,
       }),
       entries: release,
       turnAgo: 42,

@@ -83,11 +83,7 @@ describe('the stack, top to bottom', () => {
     session: session({
       status: 'active',
       activity: '⚡ cargo check',
-      agents: [
-        { id: 'a1', type: 'general-purpose', label: '📖 ledger.rs', started_ms: serverNowMs() - 9_000, last_evidence_ms: serverNowMs() - 400 },
-        { id: 'a2', type: 'general-purpose', label: '⚡ cargo check', started_ms: serverNowMs() - 8_000, last_evidence_ms: serverNowMs() - 900 },
-        { id: 'a3', type: 'Explore', label: '🔍 money', started_ms: serverNowMs() - 6_000, last_evidence_ms: serverNowMs() - 1_400 },
-      ],
+      agents_live: 3,
       permission_request: { tool: 'Bash', summary: '⚡ cargo publish --dry-run', kind: 'bash' },
     }),
     turnStart: serverNowMs() - 12_000,
@@ -275,6 +271,8 @@ describe('the working row’s first rung', () => {
   })
 
   test('the agents clause survives the reskin', () => {
+    // The working row is the one surface that counts the ROWS it can open, so
+    // its fixture hands it rows rather than `agents_live`.
     const rows = (n: number) =>
       Array.from({ length: n }, (_, i) => ({
         id: `a${i}`,

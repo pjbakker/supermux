@@ -237,13 +237,13 @@ function stateWordFor(s: ApiSession, group: GroupKey): StateWord {
     if (s.status === 'error' || s.blocked) return { word: 'blocked', cls: 'st-block' }
     return { word: 'needs you', cls: 'st-need' }
   }
-  if (s.status === 'active' || s.status === 'starting') return { word: 'working' + subagentsClause(s.agents), cls: 'st-work' }
+  if (s.status === 'active' || s.status === 'starting') return { word: 'working' + subagentsClause(s.agents_live), cls: 'st-work' }
   if (s.status === 'error') return { word: 'blocked', cls: 'st-block' }
   if (s.status === 'stopped') return { word: 'stopped', cls: 'st-idle' }
   // A background workflow still running after the main turn settled: the row is
   // bucketed active by `groupSessions`, so say WORKING (with the parallelism
   // clause when it is available) rather than done/idle.
-  if (s.subagents_live) return { word: 'working' + subagentsClause(s.agents), cls: 'st-work' }
+  if (s.subagents_live) return { word: 'working' + subagentsClause(s.agents_live), cls: 'st-work' }
   if (group === 'done') return { word: 'done', cls: 'st-done' }
   return { word: 'idle', cls: 'st-idle' }
 }

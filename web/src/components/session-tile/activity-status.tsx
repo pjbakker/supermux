@@ -84,12 +84,12 @@ function stripPua(s: string): string {
 export interface ActivityLineProps {
   /** The live activity label from the backend (already emoji-prefixed). */
   activity?: string
-  /** The subagents the server has first-hand evidence of (`SessionSummary.agents`).
-   *  When there are ≥ 2 a calm `· N agents` clause is appended — the display-only
-   *  parallelism signal, so a 5-agent turn reads visibly different from a single
-   *  tool. Counts ROWS, never the raw `subagents` number, so the clause cannot
-   *  outlive the children it is describing. */
-  agents?: readonly { id: string }[]
+  /** How many subagents the server has first-hand evidence of
+   *  (`SessionSummary.agents_live`). At ≥ 2 a calm `· N agents` clause is
+   *  appended — the display-only parallelism signal, so a 5-agent turn reads
+   *  visibly different from a single tool. Counts evidence-bearing rows, never
+   *  the raw `subagents`, so the clause cannot outlive the children. */
+  agentsLive?: number
   /** Extra classes for the wrapping span (sizing / layout from the caller). */
   className?: string
 }
@@ -104,11 +104,11 @@ export interface ActivityLineProps {
  *  tight line the `truncate` ellipsis clips it before the activity label — the
  *  name always wins the squeeze. (No container query / `container-type`: that
  *  would impose size containment and collapse the header's content-sized line.) */
-export function ActivityLine({ activity, agents, className }: ActivityLineProps) {
+export function ActivityLine({ activity, agentsLive, className }: ActivityLineProps) {
   // Hook must run unconditionally (rules-of-hooks) — before any early return.
   const reduce = useReducedMotion()
   const label = activity?.trim() ? stripPua(activity.trim()) : undefined
-  const n = agents?.length ?? 0
+  const n = agentsLive ?? 0
   const showCount = n >= AGENT_CLAUSE_MIN
   if (!label && !showCount) return null
   return (

@@ -974,6 +974,10 @@ pub(crate) fn broadcast_activity_delta(state: &AppState, session: &str) {
     let permission = act.permission.as_ref().map(|a| {
         json!({ "tool": a.tool, "summary": a.summary, "kind": a.kind, "mode": a.mode })
     });
+    // Read the rows ONCE: the two keys below are the list and its length, and
+    // reading twice could serialize a count that disagrees with the rows beside
+    // it (the sweep runs on read).
+    let agents = state.agent_rows_now(session);
     let _ = state.sse_tx.send(SseEvent {
         event: "sessions".to_string(),
         company_id: None,
@@ -1013,15 +1017,16 @@ pub(crate) fn broadcast_activity_delta(state: &AppState, session: &str) {
             // so the roster updates the "working" bucket/word/face live (and
             // clears it) without a refetch when the signal flips.
             "subagents_live": state.subagents_live(session),
-            // The per-agent rows — WHICH children have fresh first-hand evidence
-            // and what each is doing. ALWAYS present (an empty array is how a
-            // client clears its list), and it is what every surface now renders
-            // instead of the raw count beside it: the count is a number that can
-            // drift, a row exists only because a hook carrying that exact
-            // `agent_id` arrived. Display-only in both directions — nothing
-            // downstream of this key reaches the status classifier or the turn
-            // boundary.
-            "agents": state.agent_rows_now(session),
+            // HOW MANY children have fresh first-hand evidence — the clause every
+            // surface but the chat's working row draws, replacing the raw count
+            // beside it: `subagents` is a number a lost `SubagentStop` can pin,
+            // this one counts rows that exist only because a hook carrying that
+            // exact `agent_id` arrived. …and the rows themselves, for the one
+            // surface that lists them. Both always present (0 / `[]` is how a
+            // client clears), both display-only: nothing downstream of them
+            // reaches the status classifier or the turn boundary.
+            "agents_live": agents.len(),
+            "agents": agents,
             // Server-clock ms stamp: the fase-A1 hook→UI latency anchor AND
             // the chat client's clock-skew source — every chat supersede
             // comparison runs in this clock domain (a0-findings §1 item 3).
@@ -1458,11 +1463,13 @@ mod tests {
         );
 
         let mut last: Option<Value> = None;
+        let mut last_live: Option<i64> = None;
         while let Ok(ev) = rx.try_recv() {
             if ev.event == "sessions" {
                 if let Some(d) = ev.payload.get("delta").and_then(|d| d.as_array()).and_then(|a| a.first()) {
                     if d.get("name").and_then(|n| n.as_str()) == Some(s) {
                         last = d.get("agents").cloned();
+                        last_live = d.get("agents_live").and_then(|v| v.as_i64());
                     }
                 }
             }
@@ -1470,6 +1477,14 @@ mod tests {
         let agents = last.expect("the sessions delta must carry an `agents` key");
         let agents = agents.as_array().expect("`agents` is always an array");
         assert_eq!(agents.len(), 1);
+        // The COUNT rides the same frame, and must agree with the list beside it:
+        // every surface but the chat's working row draws the clause from this
+        // number alone, so a disagreement is a clause that opens a different list.
+        assert_eq!(
+            last_live,
+            Some(agents.len() as i64),
+            "`agents_live` is the length of the `agents` beside it",
+        );
         assert_eq!(agents[0]["id"], "a1");
         assert_eq!(agents[0]["type"], "workflow-subagent");
         assert_eq!(agents[0]["label"], "⚡ probe");

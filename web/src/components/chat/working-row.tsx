@@ -113,7 +113,10 @@ export function WorkingRow({
   // The ladder's own clock. One scheduled flip per transition, exactly like the
   // 5s rung above it — never a tick (see the header rule).
   const nowMs = useAgentQuietEdge(rows)
-  const clauseText = subagentsClause(rows)
+  // The one clause site that counts its OWN rows instead of the server's
+  // pre-derived `agents_live` — the control and the list it opens must come from
+  // the same array, or it says `3 agents` and opens two.
+  const clauseText = subagentsClause(rows.length)
   // The emoji taxonomy stays terminal/tile-only, so the label is stripped here
   // exactly as the confirmed receipt it will become is (`stripEmojiPrefix`).
   const label = activity ? stripEmojiPrefix(activity) : 'Thinking…'
