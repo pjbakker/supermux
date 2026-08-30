@@ -17,6 +17,7 @@ import {
   companyFilesRoot,
   companyFirstOrder,
   companyForDigit,
+  companyLogoUrl,
   confineToCompanyRoot,
   inCompanyScope,
   resolveActiveCompany,
@@ -103,6 +104,26 @@ describe('companyFirstOrder — stable space-first search ranking', () => {
   test('empty input ⇒ empty output', () => {
     expect(companyFirstOrder([], 1)).toEqual([])
     expect(companyFirstOrder([], null)).toEqual([])
+  })
+})
+
+describe('companyLogoUrl — the authed, cache-busted logo src', () => {
+  const base = { id: 7 } as Pick<Company, 'id' | 'has_logo' | 'updated_at'>
+
+  test('no logo → null (caller falls back to the generated mark)', () => {
+    expect(companyLogoUrl({ ...base, has_logo: false })).toBeNull()
+    expect(companyLogoUrl({ ...base })).toBeNull()
+  })
+
+  test('cache-buster from updated_at + the ?_token= the <img> needs', () => {
+    const u = companyLogoUrl({ ...base, has_logo: true, updated_at: 1730 }, 'tok en&')
+    expect(u).toBe('/api/companies/7/logo?v=1730&_token=tok+en%26')
+  })
+
+  test('token omitted (unit/bun) → just the versioned path, no token leak', () => {
+    expect(companyLogoUrl({ ...base, has_logo: true, updated_at: 42 })).toBe(
+      '/api/companies/7/logo?v=42',
+    )
   })
 })
 

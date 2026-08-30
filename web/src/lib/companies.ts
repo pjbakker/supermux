@@ -31,14 +31,26 @@ export interface Company {
   has_logo?: boolean
 }
 
-/** The URL that serves a company's uploaded logo. `updatedAt` is appended as a
- *  cache-buster so a re-upload shows immediately (the GET sets a 60s private
- *  cache). Returns `null` when the company has no logo → callers fall back to the
- *  generated `<CompanyMark>`. */
-export function companyLogoUrl(company: Pick<Company, 'id' | 'has_logo' | 'updated_at'>): string | null {
+/** The URL that serves a company's uploaded logo, or `null` when the company has
+ *  no logo (callers fall back to the generated `<CompanyMark>`).
+ *
+ *  `updated_at` rides along as a cache-buster so a re-upload shows immediately
+ *  (the GET sets a 60s private cache). A `token` MUST be passed for use in an
+ *  `<img src>`: the logo GET is bearer-protected and an `<img>` cannot send an
+ *  Authorization header, so it uses the `?_token=` query fallback the auth layer
+ *  accepts (`server/src/auth.rs`) — the same pattern as the Files raw-image
+ *  viewer. Kept pure (token passed in, not read from `window`) so it unit-tests
+ *  in bun without a DOM. */
+export function companyLogoUrl(
+  company: Pick<Company, 'id' | 'has_logo' | 'updated_at'>,
+  token?: string | null,
+): string | null {
   if (!company.has_logo) return null
-  const v = company.updated_at ? `?v=${company.updated_at}` : ''
-  return `/api/companies/${company.id}/logo${v}`
+  const params = new URLSearchParams()
+  if (company.updated_at) params.set('v', String(company.updated_at))
+  if (token) params.set('_token', token)
+  const qs = params.toString()
+  return `/api/companies/${company.id}/logo${qs ? `?${qs}` : ''}`
 }
 
 /** Resolve a persisted `activeCompany` id against the live company set: an id

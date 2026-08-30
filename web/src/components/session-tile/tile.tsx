@@ -825,11 +825,20 @@ export function SessionTile({
             : { scale: 0.96, transition: { duration: 0.1, ease: eases.out } }
         }
         transition={springs.tileHover}
-        style={
-          supportsViewTransitions
+        style={{
+          // The tile is a `role="button"` you long-press for its actions menu.
+          // On iOS a long-press ALSO fires native text selection + the copy/share
+          // callout on whatever text sits under the finger — the reported "test
+          // selection while holding". Suppressing selection + the callout on the
+          // button itself is the standard fix (a control is not selectable text);
+          // it never touches the chat / files surfaces where selection is wanted.
+          WebkitTouchCallout: 'none',
+          WebkitUserSelect: 'none',
+          userSelect: 'none',
+          ...(supportsViewTransitions
             ? { viewTransitionName: vtSessionName(session.name) }
-            : undefined
-        }
+            : {}),
+        }}
         className={
           // Stopped UX (polish-pass #1): a stopped tile dims to 60% via the
           // token-driven muted treatment so it reads "off" AT A GLANCE next to

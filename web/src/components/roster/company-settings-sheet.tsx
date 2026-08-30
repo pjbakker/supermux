@@ -23,7 +23,7 @@ import { CompanyMark } from '@/components/roster/company-mark'
 import { useCompanyLogo, useUpdateCompany } from '@/hooks/use-companies'
 import { companyLogoUrl, type Company } from '@/lib/companies'
 import { dominantColor, dominantColorOfFile } from '@/lib/dominant-color'
-import { apiUrl } from '@/lib/api/client'
+import { apiToken, apiUrl } from '@/lib/api/client'
 import { SessionError } from '@/lib/api'
 
 export interface CompanySettingsSheetProps {
@@ -45,7 +45,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
   // Keep the name field in sync if the row refetches under us (another edit).
   React.useEffect(() => setName(company.display_name), [company.display_name])
 
-  const logo = companyLogoUrl(company)
+  const logo = companyLogoUrl(company, apiToken())
   const accent = company.accent ?? undefined
 
   /** After a logo lands, sample its dominant colour and store it as the accent so
@@ -81,7 +81,8 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
       const row = await fromUrl.mutateAsync({ id: company.id, url: trimmed })
       setUrl('')
       // Sample from the freshly-served logo (same-origin → canvas is readable).
-      const served = companyLogoUrl(row)
+      // The `?_token=` rides along so the <img> load is authed.
+      const served = companyLogoUrl(row, apiToken())
       if (served) await deriveAccent(apiUrl(served), null)
     } catch (e) {
       setErr(e instanceof SessionError ? e.message : 'Could not fetch that favicon.')
