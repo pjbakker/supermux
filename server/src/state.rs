@@ -128,7 +128,10 @@ pub struct SessionActivity {
     /// text (see `sessions::elicitation`).
     pub elicitation: Option<ElicitationAsk>,
     /// **The live connect ask** (`connectors.connect`): a bot's `connect(service)`
-    /// tool carried the `requiresUserInteraction` marker and stopped for a human.
+    /// tool named a connector it wants the human to approve. The tool itself does
+    /// NOT stall (no `requiresUserInteraction` marker — that would raise Claude
+    /// Code's own terminal dialog, which chat cannot answer); this card is the
+    /// human's only surface, and the grant lands only when they tap it.
     /// Set by the `PreToolUse` hook when it recognises the connect affordance
     /// ([`crate::sessions::connect_ask::parse`]) and cleared by the same
     /// "something after it happened" events as [`permission`](Self::permission) —

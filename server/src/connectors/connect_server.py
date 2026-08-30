@@ -2,14 +2,25 @@
 """connect — the store's one-tap credential affordance, as a lean MCP server.
 
 The connector store (spec §8) gives every bot ONE extra tool, `connect(service)`.
-When the bot calls it, supermux does NOT run a connection itself: the tool's
-descriptor carries the `anthropic/requiresUserInteraction` marker, so Claude Code
-always routes the call to the human prompt instead of auto-running it, and
-supermux's PreToolUse detector (`sessions::connect_ask`) turns that into the
-inline Connect card. The human signs in / pastes an API key straight into the
-card, which POSTs the credential to the supermux vault — it NEVER travels through
-this tool, this process, or the transcript. The agent only ever names WHICH
-connector it wants; the secret plane is entirely out of band.
+When the bot calls it, supermux does NOT run a connection itself: the call is
+allow-listed and returns immediately, while supermux's PreToolUse detector
+(`sessions::connect_ask`) turns the same call into the inline Connect card in
+chat. The human signs in / pastes an API key straight into the card, which POSTs
+the credential to the supermux vault — it NEVER travels through this tool, this
+process, or the transcript. The agent only ever names WHICH connector it wants;
+the secret plane is entirely out of band.
+
+**Why NO `anthropic/requiresUserInteraction` marker here.** That marker overrides
+`--permission-mode bypassPermissions` and forces Claude Code's OWN permission
+prompt into the TERMINAL — a prompt the chat renderer cannot answer (it only
+classifies Bash/Edit/Write permission footers). A bot that called `connect` was
+left parked for hours behind an invisible dialog while the chat card above it
+said "Added". The card is raised by the PreToolUse detector, which does NOT need
+the marker, so dropping it costs nothing and un-parks the bot. The `connect` tool
+never grants anything by itself — the GRANT is still a human tap on the card —
+so the human remains in the loop without stalling the terminal.
+(The Shared Browser's `request_human_takeover` deliberately KEEPS the marker: its
+drive-lock relies on the call stalling. See `browser/mcp_server.py`.)
 
 This is the SERVER BINARY the store injects into every bot launch so a real agent
 actually HAS a `connect` tool in its toolset (connector-store spec §8 step 2;
@@ -20,10 +31,9 @@ the way the agent-authored iCloud server does.
 The second tool, `list_connectors` (P2d), is the CONCIERGE discovery half: a plain,
 NON-interactive read of a secret-free, company-scoped catalog snapshot the launch
 path drops next to this server (`python3 <server.py> <catalog.json>` → the snapshot
-path arrives as `sys.argv[1]`). It carries NO `requiresUserInteraction` marker, so
-it never routes to the human — the bot calls it to learn WHICH connector id it wants
-and HOW that connector signs in, explains it in plain language, and only THEN calls
-the interactive `connect(<id>)`.
+path arrives as `sys.argv[1]`). The bot calls it to learn WHICH connector id it
+wants and HOW that connector signs in, explains it in plain language, and only
+THEN calls `connect(<id>)` to raise the card.
 
 Transport: MCP stdio — newline-delimited JSON-RPC 2.0. One message per line on
 stdin; one JSON object per line on stdout. Nothing but protocol JSON is written
@@ -40,17 +50,13 @@ SERVER_NAME = "connect"
 SERVER_VERSION = "1.0.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 
-# The `_meta` key that forces a tool to the human-in-the-loop prompt even when an
-# allow-rule matches (Claude Code >= 2.1.199). Kept BYTE-IDENTICAL to the Rust
-# constant `connectors::REQUIRES_USER_INTERACTION_META` so the future host, this
-# server, the detector, and the web card all agree on the marker.
-REQUIRES_USER_INTERACTION_META = "anthropic/requiresUserInteraction"
-
-# The single tool. Its shape mirrors `connect_tool_descriptor` in
+# The interactive tool. Its shape mirrors `connect_tool_descriptor` in
 # server/src/connectors/mod.rs: name `connect`, one required `service` string
-# argument (the connector id), and the interaction marker in `_meta`. The
-# detector (`sessions::connect_ask::parse`) keys on exactly this pair — a tool
-# whose name ends in `connect` AND a non-empty `service` argument.
+# argument (the connector id), and — deliberately — NO `_meta`. The detector
+# (`sessions::connect_ask::parse`) keys on exactly that pair (a tool whose name
+# ends in `connect` AND a non-empty `service` argument), so the chat card is
+# raised without an `anthropic/requiresUserInteraction` marker parking the bot
+# behind Claude Code's own terminal prompt (see the module docstring).
 CONNECT_TOOL = {
     "name": "connect",
     "description": (
@@ -58,10 +64,12 @@ CONNECT_TOOL = {
         "call `list_connectors` to find the right connector `id` and how it signs "
         "in, and explain it to the human in plain language. Then call `connect` "
         "with that id as `service` (e.g. 'pmcp-github', 'pmcp-notion', "
-        "'icloud-mail'). This opens a secure sign-in / API-key card for the human: "
-        "the credential is stored in the supermux vault and is NEVER shown to you. "
-        "After they finish, the connector's own tools (mcp__<service>__*) appear on "
-        "your next turn — retry your task then, and confirm it works."
+        "'icloud-mail'). This ASKS the human to approve it in a secure sign-in / "
+        "API-key card; the credential is stored in the supermux vault and is NEVER "
+        "shown to you. It returns immediately and does NOT wait for them — keep "
+        "working. Once they approve, the connector's own tools (mcp__<service>__*) "
+        "appear after the bot's next restart — retry your task then, and confirm it "
+        "works. If nothing appears, say so in your reply rather than assuming."
     ),
     "inputSchema": {
         "type": "object",
@@ -73,12 +81,13 @@ CONNECT_TOOL = {
         },
         "required": ["service"],
     },
-    "_meta": {REQUIRES_USER_INTERACTION_META: True},
+    # NO `_meta`: see the module docstring. The marker would force Claude Code's
+    # own terminal permission prompt, which the chat renderer cannot answer.
 }
 
-# P2d — the discovery half. A plain, NON-interactive read (NO interaction marker,
-# so it never routes to the human) that returns the injected, secret-free catalog
-# snapshot: which connectors exist and HOW each one signs in.
+# P2d — the discovery half. A plain read that returns the injected, secret-free
+# catalog snapshot: which connectors exist and HOW each one signs in. It raises no
+# card at all (the detector only keys on `connect`).
 LIST_TOOL = {
     "name": "list_connectors",
     "description": (
@@ -95,7 +104,6 @@ LIST_TOOL = {
         "— this does NOT sign anything in or ask the human anything."
     ),
     "inputSchema": {"type": "object", "properties": {}},
-    # NO _meta: this is a normal read, never routed to the human.
 }
 
 TOOLS = [CONNECT_TOOL, LIST_TOOL]
@@ -131,11 +139,12 @@ def _list_connectors_text():
 def _connect_result(service):
     """The tool's own return value.
 
-    In the normal flow the call is intercepted BEFORE it runs: the interaction
-    marker stops the turn for the human, and supermux raises the inline Connect
-    card. If Claude Code does run the tool (a host without the interaction gate,
-    or the human approved it), this is the honest fallback: name what happened
-    and tell the agent how to proceed. No credential is ever touched here."""
+    This ALWAYS runs (the tool is allow-listed and carries no interaction
+    marker), so the wording has to be true at the moment it is written: supermux
+    has been ASKED to raise the card, but nothing here can observe whether the
+    human ever sees it — the ask lives in server memory and is lost on a restart
+    — and nothing here can observe whether they approve. So we claim the ask, not
+    the outcome. No credential is ever touched here."""
     service = (service or "").strip()
     if not service:
         return {
@@ -149,10 +158,12 @@ def _connect_result(service):
         "connected": False,
         "service": service,
         "message": (
-            f"A secure connect card for '{service}' was shown to the human. The "
-            "credential goes straight to the supermux vault and is never shown to "
-            f"you. Once they complete it, '{service}' tools (mcp__{service}__*) "
-            "become available — retry your task on your next turn."
+            f"supermux has asked the human to approve '{service}' in a secure "
+            "connect card. Nothing is connected yet, and this call did NOT wait "
+            "for them: carry on with what you can do meanwhile. The credential "
+            "goes straight to the supermux vault and is never shown to you. If "
+            f"'{service}' tools (mcp__{service}__*) have not appeared after a "
+            "while, say so plainly in your reply instead of assuming it worked."
         ),
     }
 
