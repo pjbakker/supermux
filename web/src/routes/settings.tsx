@@ -84,6 +84,7 @@ import {
 import { SnippetsSection } from '@/components/settings/snippets-section'
 import { HostsSection } from '@/components/settings/hosts-section'
 import { WorkflowsRow } from '@/components/settings/workflows-row'
+import { ImportedSchedulesSection } from '@/components/settings/imported-schedules'
 import { AuditLog } from '@/components/settings/audit-log'
 import { UpdatesSection } from '@/components/settings/updates-panel'
 import { Button } from '@/components/ui/button'
@@ -1358,6 +1359,13 @@ export function Settings() {
               whole folded /scheduler table — a schedule had no home of its own
               then, and a workflow does. `#schedules` still lands here. */}
           <WorkflowsRow />
+
+          {/* The 0038 schedules-port archive — the destination the post-upgrade
+              notification deep-links (`#imported-schedules`). Renders nothing
+              on a database that never held old schedules. Kept OUTSIDE the
+              Advanced group like the other deep-linked sections, so the
+              fragment scroll finds an always-rendered target. */}
+          <ImportedSchedulesSection />
 
           <ClaudeToolsSection />
 

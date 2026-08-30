@@ -341,6 +341,8 @@ pub fn router_for(state: AppState) -> Router {
         // (skills + user/managed commands + claude.ai MCP connectors — never
         // built-ins).
         .route("/api/workflows/commands", get(commands_handler))
+        // The 0038 schedules-port archive (owner/admin-only, like `/commands`).
+        .route("/api/workflows/import-log", get(import_log_handler))
         .route("/api/workflows/runs", get(all_runs_handler))
         .route(
             "/api/workflows/{id}",
@@ -1034,11 +1036,19 @@ struct PreviewInput {
 /// excluded (a workflow step wants a skill/MCP, not `/clear`). Backed by the
 /// same filesystem read the Claude-tools registry uses — one source of truth.
 ///
-/// Moved from `scheduler::commands_handler` unchanged.
+/// Moved from `scheduler::commands_handler` — and, like its `/api/schedules`
+/// predecessor, **owner/admin-only**: the digest is a projection of the
+/// admin-gated claude-tools registry (global skills / commands / MCP connector
+/// names), and `?cwd=` points the filesystem read at an arbitrary directory.
+/// `member_may_reach` already denies the route (outer fence); this in-handler
+/// gate is the defense-in-depth half, same shape as the companies wizard
+/// endpoints. A member gets the uniform 404.
 async fn commands_handler(
     State(state): State<AppState>,
+    OptCtx(ctx): OptCtx,
     Query(q): Query<CommandsQuery>,
 ) -> Result<Json<Envelope<Vec<crate::claude_tools::registry::InstalledCommand>>>, AppError> {
+    crate::scope::require_admin(ctx.as_ref(), "/api/workflows/commands")?;
     let cwd = q.cwd.as_deref().filter(|s| !s.is_empty());
     Ok(ok(crate::claude_tools::registry::installed_commands(&state, cwd).await?))
 }
@@ -1049,6 +1059,39 @@ struct CommandsQuery {
     /// commands are included alongside the global ones.
     #[serde(default)]
     cwd: Option<String>,
+}
+
+/// `GET /api/workflows/import-log` — the 0038 schedules-port archive, the real
+/// destination behind [`port`]'s `/settings#imported-schedules` notification.
+/// Migration 0038 dropped the `schedules` table irreversibly; every pre-drop row
+/// lives on in `workflows_import_log`, and this endpoint is the app's only way
+/// to read them back (a refused shell job's command line included, so the user
+/// can rebuild it by hand). Owner/admin-only — the archive is global,
+/// pre-company data.
+///
+/// Each entry carries the raw columns plus `row` — `row_json` parsed — so no
+/// client has to double-decode. `ported` is surfaced as a bool.
+async fn import_log_handler(
+    State(state): State<AppState>,
+    OptCtx(ctx): OptCtx,
+) -> Result<Json<Envelope<serde_json::Value>>, AppError> {
+    crate::scope::require_admin(ctx.as_ref(), "/api/workflows/import-log")?;
+    let rows = db::workflows::import_log(&state.pool).await?;
+    let data: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            let row: serde_json::Value =
+                serde_json::from_str(&r.row_json).unwrap_or(serde_json::Value::Null);
+            json!({
+                "old_id": r.old_id,
+                "ported": r.ported != 0,
+                "reason": r.reason,
+                "row": row,
+                "at": r.at,
+            })
+        })
+        .collect();
+    Ok(ok(serde_json::Value::Array(data)))
 }
 
 // ── run now, cancel, and the run ledger ───────────────────────────────────────

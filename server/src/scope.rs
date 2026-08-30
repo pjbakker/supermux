@@ -286,6 +286,22 @@ pub fn member_may_reach(method: &Method, path: &str) -> bool {
     // they cannot see), while `create` runs its target session through
     // `authorize_session_for_human`. This entry is the OUTER fence only. `under`
     // requires a segment boundary, so `/api/workflowsx` is NOT admitted.
+    //
+    // Two subpaths are carved back OUT as global-admin (mirroring the companies
+    // `{id}/**` discipline: `require_admin` inside the handler 404s a member,
+    // and the outer fence denies them too):
+    //   * `/commands` — the installed-command digest. It is a projection of the
+    //     admin-only claude-tools registry (global skills / commands / MCP
+    //     connector names; the whole `/api/claude/*` manager router and
+    //     `/api/skills` are member-denied), and its `?cwd=` points the
+    //     filesystem read at an arbitrary directory — an operator affordance,
+    //     not a member one. Its predecessor `/api/schedules/commands` was
+    //     admin-gated.
+    //   * `/import-log` — the 0038 schedules-port archive: global pre-company
+    //     rows, whole shell command lines included.
+    if under(path, "/api/workflows/commands") || under(path, "/api/workflows/import-log") {
+        return false;
+    }
     if under(path, "/api/workflows") {
         return true;
     }
@@ -511,7 +527,13 @@ mod tests {
         assert!(member_may_reach(&get, "/api/workflows/WF-1/runs"));
         assert!(member_may_reach(&get, "/api/workflows/runs"));
         assert!(member_may_reach(&post, "/api/workflows/preview"));
-        assert!(member_may_reach(&get, "/api/workflows/commands"));
+        // …EXCEPT the two global-admin reads carved back out of the prefix:
+        // the installed-command digest (a projection of the admin-only
+        // claude-tools registry — global skills/commands/MCP names, plus an
+        // owner-directed `?cwd=`) and the schedules-port archive (pre-company
+        // global rows). `require_admin` inside each handler is the second fence.
+        assert!(!member_may_reach(&get, "/api/workflows/commands"));
+        assert!(!member_may_reach(&get, "/api/workflows/import-log"));
 
         // ── DENIED (global / admin / not company-scoped in v1) ──
         // Companies writes (require_admin) — only GET is admitted.
