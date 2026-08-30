@@ -37,6 +37,7 @@ import {
   isWatching,
   keepAliveRow,
   keepAliveSheetRow,
+  span,
 } from '../../src/lib/browser/keep-signed-in'
 
 const NOW = 1_788_000_000
@@ -96,7 +97,11 @@ describe('the ⋯ row', () => {
   test('on, never checked: "Starting" appears ONLY while last_keepalive_at is null', () => {
     const starting = keepAliveRow(tab({ keepalive_enabled: true, last_keepalive_at: null }), NOW)
     expect(starting.label).toBe('Stop keeping signed in')
-    expect(starting.detail).toBe('Starting — first check within a minute.')
+    // NOT "within a minute": the sweep defers a tab whose wheel a human holds
+    // for two minutes, and taking the wheel to sign in is the gesture that leads
+    // straight to this row.
+    expect(starting.detail).toBe('Starting — the first check is due shortly.')
+    expect(starting.detail).not.toContain('within a minute')
 
     const checked = keepAliveRow(
       tab({ keepalive_enabled: true, keepalive_action: 'soft', last_keepalive_at: NOW - 1 }),
@@ -136,8 +141,71 @@ describe('the ⋯ row', () => {
       }),
       NOW,
     )
-    expect(row.detail).toBe("Hasn't been able to check since 1 d ago.")
+    // "since ... ago" was a slip: `ago()` already appends "ago". This line has
+    // to carry a whole day of failure, so it reads as a duration.
+    expect(row.detail).toBe("Hasn't been able to check for 1 d.")
     expect(row.detail).not.toContain('checked 1 min ago')
+    expect(row.detail).not.toContain('ago')
+    // And it is NOT drawn in the same grey as a healthy line.
+    expect(row.attention).toBe(true)
+  })
+
+  test('the two states that need the owner ask for the attention tint', () => {
+    // Healthy, watching, off and starting are all quiet — the feature is silent
+    // until it can no longer do its job.
+    for (const t of [
+      tab(),
+      tab({ keepalive_enabled: true, last_keepalive_at: null }),
+      tab({ keepalive_enabled: true, keepalive_action: 'soft', last_keepalive_at: NOW - 60 }),
+      tab({
+        keepalive_enabled: true,
+        keepalive_action: 'watch',
+        last_keepalive_at: NOW - 300,
+        last_probe_at: NOW - 30 * 86_400,
+      }),
+    ]) {
+      expect(keepAliveRow(t, NOW).attention).toBeFalsy()
+    }
+    // Signed out: every bot on this tab is being 409'd.
+    expect(
+      keepAliveRow(
+        tab({ keepalive_enabled: true, login_state: 'needs_login', last_keepalive_at: NOW - 60 }),
+        NOW,
+      ).attention,
+    ).toBe(true)
+    // Never probed, and long past its own window — the wake keeps failing.
+    expect(
+      keepAliveRow(
+        tab({
+          keepalive_enabled: true,
+          keepalive_action: 'soft',
+          keepalive_every: 15,
+          last_keepalive_at: NOW - 86_400,
+          last_probe_at: null,
+        }),
+        NOW,
+      ).attention,
+    ).toBe(true)
+  })
+
+  test('a re-toggled tab that is still signed out never says "Starting"', () => {
+    // THE regression: enabling nulls `last_keepalive_at` (that is how the first
+    // tick is scheduled) and does not touch `login_state`, so ordering the
+    // "Starting" branch first hid a LIVE 409 gate behind an optimistic line
+    // until some later tick happened to correct it.
+    const row = keepAliveRow(
+      tab({ keepalive_enabled: true, login_state: 'needs_login', last_keepalive_at: null }),
+      NOW,
+    )
+    expect(row.detail).toBe('Signed out — take the wheel and sign in again.')
+    expect(row.attention).toBe(true)
+  })
+
+  test('span() is a duration, because ago() already says "ago"', () => {
+    expect(span(86_400)).toBe('1 d')
+    expect(span(720)).toBe('12 min')
+    expect(span(3_600)).toBe('1 h')
+    expect(span(2)).toBe('a moment')
   })
 
   test('on, stamped but never once probed, says so', () => {
@@ -231,7 +299,9 @@ describe('the ⋯ row', () => {
       }),
       NOW,
     )
-    expect(stale.detail).toBe("Hasn't been able to check since 2 h ago.")
+    expect(stale.detail).toBe("Hasn't been able to check for 2 h.")
+    expect(stale.attention).toBe(true)
+    expect(fresh.attention).toBeFalsy()
   })
 
   test('the interval reads coarsely: minutes, then hours', () => {
@@ -257,7 +327,16 @@ describe('the ⋯ row', () => {
       tab({ keepalive_enabled: true, keepalive_action: 'soft', last_keepalive_at: NOW - 60 }),
       tab({ keepalive_enabled: true, keepalive_action: 'watch', last_keepalive_at: NOW - 60 }),
       tab({ keepalive_enabled: true, login_state: 'needs_login', last_keepalive_at: NOW - 60 }),
+      tab({ keepalive_enabled: true, login_state: 'needs_login', last_keepalive_at: null }),
       tab({ keepalive_enabled: true, last_keepalive_at: NOW - 60, last_probe_at: null }),
+      tab({ keepalive_enabled: true, last_keepalive_at: NOW - 86_400, last_probe_at: null }),
+      // The stale line at its longest reading: days, on a 6-hourly cadence.
+      tab({
+        keepalive_enabled: true,
+        keepalive_every: 360,
+        last_keepalive_at: NOW - 60,
+        last_probe_at: NOW - 30 * 86_400,
+      }),
       tab({ keepalive_enabled: true, url: 'about:blank', last_keepalive_at: NOW - 60 }),
       tab({
         keepalive_enabled: true,
@@ -292,6 +371,38 @@ describe('the sheet row — where the cost is stated', () => {
     const r = keepAliveSheetRow(tab({ keepalive_enabled: true, keepalive_action: 'watch' }))
     expect(r.title).toBe('Watching this tab')
     expect(r.detail).toContain("won't hammer it")
+  })
+
+  test('a stuck tab does not get a "Keeping you signed in" title', () => {
+    // This is the surface the "Can't check …" push lands on. A check-marked
+    // "Keeping you signed in" over a day of failed checks is the false green
+    // light the module exists to prevent.
+    const r = keepAliveSheetRow(
+      tab({
+        keepalive_enabled: true,
+        keepalive_action: 'soft',
+        keepalive_every: 15,
+        last_keepalive_at: NOW - 60,
+        last_probe_at: NOW - 86_400,
+      }),
+      NOW,
+    )
+    expect(r.on).toBe(true)
+    expect(r.attention).toBe(true)
+    expect(r.title).toBe("Can't check this tab")
+    expect(r.detail).toContain('1 d')
+    // Watch mode pings nothing by design and is never "stuck".
+    const w = keepAliveSheetRow(
+      tab({
+        keepalive_enabled: true,
+        keepalive_action: 'watch',
+        last_keepalive_at: NOW - 300,
+        last_probe_at: NOW - 30 * 86_400,
+      }),
+      NOW,
+    )
+    expect(w.title).toBe('Watching this tab')
+    expect(w.attention).toBeFalsy()
   })
 
   test('any unrecognised mode — the column default included — means soft', () => {

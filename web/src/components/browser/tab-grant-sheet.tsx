@@ -17,7 +17,7 @@
 // close-tab note says a delete is not a sign-out — because it is not.
 import * as React from 'react'
 
-import { Loader2, Pin, PinOff, Plus, Shield, ShieldCheck, X } from 'lucide-react'
+import { Loader2, Pin, PinOff, Plus, Shield, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 
 import { ALL_AGENTS, companyGrantKey } from '@/lib/api/connectors'
 import {
@@ -33,6 +33,7 @@ import {
 import { canKeepSignedIn, keepAliveSheetRow } from '@/lib/browser/keep-signed-in'
 import { GrantControl, type GrantScope } from '@/components/store/grant-control'
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
+import { cn } from '@/lib/utils'
 import { SessionPicker } from '@/components/session/session-picker'
 import { useCompanies } from '@/hooks/use-companies'
 
@@ -104,6 +105,9 @@ export function TabGrantSheet({
   }, [granted, company])
 
   const state = tab ? tabState(tab) : null
+  // One call, one story: the title, the line under it and the icon all come from
+  // the same row, so the icon can never disagree with the sentence beside it.
+  const keepAlive = tab ? keepAliveSheetRow(tab) : null
 
   const grant = async (grantee: string) => {
     setBusy(grantee)
@@ -196,13 +200,28 @@ export function TabGrantSheet({
             >
               <span className="flex min-w-0 flex-col">
                 <span className="text-[13px] font-medium text-foreground">
-                  {keepAliveSheetRow(tab).title}
+                  {keepAlive?.title}
                 </span>
-                <span className="text-[11.5px] text-muted-foreground">
-                  {keepAliveSheetRow(tab).detail}
+                <span
+                  className={cn(
+                    'text-[11.5px]',
+                    keepAlive?.attention
+                      ? 'text-amber-600 dark:text-amber-500'
+                      : 'text-muted-foreground',
+                  )}
+                >
+                  {keepAlive?.detail}
                 </span>
               </span>
-              {tab.keepalive_enabled ? (
+              {/* The icon is the STATE, and the state is not always good: a
+                  check mark over "Can't check this tab" is the false green light
+                  this sheet exists to prevent. */}
+              {keepAlive?.attention ? (
+                <ShieldAlert
+                  className="size-4 shrink-0 text-amber-600 dark:text-amber-500"
+                  aria-hidden
+                />
+              ) : tab.keepalive_enabled ? (
                 <ShieldCheck className="size-4 shrink-0 text-muted-foreground" aria-hidden />
               ) : (
                 <Shield className="size-4 shrink-0 text-muted-foreground" aria-hidden />

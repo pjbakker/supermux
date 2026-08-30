@@ -111,6 +111,27 @@ describe('BrowserMenuItem.detail', () => {
     expect(html).toContain('Not a web page')
   })
 
+  test('a row that needs the owner is TINTED — the healthy one is not', () => {
+    // The failure this pins: a tab whose every check has failed for a day, and a
+    // tab that is signed out (409ing every bot on it), both rendered in the same
+    // muted grey as "Every 45 min · checked 12 min ago." — the bad news was in
+    // the menu, and it looked exactly like the good news.
+    const healthy = menu([{ id: 'keepalive', ...keepAliveRow(tab(), NOW) }])
+    expect(healthy).toContain('text-muted-foreground')
+    expect(healthy).not.toContain('text-amber-600')
+
+    for (const t of [
+      tab({ login_state: 'needs_login' }),
+      tab({ keepalive_every: 15, last_keepalive_at: NOW - 60, last_probe_at: NOW - 86_400 }),
+    ]) {
+      const html = menu([{ id: 'keepalive', ...keepAliveRow(t, NOW) }])
+      expect(html).toContain('text-amber-600')
+      // The LABEL stays neutral: the verb is not what is wrong.
+      expect(html).toContain('Stop keeping signed in')
+      expect(html).not.toContain('text-red-600')
+    }
+  })
+
   test('the label is the VERB, and it flips with the state', () => {
     expect(menu([{ id: 'keepalive', ...keepAliveRow(tab({ keepalive_enabled: false }), NOW) }]))
       .toContain('Keep me signed in')

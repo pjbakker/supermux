@@ -183,21 +183,26 @@ pub const UNCLEAR_STRIKES:     u8 = 3;     // back off after this many non-answe
 /// Seconds until the soonest deadline this origin's session appears to rely on,
 /// or `None` when nothing in the jar carries one.
 ///
-/// httpOnly FIRST, and only httpOnly when any exists: a real auth cookie is
-/// httpOnly (measured — the test jar's `sid` is invisible to `document.cookie`
-/// while the 5-minute `shortcsrf` is not), so preferring it keeps a short
-/// CSRF/consent/challenge cookie from impersonating the session clock. Falling
-/// back to all non-session cookies when nothing is httpOnly is wrong only in
-/// the safe direction: a too-short deadline just means a chattier schedule,
-/// clamped at the 5-minute floor, while a too-long one misses the expiry.
-pub fn auth_deadline(cookies: &[CookieLite], now: i64) -> Option<i64> {
-    let live: Vec<&CookieLite> =
-        cookies.iter().filter(|c| !c.session && c.expires > now as f64).collect();
-    let has_http_only = live.iter().any(|c| c.http_only);
-    live.iter()
+/// httpOnly FIRST, and only httpOnly when the jar holds ANY — session cookies
+/// included: a real auth cookie is httpOnly (measured — the test jar's `sid` is
+/// invisible to `document.cookie` while the 5-minute `shortcsrf` is not), so
+/// preferring it keeps a short CSRF/consent/challenge cookie from impersonating
+/// the session clock. The vote runs over the whole jar BEFORE the session
+/// filter, because the commonest auth cookie on the web is an httpOnly *session*
+/// cookie (`PHPSESSID`, `JSESSIONID`, `connect.sid`, Rails `_session`) with no
+/// expiry to filter on; voting after it read those sites as "nothing httpOnly
+/// here". Such a jar now carries no deadline at all — "nothing known", the
+/// honest answer for a server-side session, and the blind refresh.
+///
+/// The deadline carries its PROVENANCE, because only an httpOnly one may put a
+/// tab into watch mode (see `plan_for`).
+pub fn auth_deadline(cookies: &[CookieLite], now: i64) -> Option<Deadline> {
+    let has_http_only = cookies.iter().any(|c| c.http_only);
+    cookies.iter()
+        .filter(|c| !c.session && c.expires > now as f64)
         .filter(|c| !has_http_only || c.http_only)
-        .map(|c| c.expires as i64 - now)
-        .min()
+        .map(|c| Deadline { secs: c.expires as i64 - now, http_only: c.http_only })
+        .min_by_key(|d| d.secs)
 }
 ```
 
@@ -206,11 +211,16 @@ pub fn auth_deadline(cookies: &[CookieLite], now: i64) -> Option<i64> {
 ```rust
 pub enum Plan { Refresh(i64), Watch }   // minutes
 
-pub fn plan_for(ttl_secs: Option<i64>) -> Plan {
-    match ttl_secs {
-        None                                => Plan::Refresh(BLIND_MINUTES),
-        Some(t) if t < WATCH_UNDER_SECS     => Plan::Watch,
-        Some(t) => Plan::Refresh((t / 120).clamp(FLOOR_MINUTES, CEILING_MINUTES)),
+pub fn plan_for(deadline: Option<Deadline>) -> Plan {
+    match deadline {
+        None => Plan::Refresh(BLIND_MINUTES),
+        // ONLY an httpOnly deadline stops the pings. Watch mode is not a
+        // chattier schedule, it is NO schedule — so a short *visible* cookie
+        // (a CSRF/consent/challenge token, possibly re-set by the page's own
+        // JS forever) must never demote a healthy site to zero requests while
+        // the menu tells the owner "this site signs out in minutes".
+        Some(d) if d.http_only && d.secs < WATCH_UNDER_SECS => Plan::Watch,
+        Some(d) => Plan::Refresh((d.secs / 120).clamp(FLOOR_MINUTES, CEILING_MINUTES)),
     }
 }
 ```
@@ -316,6 +326,10 @@ push::send_push_for(state, NotifCategory::AgentWaiting,
 
 `AgentWaiting` is reused deliberately: it is literally the "needs you" category and it honours the owner's existing mute prefs, whereas a new category means new prefs plumbing in `db/push.rs`. `session: None` — this is not about one bot. The deep link is `/browser`; `routes/browser.tsx` has no `?tab=` param today and this spec does not add one.
 
+**The second push — "can't check".** The sign-out edge is not the only way this feature stops working, and it was the only one that spoke. A tab whose every check fails (a 404/5xx root, a cross-origin SSO bounce the fetch rejects, a wake that keeps failing) is *still stamped every tick* and *still backs off* to its plan's interval, so nothing about it looks wrong from the outside; the bad news lived only inside the ⋯ menu, in the same muted grey as the healthy line. So after `STALE_INTERVALS = 3` of the tab's **own** intervals with no `probed` tick, the sweep fires **one** push (`Can't check {host}` / "supermux hasn't been able to check this tab. Bots using it may already be signed out.", same category and tier) and audits `browser.keepalive_stuck`.
+
+The streak is in-memory (`Health::last_check` / `stale_pushed`, seeded from the row's own `last_probe_at`), because a tab whose every *wake* fails never gets a `last_probe_at` and the row carries no "enabled at" to measure from. Re-armed only by a tick that actually probed. **Watch mode is never stale** — it pings nothing by design — and a `needs_login` tab is skipped, because it already has its own push and its own row. The ⋯ row and the sheet draw these two states in the attention tint with a `ShieldAlert`, never a check-marked shield.
+
 ### 2.6 Pause and lock rules
 
 1. **`tab.mode() == DriveMode::HumanDriving` ⇒ skip the whole tick** (no ping, no cookie read, no stamp), retry in 2 minutes. `AgentContext::evaluate` is ungated by design (`context.rs:1095-1097`), so this explicit check is the only thing between a background ping and the owner's thumbs on a sign-in form.
@@ -417,12 +431,12 @@ The row, in `pageRows()` (`workspace.tsx:447`), directly above `Sharing & settin
 | no active tab, or url not `http(s)` **and off** | *(disabled)* **Keep me signed in** | *hint:* `Only web pages can be kept signed in` |
 | url not `http(s)` but **on** | **Stop keeping signed in** | `Not a web page — nothing to check here.` — never greyed: it still holds a slot, so the way off has to stay reachable |
 | off | **Keep me signed in** | `Refresh bol.com in the background so bots stay signed in.` |
-| on, `last_keepalive_at === null` | **Stop keeping signed in** | `Starting — first check within a minute.` |
+| on, `login_state === 'needs_login'` (checked FIRST — re-enabling nulls the stamp without clearing the gate) | **Stop keeping signed in** | `Signed out — take the wheel and sign in again.` *(attention tint)* |
+| on, `last_keepalive_at === null` | **Stop keeping signed in** | `Starting — the first check is due shortly.` |
 | on, `action === 'soft'`, healthy | **Stop keeping signed in** | `Every 45 min · checked 12 min ago.` |
 | on, `action === 'watch'` | **Stop keeping signed in** | `Watching only — this site expires sessions in minutes; refreshing would fight that.` |
-| on, `login_state === 'needs_login'` | **Stop keeping signed in** | `Signed out — take the wheel and sign in again.` |
 | on, `last_probe_at === null` | **Stop keeping signed in** | `Hasn't been able to check yet.` |
-| on, `now − last_probe_at > 3 × every × 60` | **Stop keeping signed in** | `Hasn't been able to check since 2 h ago.` |
+| on, `now − last_probe_at > 3 × every × 60` | **Stop keeping signed in** | `Hasn't been able to check for 2 h.` *(attention tint)* |
 
 **The age comes from `last_probe_at`, never `last_keepalive_at`.** The latter is only the scheduler's cursor: the sweep stamps it on *every* tick it completes, including the ticks that learned nothing (an unclear streak backing off, a wake that kept failing, a page it cannot ping). Reading the age off it renders `Every 15 min · checked 1 min ago.` over a tab whose every ping has failed for a day — and because the row keeps being stamped, the stale line can never fire either. That is the exact false green light §7.3 forbids. Watch mode is checked **before** the age lines: it pings nothing by design, so its probe stamp stands still and any age there would read as neglect.
 
@@ -434,7 +448,7 @@ Interval wording is coarse, via one helper: `every < 120 ⇒ "45 min"`, else `"6
 onKeepAlive={(id, on) => void actions.patch(id, { keepalive_enabled: on }, 'keepalive')}
 ```
 
-The menu closes on select, so success needs a word: on a resolved enable, toast `Keeping bol.com signed in — first check within a minute.`; on disable, toast `Stopped keeping bol.com signed in.` Failures already toast through `patchM`'s `fail(verb)` (`use-browser-tabs.ts:210`), which is how the two 400s in §4 reach the owner. `TabVerb` gains `'keepalive'` with the message `Could not change keep-signed-in for this tab`.
+The menu closes on select, so success needs a word: on a resolved enable, toast `Keeping bol.com signed in — the first check is due shortly.` (not "within a minute": the sweep defers a tab whose wheel a human is holding, and taking the wheel to sign in is the gesture that leads straight here); on disable, toast `Stopped keeping bol.com signed in.` Failures already toast through `patchM`'s `fail(verb)` (`use-browser-tabs.ts:210`), which is how the two 400s in §4 reach the owner. `TabVerb` gains `'keepalive'` with the message `Could not change keep-signed-in for this tab`.
 
 ### 5.2 The sheet row (the depth surface)
 
@@ -489,7 +503,7 @@ pub fn spawn(state: AppState) {
 **`server/src/connectors/browser/keepalive.rs`, `#[cfg(test)]` — pure, no Chrome:**
 
 1. `auth_deadline` picks the httpOnly cookie over a shorter non-httpOnly one: the measured jar `[shortcsrf +300 s non-httpOnly, sid +600 s httpOnly, sess expires=-1]` ⇒ `Some(600)`. *(This is F2's regression test.)*
-2. `auth_deadline` falls back to all non-session cookies when none is httpOnly: `[+300, +1200]` ⇒ `Some(300)`.
+2. `auth_deadline` falls back to all non-session cookies when none is httpOnly: `[+300, +1200]` ⇒ `Some(300, visible)` — and that visible deadline plans `Refresh(FLOOR_MINUTES)`, **never** `Watch`. An httpOnly session cookie beside a 5-minute consent cookie carries no deadline at all ⇒ the blind refresh.
 3. `auth_deadline` ⇒ `None` for a session-only jar, and for an empty jar.
 4. `auth_deadline` ignores an already-expired cookie.
 5. `plan_for`: `None`⇒`Refresh(15)`; `Some(1800)`⇒`Refresh(15)`; `Some(2880)`⇒`Refresh(24)`; `Some(601)`⇒`Refresh(5)` (floor); `Some(599)`⇒`Watch`; `Some(14*86400)`⇒`Refresh(360)` (ceiling).

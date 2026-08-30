@@ -77,6 +77,7 @@ import {
   RotateCw,
   Search,
   Shield,
+  ShieldAlert,
   ShieldCheck,
   TextSelect,
   Users,
@@ -455,6 +456,10 @@ export function BrowserWorkspace({
     { id: 'close', label: 'Close', icon: X, danger: true },
   ]
 
+  // One read of the keep-alive state, so the ICON can never disagree with the
+  // sentence beside it.
+  const keepAlive = keepAliveRow(active)
+
   const pageRows = (): BrowserMenuItem[] => [
     { id: 'back', label: 'Back', icon: ArrowLeft, disabled: !nav.canGoBack },
     { id: 'forward', label: 'Forward', icon: ArrowRight, disabled: !nav.canGoForward },
@@ -488,9 +493,17 @@ export function BrowserWorkspace({
       ? [
           {
             id: 'keepalive',
-            icon: active?.keepalive_enabled ? ShieldCheck : Shield,
+            // The icon follows the STATE, not the switch. A CHECK-marked shield
+            // beside "Signed out — take the wheel and sign in again." is exactly
+            // the false green light this surface exists to prevent, and the same
+            // shield sat over a day of failed checks.
+            icon: keepAlive.attention
+              ? ShieldAlert
+              : active?.keepalive_enabled
+                ? ShieldCheck
+                : Shield,
             separated: true,
-            ...keepAliveRow(active),
+            ...keepAlive,
           } satisfies BrowserMenuItem,
         ]
       : []),

@@ -21,10 +21,14 @@
 //      page that cannot be pinged). Reading the age off it renders
 //      "checked 1 min ago" over a tab whose every ping has failed for a day —
 //      the false green light this whole surface exists to prevent.
-//   2. `needs_login` outranks everything except "not started yet": a signed-out
-//      tab 409s every bot on it, and that is the fact the owner has to act on.
+//   2. `needs_login` outranks EVERYTHING once the toggle is on — "starting"
+//      included. A signed-out tab 409s every bot on it, that is the fact the
+//      owner has to act on, and re-toggling the feature nulls the schedule
+//      stamp without clearing the gate.
 //   3. A tab that has fallen behind says so with the age, rather than showing a
-//      cadence it is not keeping.
+//      cadence it is not keeping — and it says it in the ATTENTION tint, not in
+//      the same grey as a healthy line. The two states that need the owner
+//      (signed out, cannot check) are the two the whole surface exists for.
 //   4. Watch mode says supermux is WATCHING, never refreshing — because it is
 //      deliberately not refreshing, and claiming otherwise on a bank tab would
 //      be the worst lie this surface could tell.
@@ -56,6 +60,35 @@ export interface KeepAliveRow {
   detail?: string
   disabled?: boolean
   hint?: string
+  /** This row's STATE needs the owner: it is signed out, or supermux can no
+   *  longer check it. The menu tints the detail line and the icon; the label
+   *  stays neutral, because the VERB is not the problem.
+   *
+   *  Without this the two states the feature exists to surface rendered in the
+   *  same muted grey as "Every 45 min · checked 12 min ago." — a day of failed
+   *  checks looked exactly like a healthy day. */
+  attention?: boolean
+}
+
+/** `ago()` with its "ago" removed — a DURATION, not a moment.
+ *
+ *  `ago()` already appends "ago", so "since 1 d ago" was a grammatical slip on
+ *  the one line that has to carry a whole day of failure. "just now" has no
+ *  duration reading at all, hence "a moment". */
+export function span(seconds: number): string {
+  const phrase = ago(seconds)
+  return phrase === 'just now' ? 'a moment' : phrase.replace(/ ago$/, '')
+}
+
+/** Seconds since this tab was last actually CHECKED, and the window it has to
+ *  beat. `last_probe_at` is the only honest clock (a tick that learned nothing
+ *  still stamps `last_keepalive_at`); a tab that has never been probed measures
+ *  from its first completed tick instead, so "hasn't checked yet" can still
+ *  escalate rather than reading as fine forever. */
+function checkGap(tab: BrowserTab, now: number): { since: number; stale: boolean } {
+  const clock = tab.last_probe_at ?? tab.last_keepalive_at ?? now
+  const since = Math.max(0, now - clock)
+  return { since, stale: since > STALE_INTERVALS * Math.max(1, tab.keepalive_every) * 60 }
 }
 
 /** Coarse on purpose: nobody acts on the difference between 46 and 45 minutes,
@@ -111,11 +144,24 @@ export function keepAliveRow(
     }
   }
   // Enabled from here down.
-  if (tab.last_keepalive_at === null) {
-    return { label: ON_LABEL, detail: 'Starting — first check within a minute.' }
-  }
+  //
+  // `needs_login` FIRST — before "Starting". Turning the toggle off and on again
+  // nulls `last_keepalive_at` (that is how the first tick is scheduled) without
+  // touching `login_state`, so a "Starting" line ordered above this one hid a
+  // LIVE enforcement gate — every bot on the tab 409ing — behind an optimistic
+  // sentence, until the next tick happened to correct it.
   if (tab.login_state === 'needs_login') {
-    return { label: ON_LABEL, detail: 'Signed out — take the wheel and sign in again.' }
+    return {
+      label: ON_LABEL,
+      detail: 'Signed out — take the wheel and sign in again.',
+      attention: true,
+    }
+  }
+  if (tab.last_keepalive_at === null) {
+    // NOT "within a minute": the sweep skips a tab whose wheel a human is
+    // holding (2 minutes), and the natural gesture is exactly that — take the
+    // wheel, sign in, ⋯, Keep me signed in — so the honest promise is vaguer.
+    return { label: ON_LABEL, detail: 'Starting — the first check is due shortly.' }
   }
   // Watch mode BEFORE any age line: it deliberately pings nothing, so
   // `last_probe_at` stands still by design and an age would read as neglect.
@@ -131,16 +177,20 @@ export function keepAliveRow(
   // every ping fails (a 404/5xx root, a cross-origin SSO bounce the fetch
   // rejects, a wake that keeps failing) is still stamped every tick, so an age
   // taken from the stamp can never go stale and the row lies indefinitely.
+  const { since, stale } = checkGap(tab, now)
   if (tab.last_probe_at === null) {
-    return { label: ON_LABEL, detail: "Hasn't been able to check yet." }
+    return { label: ON_LABEL, detail: "Hasn't been able to check yet.", attention: stale }
   }
-  const age = Math.max(0, now - tab.last_probe_at)
-  if (age > STALE_INTERVALS * Math.max(1, tab.keepalive_every) * 60) {
-    return { label: ON_LABEL, detail: `Hasn't been able to check since ${ago(age)}.` }
+  if (stale) {
+    return {
+      label: ON_LABEL,
+      detail: `Hasn't been able to check for ${span(since)}.`,
+      attention: true,
+    }
   }
   return {
     label: ON_LABEL,
-    detail: `Every ${everyLabel(tab.keepalive_every)} · checked ${ago(age)}.`,
+    detail: `Every ${everyLabel(tab.keepalive_every)} · checked ${ago(since)}.`,
   }
 }
 
@@ -152,9 +202,15 @@ export interface KeepAliveSheetRow {
   title: string
   detail: string
   on: boolean
+  /** Same meaning as on the ⋯ row: the state needs the owner, so the icon must
+   *  not be a check mark. */
+  attention?: boolean
 }
 
-export function keepAliveSheetRow(tab: BrowserTab): KeepAliveSheetRow {
+export function keepAliveSheetRow(
+  tab: BrowserTab,
+  now: number = Date.now() / 1000,
+): KeepAliveSheetRow {
   if (tab.keepalive_enabled && !canKeepSignedIn(tab.url)) {
     // Still ON, and still switchable off from here — but claiming it is being
     // kept signed in would be a lie: there is no origin to ping.
@@ -178,6 +234,18 @@ export function keepAliveSheetRow(tab: BrowserTab): KeepAliveSheetRow {
       title: 'Watching this tab',
       detail:
         "This site expires sessions in minutes. supermux won't hammer it; it will tell you when you're signed out.",
+    }
+  }
+  // A streak of failed checks says so HERE too — this is the surface the
+  // "Can't check …" notification lands on, and a check mark over "Keeping you
+  // signed in" would be the false green light the module header opens with.
+  const { since, stale } = checkGap(tab, now)
+  if (stale && tab.last_keepalive_at !== null) {
+    return {
+      on: true,
+      attention: true,
+      title: "Can't check this tab",
+      detail: `Nothing has answered here for ${span(since)}. The sign-in may already be gone — take the wheel and look.`,
     }
   }
   return {

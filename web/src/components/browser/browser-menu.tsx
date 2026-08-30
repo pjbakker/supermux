@@ -50,6 +50,14 @@ export interface BrowserMenuItem {
   detail?: string
   /** Draws it in the destructive tint (Close, Close others). */
   danger?: boolean
+  /** The row's STATE needs the owner — it tints the ICON and the detail line in
+   *  the workspace's amber, and leaves the label alone.
+   *
+   *  NOT `danger`: that is the destructive-VERB tint, and a row whose verb is
+   *  "Stop keeping signed in" is not destructive. What is wrong is the state the
+   *  detail line describes, so that is what gets the colour — the same amber the
+   *  sign-in banner and the tab chip already use for `needs_login`. */
+  attention?: boolean
   /** A hairline above this row. */
   separated?: boolean
 }
@@ -198,13 +206,28 @@ export function BrowserMenu({ at, items, label, onSelect, onClose, fixed }: Brow
                 !item.disabled && i === active && (item.danger ? 'bg-red-500/10' : 'bg-secondary'),
               )}
             >
-              {Icon && <Icon className="size-4 shrink-0 opacity-70" aria-hidden />}
+              {Icon && (
+                <Icon
+                  className={cn(
+                    'size-4 shrink-0',
+                    item.attention && !item.disabled
+                      ? 'text-amber-600 dark:text-amber-500'
+                      : 'opacity-70',
+                  )}
+                  aria-hidden
+                />
+              )}
               {item.detail ? (
                 <span className="flex min-w-0 flex-1 flex-col">
                   <span className="truncate">{item.label}</span>
                   <span
                     data-browser-menu-detail={item.id}
-                    className="line-clamp-2 text-[11.5px] leading-snug text-muted-foreground"
+                    className={cn(
+                      'line-clamp-2 text-[11.5px] leading-snug',
+                      item.attention && !item.disabled
+                        ? 'text-amber-600 dark:text-amber-500'
+                        : 'text-muted-foreground',
+                    )}
                   >
                     {item.detail}
                   </span>

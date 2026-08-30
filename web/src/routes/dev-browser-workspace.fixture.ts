@@ -1,4 +1,4 @@
-// Fixtures for /dev/browser-workspace — eleven tabs that between them cover every
+// Fixtures for /dev/browser-workspace — twelve tabs that between them cover every
 // state the rail has to draw, offline.
 //
 // Chosen deliberately, not decoratively:
@@ -10,10 +10,12 @@
 //   · a tab with a 90-character title, which is the exact input that breaks a
 //     rail that is not `min-w-0` + fixed-width all the way down;
 //   · a tab lent via `*`, so the sheet's shared-grant honesty line renders;
-//   · a tab with KEEP-ME-SIGNED-IN on and healthy, one in WATCH mode, and one
-//     that is on but has NOT been able to check — the three states whose ⋯
-//     detail line has to stay legible at 390px, and the only place the longest
-//     string this feature ships gets drawn.
+//   · a tab with KEEP-ME-SIGNED-IN on and healthy, one in WATCH mode, one that
+//     is on but has NOT been able to check, and one that is on and SIGNED OUT —
+//     the four states whose ⋯ detail line has to stay legible at 390px, the only
+//     place the longest string this feature ships gets drawn, and the two states
+//     (signed out, cannot check) that have to draw in the attention tint rather
+//     than in the same grey as a healthy line.
 //
 // DEV-only and lazily imported by the bench route, so none of it reaches the
 // production bundle.
@@ -197,6 +199,27 @@ export const BENCH_TABS: BrowserTab[] = [
     grants: [grant('tb_stuck', 'Ada')],
     created_at: NOW - 500_000,
     last_used_at: NOW - 4_000,
+  },
+  {
+    // ON AND SIGNED OUT — the state that DEMANDS action: every bot granted this
+    // tab is being 409'd until the owner takes the wheel. It draws the amber
+    // detail line and the ShieldAlert, never a check mark.
+    id: 'tb_locked',
+    title: 'Payroll',
+    url: 'https://payroll.example/dashboard',
+    pinned: false,
+    company_id: null,
+    origins: ['payroll.example'],
+    login_state: 'needs_login',
+    last_probe_at: NOW - 600,
+    live: true,
+    keepalive_enabled: true,
+    keepalive_every: 10,
+    keepalive_action: 'soft',
+    last_keepalive_at: NOW - 600,
+    grants: [grant('tb_locked', 'Grace')],
+    created_at: NOW - 700_000,
+    last_used_at: NOW - 3_000,
   },
   {
     // WATCH MODE — the one state where supermux says no. Its copy is the

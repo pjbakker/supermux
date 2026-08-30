@@ -12,7 +12,7 @@
 //!   next tick = clamp(shortest auth-cookie lifetime / 2, 5 min, 6 h)
 //! ```
 //!
-//! # The three rules that carry the design
+//! # The four rules that carry the design
 //!
 //! **1. Soft ping, always. [`Page.reload`] is not implemented here, in any
 //! mode, behind any flag.** A reload burns one-time CSRF nonces, drops unsaved
@@ -32,12 +32,23 @@
 //! CSRF/consent cookie sitting beside a 10-minute httpOnly auth cookie is the
 //! common shape; picking the minimum naively mis-times the schedule and (in the
 //! design this replaces) refused to enable on perfectly healthy sites.
-//! [`auth_deadline`] prefers httpOnly candidates for that reason. And a jar
+//! [`auth_deadline`] prefers httpOnly candidates for that reason, and only an
+//! httpOnly deadline may ever put a tab into watch mode — watch mode is *zero*
+//! pings, so earning it off a JS-readable CSRF/consent token silently switched
+//! the whole feature off on a site that was fine. And a jar
 //! that could not be READ is not an empty jar: an empty one plans the blind
 //! 15-minute refresh, so folding a CDP error into `Vec::new()` released watch
 //! mode and pinged the one class of site this feature promises not to ping (a
 //! short idle timeout is a deliberate security control). A failed read carries
 //! the row's own plan forward — see [`plan_after_read`].
+//!
+//! **4. Silent until it can no longer do its job — and then not silent.** No
+//! per-tick chatter, no badge for a normal day. But a tab whose every check
+//! fails is stamped and backed off exactly like a healthy one, so it needs to
+//! be said out loud: after [`STALE_INTERVALS`] of its own intervals without a
+//! successful check, [`is_stale`] fires **one** push (re-armed by the next
+//! successful check), and the ⋯ row takes the attention tint instead of leaving
+//! the bad news in the same grey as the healthy line.
 //!
 //! # Why the cookie read happens AFTER the ping
 //!
@@ -108,6 +119,12 @@ pub const HUMAN_DEFER_SECS: i64 = 120;
 /// one a minute forever.
 pub const QUIET_TICKS: u8 = 4;
 
+/// Intervals without a successful check before supermux says so OUT LOUD. Three,
+/// not one: a single missed tick is ordinary (the human held the wheel, the wake
+/// budget deferred the tab, the box was busy). The ⋯ row flips to its stale line
+/// on the same three, so the notification and the row never disagree.
+pub const STALE_INTERVALS: i64 = 3;
+
 /// `keepalive_action` — soft mode: fetch-ping, then read the jar.
 pub const ACTION_SOFT: &str = "soft";
 /// `keepalive_action` — watch mode: read the jar only, ping nothing.
@@ -166,26 +183,45 @@ impl CookieLite {
     }
 }
 
-/// Seconds until the soonest deadline this origin's session appears to rely on,
-/// or `None` when nothing in the jar carries one.
+/// A deadline read out of the jar, and **where it came from**. The provenance
+/// is not decoration: it is the whole difference between "this site expires in
+/// minutes, stop pinging it" and "some consent banner cookie is short".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deadline {
+    /// Seconds from now until it expires.
+    pub secs: i64,
+    /// Did it come off an httpOnly cookie — one only the server can set?
+    pub http_only: bool,
+}
+
+/// The soonest deadline this origin's session appears to rely on, or `None`
+/// when nothing in the jar carries one.
 ///
-/// **httpOnly first, and only httpOnly when any exists.** A real auth cookie is
-/// httpOnly (measured: a test jar's `sid` is invisible to `document.cookie`
-/// while its 5-minute `shortcsrf` is not), so preferring it keeps a short
-/// CSRF/consent/challenge cookie from impersonating the session clock. Falling
-/// back to every non-session cookie when nothing is httpOnly is wrong only in
-/// the safe direction: a too-short deadline just means a chattier schedule,
-/// clamped at the 5-minute floor, while a too-long one misses the expiry.
-pub fn auth_deadline(cookies: &[CookieLite], now: i64) -> Option<i64> {
-    let live: Vec<&CookieLite> = cookies
+/// **httpOnly first, and only httpOnly when the jar holds ANY — session cookies
+/// included.** A real auth cookie is httpOnly (measured: a test jar's `sid` is
+/// invisible to `document.cookie` while its 5-minute `shortcsrf` is not), so
+/// preferring it keeps a short CSRF/consent/challenge cookie from impersonating
+/// the session clock.
+///
+/// The provenance vote deliberately runs over the whole jar, **before** the
+/// session filter. Deciding it after — as this did — read the most common auth
+/// shape on the web as "no httpOnly cookie here": `PHPSESSID`, `JSESSIONID`,
+/// `connect.sid` and Rails' `_session` are httpOnly *session* cookies whose
+/// lifetime lives on the server, so they carry no expiry to filter on, and a
+/// 5-minute consent cookie was left speaking for the session on a perfectly
+/// healthy site. Now such a jar honestly carries **no deadline at all**, which
+/// plans the blind refresh — the answer for a server-side session.
+pub fn auth_deadline(cookies: &[CookieLite], now: i64) -> Option<Deadline> {
+    let has_http_only = cookies.iter().any(|c| c.http_only);
+    cookies
         .iter()
         .filter(|c| !c.session && c.expires > now as f64)
-        .collect();
-    let has_http_only = live.iter().any(|c| c.http_only);
-    live.iter()
         .filter(|c| !has_http_only || c.http_only)
-        .map(|c| c.expires as i64 - now)
-        .min()
+        .map(|c| Deadline {
+            secs: c.expires as i64 - now,
+            http_only: c.http_only,
+        })
+        .min_by_key(|d| d.secs)
 }
 
 /// What the next tick should do, and when.
@@ -223,11 +259,20 @@ impl Plan {
 /// **The watch decision is never latched**: it is recomputed from the post-ping
 /// jar on every tick, so an ephemeral 5-minute cookie that briefly shortened
 /// the deadline stops mattering the moment it expires.
-pub fn plan_for(ttl_secs: Option<i64>) -> Plan {
-    match ttl_secs {
+pub fn plan_for(deadline: Option<Deadline>) -> Plan {
+    match deadline {
         None => Plan::Refresh(BLIND_MINUTES),
-        Some(t) if t < WATCH_UNDER_SECS => Plan::Watch,
-        Some(t) => Plan::Refresh((t / 120).clamp(FLOOR_MINUTES, CEILING_MINUTES)),
+        // **ONLY an httpOnly deadline may stop the pings.** Watch mode is not a
+        // gentler schedule, it is *no* schedule — zero requests, and a menu line
+        // that says "this site signs out in minutes". Earning that claim off a
+        // JS-readable cookie was a silent way to switch the feature off on a
+        // healthy site: any short CSRF/consent/challenge token could demote the
+        // tab, and if the page's own JS kept re-setting it (an SPA heartbeat, a
+        // rotating CSRF) the demotion stuck, because a watching tab requests
+        // nothing that could ever disagree. A visible cookie's deadline is still
+        // worth *scheduling* on — it is just never evidence about the session.
+        Some(d) if d.http_only && d.secs < WATCH_UNDER_SECS => Plan::Watch,
+        Some(d) => Plan::Refresh((d.secs / 120).clamp(FLOOR_MINUTES, CEILING_MINUTES)),
     }
 }
 
@@ -400,6 +445,19 @@ pub struct Health {
     /// Unix seconds before which this tab is not touched (the human-driving
     /// back-off).
     pub defer_until: i64,
+    /// Unix seconds of the last tick that actually CHECKED this tab, seeded from
+    /// the row's own `last_probe_at` the first time the sweep sees it.
+    ///
+    /// The stale clock runs off this rather than off the column because a tab
+    /// whose every *wake* fails never gets a `last_probe_at` at all, and the row
+    /// carries no "enabled at" to measure from. Nothing is persisted: a restart
+    /// re-seeds from the column when it has one (so a tab that is still stuck is
+    /// re-announced once) and from `now` when it does not (so the streak starts
+    /// over). Both are honest; neither invents a gap that did not happen.
+    pub last_check: i64,
+    /// Has the "can't check" push already fired for this streak? One per streak
+    /// per process, re-armed by the next successful check.
+    pub stale_pushed: bool,
 }
 
 /// Fold one tick's outcome and plan into a write.
@@ -572,6 +630,27 @@ pub fn is_watch_mode(action: &str) -> bool {
     action == ACTION_WATCH
 }
 
+/// Has this tab gone long enough without a successful check that the owner has
+/// to be TOLD, rather than left to find it in a menu?
+///
+/// WHY this exists: everything else in this file is designed to fail quietly,
+/// and that is right — but the quiet has one hole. A tab whose every ping fails
+/// (a 404/5xx root, a cross-origin SSO bounce the fetch rejects, a wake that
+/// keeps failing) is still stamped every tick and still backs off to its plan's
+/// interval, so from the outside it is indistinguishable from a healthy one.
+/// The promise this feature makes is "silent until it can no longer do its
+/// job"; without this it was silent exactly then, and the bad news lived only
+/// inside the ⋯ menu, in the same grey as the healthy line.
+///
+/// **Watch mode is never stale.** It pings nothing by design, so its probe stamp
+/// stands still forever and an alarm there would be false every single time.
+pub fn is_stale(last_check: i64, now: i64, every_min: i64, action: &str) -> bool {
+    if is_watch_mode(action) {
+        return false;
+    }
+    now - last_check > STALE_INTERVALS * every_min.max(1) * 60
+}
+
 // ── the loop ─────────────────────────────────────────────────────────────────
 
 /// Start the sweep. Mirrors `workflows::spawn`.
@@ -614,7 +693,17 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
     let mut woken = 0usize;
 
     for row in &rows {
-        let h = *health.entry(row.id.clone()).or_default();
+        let h = {
+            let e = health.entry(row.id.clone()).or_default();
+            // Seed the stale clock once, from the row's own last successful
+            // probe when it has one. A tab that has never been probed starts its
+            // streak NOW, so a restart delays that notification rather than
+            // firing one about a gap this process did not witness.
+            if e.last_check == 0 {
+                e.last_check = row.last_probe_at.unwrap_or(now);
+            }
+            *e
+        };
         if now < h.defer_until {
             continue;
         }
@@ -634,6 +723,10 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
                 ACTION_SOFT
             };
             stamp(state, &row.id, BLIND_MINUTES, action, None, false).await;
+            // NOT a stale streak: there is genuinely nothing to check here, the
+            // row says so in its own words ("Not a web page"), and a tab parked
+            // on `about:blank` overnight must not turn into a notification.
+            health.entry(row.id.clone()).or_default().last_check = now;
             continue;
         }
         if !live.contains(&row.id) {
@@ -658,7 +751,7 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
                     plan_after_read(None, now, &row.keepalive_action, row.keepalive_every),
                     row.login_state == db_tabs::LOGIN_NEEDED,
                 );
-                apply(state, row, step).await;
+                apply_tracked(state, row, step, health, now).await;
                 continue;
             }
         };
@@ -716,11 +809,52 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
         if matches!(step.write, Write::Stamp { .. }) {
             entry.jitter = draw_jitter(plan.minutes());
         }
-        apply(state, row, step).await;
+        apply_tracked(state, row, step, health, now).await;
         // The tab is LEFT LIVE. Dehydrating it would replace this ~1 KB fetch
         // with a full page load of `meta.url` on the next tick — the opposite
         // of a quiet keep-alive.
     }
+}
+
+/// Perform the step, then run the stale clock. **Every path that writes goes
+/// through here**, the wake failure included — a tab that can never be woken is
+/// exactly the silent failure the notification exists for.
+async fn apply_tracked(
+    state: &AppState,
+    row: &db_tabs::TabRow,
+    step: Step,
+    health: &mut HashMap<String, Health>,
+    now: i64,
+) {
+    apply(state, row, step).await;
+    let entry = health.entry(row.id.clone()).or_default();
+    // `probed` is the only honest definition of "it worked": a tick that backed
+    // off, watched, or failed to wake writes `probed: false` and must not reset
+    // the streak. A CONFIRMED sign-out is a successful check — it probed, it
+    // learned, and it has a notification of its own.
+    if matches!(step.write, Write::Stamp { probed: true, .. }) {
+        entry.last_check = now;
+        entry.stale_pushed = false;
+        return;
+    }
+    // One tab, one story: a `needs_login` tab already told the owner what to do,
+    // and "can't check it" on top of "signed out" is noise about the same tab.
+    if entry.stale_pushed || row.login_state == db_tabs::LOGIN_NEEDED {
+        return;
+    }
+    if !is_stale(entry.last_check, now, row.keepalive_every, &row.keepalive_action) {
+        return;
+    }
+    entry.stale_pushed = true;
+    let host = host_of(&row.url);
+    tell_the_owner(
+        state,
+        row,
+        "browser.keepalive_stuck",
+        format!("Can't check {host}"),
+        "supermux hasn't been able to check this tab. Bots using it may already be signed out.",
+    )
+    .await;
 }
 
 /// Perform a step's write, its audit row and its one push.
@@ -739,27 +873,42 @@ async fn apply(state: &AppState, row: &db_tabs::TabRow, step: Step) {
         return;
     }
     let host = host_of(&row.url);
+    tell_the_owner(
+        state,
+        row,
+        "browser.keepalive_signed_out",
+        format!("Signed out of {host}"),
+        "Bots using this tab are blocked until you sign in again.",
+    )
+    .await;
+}
+
+/// The feature's ONLY channel to the owner: an audit row, then one push.
+///
+/// `AgentWaiting` is reused deliberately: it is literally the "needs you"
+/// category and it honours the owner's existing mute prefs, whereas a new
+/// category means new prefs plumbing. `session: None` — this is not about one
+/// bot. The audit row logs the HOST, never the url: a tab's url can carry a
+/// magic-link or session token in its query string.
+async fn tell_the_owner(
+    state: &AppState,
+    row: &db_tabs::TabRow,
+    event: &str,
+    title: String,
+    body: &str,
+) {
     let _ = crate::db::audit::log(
         &state.pool,
         "system",
-        "browser.keepalive_signed_out",
+        event,
         &format!("tab:{}", row.id),
-        serde_json::json!({ "host": host }),
+        serde_json::json!({ "host": host_of(&row.url) }),
     )
     .await;
-    // `AgentWaiting` is reused deliberately: it is literally the "needs you"
-    // category and it honours the owner's existing mute prefs, whereas a new
-    // category means new prefs plumbing. `session: None` — this is not about
-    // one bot.
     push::send_push_for(
         state,
         NotifCategory::AgentWaiting,
-        &PushPayload::simple(
-            format!("Signed out of {host}"),
-            "Bots using this tab are blocked until you sign in again.".to_string(),
-            "/browser",
-            Tier::Attention,
-        ),
+        &PushPayload::simple(title, body.to_string(), "/browser", Tier::Attention),
         None,
     )
     .await;
@@ -811,6 +960,12 @@ mod tests {
         }
     }
 
+    /// A deadline, with its provenance — the field that decides whether it may
+    /// stop the pings.
+    fn d(secs: i64, http_only: bool) -> Deadline {
+        Deadline { secs, http_only }
+    }
+
     /// F2's regression test, on the exact measured jar: a 5-minute non-httpOnly
     /// `shortcsrf` beside the real 10-minute httpOnly `sid`. Taking the naive
     /// minimum here is what made the previous design refuse to enable on a
@@ -823,14 +978,46 @@ mod tests {
             c(now as f64 + 600.0, false, true),  // sid — the real auth cookie
             c(-1.0, true, false),                // sess
         ];
-        assert_eq!(auth_deadline(&jar, now), Some(600));
+        assert_eq!(auth_deadline(&jar, now), Some(d(600, true)));
     }
 
+    /// R2's regression, and the one that switched the feature OFF on a healthy
+    /// site. The most common auth cookie on the web is an httpOnly **session**
+    /// cookie (`PHPSESSID`, `JSESSIONID`, `connect.sid`, Rails `_session`): no
+    /// expiry, lifetime on the server. Voting on the provenance *after* the
+    /// session filter read such a jar as "nothing httpOnly here", let the
+    /// 5-minute consent cookie beside it speak for the session, and
+    /// `plan_for(Some(300))` then demoted the tab to `Watch` — zero pings, and a
+    /// menu line telling the owner "this site signs out in minutes" about a site
+    /// that does not. Worse, watching requests nothing, so if the page's own JS
+    /// kept re-setting that cookie the demotion never lifted.
     #[test]
-    fn with_no_httponly_cookie_every_non_session_cookie_counts() {
+    fn an_httponly_session_cookie_is_the_auth_cookie_not_the_consent_banner() {
+        let now = 1_788_114_850;
+        let jar = [
+            c(-1.0, true, true),                 // PHPSESSID — the real auth cookie
+            c(now as f64 + 300.0, false, false), // cookieconsent — 5 minutes, visible
+        ];
+        // The server sets something httpOnly, so nothing visible carries a
+        // deadline: "nothing known" is the honest answer for a server-side
+        // session, and it plans the blind refresh.
+        assert_eq!(auth_deadline(&jar, now), None);
+        assert_eq!(plan_for(auth_deadline(&jar, now)), Plan::Refresh(BLIND_MINUTES));
+    }
+
+    /// And the belt to that brace: when the jar holds NO httpOnly cookie at all,
+    /// a short visible one is still allowed to set the *schedule* — but never to
+    /// stop it. Watch mode is not a chattier schedule, it is no schedule, so a
+    /// visible deadline clamps to the floor instead.
+    #[test]
+    fn with_no_httponly_cookie_visible_ones_schedule_but_never_watch() {
         let now = 1_000_000;
         let jar = [c(now as f64 + 300.0, false, false), c(now as f64 + 1200.0, false, false)];
-        assert_eq!(auth_deadline(&jar, now), Some(300));
+        assert_eq!(auth_deadline(&jar, now), Some(d(300, false)));
+        assert_eq!(plan_for(auth_deadline(&jar, now)), Plan::Refresh(FLOOR_MINUTES));
+        assert_eq!(plan_for(Some(d(60, false))), Plan::Refresh(FLOOR_MINUTES));
+        // Only the httpOnly one earns the silence.
+        assert_eq!(plan_for(Some(d(300, true))), Plan::Watch);
     }
 
     #[test]
@@ -844,18 +1031,18 @@ mod tests {
     fn an_already_expired_cookie_is_not_a_deadline() {
         let now = 1_000_000;
         let jar = [c(now as f64 - 10.0, false, true), c(now as f64 + 4000.0, false, true)];
-        assert_eq!(auth_deadline(&jar, now), Some(4000));
+        assert_eq!(auth_deadline(&jar, now), Some(d(4000, true)));
         assert_eq!(auth_deadline(&[c(now as f64 - 10.0, false, true)], now), None);
     }
 
     #[test]
     fn the_plan_is_half_the_window_clamped_and_watches_under_ten_minutes() {
         assert_eq!(plan_for(None), Plan::Refresh(BLIND_MINUTES));
-        assert_eq!(plan_for(Some(1800)), Plan::Refresh(15));
-        assert_eq!(plan_for(Some(2880)), Plan::Refresh(24));
-        assert_eq!(plan_for(Some(601)), Plan::Refresh(5)); // floor
-        assert_eq!(plan_for(Some(599)), Plan::Watch);
-        assert_eq!(plan_for(Some(14 * 86_400)), Plan::Refresh(CEILING_MINUTES));
+        assert_eq!(plan_for(Some(d(1800, true))), Plan::Refresh(15));
+        assert_eq!(plan_for(Some(d(2880, true))), Plan::Refresh(24));
+        assert_eq!(plan_for(Some(d(601, true))), Plan::Refresh(5)); // floor
+        assert_eq!(plan_for(Some(d(599, true))), Plan::Watch);
+        assert_eq!(plan_for(Some(d(14 * 86_400, true))), Plan::Refresh(CEILING_MINUTES));
     }
 
     /// The 18-minute sliding window from §F3, spelled out: reading the deadline
@@ -865,8 +1052,9 @@ mod tests {
     /// jar reads the full 18 minutes and the cadence is 9 with no watch trip.
     #[test]
     fn the_post_ping_read_is_what_keeps_a_sliding_site_refreshing() {
-        assert_eq!(plan_for(Some(18 * 60)), Plan::Refresh(9)); // post-ping: full window
-        assert_eq!(plan_for(Some(9 * 60)), Plan::Watch); // pre-ping: the self-inflicted sign-out
+        assert_eq!(plan_for(Some(d(18 * 60, true))), Plan::Refresh(9)); // post-ping: full window
+        // pre-ping: the self-inflicted sign-out
+        assert_eq!(plan_for(Some(d(9 * 60, true))), Plan::Watch);
     }
 
     #[test]
@@ -1171,6 +1359,64 @@ mod tests {
         assert!(!is_watch_mode("soft"));
         assert!(!is_watch_mode("Watch"));
         assert!(is_watch_mode("watch"));
+    }
+
+    /// R2's second regression: when the keep-alive stops working, something has
+    /// to reach the owner. A tab whose every check fails is stamped every tick
+    /// and backs off to its plan's interval, so nothing about it looks wrong
+    /// from the outside — the one push fired only on the sign-out edge, and the
+    /// bad news otherwise lived inside a menu in the same grey as a healthy
+    /// line. Three of the tab's OWN intervals is the threshold, so a chatty tab
+    /// is noticed in minutes and a 6-hourly one is not cried wolf over.
+    #[test]
+    fn a_streak_of_failed_checks_becomes_something_the_owner_can_see() {
+        let now = 1_788_000_000;
+        let every = 15;
+        let cutoff = STALE_INTERVALS * every * 60;
+        // One, two, even three missed intervals are ordinary.
+        assert!(!is_stale(now - cutoff, now, every, ACTION_SOFT));
+        assert!(is_stale(now - cutoff - 1, now, every, ACTION_SOFT));
+        // The threshold is the tab's own cadence, not a fixed clock.
+        assert!(!is_stale(now - cutoff - 1, now, 360, ACTION_SOFT));
+        assert!(is_stale(now - 3 * 360 * 60 - 1, now, 360, ACTION_SOFT));
+        // A garbage cadence still yields a finite threshold rather than a
+        // division by nothing.
+        assert!(is_stale(now - 181, now, 0, ACTION_SOFT));
+        // WATCH MODE IS NEVER STALE. It pings nothing by design, so its probe
+        // stamp stands still forever and every alarm here would be false.
+        assert!(!is_stale(now - 30 * 86_400, now, 10, ACTION_WATCH));
+    }
+
+    /// The three ticks that must NOT reset the streak, in the machine's own
+    /// vocabulary: `probed` is the only honest definition of "it worked".
+    #[test]
+    fn only_a_tick_that_actually_probed_re_arms_the_stale_clock() {
+        let mut h = Health::default();
+        let plan = Plan::Refresh(15);
+        // Backed off after an unclear streak: stamped, learned nothing.
+        for _ in 0..UNCLEAR_STRIKES {
+            let s = decide(&mut h, Outcome::Pinged(Ping::Unclear), plan, false);
+            if let Write::Stamp { probed, .. } = s.write {
+                assert!(!probed, "an unclear back-off never claims a check");
+            }
+        }
+        // Watching: requested nothing.
+        assert!(matches!(
+            decide(&mut h, Outcome::Watching, Plan::Watch, false).write,
+            Write::Stamp { probed: false, .. }
+        ));
+        // A real answer — including a confirmed sign-out, which has its own
+        // notification and is a successful check.
+        assert!(matches!(
+            decide(&mut h, Outcome::Pinged(Ping::Alive), plan, false).write,
+            Write::Stamp { probed: true, .. }
+        ));
+        let mut h2 = Health::default();
+        decide(&mut h2, Outcome::Pinged(Ping::Suspicious), plan, false);
+        assert!(matches!(
+            decide(&mut h2, Outcome::Pinged(Ping::Suspicious), plan, false).write,
+            Write::Stamp { probed: true, .. }
+        ));
     }
 
     #[test]

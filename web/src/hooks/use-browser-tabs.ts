@@ -139,8 +139,10 @@ export interface BrowserTabActions {
   sleep: (id: string) => Promise<BrowserTab | null>
   /** Pin / unpin — a pinned tab is not reaped and sorts first. */
   setPinned: (id: string, pinned: boolean) => Promise<boolean>
-  /** "Keep me signed in". A pure DB write server-side — the first check lands
-   *  within a minute, and the sweep learns the cadence from the cookie jar.
+  /** "Keep me signed in". A pure DB write server-side — the row goes DUE
+   *  immediately and the sweep learns the cadence from the cookie jar. Not "in a
+   *  minute": the sweep defers a tab whose wheel a human is holding, and the
+   *  gesture that leads here is exactly that (take the wheel, sign in, ⋯).
    *  `false` = the server refused (a non-web page, or the fifth tab), and the
    *  human has already been told why. */
   setKeepAlive: (id: string, on: boolean, host?: string) => Promise<boolean>
@@ -264,7 +266,7 @@ export function useBrowserTabActions(): BrowserTabActions {
       const what = host ?? 'this tab'
       toast({
         message: on
-          ? `Keeping ${what} signed in — first check within a minute.`
+          ? `Keeping ${what} signed in — the first check is due shortly.`
           : `Stopped keeping ${what} signed in.`,
         duration: 4000,
       })

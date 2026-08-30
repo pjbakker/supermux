@@ -558,7 +558,7 @@ function Bench({
       }}
       onPin={(id, pinned) => patch(id, (t) => ({ ...t, pinned }))}
       // Offline bench: the toggle flips the row locally so the ⋯ detail line's
-      // "Starting — first check within a minute." state is shootable too.
+      // "Starting — the first check is due shortly." state is shootable too.
       onKeepAlive={(id, on) =>
         patch(id, (t) => ({
           ...t,
