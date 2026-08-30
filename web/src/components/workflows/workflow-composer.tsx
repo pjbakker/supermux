@@ -295,14 +295,25 @@ export function ComposerBody({
   const setStep = (key: string, next: StepDraft) =>
     setDraft((d) => ({ ...d, steps: d.steps.map((s) => (s.key === key ? next : s)) }))
 
-  const addStep = (at?: number) =>
+  // MINT THE STEP OUTSIDE THE UPDATER, AND OPEN IT OUTSIDE THE UPDATER.
+  //
+  // A state updater must be PURE — React invokes it twice under StrictMode. So
+  // a `newStep()` + `setExpanded(step.key)` *inside* it minted TWO keys and left
+  // `expanded` pointing at the one React discarded: "Add step" then opened
+  // NOTHING, and the very next thing the user typed landed in the PREVIOUS
+  // step's textarea, silently overwriting the prompt they had just written.
+  // (Measured: after Add step both step headers read `aria-expanded="false"`
+  // and the panel had zero textareas.) Hoisting both out makes the updater a
+  // pure splice and the open an ordinary event-handler state write.
+  const addStep = (at?: number) => {
+    const step = newStep()
     setDraft((d) => {
-      const step = newStep()
       const steps = [...d.steps]
       steps.splice(at ?? steps.length, 0, step)
-      setExpanded(step.key)
       return { ...d, steps }
     })
+    setExpanded(step.key)
+  }
 
   const moveStep = (key: string, delta: -1 | 1) =>
     setDraft((d) => {
@@ -315,11 +326,16 @@ export function ComposerBody({
       return { ...d, steps }
     })
 
-  const deleteStep = (key: string) =>
+  // Same purity rule as `addStep`: the replacement blank step is minted once,
+  // here, not inside the updater — a fresh key per invocation is exactly the
+  // impurity StrictMode's double-invoke exists to catch.
+  const deleteStep = (key: string) => {
+    const replacement = newStep()
     setDraft((d) => {
       const steps = d.steps.filter((s) => s.key !== key)
-      return { ...d, steps: steps.length ? steps : [newStep()] }
+      return { ...d, steps: steps.length ? steps : [replacement] }
     })
+  }
 
   const title = draft.title.trim() || defaultTitle(draft)
 
