@@ -37,7 +37,7 @@ import { ChevronsUpDown, Plus, SlidersHorizontal, Trash2, UserPlus } from 'lucid
 
 import { useCompanies } from '@/hooks/use-companies'
 import { useUI } from '@/stores/ui-store'
-import { companyForDigit } from '@/lib/companies'
+import { companyForDigit, companyLogoUrl } from '@/lib/companies'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { CompanyMark, HqMark } from '@/components/roster/company-mark'
 import { CompanyPicker } from '@/components/roster/company-picker'
@@ -424,6 +424,7 @@ export function CompanySwitcher({
                 name={active.display_name}
                 size={26}
                 className="grok-identity"
+                logoUrl={companyLogoUrl(active)}
               />
             ) : (
               <HqMark size={26} />
@@ -447,6 +448,7 @@ export function CompanySwitcher({
                 name={active.display_name}
                 size={22}
                 className="grok-identity"
+                logoUrl={companyLogoUrl(active)}
               />
             ) : (
               <HqMark size={22} />
@@ -578,6 +580,7 @@ export function ScopeTitle() {
           name={active.display_name}
           size={24}
           className="grok-identity"
+          logoUrl={companyLogoUrl(active)}
         />
       ) : (
         <HqMark size={24} />
