@@ -38,6 +38,14 @@ pub struct StartResult {
     pub started: bool,
     /// The agent UI / shell prompt was observed within the wait-for-ready window.
     pub ready: bool,
+    /// Did the OPENING PROMPT actually submit? `Some(true)`: observed (a turn
+    /// started, or the agent parked on a selector it could only reach by
+    /// answering). `Some(false)`: the whole verify window was observed and the
+    /// prompt still looked unsubmitted — the session is left running for
+    /// recovery. `None`: no prompt was delivered, or delivery could not be
+    /// verified (see [`deliver_prompt`]). A caller may NOT read `None` as a
+    /// failure.
+    pub prompt_submitted: Option<bool>,
     /// `supermux-<name>` — the tmux target.
     pub target: String,
 }
@@ -1097,6 +1105,118 @@ fn current_screen_tail(capture: &str) -> String {
     lines[start..].join("\n")
 }
 
+// ── opening-prompt submission check ──────────────────────────────────────────
+
+/// What one capture says about the OPENING PROMPT we just typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitState {
+    /// The input was CONSUMED: a turn is running, or the agent is parked on a
+    /// selector it could only have reached by answering the prompt.
+    Submitted,
+    /// The prompt's own text is still on screen with no turn running — either the
+    /// composer still holds it (the swallowed Enter) or a finished turn echoed it
+    /// into the transcript. The caller resolves that ambiguity by pressing Enter
+    /// again, which is a no-op in the second case.
+    Stuck,
+    /// Neither marker: a cleared or mid-repaint screen. Keep polling.
+    Unknown,
+}
+
+/// Did the opening prompt submit? Pure over one capture, so it is unit-tested
+/// without a terminal exactly like [`send_block`]'s heuristics.
+///
+/// Two positive arms, both reusing the send guard's own vocabulary:
+///   1. [`agent_busy`] — Claude/Codex pin `esc to interrupt` for the whole turn.
+///      Read over the WHOLE capture (not the tail) for the same reason
+///      [`agent_footer_live`] is: a teammate roster drawn below the footer can
+///      push it out of the tail. The stale-scrollback worry that keeps
+///      `send_block` narrow does not apply here — this runs seconds after a boot
+///      whose agent we just watched take the wheel;
+///   2. [`selection_screen`] on the current screen — an approval menu / question
+///      PROVES the input was consumed: the agent read the prompt, ran, and is now
+///      waiting on a human. Nothing is "working" during that wait, so without this
+///      arm the classifier says Stuck and the retry Enter CONFIRMS whatever row is
+///      highlighted (a `rm -rf`, an edit, a plan). This arm is what makes retrying
+///      safe at all.
+///
+/// The selector arm must not fire on THE PROMPT'S OWN ECHO. `is_selection_row`
+/// matches `❯ <n>. …`, which is exactly how the composer draws a prompt that
+/// starts "1. check the queue", and the key-legend markers are unanchored
+/// substrings a prompt can carry verbatim. So echoed lines are dropped BEFORE the
+/// screen is classified. Per line, because no marker spans a newline — which
+/// keeps a genuine selector drawn UNDER an echoed prompt working.
+///
+/// Otherwise: the prompt tail still squashes into the capture → Stuck.
+fn submit_state(capture: &str, prompt: &str) -> SubmitState {
+    if agent_busy(capture) {
+        return SubmitState::Submitted;
+    }
+    let screen = current_screen_tail(capture);
+    let without_echo = screen
+        .lines()
+        .filter(|l| !line_is_prompt_echo(l, prompt))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if selection_screen(&without_echo) {
+        return SubmitState::Submitted;
+    }
+    let tail = prompt_tail(prompt);
+    if !tail.is_empty() && squash(capture).contains(&tail) {
+        SubmitState::Stuck
+    } else {
+        SubmitState::Unknown
+    }
+}
+
+/// How many trailing characters of the (squashed) prompt the Stuck match keys on.
+/// Long enough that ordinary transcript prose cannot collide with it, short
+/// enough that a one-line prompt still has a tail.
+const PROMPT_TAIL_CHARS: usize = 60;
+
+/// The last [`PROMPT_TAIL_CHARS`] characters of the squashed prompt — the needle
+/// the Stuck arm looks for in the squashed capture.
+fn prompt_tail(prompt: &str) -> String {
+    let p = squash(prompt);
+    let start = p
+        .char_indices()
+        .rev()
+        .nth(PROMPT_TAIL_CHARS - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    p[start..].to_string()
+}
+
+/// Drop everything the composer's LAYOUT inserts into text: all whitespace (it
+/// hard-wraps at pane width, at positions we cannot predict) and every
+/// box-drawing glyph. Claude fences each wrapped line with `│` inside a `╭─╮` box,
+/// so the borders land in the middle of the text too — squashing whitespace alone
+/// would leave `…bootedbythe││scheduler…`, which never matches the prompt.
+/// U+2500..U+257F is the whole box-drawing block, so any border style a provider
+/// switches to is covered without hard-coding glyphs.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '\u{2500}'..='\u{257F}'))
+        .collect()
+}
+
+/// Is `line` nothing but a piece of `prompt` drawn back onto the screen?
+///
+/// Deliberately loose: the composer breaks the prompt at unpredictable points, so
+/// any single drawn line is some contiguous run of it. The composer CURSOR glyphs
+/// are stripped on both sides as well — the first drawn line opens `❯ `, which the
+/// prompt itself never contained and which is what makes it look like a selector.
+/// An empty line is never an echo (it is never evidence of anything either).
+fn line_is_prompt_echo(line: &str, prompt: &str) -> bool {
+    let strip_cursor = |s: &str| -> String {
+        squash(s)
+            .chars()
+            .filter(|c| !matches!(c, '❯' | '❱' | '›' | '>'))
+            .collect()
+    };
+    let l = strip_cursor(line);
+    !l.is_empty() && strip_cursor(prompt).contains(&l)
+}
+
 /// Heuristic: are we stuck in a `--resume` session picker (Claude OR Codex)?
 ///
 /// Claude's picker draws "Resume a conversation" / "Select a session" / "…
@@ -1316,6 +1436,114 @@ async fn wait_for_agent_ready(
         }
     }
     false
+}
+
+/// Verify bounds for [`deliver_prompt`]. Worst case is
+/// `VERIFY_POLLS * VERIFY_POLL` = 3s of extra wall-clock, and `start()` holds the
+/// per-session lock across all of it — so these stay tight and are pinned by a
+/// test. Even a healthy boot pays ONE `VERIFY_POLL` (~500ms): the first capture is
+/// taken after the sleep, because a submit that landed still needs a frame to be
+/// drawn.
+const VERIFY_POLLS: usize = 6;
+const VERIFY_POLL: Duration = Duration::from_millis(500);
+/// How many extra Enters a stuck composer may receive. A spurious Enter on an
+/// idle or busy composer is a no-op; on a SELECTOR it is a confirmation, which is
+/// why [`submit_state`] stops the loop there.
+const MAX_EXTRA_ENTERS: usize = 3;
+
+/// Type the opening prompt, then VERIFY it actually submitted and press Enter
+/// again — capped — when it did not.
+///
+/// THE BUG. `wait_for_agent_ready` returns Ready on the FIRST tick the agent UI is
+/// at the wheel, and the agent's own glyphs are drawn before its input handler has
+/// mounted. The Enter after the typed prompt is then occasionally swallowed (or
+/// read as part of the paste, which is what `submit_gap` addresses), and the
+/// prompt sits in the composer forever. Nothing downstream notices: `start()` has
+/// already written `active` and `set_last_send` records the prompt as sent, so the
+/// scheduler / board / a company's Router boot all believe work started while the
+/// agent is idle at a full composer.
+///
+/// Send failures propagate — a real I/O error is a boot failure, as before.
+/// Verification failure is NOT fatal: the session stays up so a human (or the next
+/// send) can recover it.
+///
+/// The return value keeps "could not look" separate from "looked, and it is bad",
+/// because those must not be reported the same way:
+///
+/// * `Ok(Some(true))` — observed submitted.
+/// * `Ok(Some(false))` — the whole window was observed and the prompt still looks
+///   stuck. The ONLY case the caller warns about.
+/// * `Ok(None)` — delivered, not verifiable. Three cases, all deliberate:
+///   a SHELL session (verification is built entirely on agent TUI signals; a shell
+///   has no busy footer and echoes every command it runs, so every classification
+///   would land on Stuck — firing retry Enters into the foreground process's stdin
+///   and reporting a false negative on a perfectly good start); a composer that was
+///   ALREADY BUSY before we typed (the double-launch guard delivers into a live
+///   agent, where the busy footer is on screen from the first poll no matter what
+///   our Enter did — the check would rubber-stamp a submit it never observed); and
+///   a window in which every capture failed (we never saw the pane, so the
+///   untouched `Unknown` must not be read as a cleared composer).
+async fn deliver_prompt(
+    rt: &dyn SessionRuntime,
+    provider: &str,
+    prompt: &str,
+) -> Result<Option<bool>, AppError> {
+    if provider == "shell" {
+        rt.send_text(prompt).await?;
+        submit_gap(rt).await;
+        rt.send_key("Enter").await?;
+        return Ok(None);
+    }
+
+    let pre_busy = rt
+        .capture_plain(status::CAPTURE_LINES)
+        .await
+        .map(|c| agent_busy(&c))
+        .unwrap_or(false);
+
+    rt.send_text(prompt).await?;
+    submit_gap(rt).await;
+    rt.send_key("Enter").await?;
+
+    if pre_busy {
+        tracing::info!(
+            provider = %provider,
+            "deliver_prompt: agent was already mid-turn; prompt queued without verification",
+        );
+        return Ok(None);
+    }
+
+    let mut extra_enters = 0usize;
+    let mut observed = false;
+    let mut last = SubmitState::Unknown;
+    for _ in 0..VERIFY_POLLS {
+        tokio::time::sleep(VERIFY_POLL).await;
+        let Ok(cap) = rt.capture_plain(status::CAPTURE_LINES).await else {
+            continue; // capture hiccup: tells us nothing, keep polling
+        };
+        observed = true;
+        last = submit_state(&cap, prompt);
+        match last {
+            SubmitState::Submitted => return Ok(Some(true)),
+            SubmitState::Stuck if extra_enters < MAX_EXTRA_ENTERS => {
+                extra_enters += 1;
+                tracing::info!(
+                    provider = %provider,
+                    attempt = extra_enters,
+                    "deliver_prompt: opening prompt still unsubmitted, pressing Enter again",
+                );
+                rt.send_key("Enter").await?;
+            }
+            // Cap reached, or nothing readable: keep watching out the window.
+            SubmitState::Stuck | SubmitState::Unknown => {}
+        }
+    }
+    if !observed {
+        return Ok(None);
+    }
+    // The window closed on an Unknown: the prompt text is gone from the screen and
+    // no turn is running — the composer cleared, so it submitted.
+    Ok(Some(last == SubmitState::Unknown))
 }
 
 /// SIGTERM then (after a grace) SIGKILL the pane process group.
@@ -2044,6 +2272,7 @@ async fn start_locked(
             name: name.to_string(),
             started: true,
             ready,
+            prompt_submitted: None, // nothing was typed on this path
             target: rt.target(),
         });
     }
@@ -2063,11 +2292,21 @@ async fn start_locked(
     // in the booting affordance for up to 2s after the agent UI is ready).
     state.wake_detector(name);
 
+    let mut prompt_submitted = None;
     if let Some(p) = prompt {
         if !p.trim().is_empty() {
-            rt.send_text(p).await?;
-            submit_gap(rt.as_ref()).await;
-            rt.send_key("Enter").await?;
+            prompt_submitted = deliver_prompt(rt.as_ref(), &s.provider, p).await?;
+            if prompt_submitted == Some(false) {
+                // Honest, and only where it was actually looked at: the boot ran,
+                // the session is up, but the first turn never started. Every caller
+                // of `start(prompt)` — scheduler, board, a company's Router boot —
+                // otherwise reads the `active` row we just wrote as "working".
+                tracing::warn!(
+                    name = %name,
+                    "start: opening prompt still looked unsubmitted after capped Enter retries; \
+                     session left running for recovery",
+                );
+            }
             let (preview, at) = db::sessions::set_last_send(&state.pool, name, p).await?;
             broadcast_send(state, name, &preview, at);
         }
@@ -2077,6 +2316,7 @@ async fn start_locked(
         name: name.to_string(),
         started: true,
         ready,
+        prompt_submitted,
         target: rt.target(),
     })
 }
@@ -3848,6 +4088,106 @@ mod agent_ready_heuristics_tests {
             "the Claude idle composer must remain a ready send target (unchanged)",
         );
     }
+
+    // ── opening-prompt submission classifier ─────────────────────────────────
+
+    #[test]
+    fn a_running_turn_reads_as_submitted() {
+        let prompt = "You are the operator, boot now";
+        assert_eq!(
+            submit_state("❯ You are the operator, boot now\n✻ Thinking… (esc to interrupt · 3s)", prompt),
+            SubmitState::Submitted,
+        );
+    }
+
+    /// The busy footer is read over the WHOLE capture: a teammate roster drawn
+    /// BELOW it pushes it clean out of the 10-line current screen (the same shape
+    /// that broke the send guard), and a missed busy footer here means retry
+    /// Enters into a working agent.
+    #[test]
+    fn a_running_turn_under_a_teammate_roster_still_reads_as_submitted() {
+        let cap = "✻ Thinking… (esc to interrupt · 3s)\n\
+                   View teammates:\n● main\n◯ bot-a\n◯ bot-b\n◯ bot-c\n\
+                   ◯ bot-d\n◯ bot-e\n◯ bot-f\n◯ bot-g\n◯ bot-h\n↓ 4 more";
+        assert_eq!(submit_state(cap, "boot now"), SubmitState::Submitted);
+    }
+
+    /// THE BUG ITSELF: the Enter was swallowed and the prompt is still sitting in
+    /// the composer, hard-wrapped inside Claude's box. The tail match has to survive
+    /// both the line breaks and the `│` borders drawn through the text.
+    #[test]
+    fn a_prompt_still_in_the_wrapped_composer_reads_as_stuck() {
+        let prompt = "You are the platform operator, booted by the scheduler. \
+                      Read prompts/platform.md next to it, then follow it exactly.";
+        let cap = "╭──────────────────────────────────────────╮\n\
+                   │ ❯ You are the platform operator, booted  │\n\
+                   │   by the scheduler. Read                 │\n\
+                   │   prompts/platform.md next to it, then   │\n\
+                   │   follow it exactly.                     │\n\
+                   ╰──────────────────────────────────────────╯\n\
+                   ⏵⏵ bypass permissions on";
+        assert_eq!(submit_state(cap, prompt), SubmitState::Stuck);
+    }
+
+    #[test]
+    fn a_cleared_composer_reads_as_unknown() {
+        assert_eq!(
+            submit_state("❯ Try \"fix tests\"\n  ? for shortcuts", "boot the operator and report"),
+            SubmitState::Unknown,
+        );
+    }
+
+    /// The arm that makes retrying safe at all. The prompt submitted, the agent ran
+    /// and is now parked on a permission menu: nothing is working, so without this
+    /// the classifier says Stuck and the retry Enter CONFIRMS the highlighted row.
+    #[test]
+    fn an_approval_selector_reads_as_submitted_so_no_enter_confirms_it() {
+        let cap = "  Bash(rm -rf ./build)\n  Do you want to proceed?\n\
+                   ❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\
+                   Enter to confirm · Esc to cancel";
+        assert_eq!(submit_state(cap, "clean the build dir and rerun the tests"), SubmitState::Submitted);
+    }
+
+    /// A prompt that OPENS with a numbered item is drawn `❯ 1. …` — the exact shape
+    /// `is_selection_row` matches. Read as a selector it would report a confident
+    /// Submitted with zero retries on a genuinely stuck boot.
+    #[test]
+    fn a_numbered_prompt_echo_is_not_mistaken_for_a_selector() {
+        let prompt = "1. check the queue, 2. answer the oldest issue";
+        let cap = "❯ 1. check the queue, 2. answer the oldest issue\n  ? for shortcuts";
+        assert_eq!(submit_state(cap, prompt), SubmitState::Stuck);
+    }
+
+    /// Same trap through the key-legend markers, which are unanchored substrings a
+    /// prompt can carry verbatim.
+    #[test]
+    fn a_prompt_echo_carrying_a_key_legend_is_not_mistaken_for_a_selector() {
+        let prompt = "if the deploy hangs, tell the user to press esc to cancel";
+        let cap = "❯ if the deploy hangs, tell the user to press esc to cancel\n  ? for shortcuts";
+        assert_eq!(submit_state(cap, prompt), SubmitState::Stuck);
+    }
+
+    /// The echo filter runs per LINE, so a GENUINE selector drawn underneath an
+    /// echoed prompt is still seen — guarding on the prompt as a whole would switch
+    /// the safe arm off for exactly the prompts that carry a token.
+    #[test]
+    fn a_real_selector_under_an_echoed_prompt_still_reads_as_submitted() {
+        let prompt = "1. check the queue, 2. answer the oldest issue";
+        let cap = "❯ 1. check the queue, 2. answer the oldest issue\n\
+                   Do you want to proceed?\n❯ 1. Yes\n  2. No, keep going";
+        assert_eq!(submit_state(cap, prompt), SubmitState::Submitted);
+    }
+
+    /// `start()` holds the per-session lock across delivery, so the verify window is
+    /// a lock-held cost on EVERY prompted boot. Pin the bounds.
+    #[test]
+    fn the_verify_window_stays_within_three_seconds() {
+        assert!(
+            VERIFY_POLL * VERIFY_POLLS as u32 <= Duration::from_secs(3),
+            "the verify loop is paid under start()'s session lock — keep it bounded",
+        );
+        assert!(MAX_EXTRA_ENTERS <= 3, "retry Enters stay capped");
+    }
 }
 
 #[cfg(test)]
@@ -5088,17 +5428,25 @@ mod write_runtime_tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     struct StubRuntime {
         capture: String,
         /// When true, `capture_plain` returns an Err — the send-guard fail-closed
         /// path (wave-8).
         capture_err: bool,
+        /// A SCRIPTED pane: one screen per `capture_plain` call, the last entry
+        /// repeating once the script runs out (so a "permanently stuck" pane needs
+        /// one line). Empty = the static `capture`, which is what every send-guard
+        /// test uses. Exists for `deliver_prompt`, whose whole job is reading a
+        /// pane that CHANGES between polls.
+        script: Mutex<Vec<String>>,
         /// What `shell_is_foreground` reports. `None` = "can't tell" (the tmux
         /// default, which forces the text guard); `Some(true)` = a bare shell.
         shell_fg: Option<bool>,
         text_calls: AtomicUsize,
         key_calls: AtomicUsize,
+        capture_calls: AtomicUsize,
     }
 
     impl StubRuntime {
@@ -5106,9 +5454,11 @@ mod write_runtime_tests {
             Arc::new(Self {
                 capture: capture.to_string(),
                 capture_err: false,
+                script: Mutex::new(Vec::new()),
                 shell_fg: None,
                 text_calls: AtomicUsize::new(0),
                 key_calls: AtomicUsize::new(0),
+                capture_calls: AtomicUsize::new(0),
             })
         }
         /// A runtime whose `capture_plain` always fails — exercises the send
@@ -5117,9 +5467,11 @@ mod write_runtime_tests {
             Arc::new(Self {
                 capture: String::new(),
                 capture_err: true,
+                script: Mutex::new(Vec::new()),
                 shell_fg: None,
                 text_calls: AtomicUsize::new(0),
                 key_calls: AtomicUsize::new(0),
+                capture_calls: AtomicUsize::new(0),
             })
         }
         /// A native-shaped runtime that reports it is sitting at a BARE SHELL
@@ -5129,10 +5481,27 @@ mod write_runtime_tests {
             Arc::new(Self {
                 capture: capture.to_string(),
                 capture_err: false,
+                script: Mutex::new(Vec::new()),
                 shell_fg: Some(true),
                 text_calls: AtomicUsize::new(0),
                 key_calls: AtomicUsize::new(0),
+                capture_calls: AtomicUsize::new(0),
             })
+        }
+        /// A pane that shows each of `screens` in turn, then holds the last one.
+        fn showing(screens: &[&str]) -> Arc<Self> {
+            let rt = Self::parked_at("");
+            *rt.script.lock().unwrap() = screens.iter().map(|s| s.to_string()).collect();
+            rt
+        }
+        /// The next scripted screen, or the static capture when nothing is scripted.
+        fn next_screen(&self) -> String {
+            let mut q = self.script.lock().unwrap();
+            match q.len() {
+                0 => self.capture.clone(),
+                1 => q[0].clone(),
+                _ => q.remove(0),
+            }
         }
     }
 
@@ -5162,10 +5531,11 @@ mod write_runtime_tests {
             Ok(())
         }
         async fn capture_plain(&self, _lines: usize) -> anyhow::Result<String> {
+            self.capture_calls.fetch_add(1, Ordering::SeqCst);
             if self.capture_err {
                 anyhow::bail!("stub: capture unavailable");
             }
-            Ok(self.capture.clone())
+            Ok(self.next_screen())
         }
         async fn capture_ansi(&self, _lines: usize) -> anyhow::Result<String> {
             Ok(self.capture.clone())
@@ -5446,5 +5816,110 @@ mod write_runtime_tests {
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── opening-prompt delivery (`deliver_prompt`) ────────────────────────────
+    //
+    // The whole point of these is the KEY COUNT: how many Enters a boot presses,
+    // and into what. Reachable only through a live terminal before the scripted
+    // `StubRuntime`; `start_paused` makes the 500ms verify polls free.
+
+    const PROMPT: &str = "boot the operator and work the queue";
+
+    /// A SHELL is typed and submitted exactly once and never looked at: it has no
+    /// busy footer and echoes back every command it runs, so verification would
+    /// classify every good start as Stuck and fire retry Enters into the
+    /// foreground process's stdin.
+    #[tokio::test(start_paused = true)]
+    async fn a_shell_prompt_is_delivered_once_and_never_verified() {
+        let rt = StubRuntime::parked_at("$ ");
+        let out = deliver_prompt(rt.as_ref(), "shell", PROMPT).await.unwrap();
+        assert_eq!(out, None, "a shell start is unverifiable, not failed");
+        assert_eq!(rt.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1, "exactly one Enter, as before");
+        assert_eq!(rt.capture_calls.load(Ordering::SeqCst), 0, "the pane is never read");
+    }
+
+    /// The healthy boot: the turn is running at the first poll → verified with no
+    /// extra Enter.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_started_verifies_without_a_retry() {
+        let rt = StubRuntime::showing(&["❯ \n  ? for shortcuts", "✻ Thinking… (esc to interrupt · 2s)"]);
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, Some(true));
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1, "no retry Enter on a healthy boot");
+    }
+
+    /// THE SWALLOWED ENTER: the prompt sits in the composer poll after poll. One
+    /// retry Enter is enough, and it must be the ONLY one.
+    #[tokio::test(start_paused = true)]
+    async fn a_swallowed_enter_is_retried_and_then_verifies() {
+        let stuck = format!("❯ {PROMPT}\n  ? for shortcuts");
+        let rt = StubRuntime::showing(&[
+            "❯ \n  ? for shortcuts",             // pre-send: idle composer
+            &stuck,                               // poll 1: the Enter was swallowed
+            "✻ Thinking… (esc to interrupt · 1s)", // poll 2: the retry landed
+        ]);
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, Some(true));
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 2, "the submit plus exactly one retry");
+    }
+
+    /// A pane that never budges: retries stop at the cap and the boot reports an
+    /// OBSERVED failure (which is what `start()` warns on).
+    #[tokio::test(start_paused = true)]
+    async fn a_permanently_stuck_composer_stops_at_the_retry_cap() {
+        let rt = StubRuntime::parked_at(&format!("❯ {PROMPT}\n  ? for shortcuts"));
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, Some(false), "observed the whole window and it never submitted");
+        assert_eq!(
+            rt.key_calls.load(Ordering::SeqCst),
+            1 + MAX_EXTRA_ENTERS,
+            "the submit plus at most MAX_EXTRA_ENTERS retries — never one per poll",
+        );
+    }
+
+    /// THE DANGEROUS ONE. The prompt submitted and the agent is now parked on a
+    /// permission menu with its default highlighted; the prompt is still echoed
+    /// above it. A retry Enter here CONFIRMS that default, so the selector must
+    /// stop the loop dead.
+    #[tokio::test(start_paused = true)]
+    async fn an_approval_selector_never_receives_a_retry_enter() {
+        let selector = format!(
+            "❯ {PROMPT}\n  Bash(rm -rf ./build)\n  Do you want to proceed?\n\
+             ❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\
+             Enter to confirm · Esc to cancel",
+        );
+        let rt = StubRuntime::showing(&["❯ \n  ? for shortcuts", &selector]);
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, Some(true), "a selector proves the prompt was consumed");
+        assert_eq!(
+            rt.key_calls.load(Ordering::SeqCst),
+            1,
+            "NO extra Enter may be pressed into a highlighted destructive default",
+        );
+    }
+
+    /// Never saw the pane at all → unverifiable, NOT a failure (and no retries: an
+    /// unread screen could be anything, including a selector).
+    #[tokio::test(start_paused = true)]
+    async fn a_window_of_failed_captures_is_unverifiable_not_failed() {
+        let rt = StubRuntime::capture_fails();
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, None, "we never looked, so we may not claim it failed");
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1, "one submit, no blind retries");
+    }
+
+    /// The double-launch guard delivers into an agent that is already mid-turn:
+    /// its busy footer is on screen from the first poll whatever our Enter did, so
+    /// the check would rubber-stamp a submit it never observed. Deliver, and say so.
+    #[tokio::test(start_paused = true)]
+    async fn an_already_busy_agent_is_delivered_but_not_verified() {
+        let rt = StubRuntime::parked_at("✻ Thinking… (esc to interrupt · 40s)");
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, None, "busy before we typed: honest unknown, not a claimed true");
+        assert_eq!(rt.text_calls.load(Ordering::SeqCst), 1, "the prompt is still queued to the agent");
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rt.capture_calls.load(Ordering::SeqCst), 1, "the pre-send sample only");
     }
 }
