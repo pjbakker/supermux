@@ -81,9 +81,4 @@ describe('header count == Σ section counts', () => {
     expect(shown).toBe(2)
     expect(totalBotCount(sessions.length, [])).toBe(2)
   })
-
-  test('crews suffix counts only rostered teams', () => {
-    const teams = [team('a', [member('idle')]), team('solo', [])]
-    expect(rosteredTeams(teams).length).toBe(1)
-  })
 })

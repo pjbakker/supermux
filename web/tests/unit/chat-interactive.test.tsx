@@ -1109,26 +1109,17 @@ describe('the transcript does not re-render on every keystroke', () => {
     //
     // This assertion is structural on purpose: there is no client renderer in
     // this unit net, so what can be pinned is the boundary itself.
+    //
+    // The boundary is only worth anything while every prop the row is handed
+    // stays stable across a keystroke: `node` comes out of `buildTranscript`'s
+    // useMemo, the indexes are useMemo'd in the panel, `rawUrl`/`pinFor` are
+    // module-level, and `nowMs` is bucketed to 30s. A prop wired in without a
+    // stability story (a `draft`, a `composer`) is what would silently undo the
+    // fix — the comparator that decides it is `areTranscriptPropsEqual` in
+    // `transcript-item.tsx`, not a list of prop names retyped here.
     expect(
       (TranscriptItem as unknown as { $$typeof?: symbol }).$$typeof,
     ).toBe(Symbol.for('react.memo'))
-  })
-
-  test('every prop the row is given is stable across a keystroke', () => {
-    // The boundary is only worth anything while this stays true. `node` comes
-    // out of `buildTranscript`'s useMemo, the indexes are useMemo'd in the
-    // panel, `rawUrl`/`pinFor` are module-level, and `nowMs` is bucketed to
-    // 30s — so nothing a keystroke touches reaches this component.
-    const props = new Set(
-      Object.keys({
-        node: 1, name: 1, surface: 1, labels: 1, mentions: 1, names: 1,
-        rawUrl: 1, pinFor: 1,
-      }),
-    )
-    // A prop added here without a stability story is what would silently undo
-    // the fix; this is the reminder in the diff.
-    expect(props.has('draft')).toBe(false)
-    expect(props.has('composer')).toBe(false)
   })
 })
 

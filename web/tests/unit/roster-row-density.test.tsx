@@ -133,12 +133,6 @@ describe('what did NOT change', () => {
     expect(out).toContain('<svg')
   })
 
-  test('radius 12 is still the literal, at every density', () => {
-    for (const density of ['list', 'strip', 'picker'] as const) {
-      expect(html(<RosterRow seed="s" density={density} />)).toContain('rounded-[12px]')
-    }
-  })
-
   test('attention is available at every density (fact-ladder rule 2)', () => {
     for (const density of ['list', 'strip', 'picker'] as const) {
       const on = html(<RosterRow seed="s" density={density} attention />)

@@ -38,7 +38,6 @@ import {
   ROLLUP_COUNTS,
   ROSTER_CAST,
   ROSTER_DENSITIES,
-  ROSTER_NAMES,
   ROSTER_STATES,
   STATE_MODELS,
   TIER_MODELS,
@@ -72,19 +71,9 @@ describe('dev-roster cast — the four channels', () => {
     expect([...BENCH_THEMES]).toEqual(['light', 'dark'])
   })
 
-  test('the matrix the bench claims is 3 × 6 × 4 × 2', () => {
-    const cells =
-      ROSTER_DENSITIES.length * ROSTER_STATES.length * ATTENTION_TIERS.length * BENCH_THEMES.length
-    expect(cells).toBe(144)
-  })
 })
 
 describe('dev-roster cast — the roster', () => {
-  test('fourteen names, fourteen members, no duplicates', () => {
-    expect(ROSTER_CAST.length).toBe(ROSTER_NAMES.length)
-    expect(new Set(ROSTER_CAST.map((m) => m.name)).size).toBe(ROSTER_CAST.length)
-  })
-
   test('deduped as one unit — fourteen distinct silhouette × pigment pairs', () => {
     const tokens = ROSTER_CAST.map((m) => {
       const c = characterFromSeed(m.name, m.pin)

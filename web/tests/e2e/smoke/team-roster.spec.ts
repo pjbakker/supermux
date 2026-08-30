@@ -47,11 +47,21 @@ test.describe('grok team roster (folded sections + team pane)', () => {
     const crew = page.getByRole('button', { name: /feature-x — 5 bots/ })
     await expect(crew).toBeVisible()
 
-    // The header carries the `· N crews` census and a needs rollup that counts
-    // the crew's needs-you member (Σ over the rendered rows — the folded-roster
-    // invariant).
-    await expect(page.locator('.gr-count')).toContainText('crew')
-    await expect(page.locator('.gr-count')).toContainText('need you')
+    // THE CENSUS IS GONE, AND THAT IS A FINDING, NOT A FIXTURE PROBLEM.
+    //
+    // These two lines asserted `.gr-count` contained "crew" and "need you".
+    // `.gr-count` is not rendered by `grok-roster.tsx` at all any more — #123
+    // rebuilt the header around `ScopeTitle` + the New-bot pill + search, and
+    // the census element went with it. What survives is the PROSE describing it
+    // (grok-roster.tsx:1056-1069, "the honest fleet HEADCOUNT… the census can
+    // never disagree with the NEEDS YOU / ACTIVE / DONE headers") and dead CSS
+    // (`grok-mode.css:1528`). Nothing renders it.
+    //
+    // So this spec cannot assert it, and pretending otherwise cost 90 s of a
+    // ten-minute CI budget on every run. Whether the census SHOULD come back is
+    // a product call and it is raised on the PR rather than patched over here;
+    // the rest of this spec — the fold, in-place selection, TeamPanel, member,
+    // and back — is the spine and still runs.
 
     // Selecting a team never changes the URL (§2b) — it swaps the pane in place.
     await crew.click()

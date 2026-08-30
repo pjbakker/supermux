@@ -328,6 +328,11 @@ describe('settleUndelivered — the lost-response eviction exit (IMG_2451)', () 
 describe('the delivery watchdog', () => {
   const dead = { nowMs: WATCHDOG_MS + 1, sawActiveSince: () => false }
 
+  // `watchdogState` takes no session status ON PURPOSE (master plan §4.4.1): a
+  // session that is "active" because a PREVIOUS turn is still running says
+  // nothing about whether THIS send arrived. Only evidence stamped after the
+  // send counts, and that is what `sawActiveSince` reports — see the probe-bounds
+  // and aliveness tests below.
   test('no entry + no Active transition in 5s → undelivered', () => {
     expect(watchdogState(mk('x', 0), dead)).toBe('undelivered')
   })
@@ -342,16 +347,6 @@ describe('the delivery watchdog', () => {
     expect(watchdogState(mk('x', 0), { nowMs: WATCHDOG_MS - 1, sawActiveSince: () => false })).toBe(
       'unconfirmed',
     )
-  })
-
-  test('status is irrelevant to the escalation — waiting, idle and active all escalate', () => {
-    // The signature carries no status ON PURPOSE (master plan §4.4.1): a session
-    // that is "active" because a PREVIOUS turn is still running says nothing
-    // about whether THIS send arrived. Only evidence stamped after the send
-    // counts, and that is what `sawActiveSince` reports.
-    for (const _status of ['waiting', 'idle', 'active']) {
-      expect(watchdogState(mk('x', 0), dead)).toBe('undelivered')
-    }
   })
 
   test('the probe asks for evidence after the send AND inside the window', () => {

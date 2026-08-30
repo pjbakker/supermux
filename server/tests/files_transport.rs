@@ -1,25 +1,27 @@
 //! Integration tests for the `FileTransport` trait (local + over-SSH file IO).
 //!
-//! Three slices:
+//! Two slices:
 //!
-//! 1. **Local impl round-trip.** Direct trait-level reads/writes/lists/stats
-//!    against a temp dir. A regression net for [`LocalFileTransport`].
-//! 2. **Path-safety regression on the remote side.** `resolve_safe_remote` is
-//!    new; we assert it blocks `/etc/shadow` (exact match), `/ETC/SHADOW`
-//!    (case-insensitive, matches the macOS test in `tests/files.rs`), and
-//!    relative inputs the same way `resolve_safe` does.
-//! 3. **Localhost SSH round-trip (#[ignore]).** Real shell out across an
+//! 1. **Path-safety regression on the remote side.** `resolve_safe_remote`
+//!    blocks `/etc/shadow` (exact match), `/ETC/SHADOW` (case-insensitive,
+//!    matches the macOS test in `tests/files.rs`), and relative inputs the same
+//!    way `resolve_safe` does.
+//! 2. **Localhost SSH round-trip (#[ignore]).** Real shell out across an
 //!    actual ControlMaster — only runs when a local sshd is reachable for the
 //!    invoking user. Mirrors the gating pattern used by
 //!    `tests/host_pool_ssh.rs`. Skipped by default in CI.
+//!
+//! The LOCAL impl's round-trip (write/read/list/stat/rename/delete, and the
+//! create-parents branch) is covered by the `#[cfg(test)] mod tests` inside
+//! `src/files/transport.rs`, piece by piece, and the `is_local()` marker is
+//! load-bearing through the per-company jail, which `tests/scope_p3b.rs`
+//! exercises over real HTTP.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use supermux_server::files::path_safe;
-use supermux_server::files::transport::{
-    FileTransport, LocalFileTransport, SshFileTransport,
-};
+use supermux_server::files::transport::{FileTransport, SshFileTransport};
 use supermux_server::sessions::host_pool::HostPool;
 use supermux_server::sessions::transport::HostId;
 
@@ -30,58 +32,6 @@ fn tmp_dir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&d).unwrap();
     d
-}
-
-// ─────────────────────────── Local impl round-trip ─────────────────────────
-
-#[tokio::test]
-async fn local_full_roundtrip_read_write_list_stat_rename_delete() {
-    let dir = tmp_dir("local-rt");
-    let t: Arc<dyn FileTransport> = Arc::new(LocalFileTransport);
-
-    let a = dir.join("hello.txt");
-    let b = dir.join("renamed.txt");
-
-    // write + read
-    t.write(&a, b"hi rt6\n").await.unwrap();
-    assert_eq!(t.read(&a).await.unwrap(), b"hi rt6\n");
-
-    // stat
-    let s = t.stat(&a).await.unwrap();
-    assert!(!s.is_dir);
-    assert_eq!(s.size, b"hi rt6\n".len() as u64);
-
-    // list
-    let mut entries = t.list_dir(&dir).await.unwrap();
-    entries.sort_by(|x, y| x.name.cmp(&y.name));
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "hello.txt");
-    assert!(!entries[0].is_dir);
-
-    // rename + delete
-    t.rename(&a, &b).await.unwrap();
-    assert!(t.stat(&a).await.is_err());
-    assert!(t.stat(&b).await.is_ok());
-    t.delete(&b).await.unwrap();
-    assert!(t.stat(&b).await.is_err());
-
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[tokio::test]
-async fn local_write_creates_parents_atomically() {
-    let dir = tmp_dir("local-mkparents");
-    let t: Arc<dyn FileTransport> = Arc::new(LocalFileTransport);
-    let deep = dir.join("a/b/c/d/leaf.toml");
-    t.write(&deep, b"x = 1\n").await.unwrap();
-    assert_eq!(t.read(&deep).await.unwrap(), b"x = 1\n");
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[tokio::test]
-async fn local_is_local_marker_is_true() {
-    let t = LocalFileTransport;
-    assert!(t.is_local());
 }
 
 // ───────────────────────── Remote path-safety regression ────────────────────

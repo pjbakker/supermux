@@ -53,7 +53,15 @@ test.describe('chat WS — a server restart mid-stream (A6 T3.1)', () => {
     await backend?.dispose()
   })
 
-  test('reconnects visibly, re-seeds the gap, and duplicates nothing', async ({ page }) => {
+  // @quarantine — same rule as `chat-toggle-focus-leak`: broken, not slow. Red
+  // on main in run 32700541733 and on every run of this branch. The composer's
+  // pending chip reaches `undelivered` where this asserts `unconfirmed`, which
+  // is what a hosted runner with no real `claude` to deliver to produces — so
+  // the spec is asserting a delivery this environment cannot perform. Whether
+  // the fix is a fixture or a `@needs-claude` tag is a diagnosis nobody has
+  // finished, and 35 s per PR is not how that gets decided. Runs nightly; take
+  // the tag off in the commit that makes it pass.
+  test('@quarantine reconnects visibly, re-seeds the gap, and duplicates nothing', async ({ page }) => {
     test.setTimeout(300_000)
 
     const fx = await chatSession(backend, 'a6t3-restart')
