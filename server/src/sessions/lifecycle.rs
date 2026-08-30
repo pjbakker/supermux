@@ -1557,6 +1557,11 @@ async fn emit_board_if_linked(state: &AppState, name: &str) {
 // ── public lifecycle API ────────────────────────────────────────────────────
 
 /// Spawn (or re-attach to) the session's tmux session and launch the agent.
+///
+/// Thin wrapper over [`start_locked`], which runs [`mark_boot_failed`] on every
+/// failure exit before the error propagates. The per-session lock is taken
+/// HERE, not inside, so the failure stamp lands in the same critical section as
+/// the boot it is correcting.
 pub async fn start(
     state: &AppState,
     name: &str,
@@ -1565,6 +1570,70 @@ pub async fn start(
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
     start_locked(state, name, prompt).await
+}
+
+/// Best-effort: record a failed boot as `stopped` so the row stops reading LIVE.
+///
+/// Without this a failed `start` leaves the runtime status at one of two values,
+/// and `db::sessions::live_with_prefix` reads BOTH as live:
+///   * `''` (the `ensure_runtime` default) when the failure beat the `starting`
+///     write below. Empty falls to the freshness arm, and `created_at` is
+///     seconds old, so the dead row blocks its own prefix for the whole quiet
+///     window (2h by default).
+///   * `starting` for any failure after that write. That one is live
+///     unconditionally, so it blocks forever.
+///
+/// Either way the spawn guard would refuse to respawn the identity whose boot
+/// just died, which is exactly backwards. The status detector cannot repair it
+/// either: it declines to reclassify a session whose runtime is not alive.
+///
+/// `stopped`, not `error`: the `session_runtime` status CHECK (migration 0009)
+/// rejects `error`.
+///
+/// Skipped when the runtime is in fact alive. A failure that leaves the agent
+/// running (a send that did not land, say) belongs to the detector, and writing
+/// `stopped` over a live session would be a lie its next tick has to undo.
+/// Everything here is best-effort: the caller propagates the ORIGINAL error, so
+/// a failed stamp is logged and never raised.
+///
+/// A stamped failure also runs the normal stop-time cleanup
+/// ([`maybe_archive_on_stop`]), because a dead row is only half the problem: the
+/// status detector and the steering deliver loop both hang off `exists_active`,
+/// which filters `archived = 0`, so an unarchived dead row keeps two tokio loops
+/// alive for the life of the process. The gate is `archive_on_stop = 1`, i.e.
+/// exactly the scheduler/dispatcher's disposable spawns; human-, board- and
+/// team-created sessions stay visible for inspection. Safe under the per-session
+/// lock `start()` holds around this call for the same reason `stop()`'s call is:
+/// `archive()` takes no session lock and its teardown is async-job-shaped, so it
+/// never waits on this task.
+async fn mark_boot_failed(state: &AppState, name: &str) {
+    // No runtime row means no session to stamp (a start that failed on
+    // `require_session`), and the write would be a silent no-op anyway.
+    match db::sessions::runtime(&state.pool, name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "mark_boot_failed: runtime lookup failed");
+            return;
+        }
+    }
+    if let Ok(rt) = state.runtime_for(name).await {
+        if rt.alive().await {
+            return;
+        }
+    }
+    match db::sessions::set_last_status(&state.pool, name, "stopped").await {
+        Ok(()) => {
+            broadcast_status(state, name, "stopped");
+            // A failed boot IS a stop, so it gets the same cleanup: disposable
+            // spawns archive themselves, which also ends their detector and
+            // steering loops.
+            maybe_archive_on_stop(state, name).await;
+        }
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "mark_boot_failed: could not stamp 'stopped'; the spawn guard may block this prefix until the quiet window elapses")
+        }
+    }
 }
 
 /// Outcome of [`start_if_stopped`]: either we started (carrying `start`'s
@@ -1657,7 +1726,26 @@ async fn clear_stale_resume_link(
 /// The body of [`start`], assuming the per-session lock is ALREADY held. Split
 /// out so [`start_if_stopped`] can wrap it with an atomic precondition without
 /// re-entering the (non-reentrant) lock.
+///
+/// Every failure exit runs [`mark_boot_failed`] before the error propagates, so
+/// a boot that died never leaves its row reading LIVE to the spawn guard. It
+/// sits here rather than in [`start`] so the auto-heal path
+/// ([`start_if_stopped`]), which calls this directly, is covered too.
 async fn start_locked(
+    state: &AppState,
+    name: &str,
+    prompt: Option<&str>,
+) -> Result<StartResult, AppError> {
+    match start_locked_inner(state, name, prompt).await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            mark_boot_failed(state, name).await;
+            Err(e)
+        }
+    }
+}
+
+async fn start_locked_inner(
     state: &AppState,
     name: &str,
     prompt: Option<&str>,
@@ -2143,6 +2231,8 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
         db::sessions::set_last_status(&state.pool, name, "stopped").await?;
         broadcast_status(state, name, "stopped");
         emit_board_if_linked(state, name).await;
+        // Disposable (archive_on_stop) sessions archive themselves on stop.
+        maybe_archive_on_stop(state, name).await;
         return Ok(());
     }
 
@@ -2220,9 +2310,14 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     // the board card mirrors the linked session's state — re-publish so a linked
     // card reflects the now-stopped session rather than a stale running dot.
     emit_board_if_linked(state, name).await;
+    // The team's swarm server is reaped off the pid captured before the kill,
+    // ahead of the archive below: `archive` runs its own teardown, but by then
+    // the pane is gone and there is no foreground pid left to read.
     if let Some(pid) = swarm_lead {
         crate::sessions::swarm::spawn_teardown_for_lead(pid);
     }
+    // Disposable (archive_on_stop) sessions archive themselves on stop.
+    maybe_archive_on_stop(state, name).await;
     Ok(())
 }
 
@@ -2755,6 +2850,31 @@ fn cap_bytes_from_tail(s: String, max: usize) -> String {
     match s[cut..].find('\n') {
         Some(nl) => s[cut + nl + 1..].to_string(),
         None => s[cut..].to_string(),
+    }
+}
+
+/// Archive `name` IFF it is a live, `archive_on_stop`-flagged session -- the
+/// shared hook behind "disposable sessions clean themselves up when they
+/// stop". Best-effort and idempotent: the `archive_pending` gate (row live AND
+/// flagged AND not already archived) means a duplicate call -- e.g. an explicit
+/// Stop racing the Claude `SessionEnd` hook -- is a no-op in practice: the gate
+/// suppresses it. The check and the flip are separate statements, so a rare
+/// exactly-simultaneous race could still write one extra `session.archive` audit
+/// row, but the SSE delta and teardown are both idempotent. `archive()` takes no
+/// session lock, so this is
+/// safe to call from `stop()` while it still holds one. Errors are logged, never
+/// propagated (archiving is a courtesy, not part of the stop contract).
+pub async fn maybe_archive_on_stop(state: &AppState, name: &str) {
+    match db::sessions::archive_pending(&state.pool, name).await {
+        Ok(true) => {
+            if let Err(e) = archive(state, name).await {
+                tracing::warn!(name = %name, error = %e, "auto-archive on stop failed");
+            } else {
+                tracing::info!(name = %name, "auto-archived disposable session on stop");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::debug!(name = %name, error = %e, "archive_pending check failed"),
     }
 }
 
@@ -4079,6 +4199,7 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session, &[]);
@@ -4145,6 +4266,7 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
         };
 
         // Fresh: no cc handles → `--name`, not resume-intended.
@@ -4214,6 +4336,7 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
         };
 
         let (command, _resume) = build_launch_command(&config, &session, &[]);
@@ -4447,6 +4570,7 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
         }
     }
 

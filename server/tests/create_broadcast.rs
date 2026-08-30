@@ -76,6 +76,8 @@ fn create_input(name: &str, dir: &std::path::Path) -> CreateInput {
         runtime: Some("native".to_string()),
         model: None,
         company_id: None,
+        archive_on_stop: None,
+        ..Default::default()
     }
 }
 

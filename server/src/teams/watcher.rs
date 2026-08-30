@@ -1172,6 +1172,8 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                ..Default::default()
             },
         )
         .await
@@ -1218,6 +1220,8 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                ..Default::default()
             },
         )
         .await
@@ -1288,6 +1292,8 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                ..Default::default()
             },
         )
         .await
@@ -1356,6 +1362,8 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                ..Default::default()
             },
         )
         .await
@@ -1434,6 +1442,8 @@ mod tests {
             runtime: None,
             model: None,
             company_id: None,
+            archive_on_stop: None,
+            ..Default::default()
         };
         crate::sessions::create(&state, mk("old-host", "/old")).await.unwrap();
         crate::sessions::create(&state, mk("new-host", "/new")).await.unwrap();
@@ -1973,6 +1983,7 @@ mod tests {
                 runtime: "native".into(),
                 model: String::new(),
                 company_id: None,
+                archive_on_stop: false,
             },
         )
         .await

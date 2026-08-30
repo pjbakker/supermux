@@ -354,6 +354,16 @@ pub struct CreateWorkflowInput {
     /// honoured, and `db::workflows::insert` re-derives it regardless.
     #[serde(default)]
     pub company_id: Option<i64>,
+    /// Archive the target session when it stops (migration 0025). NOT a
+    /// workflows column: the preference is stamped onto `sessions.
+    /// archive_on_stop` of the target session itself, the one place the stop
+    /// hook reads, so two workflows on one bot can never disagree about it.
+    /// `Some(v)` stamps `v`; absent leaves the session's marker untouched
+    /// (opt-in, default off, a fresh session row carries 0). The engine's
+    /// archive contract is unchanged: once the session archives itself, this
+    /// workflow reads as a readable SKIP ("paused until you unarchive").
+    #[serde(default)]
+    pub archive_on_stop: Option<bool>,
 
     // ── named ONLY so they can be refused with a sentence ──────────────────
     #[serde(default)]
@@ -496,7 +506,30 @@ pub async fn create(
     };
     let wf = db::workflows::insert(&state.pool, &wf).await?;
     let steps = db::workflows::replace_steps(&state.pool, &wf.id, &steps).await?;
+    stamp_archive_on_stop(state, &wf.session, input.archive_on_stop).await;
     Ok(db::workflows::WorkflowWithSteps { workflow: wf, steps })
+}
+
+/// Stamp the disposable marker (`sessions.archive_on_stop`, 0025) onto the
+/// workflow's target session, when the caller asked for it.
+///
+/// This is the workflows half of archive-on-stop, and deliberately the WHOLE
+/// half: the marker lives on the session row (the one place
+/// `lifecycle::maybe_archive_on_stop` reads), never on the workflow, so there
+/// is no second copy to drift. `None` touches nothing, so an old client that
+/// omits the field changes no behaviour. Best-effort: the workflow save
+/// already succeeded, and a marker on a row that vanished mid-request matches
+/// zero rows, which is logged rather than raised.
+async fn stamp_archive_on_stop(state: &AppState, session: &str, want: Option<bool>) {
+    let Some(on) = want else { return };
+    match db::sessions::set_archive_on_stop(&state.pool, session, on).await {
+        Ok(0) => tracing::warn!(
+            session,
+            "archive_on_stop stamp matched no session row; the marker was not written"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(session, error = %e, "archive_on_stop stamp failed"),
+    }
 }
 
 /// The per-step half of the funnel, shared by `create` and `PUT /{id}/steps`.
@@ -757,6 +790,11 @@ struct PatchInput {
     schedule_expr: Option<String>,
     #[serde(default)]
     on_complete: Option<serde_json::Value>,
+    /// Archive the target session when it stops (migration 0025): stamped onto
+    /// the SESSION row, exactly as on create; see `CreateWorkflowInput`.
+    /// `Some(false)` clears the marker, absent leaves it untouched.
+    #[serde(default)]
+    archive_on_stop: Option<bool>,
     // `session` and `company_id` are deliberately ABSENT rather than named: a
     // workflow cannot be reassigned to another bot (and therefore not to another
     // company) after it is created, and a client echoing back the object it just
@@ -828,6 +866,7 @@ async fn patch_handler(
         on_complete,
     };
     db::workflows::patch(&state.pool, &id, &patch).await?;
+    stamp_archive_on_stop(&state, &existing.session, input.archive_on_stop).await;
 
     let updated = db::workflows::get_with_steps(&state.pool, &id)
         .await?

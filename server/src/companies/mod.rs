@@ -381,6 +381,12 @@ async fn provision_group_chat(state: &AppState, company: &Company) {
             runtime: None,
             model: None,
             company_id: Some(company.id),
+            archive_on_stop: None,
+            // The router is created and briefed by this path itself; no
+            // create-time prompt, no singleton guard.
+            prompt: None,
+            unless_live_prefix: None,
+            max_quiet_secs: None,
         },
     )
     .await;

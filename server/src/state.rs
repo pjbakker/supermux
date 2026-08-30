@@ -443,6 +443,12 @@ pub struct AppState {
     /// because its only key (`workflow_runs.id`) is a per-database
     /// AUTOINCREMENT — see [`crate::workflows::engine::RunRegistry`].
     pub workflow_runs: Arc<crate::workflows::engine::RunRegistry>,
+    /// Per-prefix spawn-guard locks for `CreateInput.unless_live_prefix`:
+    /// the liveness check and the session INSERT must be atomic per prefix,
+    /// or two concurrent dispatch cycles both pass the check (the TOCTOU
+    /// double-boot class the server-side guard exists to close). Entries are
+    /// tiny and few (one per operator identity); never cleaned up.
+    pub spawn_guards: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Per-session status watch channels (the wait-primitive seam).
     /// Empty until the detector drives updates; the map + cleanup ensures
     /// churn never leaks entries.
@@ -808,6 +814,7 @@ impl AppState {
             session_locks: Arc::new(DashMap::new()),
             send_dedup: Arc::new(crate::sessions::send_dedup::SendDedup::default()),
             workflow_runs: Arc::new(crate::workflows::engine::RunRegistry::default()),
+            spawn_guards: Arc::new(DashMap::new()),
             status_watch: Arc::new(DashMap::new()),
             hook_tokens: Arc::new(DashMap::new()),
             pane_conversations: Arc::new(DashMap::new()),
@@ -1959,6 +1966,16 @@ impl AppState {
     pub fn lock_for(&self, name: &str) -> Arc<Mutex<()>> {
         self.session_locks
             .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Get (creating on first use) the spawn-guard lock for `prefix`.
+    /// Keyed by the prefix, not by session name: the whole point is to
+    /// serialize spawns whose names differ but whose identity does not.
+    pub fn spawn_guard_for(&self, prefix: &str) -> Arc<Mutex<()>> {
+        self.spawn_guards
+            .entry(prefix.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }

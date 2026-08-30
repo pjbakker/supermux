@@ -1090,11 +1090,21 @@ fn force_stopped(state: &AppState, session: &str) {
         // server. This forks tmux, and the tile flip must not wait on that; the
         // agent takes far longer than these few ms to actually leave the pane, and
         // the teardown polls for its death anyway.
+        //
+        // This runs BEFORE the archive below on purpose: archiving kills the pane,
+        // and `lead_pid_of` reads the pane's foreground pgid — once the pane is
+        // gone there is no pid left to hand the teardown, and the team's tmux
+        // server would leak exactly on the disposable sessions that churn most.
         if let Ok(rt) = state.runtime_for(&session).await {
             if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
                 crate::sessions::swarm::spawn_teardown_for_lead(pid);
             }
         }
+        // Disposable (archive_on_stop) sessions archive themselves when their
+        // agent ends. Guarded upstream in `apply_payload`: a foreign (teammate)
+        // SessionEnd never reaches `force_stopped`, so it can never archive the
+        // lead's live session.
+        crate::sessions::lifecycle::maybe_archive_on_stop(&state, &session).await;
     });
 }
 
@@ -1254,6 +1264,7 @@ mod tests {
                 runtime: "native".to_string(),
                 model: String::new(),
                 company_id: Some(company.id),
+                archive_on_stop: false,
             },
         )
         .await

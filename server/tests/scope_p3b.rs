@@ -92,6 +92,7 @@ async fn make_session(state: &AppState, name: &str, company: Option<i64>, dir: &
             runtime: "native".to_string(),
             model: String::new(),
             company_id: company,
+            archive_on_stop: false,
         },
     )
     .await
@@ -124,6 +125,7 @@ async fn make_remote_session(
             runtime: "native".to_string(),
             model: String::new(),
             company_id: company,
+            archive_on_stop: false,
         },
     )
     .await

@@ -121,6 +121,11 @@ pub struct Session {
     /// [`crate::bot_memory`] / [`crate::sessions::connector_config`].
     #[serde(default)]
     pub role_id: Option<String>,
+    /// Disposable marker (0025): when 1, the stop hook archives this session the
+    /// moment it settles to `stopped`. Stamped on request by the create path and
+    /// the workflows plumbing; 0 for every other session.
+    #[serde(default)]
+    pub archive_on_stop: i64,
 }
 
 /// A row of the `session_runtime` table (ephemeral, persisted across restarts).
@@ -425,6 +430,8 @@ pub struct NewSession {
     /// (empty = provider default). Mirrors `runtime`: carried end-to-end so the
     /// create path persists it in one INSERT.
     pub model: String,
+    /// Auto-archive this session when it stops (the disposable marker, 0025).
+    pub archive_on_stop: bool,
 }
 
 /// Insert a full session config row. `created_at` is set to now.
@@ -433,8 +440,9 @@ pub async fn create(pool: &SqlitePool, s: &NewSession) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO sessions
             (name, display_name, dir, desc, provider, creator, flags, tags, branch, mcp,
-             worktree, worktree_repo, host_id, company_id, runtime, model, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             worktree, worktree_repo, host_id, company_id, runtime, model, archive_on_stop,
+             created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.name)
     .bind(&s.display_name)
@@ -452,6 +460,7 @@ pub async fn create(pool: &SqlitePool, s: &NewSession) -> sqlx::Result<()> {
     .bind(s.company_id)
     .bind(&s.runtime)
     .bind(&s.model)
+    .bind(s.archive_on_stop as i64)
     .bind(now)
     .execute(pool)
     .await?;
@@ -760,6 +769,84 @@ pub async fn set_archived(pool: &SqlitePool, name: &str, archived: bool) -> sqlx
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Set the disposable marker (0025). Returns the number of rows matched so a
+/// caller stamping a name that has no row can say so instead of silently
+/// succeeding.
+pub async fn set_archive_on_stop(
+    pool: &SqlitePool,
+    name: &str,
+    on: bool,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query("UPDATE sessions SET archive_on_stop = ? WHERE name = ?")
+        .bind(on as i64)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// True iff a LIVE (non-archived) row exists AND is flagged `archive_on_stop`.
+/// The stop hook's single gate: a missing row, an already-archived row, or an
+/// unflagged row all return false, so the caller never double-archives.
+pub async fn archive_pending(pool: &SqlitePool, name: &str) -> sqlx::Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM sessions WHERE name = ? AND archived = 0 AND archive_on_stop = 1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// One live, non-archived session whose name starts with `prefix`, or `None`.
+///
+/// Liveness: `active`/`starting` count as live at any age; `stopped`/`error`
+/// never do (`error` is not in the `last_status` CHECK today, but a dead
+/// session must never block its own respawn if it is added); everything else
+/// (`idle`, `waiting`, `unknown`, and the missing runtime row a just-created
+/// session has) only while its newest activity stamp is younger than
+/// `max_quiet_secs`.
+///
+/// This is the spawn guard's (`unless_live_prefix`) sole gate, so "unsure"
+/// must read as live: a stale false-positive delays a boot by one cycle, a
+/// false-negative double-boots. That is also why an unrecognised status falls
+/// into the freshness branch rather than being treated as free.
+///
+/// The prefix match is an exact, case-sensitive `substr` comparison, not LIKE:
+/// SQLite's default LIKE is ASCII-case-insensitive and treats `%`/`_` as
+/// wildcards, either of which would let one identity's prefix swallow another
+/// and block its spawn indefinitely.
+pub async fn live_with_prefix(
+    pool: &SqlitePool,
+    prefix: &str,
+    max_quiet_secs: i64,
+) -> sqlx::Result<Option<String>> {
+    let cutoff = chrono::Utc::now().timestamp() - max_quiet_secs;
+    // MAX() with several arguments is SQLite's scalar max, not the aggregate.
+    // `length()` is evaluated by SQLite on the same value it compares, so the
+    // character counting can't drift from Rust's notion of string length.
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT s.name FROM sessions s
+         LEFT JOIN session_runtime r ON r.name = s.name
+         WHERE s.archived = 0
+           AND substr(s.name, 1, length(?)) = ?
+           AND CASE COALESCE(r.last_status, '')
+                 WHEN 'active' THEN 1
+                 WHEN 'starting' THEN 1
+                 WHEN 'stopped' THEN 0
+                 WHEN 'error' THEN 0
+                 ELSE MAX(COALESCE(r.last_status_at, 0), s.last_started, s.last_send, s.created_at) > ?
+               END
+         LIMIT 1",
+    )
+    .bind(prefix)
+    .bind(prefix)
+    .bind(cutoff)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(n,)| n))
 }
 
 /// Clear the Claude resume identifiers (used by the resume-picker fallback when

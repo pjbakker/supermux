@@ -376,6 +376,7 @@ mod tests {
                 runtime: "native".into(),
                 model: String::new(),
                 company_id: None,
+                archive_on_stop: false,
             },
         )
         .await
