@@ -246,6 +246,18 @@ impl HumanAuthConfig {
         })
     }
 
+    /// This company's PERMANENT (non-ephemeral) `company_hosts` entry — the one
+    /// the wizard writes for a BYO-domain company, and the AUTHORITY on which
+    /// address that company publishes (the owner may have picked a label other
+    /// than the slug). `None` ⇒ nothing written yet, so callers fall back to the
+    /// slug-derived default. An ephemeral quick-tunnel entry is deliberately
+    /// skipped: it is a different, temporary transport that can coexist.
+    pub fn company_entry(&self, company_id: i64) -> Option<&CompanyHost> {
+        self.company_hosts
+            .iter()
+            .find(|c| c.company_id == company_id && !c.ephemeral)
+    }
+
     /// True when `host` (a raw `Host` header value) matches a configured
     /// [`owner_hosts`](Self::owner_hosts) entry — case-insensitive, port-stripped,
     /// the same matching style as [`host_entry`](Self::host_entry). Used by the
@@ -262,8 +274,12 @@ impl HumanAuthConfig {
     }
 }
 
-/// Derive the canonical tunnel host for a company slug under a chosen
-/// `base_domain`: `<slug>.<base_domain>`.
+/// Derive a company's tunnel host from a single DNS `label` under a chosen
+/// `base_domain`: `<label>.<base_domain>`.
+///
+/// The label DEFAULTS to the company slug (what the wizard suggests) but the
+/// owner may change it — the persisted [`CompanyHost`] entry is authoritative
+/// from then on, so this stays a pure formatter over whichever label won.
 ///
 /// The base domain is the operator's own Cloudflare zone (e.g. `example.com`),
 /// picked in the wizard and stored on the companion config — there is NO
@@ -276,20 +292,37 @@ impl HumanAuthConfig {
 /// case-insensitive; the `companies.slug` charset — letters/digits/`_`/`.`/`-` —
 /// already excludes any character illegal in a host label except `_`, which the
 /// operator avoids in a slug meant to be tunneled).
-pub fn company_canonical_host(slug: &str, base_domain: &str) -> String {
+pub fn company_canonical_host(label: &str, base_domain: &str) -> String {
     format!(
         "{}.{}",
-        slug.trim().to_ascii_lowercase(),
+        label.trim().to_ascii_lowercase(),
         base_domain.trim().to_ascii_lowercase()
     )
 }
 
-/// The exact Google redirect URI for a company's canonical host under
-/// `base_domain`: `https://<slug>.<base_domain>/auth/callback`.
-pub fn company_redirect_uri(slug: &str, base_domain: &str) -> String {
+/// Is `s` a single legal DNS label — the bit an owner types in front of their
+/// base domain (`<label>.example.com`)?
+///
+/// 1..=63 characters of lowercase `a-z`, `0-9` and `-`, never starting or ending
+/// with `-`. Deliberately NARROWER than RFC 1123 (no uppercase, no leading digit
+/// debate, no dots): the label rides ONE wildcard `*.<base>` CNAME, which covers
+/// exactly one level, so a dotted "label" could never resolve. Callers lower-case
+/// + trim before asking.
+pub fn is_dns_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+}
+
+/// The exact Google redirect URI for a company's host under `base_domain`:
+/// `https://<label>.<base_domain>/auth/callback`.
+pub fn company_redirect_uri(label: &str, base_domain: &str) -> String {
     format!(
         "https://{}/auth/callback",
-        company_canonical_host(slug, base_domain)
+        company_canonical_host(label, base_domain)
     )
 }
 
@@ -297,8 +330,9 @@ pub fn company_redirect_uri(slug: &str, base_domain: &str) -> String {
 /// in `config.toml`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompanyHost {
-    /// Public tunnel hostname a company's colleagues reach (canonical form
-    /// `<slug>.<base_domain>`, P3d). Also feeds the WS Origin allowlist.
+    /// Public tunnel hostname a company's colleagues reach (`<label>.<base_domain>`,
+    /// P3d — the label is the company slug unless the owner picked another one in
+    /// the wizard). Also feeds the WS Origin allowlist.
     pub host: String,
     /// The company this Host serves. A cookie minted for a different company is
     /// rejected on this Host.
@@ -315,20 +349,37 @@ pub struct CompanyHost {
 }
 
 impl CompanyHost {
-    /// Does this entry map the CANONICAL layout for `(slug, company_id)` under the
-    /// configured `base_domain`? A valid P3d tunnel entry has
-    /// `host == <slug>.<base_domain>`,
-    /// `redirect_uri == https://<slug>.<base_domain>/auth/callback`, and
-    /// `company_id == expected_company_id`. Host/redirect are compared
-    /// case-insensitively (DNS + scheme are case-folding). A wrong `base_domain`
-    /// therefore de-canonicalises the entry (correctly signalling a re-derive is
-    /// needed). Used by the provisioner doc/test and the status handler.
-    pub fn is_canonical_for(&self, slug: &str, expected_company_id: i64, base_domain: &str) -> bool {
-        let want_host = company_canonical_host(slug, base_domain);
-        let want_redirect = company_redirect_uri(slug, base_domain);
+    /// The single DNS label this entry publishes under `base_domain` — `host`
+    /// minus the `.<base_domain>` suffix — or `None` when the entry does not sit
+    /// directly under that base (a stale/foreign base, or a multi-level host the
+    /// one wildcard CNAME could never serve).
+    pub fn label_under(&self, base_domain: &str) -> Option<String> {
+        let host = self.host.trim().to_ascii_lowercase();
+        let suffix = format!(".{}", base_domain.trim().to_ascii_lowercase());
+        let label = host.strip_suffix(&suffix)?.to_string();
+        is_dns_label(&label).then_some(label)
+    }
+
+    /// Is this entry a USABLE P3d tunnel entry for `expected_company_id` under the
+    /// configured `base_domain`? True when the entry belongs to that company, its
+    /// `host` is a single DNS label under the CURRENT base, and its `redirect_uri`
+    /// is the `https://<host>/auth/callback` form for that exact host.
+    ///
+    /// The label itself is NOT pinned to the company slug: the owner may name the
+    /// address whatever they like in the wizard, and the persisted entry is then
+    /// the authority. What stays strict is the base domain (an entry under a stale
+    /// or foreign base de-canonicalises — the correct re-derive signal), the
+    /// host↔company binding, and the redirect↔host agreement (no open redirect).
+    /// Host/redirect are compared case-insensitively (DNS + scheme fold case).
+    pub fn is_valid_for(&self, expected_company_id: i64, base_domain: &str) -> bool {
+        let Some(label) = self.label_under(base_domain) else {
+            return false;
+        };
         self.company_id == expected_company_id
-            && self.host.trim().eq_ignore_ascii_case(&want_host)
-            && self.redirect_uri.trim().eq_ignore_ascii_case(&want_redirect)
+            && self
+                .redirect_uri
+                .trim()
+                .eq_ignore_ascii_case(&company_redirect_uri(&label, base_domain))
     }
 }
 
@@ -823,8 +874,8 @@ mod tests {
     }
 
     #[test]
-    fn company_host_maps_slug_to_company_and_redirect() {
-        // A correctly hand-edited `[[company_hosts]]` block for (slug=acme, id=7)
+    fn company_host_maps_label_to_company_and_redirect() {
+        // A correctly written `[[company_hosts]]` block for (label=acme, id=7)
         // under the configured base domain `example.com`.
         let entry = CompanyHost {
             host: "acme.example.com".to_string(),
@@ -832,7 +883,8 @@ mod tests {
             redirect_uri: "https://acme.example.com/auth/callback".to_string(),
             ephemeral: false,
         };
-        assert!(entry.is_canonical_for("acme", 7, "example.com"));
+        assert!(entry.is_valid_for(7, "example.com"));
+        assert_eq!(entry.label_under("example.com").as_deref(), Some("acme"));
         // Case-insensitive host/redirect match (DNS + scheme fold case).
         let mixed = CompanyHost {
             host: "ACME.example.com".to_string(),
@@ -840,23 +892,88 @@ mod tests {
             redirect_uri: "https://ACME.example.com/auth/callback".to_string(),
             ephemeral: false,
         };
-        assert!(mixed.is_canonical_for("acme", 7, "example.com"));
+        assert!(mixed.is_valid_for(7, "example.com"));
 
-        // Wrong company id → not canonical (host↔company binding must be exact).
-        assert!(!entry.is_canonical_for("acme", 8, "example.com"));
-        // Wrong slug (host serves a different company's domain) → not canonical.
-        assert!(!entry.is_canonical_for("beta", 7, "example.com"));
-        // Wrong BASE domain → not canonical (a base change de-canonicalises the
-        // entry, which is the correct re-derive signal). Fail-closed.
-        assert!(!entry.is_canonical_for("acme", 7, "other.test"));
-        // A stray redirect host → not canonical (open-redirect / mis-registration).
+        // The OWNER'S OWN label (not the slug) is just as valid — the entry is the
+        // authority on the address, which is the whole point of an editable
+        // subdomain. Nothing here re-derives `<slug>.<base>`.
+        let renamed = CompanyHost {
+            host: "team.example.com".to_string(),
+            company_id: 7,
+            redirect_uri: "https://team.example.com/auth/callback".to_string(),
+            ephemeral: false,
+        };
+        assert!(renamed.is_valid_for(7, "example.com"));
+        assert_eq!(renamed.label_under("example.com").as_deref(), Some("team"));
+
+        // Wrong company id → not valid (host↔company binding must be exact).
+        assert!(!entry.is_valid_for(8, "example.com"));
+        // Wrong BASE domain → not valid (a base change de-canonicalises the entry,
+        // which is the correct re-derive signal). Fail-closed.
+        assert!(!entry.is_valid_for(7, "other.test"));
+        assert_eq!(entry.label_under("other.test"), None);
+        // A multi-level host is NOT a single label under the base — the one
+        // wildcard `*.<base>` CNAME covers exactly one level.
+        let deep = CompanyHost {
+            host: "eu.acme.example.com".to_string(),
+            company_id: 7,
+            redirect_uri: "https://eu.acme.example.com/auth/callback".to_string(),
+            ephemeral: false,
+        };
+        assert!(!deep.is_valid_for(7, "example.com"));
+        // A stray redirect host → not valid (open-redirect / mis-registration).
         let bad_redirect = CompanyHost {
             host: "acme.example.com".to_string(),
             company_id: 7,
             redirect_uri: "https://evil.example/auth/callback".to_string(),
             ephemeral: false,
         };
-        assert!(!bad_redirect.is_canonical_for("acme", 7, "example.com"));
+        assert!(!bad_redirect.is_valid_for(7, "example.com"));
+    }
+
+    #[test]
+    fn dns_label_rules() {
+        for good in ["a", "acme", "team-2", "x1", &"a".repeat(63)] {
+            assert!(is_dns_label(good), "{good} should be a legal label");
+        }
+        for bad in [
+            "",                    // empty
+            "-acme",               // leading hyphen
+            "acme-",               // trailing hyphen
+            "ACME",                // uppercase (callers lower-case first)
+            "acme.eu",             // a dot is a second level the wildcard misses
+            "acme_eu",             // underscore is illegal in a hostname
+            "acme eu",             // whitespace
+            &"a".repeat(64),       // 64 > 63
+        ] {
+            assert!(!is_dns_label(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn company_entry_is_the_permanent_one() {
+        let cfg = HumanAuthConfig {
+            company_hosts: vec![
+                CompanyHost {
+                    host: "calm-frog-1234.trycloudflare.com".to_string(),
+                    company_id: 7,
+                    redirect_uri: "https://calm-frog-1234.trycloudflare.com/auth/callback"
+                        .to_string(),
+                    ephemeral: true,
+                },
+                CompanyHost {
+                    host: "team.example.com".to_string(),
+                    company_id: 7,
+                    redirect_uri: "https://team.example.com/auth/callback".to_string(),
+                    ephemeral: false,
+                },
+            ],
+            ..Default::default()
+        };
+        // The ephemeral quick-tunnel entry is skipped — a temporary transport is
+        // never the authority on the company's permanent address.
+        assert_eq!(cfg.company_entry(7).map(|e| e.host.as_str()), Some("team.example.com"));
+        assert!(cfg.company_entry(8).is_none());
     }
 
     #[test]

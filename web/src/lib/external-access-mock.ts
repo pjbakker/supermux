@@ -36,6 +36,7 @@ import type {
   ZonesResult,
 } from '@/lib/api'
 import { SessionError } from '@/lib/api'
+import { subdomainError } from '@/lib/company-subdomain'
 
 // Entry `Q` is the "try without a domain" quick-tunnel branch. `?tunnel=1` on top
 // of it seeds an ALREADY-active temporary link so the offline rig can screenshot
@@ -81,6 +82,7 @@ interface QuickTunnelMock {
 interface MockState {
   cfToken: 'none' | 'valid'
   baseDomain: string | null // chosen in the "Choose your domain" sub-step (null ⇒ unset)
+  subdomain: string | null // the label in front of it — the owner may change it (null ⇒ the slug)
   provisionedAt: number | null // when provision-tunnel was called (drives connecting→healthy)
   google: 'unset' | 'configured'
   hostWritten: boolean
@@ -96,11 +98,13 @@ const CONNECT_MS = 2500 // connecting → healthy dwell, long enough to SEE the 
 const QUICK_HOST = 'calm-frog-1a2b3c4d.trycloudflare.com'
 const SLUG = 'acme'
 
-/** Host / redirect derived from the CHOSEN base domain — empty until one is set,
- *  mirroring the server's fail-closed `CompanyStatus` (never a fake host). */
+/** Host / redirect for the CHOSEN base domain + label — empty until a base is set,
+ *  mirroring the server's fail-closed `CompanyStatus` (never a fake host). The
+ *  label is the owner's if they picked one, else the slug the wizard suggests,
+ *  exactly like the server's entry-authoritative resolution. */
 function derived(baseDomain: string | null): { host: string; redirect: string } {
   if (!baseDomain) return { host: '', redirect: '' }
-  const host = `${SLUG}.${baseDomain}`
+  const host = `${state.subdomain ?? SLUG}.${baseDomain}`
   return { host, redirect: `https://${host}/auth/callback` }
 }
 
@@ -109,6 +113,7 @@ function initialState(entry: Entry): MockState {
   const base: MockState = {
     cfToken: 'none',
     baseDomain: null,
+    subdomain: null,
     provisionedAt: null,
     google: 'unset',
     hostWritten: false,
@@ -218,7 +223,11 @@ export const externalAccessMock = {
       const aiVerified = state.agentInboxAttempts >= 2
       out.company = {
         company_id: companyId,
-        company_host_written: state.baseDomain != null && (state.hostWritten || state.google === 'configured'),
+        // Only a real host write counts. Treating "Google is configured" as a
+        // written host hid entry B's actual state: a new company on a set-up box
+        // has NO address until `host` is posted, which is exactly when the wizard
+        // must offer to name it.
+        company_host_written: state.baseDomain != null && state.hostWritten,
         redirect_registered: verified ? 'ok' : state.verifyAttempts > 0 ? 'mismatch' : 'unknown',
         reachable: verified && tunnel === 'healthy',
         host, // '' until a base domain is chosen — never a fake host
@@ -306,11 +315,22 @@ export const externalAccessMock = {
     return { configured: true }
   },
 
-  async host(_companyId?: number): Promise<HostResult> {
+  async host(_companyId?: number, subdomain?: string): Promise<HostResult> {
     await wait(400)
+    const before = derived(state.baseDomain).host
+    if (subdomain != null) {
+      const bad = subdomainError(subdomain)
+      if (bad) throw new SessionError(`${bad}.`, 400)
+      state.subdomain = subdomain.trim().toLowerCase()
+    }
     state.hostWritten = true
     const { host, redirect } = derived(state.baseDomain)
-    return { host, redirect_uri: redirect }
+    return {
+      host,
+      redirect_uri: redirect,
+      // Only when the address actually moved — same honesty as the server.
+      previous_host: before && before !== host ? before : null,
+    }
   },
 
   async verifyLogin(_companyId?: number): Promise<VerifyLoginResult> {

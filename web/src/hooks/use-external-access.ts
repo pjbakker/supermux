@@ -198,12 +198,18 @@ export function useGoogleConfig(companyId?: number) {
 }
 
 /** `POST /api/companies/{id}/host` — Entry B: write just this company's host on
- *  an already-configured box (no secret paste). */
+ *  an already-configured box (no secret paste). The optional argument is the
+ *  owner's chosen subdomain label; calling it with nothing (`mutateAsync()`) KEEPS
+ *  whatever label the company already publishes, so a plain re-assert never
+ *  renames an owner-chosen address back to the slug. */
 export function useCompanyHost(companyId: number) {
   const invalidate = useInvalidateStatus(companyId)
   return useMutation({
-    mutationFn: () =>
-      route(() => externalAccessApi.host(companyId), (m) => m.host(companyId)),
+    mutationFn: (subdomain?: string) =>
+      route(
+        () => externalAccessApi.host(companyId, subdomain),
+        (m) => m.host(companyId, subdomain),
+      ),
     onSuccess: invalidate,
   })
 }

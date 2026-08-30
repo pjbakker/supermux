@@ -13,7 +13,7 @@
 //! | `POST /api/external-access/google`         | Save the Google client id + secret (0600), hot-reload. |
 //! | `POST /api/external-access/agent-inbox`    | Mint `agent@<domain>` via CF Email Routing → a connected mailbox. |
 //! | `DELETE /api/external-access/agent-inbox`  | Remove a company's agent-inbox (rule + record). |
-//! | `POST /api/companies/{id}/host`            | Derive + write this company's `company_hosts` entry, hot-reload. |
+//! | `POST /api/companies/{id}/host`            | Write this company's `company_hosts` entry — optional `{subdomain}`, else keep the current label, else the slug — hot-reload. |
 //! | `POST /api/companies/{id}/verify-login`    | Surface the exact redirect URI to register (redirect_uri_mismatch). |
 //! | `POST /api/companies/{id}/humans`          | Seed a colleague `human_users` row; returns the login url. |
 //! | `GET  /api/companies/{id}/humans`          | List invitees + Invited/Pending/Active status. |
@@ -48,7 +48,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{company_canonical_host, company_redirect_uri};
+use crate::config::{company_canonical_host, company_redirect_uri, is_dns_label};
 use crate::error::AppError;
 use crate::scope::OptCtx;
 use crate::state::AppState;
@@ -217,6 +217,35 @@ fn require_base_domain(state: &AppState) -> Result<String, AppError> {
                 "choose your domain first (the wizard's Domain step)".into(),
             )
         })
+}
+
+/// A company's LIVE public host + redirect URI.
+///
+/// The persisted `company_hosts` entry is AUTHORITATIVE: the wizard SUGGESTS
+/// `<slug>.<base>` but the owner may pick any label, so re-deriving from the slug
+/// at each call site (as every one of these used to) would silently disagree with
+/// the address colleagues actually sign in on. The slug-derived default is only
+/// the fallback — before any entry is written, or when the stored one no longer
+/// sits under the current base domain (a base change must re-derive, fail-closed).
+fn resolve_company_host(
+    cfg: &crate::config::HumanAuthConfig,
+    company_id: i64,
+    slug: &str,
+    base_domain: &str,
+) -> (String, String) {
+    match cfg
+        .company_entry(company_id)
+        .filter(|e| e.is_valid_for(company_id, base_domain))
+    {
+        Some(e) => (
+            e.host.trim().to_ascii_lowercase(),
+            e.redirect_uri.trim().to_string(),
+        ),
+        None => (
+            company_canonical_host(slug, base_domain),
+            company_redirect_uri(slug, base_domain),
+        ),
+    }
 }
 
 /// The wildcard ingress host under a resolved base domain: `*.<base_domain>`.
@@ -537,12 +566,15 @@ async fn status_handler(
                 });
             match &base_domain {
                 Some(base) => {
-                    let host = company_canonical_host(&co.slug, base);
-                    let redirect_uri = company_redirect_uri(&co.slug, base);
-                    let entry = cfg.host_entry(&host);
+                    // Entry-authoritative: report the address this company ACTUALLY
+                    // publishes (the owner may have renamed the subdomain), and
+                    // only fall back to the slug-derived suggestion when nothing is
+                    // written yet.
+                    let (host, redirect_uri) = resolve_company_host(&cfg, id, &co.slug, base);
+                    let entry = cfg.company_entry(id);
                     let written = entry.is_some();
                     let redirect_registered = match entry {
-                        Some(e) if e.is_canonical_for(&co.slug, id, base) => "ok",
+                        Some(e) if e.is_valid_for(id, base) => "ok",
                         Some(_) => "mismatch",
                         None => "unknown",
                     };
@@ -1067,16 +1099,49 @@ async fn base_domain_handler(
 
 // ── 5. POST /api/companies/{id}/host ─────────────────────────────────────────
 
+/// Optional body for `POST /api/companies/{id}/host`. The endpoint is also
+/// called with NO body at all (the wizard's Google mini-step just re-asserts the
+/// entry), hence `Option<Json<_>>` at the handler and a defaulted field here.
+#[derive(Debug, Default, Deserialize)]
+struct HostInput {
+    /// The single DNS label the owner wants in front of the base domain. Absent ⇒
+    /// KEEP whatever label this company already publishes, and only fall back to
+    /// the company slug when there is no entry yet. (Defaulting to the slug
+    /// unconditionally would silently rename an owner-chosen address back.)
+    #[serde(default)]
+    subdomain: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct HostResult {
     host: String,
     redirect_uri: String,
+    /// The address this company published BEFORE this call, when the label
+    /// actually changed — so the wizard can say the old link stops working and the
+    /// new redirect URI needs registering. `None` ⇒ nothing moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_host: Option<String>,
+}
+
+/// The one place a `company_hosts` label is validated. Lower-cases + trims, then
+/// pins the single-DNS-label rule; the error text is what the wizard shows.
+fn validated_label(raw: &str) -> Result<String, AppError> {
+    let label = raw.trim().to_ascii_lowercase();
+    if !is_dns_label(&label) {
+        return Err(AppError::BadRequest(
+            "the subdomain must be 1-63 characters of a-z, 0-9 or -, and cannot start \
+             or end with -"
+                .into(),
+        ));
+    }
+    Ok(label)
 }
 
 async fn host_handler(
     State(state): State<AppState>,
     ctx: OptCtx,
     Path(id): Path<i64>,
+    input: Option<Json<HostInput>>,
 ) -> Result<Json<Envelope<HostResult>>, AppError> {
     crate::scope::require_admin(ctx.0.as_ref(), &format!("/api/companies/{id}/host"))?;
     // FAIL-CLOSED: never write a company_hosts entry without a chosen base domain.
@@ -1084,10 +1149,47 @@ async fn host_handler(
     let co = crate::db::companies::get(&state.pool, id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("company id={id}")))?;
-    let host = company_canonical_host(&co.slug, &base);
-    let redirect_uri = company_redirect_uri(&co.slug, &base);
 
-    // Upsert this company's company_hosts entry into the companion store.
+    let live = state.human_auth_cfg();
+    let current = live.company_entry(id);
+    let current_host = current.map(|e| e.host.trim().to_ascii_lowercase());
+    let current_label = current.and_then(|e| e.label_under(&base));
+
+    // The label: what the owner typed, else the one already published, else the
+    // slug the wizard suggests. A slug that is not a legal hostname label cannot
+    // be a silent default — the wildcard `*.<base>` CNAME could never serve it —
+    // so say so instead of writing an address that will not resolve.
+    let label = match input.and_then(|Json(i)| i.subdomain) {
+        Some(raw) => validated_label(&raw)?,
+        None => match current_label {
+            Some(l) => l,
+            None => validated_label(&co.slug).map_err(|_| {
+                AppError::BadRequest(format!(
+                    "\"{}\" cannot be used as a web address - choose a subdomain \
+                     (a-z, 0-9 and -) for this company",
+                    co.slug.trim()
+                ))
+            })?,
+        },
+    };
+    let host = company_canonical_host(&label, &base);
+    let redirect_uri = company_redirect_uri(&label, &base);
+
+    // Uniform, honest refusal: one address can only serve one company (the Host
+    // header is what binds a login cookie to a company).
+    if live
+        .company_hosts
+        .iter()
+        .any(|h| h.company_id != id && h.host.trim().eq_ignore_ascii_case(&host))
+    {
+        return Err(AppError::Conflict(format!(
+            "{host} is already used by another company - pick a different subdomain"
+        )));
+    }
+
+    // Upsert this company's company_hosts entry into the companion store. A rename
+    // REPLACES the old entry (the old address stops resolving to this company);
+    // DNS needs no cleanup because every label rides the one wildcard CNAME.
     let mut cfg = store::read_or_default(&state.config.data_dir).map_err(AppError::Internal)?;
     cfg.company_hosts.retain(|h| h.company_id != id);
     cfg.company_hosts.push(crate::config::CompanyHost {
@@ -1099,7 +1201,12 @@ async fn host_handler(
     store::write_atomic(&state.config.data_dir, &cfg).map_err(AppError::Internal)?;
     state.reload_human_auth().map_err(AppError::Internal)?;
 
-    Ok(ok(HostResult { host, redirect_uri }))
+    let previous_host = current_host.filter(|h| *h != host);
+    Ok(ok(HostResult {
+        host,
+        redirect_uri,
+        previous_host,
+    }))
 }
 
 // ── 6. POST /api/companies/{id}/verify-login ─────────────────────────────────
@@ -1122,10 +1229,11 @@ async fn verify_login_handler(
     let co = crate::db::companies::get(&state.pool, id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("company id={id}")))?;
-    let redirect_uri = company_redirect_uri(&co.slug, &base);
-    let host = company_canonical_host(&co.slug, &base);
-
     let cfg = state.human_auth_cfg();
+    // Entry-authoritative (see `resolve_company_host`): verify the address this
+    // company actually publishes, not a slug-derived guess.
+    let (host, redirect_uri) = resolve_company_host(&cfg, id, &co.slug, &base);
+
     if cfg.google_client_id.is_none() {
         return Ok(ok(VerifyLoginResult {
             ok: false,
@@ -1138,8 +1246,8 @@ async fn verify_login_handler(
     // redirect URI to be the one Google will see. When it is missing/non-canonical
     // the actionable failure is a redirect_uri_mismatch: hand back the exact URI to
     // register in the Google console.
-    match cfg.host_entry(&host) {
-        Some(e) if e.is_canonical_for(&co.slug, id, &base) => Ok(ok(VerifyLoginResult {
+    match cfg.company_entry(id) {
+        Some(e) if e.is_valid_for(id, &base) => Ok(ok(VerifyLoginResult {
             ok: true,
             detail: format!("Ready — colleagues can sign in at https://{host}."),
             redirect_uri,
@@ -1253,8 +1361,12 @@ async fn add_human_handler(
                 crate::auth_human::invite::mint_invite_token(&cfg.invite_key, user.id, id, exp);
             format!("https://{}/auth/invite?token={token}", q.host)
         }
-        // Permanent Google path: the canonical company host.
-        (None, Some(base)) => format!("https://{}", company_canonical_host(&co.slug, base)),
+        // Permanent Google path: the company's published host (entry-authoritative,
+        // so an owner-renamed subdomain lands in the invite link too).
+        (None, Some(base)) => format!(
+            "https://{}",
+            resolve_company_host(&state.human_auth_cfg(), id, &co.slug, base).0
+        ),
         // Unreachable: `base` is `Some` whenever `quick` is `None` (set above).
         (None, None) => unreachable!("base domain resolved on the non-quick path"),
     };

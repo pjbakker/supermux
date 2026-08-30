@@ -9,6 +9,7 @@
 // Wire shapes mirror `server/src/external_access/mod.rs` (committed 957674b) and
 // `server/src/db/human_users.rs` exactly — keep them in lockstep.
 
+import { hostPayload } from '../company-subdomain'
 import { quickTunnelPayload } from '../quick-tunnel'
 import { sessionRequest } from './sessions'
 
@@ -130,6 +131,9 @@ export interface GoogleResult {
 export interface HostResult {
   host: string
   redirect_uri: string
+  /** The address this company published BEFORE the call, when the label actually
+   *  changed. Absent ⇒ nothing moved. */
+  previous_host?: string | null
 }
 
 export interface VerifyLoginResult {
@@ -260,10 +264,17 @@ export const externalAccessApi = {
       method: 'DELETE',
     }),
 
-  /** `POST /api/companies/{id}/host` — derive + write this company's
-   *  `company_hosts` entry (Entry B). Returns `{host, redirect_uri}`. */
-  host: (companyId: number): Promise<HostResult> =>
-    sessionRequest(`/api/companies/${companyId}/host`, { method: 'POST' }),
+  /** `POST /api/companies/{id}/host` — write this company's `company_hosts` entry
+   *  (Entry B). `subdomain` is the single DNS label in front of the base domain
+   *  (the wizard suggests the company slug; the owner may change it). Omit it to
+   *  KEEP the label this company already publishes — the server only falls back to
+   *  the slug when no entry exists yet. Returns `{host, redirect_uri,
+   *  previous_host?}`. */
+  host: (companyId: number, subdomain?: string): Promise<HostResult> =>
+    sessionRequest(`/api/companies/${companyId}/host`, {
+      method: 'POST',
+      body: JSON.stringify(hostPayload(subdomain)),
+    }),
 
   /** `POST /api/companies/{id}/verify-login` — real authorize round-trip; surfaces
    *  the exact URI to register on `redirect_uri_mismatch`. */

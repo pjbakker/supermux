@@ -422,7 +422,7 @@ async fn company_host_derives_slug_dot_base_domain_and_reloads() {
     let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
         .await
         .unwrap();
-    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id))
+    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
         .await
         .expect("host derive ok");
     assert_eq!(res.0.data.host, "acme.example.com");
@@ -433,7 +433,7 @@ async fn company_host_derives_slug_dot_base_domain_and_reloads() {
         .host_entry("acme.example.com")
         .cloned()
         .expect("host entry live");
-    assert!(e.is_canonical_for("acme", co.id, "example.com"));
+    assert!(e.is_valid_for(co.id, "example.com"));
     cleanup(state, dir).await;
 }
 
@@ -445,12 +445,297 @@ async fn company_host_without_a_base_domain_is_rejected() {
     let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
         .await
         .unwrap();
-    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id)).await;
+    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None).await;
     assert!(matches!(res, Err(AppError::BadRequest(_))), "got {res:?}");
     assert!(
         state.human_auth_cfg().company_hosts.is_empty(),
         "no allowlist entry written without a base domain"
     );
+    cleanup(state, dir).await;
+}
+
+/// The owner's own label wins over the slug — the whole point of an editable
+/// subdomain. The entry, the redirect URI and every downstream read (status,
+/// verify, the invite link) follow the label, not `companies.slug`.
+#[tokio::test]
+async fn company_host_accepts_an_owner_chosen_subdomain() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "enverder", "Enverder", "/tmp/enverder")
+        .await
+        .unwrap();
+    let res = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("  Team  ".into()),
+        })),
+    )
+    .await
+    .expect("owner label accepted");
+    assert_eq!(res.0.data.host, "team.example.com", "trimmed + lower-cased");
+    assert_eq!(res.0.data.redirect_uri, "https://team.example.com/auth/callback");
+    assert!(res.0.data.previous_host.is_none(), "nothing moved on a first write");
+
+    // The live allowlist resolves the CHOSEN host (and only it) to this company.
+    let cfg = state.human_auth_cfg();
+    assert!(cfg.host_entry("team.example.com").is_some());
+    assert!(cfg.host_entry("enverder.example.com").is_none(), "slug host never written");
+    assert!(cfg.company_entry(co.id).unwrap().is_valid_for(co.id, "example.com"));
+
+    // Status reports the published address, not a slug-derived guess.
+    let st = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery {
+            company_id: Some(co.id),
+        }),
+    )
+    .await
+    .unwrap();
+    let company = st.0.data.company.expect("company block");
+    assert_eq!(company.host, "team.example.com");
+    assert_eq!(company.redirect_uri, "https://team.example.com/auth/callback");
+    assert_eq!(company.redirect_registered, "ok");
+    assert!(company.company_host_written);
+
+    // …and so does the invite link.
+    let added = add_human_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Json(AddHumanInput {
+            email: "bob@enverder.test".into(),
+            role: "member".into(),
+            display_name: None,
+        }),
+    )
+    .await
+    .expect("add ok");
+    assert_eq!(added.0.data.login_url, "https://team.example.com");
+    cleanup(state, dir).await;
+}
+
+/// A rename REPLACES the entry (one address per company) and reports what moved,
+/// so the wizard can say the old link stops working.
+#[tokio::test]
+async fn company_host_rename_replaces_the_entry_and_reports_the_old_address() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    let renamed = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await
+    .expect("rename ok");
+    assert_eq!(renamed.0.data.host, "hq.example.com");
+    assert_eq!(renamed.0.data.previous_host.as_deref(), Some("acme.example.com"));
+
+    let cfg = state.human_auth_cfg();
+    assert!(cfg.host_entry("acme.example.com").is_none(), "old host retired");
+    assert!(cfg.host_entry("hq.example.com").is_some());
+    assert_eq!(
+        cfg.company_hosts.iter().filter(|h| h.company_id == co.id).count(),
+        1,
+        "exactly one permanent entry per company"
+    );
+
+    // A BODYLESS re-assert (the Google mini-step) KEEPS the owner's label — it
+    // must never silently rename the address back to the slug.
+    let again = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    assert_eq!(again.0.data.host, "hq.example.com");
+    assert!(again.0.data.previous_host.is_none(), "no move ⇒ no previous_host");
+    cleanup(state, dir).await;
+}
+
+/// Uniform 400s for anything that is not a single DNS label — nothing that could
+/// never resolve under the one wildcard `*.<base>` CNAME reaches the store.
+#[tokio::test]
+async fn company_host_refuses_an_illegal_subdomain() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    for bad in ["", "-hq", "hq-", "hq.eu", "hq_eu", "hq eu", "a b", &"a".repeat(64)] {
+        let res = host_handler(
+            State(state.clone()),
+            OptCtx(None),
+            Path(co.id),
+            Some(Json(HostInput {
+                subdomain: Some(bad.to_string()),
+            })),
+        )
+        .await;
+        assert!(matches!(res, Err(AppError::BadRequest(_))), "{bad:?} → {res:?}");
+    }
+    assert!(
+        state.human_auth_cfg().company_hosts.is_empty(),
+        "no entry written by a refused label"
+    );
+    cleanup(state, dir).await;
+}
+
+/// Two companies cannot publish the same address: the Host header is what binds a
+/// login cookie to a company, so a collision is a clean 409, not a silent steal.
+#[tokio::test]
+async fn company_host_refuses_a_label_another_company_already_uses() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let one = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let two = crate::db::companies::create(&state.pool, "beta", "Beta", "/tmp/beta")
+        .await
+        .unwrap();
+    let _ = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(one.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await
+    .unwrap();
+    let clash = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(two.id),
+        Some(Json(HostInput {
+            subdomain: Some("HQ".into()),
+        })),
+    )
+    .await;
+    assert!(matches!(clash, Err(AppError::Conflict(_))), "got {clash:?}");
+    // The winner keeps the address; the loser wrote nothing.
+    let cfg = state.human_auth_cfg();
+    assert_eq!(cfg.host_entry("hq.example.com").unwrap().company_id, one.id);
+    assert!(cfg.company_entry(two.id).is_none());
+    // Re-asserting the SAME label for the company that owns it is not a clash.
+    let same = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(one.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await;
+    assert!(same.is_ok(), "idempotent re-assert: {same:?}");
+    cleanup(state, dir).await;
+}
+
+/// A slug that is not a legal hostname label cannot be a silent default — the
+/// owner is told to pick a subdomain instead of getting an address that would
+/// never resolve.
+#[tokio::test]
+async fn company_host_refuses_an_unusable_slug_as_the_default() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme_eu", "Acme EU", "/tmp/acme-eu")
+        .await
+        .unwrap();
+    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None).await;
+    match res {
+        Err(AppError::BadRequest(m)) => assert!(m.contains("choose a subdomain"), "{m}"),
+        other => panic!("expected a 400 telling the owner to choose: {other:?}"),
+    }
+    // …and choosing one works.
+    let fixed = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("acme-eu".into()),
+        })),
+    )
+    .await
+    .expect("explicit label accepted");
+    assert_eq!(fixed.0.data.host, "acme-eu.example.com");
+    cleanup(state, dir).await;
+}
+
+/// The FALLBACK: with no entry written yet, every reader still shows the
+/// slug-derived suggestion (nothing regresses for a company mid-wizard).
+#[tokio::test]
+async fn status_falls_back_to_the_slug_when_no_entry_exists() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let st = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery {
+            company_id: Some(co.id),
+        }),
+    )
+    .await
+    .unwrap();
+    let company = st.0.data.company.expect("company block");
+    assert_eq!(company.host, "acme.example.com", "the wizard's suggestion");
+    assert_eq!(company.redirect_uri, "https://acme.example.com/auth/callback");
+    assert!(!company.company_host_written);
+    assert_eq!(company.redirect_registered, "unknown");
+    cleanup(state, dir).await;
+}
+
+/// An entry under a STALE base domain stays not-ok (fail-closed): the base
+/// changed, so the address must be re-derived rather than trusted.
+#[tokio::test]
+async fn a_stale_base_domain_de_canonicalises_the_entry() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let _ = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await
+    .unwrap();
+    // The operator moves the box to another zone.
+    let mut cfg = store::read_or_default(&state.config.data_dir).unwrap();
+    cfg.base_domain = Some("other.test".into());
+    store::write_atomic(&state.config.data_dir, &cfg).unwrap();
+    state.reload_human_auth().unwrap();
+
+    let st = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery {
+            company_id: Some(co.id),
+        }),
+    )
+    .await
+    .unwrap();
+    let company = st.0.data.company.expect("company block");
+    assert_eq!(company.redirect_registered, "mismatch", "stale base ⇒ not ok");
+    assert_eq!(company.host, "acme.other.test", "re-derived under the new base");
+    let v = verify_login_handler(State(state.clone()), OptCtx(None), Path(co.id))
+        .await
+        .unwrap();
+    assert!(!v.0.data.ok, "verify must not be green under a stale base");
     cleanup(state, dir).await;
 }
 
@@ -485,7 +770,7 @@ async fn verify_login_surfaces_redirect_uri_mismatch_then_goes_green() {
     assert!(miss.0.data.detail.contains("https://acme.example.com/auth/callback"));
 
     // After writing the host entry: green.
-    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id))
+    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
         .await
         .unwrap();
     let ok = verify_login_handler(State(state.clone()), OptCtx(None), Path(co.id))
@@ -632,7 +917,7 @@ async fn member_gets_uniform_404_on_every_wizard_endpoint() {
         member(),
         Query(AgentInboxDeleteQuery { company_id: co.id })
     ));
-    assert_404!(host_handler(State(state.clone()), member(), Path(co.id)));
+    assert_404!(host_handler(State(state.clone()), member(), Path(co.id), None));
     assert_404!(verify_login_handler(State(state.clone()), member(), Path(co.id)));
     assert_404!(add_human_handler(
         State(state.clone()),
@@ -690,7 +975,7 @@ async fn status_reports_box_and_company_fields() {
     )
     .await
     .unwrap();
-    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id))
+    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
         .await
         .unwrap();
     let s2 = status_handler(
@@ -1190,7 +1475,7 @@ async fn ws_origin_honours_the_company_host_only_once_a_base_is_configured() {
 
     // Choose the base + write the host → the Origin is now allowed.
     set_base(&state).await;
-    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id))
+    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
         .await
         .unwrap();
     assert!(
