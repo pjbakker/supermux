@@ -134,7 +134,7 @@ async fn make_session(h: &Harness, name: &str, provider: &str, host_id: Option<i
 }
 
 fn text(s: &str) -> Msg {
-    Msg::Text(s.to_owned())
+    Msg::Text(s.into())
 }
 
 async fn connect(addr: SocketAddr, name: &str) -> Ws {

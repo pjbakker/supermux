@@ -654,7 +654,7 @@ async fn ws_probe(addr: std::net::SocketAddr, session: &str, cookie: &str) -> (b
         .insert(header::COOKIE, format!("supermux_hsess={cookie}").parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("ws upgrade");
     // A human authenticates by cookie; the first frame is consumed regardless.
-    ws.send(Msg::Text(r#"{"type":"auth","token":""}"#.to_string())).await.unwrap();
+    ws.send(Msg::Text(r#"{"type":"auth","token":""}"#.into())).await.unwrap();
 
     let mut auth_ok = false;
     let mut code = None;
