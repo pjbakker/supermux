@@ -30,16 +30,31 @@ pub struct Company {
     pub archived: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// `#rrggbb` the client sampled from the logo (or picked) — colours the nav
+    /// ring / chips / group-chat accent. `None` → the generated slug hue.
+    pub accent: Option<String>,
+    /// (Stage 2) shared mission/handbook injected into every company bot.
+    pub brief: Option<String>,
+    /// (Stage 2) JSON array of connector ids a new company bot inherits.
+    pub default_connectors: Option<String>,
+    /// Derived (`logo IS NOT NULL`), NOT a stored column — the heavy `logo` BLOB
+    /// is never loaded into this row; the client fetches it from the logo GET.
+    #[sqlx(default)]
+    pub has_logo: bool,
 }
+
+/// The column list every `Company` SELECT shares. `has_logo` is computed so the
+/// BLOB stays out of the row; the trailing alias order matches the struct.
+const COMPANY_COLS: &str = "id, slug, display_name, root_dir, archived, created_at, updated_at, \
+     accent, brief, default_connectors, (logo IS NOT NULL) AS has_logo";
 
 /// List companies, alphabetically by display name. Archived rows are hidden
 /// unless `include_archived` is set (the switcher passes `false`; a management
 /// view can pass `true`).
 pub async fn list(pool: &SqlitePool, include_archived: bool) -> sqlx::Result<Vec<Company>> {
-    sqlx::query_as::<_, Company>(
-        "SELECT id, slug, display_name, root_dir, archived, created_at, updated_at \
-         FROM companies WHERE (? OR archived = 0) ORDER BY display_name ASC",
-    )
+    sqlx::query_as::<_, Company>(&format!(
+        "SELECT {COMPANY_COLS} FROM companies WHERE (? OR archived = 0) ORDER BY display_name ASC"
+    ))
     .bind(include_archived)
     .fetch_all(pool)
     .await
@@ -47,23 +62,17 @@ pub async fn list(pool: &SqlitePool, include_archived: bool) -> sqlx::Result<Vec
 
 /// Fetch one company by id.
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Company>> {
-    sqlx::query_as::<_, Company>(
-        "SELECT id, slug, display_name, root_dir, archived, created_at, updated_at \
-         FROM companies WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
+    sqlx::query_as::<_, Company>(&format!("SELECT {COMPANY_COLS} FROM companies WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(pool)
     .await
 }
 
 /// Fetch one company by its stable `slug`.
 pub async fn get_by_slug(pool: &SqlitePool, slug: &str) -> sqlx::Result<Option<Company>> {
-    sqlx::query_as::<_, Company>(
-        "SELECT id, slug, display_name, root_dir, archived, created_at, updated_at \
-         FROM companies WHERE slug = ?",
-    )
-    .bind(slug)
-    .fetch_optional(pool)
+    sqlx::query_as::<_, Company>(&format!("SELECT {COMPANY_COLS} FROM companies WHERE slug = ?"))
+        .bind(slug)
+        .fetch_optional(pool)
     .await
 }
 
@@ -104,6 +113,89 @@ pub async fn set_display_name(
     let now = chrono::Utc::now().timestamp();
     let res = sqlx::query("UPDATE companies SET display_name = ?, updated_at = ? WHERE id = ?")
         .bind(display_name)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// The raw logo bytes + their content type, for `GET /api/companies/{id}/logo`.
+/// `None` when the company has no logo (the client falls back to the generated
+/// mark). The heavy BLOB is loaded ONLY here, never on the row-listing path.
+pub async fn get_logo(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<(Vec<u8>, String)>> {
+    let row: Option<(Option<Vec<u8>>, Option<String>)> =
+        sqlx::query_as("SELECT logo, logo_mime FROM companies WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(bytes, mime)| match (bytes, mime) {
+        (Some(b), Some(m)) if !b.is_empty() => Some((b, m)),
+        _ => None,
+    }))
+}
+
+/// Store (or replace) the company logo bytes + mime. Bumps `updated_at`.
+pub async fn set_logo(pool: &SqlitePool, id: i64, bytes: &[u8], mime: &str) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().timestamp();
+    let res =
+        sqlx::query("UPDATE companies SET logo = ?, logo_mime = ?, updated_at = ? WHERE id = ?")
+            .bind(bytes)
+            .bind(mime)
+            .bind(now)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Clear the logo (back to the generated mark). Leaves `accent` alone — the
+/// caller decides whether to also drop the derived accent.
+pub async fn clear_logo(pool: &SqlitePool, id: i64) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().timestamp();
+    let res =
+        sqlx::query("UPDATE companies SET logo = NULL, logo_mime = NULL, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Set (or clear, with `None`) the accent `#rrggbb`. Bumps `updated_at`.
+pub async fn set_accent(pool: &SqlitePool, id: i64, accent: Option<&str>) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().timestamp();
+    let res = sqlx::query("UPDATE companies SET accent = ?, updated_at = ? WHERE id = ?")
+        .bind(accent)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// (Stage 2) Set/clear the shared company brief. Bumps `updated_at`.
+pub async fn set_brief(pool: &SqlitePool, id: i64, brief: Option<&str>) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().timestamp();
+    let res = sqlx::query("UPDATE companies SET brief = ?, updated_at = ? WHERE id = ?")
+        .bind(brief)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// (Stage 2) Set/clear the default-connectors JSON for new bots. Bumps
+/// `updated_at`.
+pub async fn set_default_connectors(
+    pool: &SqlitePool,
+    id: i64,
+    json: Option<&str>,
+) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().timestamp();
+    let res = sqlx::query("UPDATE companies SET default_connectors = ?, updated_at = ? WHERE id = ?")
+        .bind(json)
         .bind(now)
         .bind(id)
         .execute(pool)
@@ -203,6 +295,26 @@ mod tests {
             get(&pool, c.id).await.unwrap().unwrap().display_name,
             "Acme Corp"
         );
+
+        // Branding: no logo/accent by default; set + read back; clear.
+        assert!(!c.has_logo && c.accent.is_none());
+        assert!(get_logo(&pool, c.id).await.unwrap().is_none());
+        assert!(set_logo(&pool, c.id, b"\x89PNG-bytes", "image/png").await.unwrap());
+        assert!(set_accent(&pool, c.id, Some("#3da0ff")).await.unwrap());
+        let got = get(&pool, c.id).await.unwrap().unwrap();
+        assert!(got.has_logo, "has_logo flips without loading the blob");
+        assert_eq!(got.accent.as_deref(), Some("#3da0ff"));
+        let (bytes, mime) = get_logo(&pool, c.id).await.unwrap().unwrap();
+        assert_eq!(bytes, b"\x89PNG-bytes");
+        assert_eq!(mime, "image/png");
+        assert!(clear_logo(&pool, c.id).await.unwrap());
+        assert!(!get(&pool, c.id).await.unwrap().unwrap().has_logo);
+        // Stage-2 fields round-trip too.
+        assert!(set_brief(&pool, c.id, Some("Ship weekly.")).await.unwrap());
+        assert!(set_default_connectors(&pool, c.id, Some("[\"slack\"]")).await.unwrap());
+        let g2 = get(&pool, c.id).await.unwrap().unwrap();
+        assert_eq!(g2.brief.as_deref(), Some("Ship weekly."));
+        assert_eq!(g2.default_connectors.as_deref(), Some("[\"slack\"]"));
 
         assert!(set_archived(&pool, c.id, true).await.unwrap());
         assert_eq!(
