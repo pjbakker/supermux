@@ -176,6 +176,10 @@ export interface WorkflowCreateInput {
   on_complete?: CompletionAction
   steps: StepInput[]
   enabled?: boolean
+  /** Archive the target session when it stops (migration 0025). Stamped onto
+   *  the SESSION row server-side (there is no workflows column), so omit the
+   *  field to leave the bot's marker untouched. */
+  archive_on_stop?: boolean
 }
 
 /** PATCH payload. `session` is absent on purpose: a workflow cannot be moved to
@@ -186,6 +190,9 @@ export interface WorkflowPatchInput {
   trigger_kind?: TriggerKind
   schedule_expr?: string
   on_complete?: CompletionAction
+  /** Archive the target session when it stops, stamped onto the SESSION row,
+   *  exactly as on create. `false` clears the marker; omit to leave it. */
+  archive_on_stop?: boolean
 }
 
 // ── errors ────────────────────────────────────────────────────────────────────

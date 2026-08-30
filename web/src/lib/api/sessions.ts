@@ -303,6 +303,11 @@ export interface ApiSession {
    *  instead of relaunching the agent. Omitted from the wire when false, so
    *  `get`/`list`/SSE rows never carry it — it is purely the PATCH advisory. */
   restart_required?: boolean
+  /** The disposable marker (migration 0025): archive this session the moment
+   *  it stops. Written by the workflows editor's "archive on stop" toggle
+   *  (stamped server-side via the workflows create/patch API) and by
+   *  disposable spawns on POST /api/sessions. */
+  archive_on_stop?: boolean
   /** Cross-device seen cursor (migration 0029) — server-clock **ms** at which
    *  this session was last read on ANY device, or null/absent for never seen.
    *  Merged newest-wins with the localStorage cursor in `use-attention.ts`;

@@ -217,7 +217,13 @@ export interface ComposerBodyProps {
   initial: ComposerDraft
   /** Offline bench: the preview endpoint, and the session list. */
   previewFn?: (expression: string) => Promise<{ next_runs: string[] }>
-  sessionsOverride?: { name: string; display_name?: string; status?: string; company_id?: number | null }[]
+  sessionsOverride?: {
+    name: string
+    display_name?: string
+    status?: string
+    company_id?: number | null
+    archive_on_stop?: boolean
+  }[]
   /** Offline bench: start with this step expanded (0-based). */
   initialExpanded?: number | null
 }
@@ -255,6 +261,7 @@ export function ComposerBody({
           display_name: s.display_name,
           status: s.status,
           company_id: s.company_id,
+          archive_on_stop: s.archive_on_stop,
         }))
       ).filter((s) => inScope(s.company_id)),
     [sessionsOverride, liveSessions.sessions, inScope],
@@ -275,6 +282,16 @@ export function ComposerBody({
     }
   }
   const commands = useWorkflowCommands()
+
+  // "Archive on stop" is a property of the BOT'S SESSION, not of the workflow
+  // row (the server stamps `sessions.archive_on_stop`; there is no workflows
+  // column). So the switch SEEDS from the live session's marker and only a
+  // value the user actually touched is sent; omitting the field on save
+  // leaves the bot's marker exactly as it was, whoever set it.
+  const [archiveTouched, setArchiveTouched] = React.useState<boolean | null>(null)
+  const sessionMarker =
+    sessions.find((s) => s.name === draft.session)?.archive_on_stop ?? false
+  const archiveOnStop = archiveTouched ?? sessionMarker
 
   const create = useCreateWorkflow()
   const patch = usePatchWorkflow()
@@ -347,11 +364,16 @@ export function ComposerBody({
             trigger_kind: body.trigger_kind,
             schedule_expr: body.schedule_expr,
             on_complete: body.on_complete,
+            // Only a value the user touched; omitting leaves the bot's marker.
+            ...(archiveTouched === null ? {} : { archive_on_stop: archiveTouched }),
           },
         })
         await replaceSteps.mutateAsync({ id, steps: body.steps })
       } else {
-        const created = await create.mutateAsync(body)
+        const created = await create.mutateAsync({
+          ...body,
+          ...(archiveTouched === null ? {} : { archive_on_stop: archiveTouched }),
+        })
         savedId = created.id
       }
       if (thenRun && savedId) {
@@ -436,7 +458,13 @@ export function ComposerBody({
             </span>
             <SessionPicker
               value={draft.session}
-              onChange={(name) => set({ session: name })}
+              onChange={(name) => {
+                // A touched archive-on-stop value belongs to the bot it was
+                // read against; switching bots re-seeds from the new bot's own
+                // marker instead of stamping it with the old one's.
+                setArchiveTouched(null)
+                set({ session: name })
+              }}
               sessions={sessions}
               allowEmpty={false}
               placeholder="Pick a bot"
@@ -504,6 +532,42 @@ export function ComposerBody({
           session={draft.session}
           bots={sessions}
         />
+
+        {/* the bot's session lifecycle: a SESSION property the server stamps,
+            not a workflow column (see the archiveTouched comment above) */}
+        <section className="flex items-center gap-3 rounded-xl border border-border bg-card p-3 sm:p-4">
+          <div className="min-w-0 flex-1">
+            <p className="text-[13px] font-medium text-foreground">
+              Archive the bot&rsquo;s session when it stops
+            </p>
+            <p className="text-[12px] leading-snug text-muted-foreground">
+              For throwaway bots: the session tidies itself away the moment it
+              stops. Its workflows pause until you unarchive it.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={archiveOnStop}
+            aria-label="Archive the bot's session when it stops"
+            onClick={() => setArchiveTouched(!archiveOnStop)}
+            className={cn(
+              'relative inline-flex h-7 w-12 shrink-0 items-center rounded-full p-0.5 transition-colors',
+              'before:absolute before:-inset-2.5 before:content-[""]',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              archiveOnStop ? 'bg-primary' : 'bg-muted',
+            )}
+          >
+            <motion.span
+              layout
+              transition={springs.toggleSnap}
+              className={cn(
+                'block size-6 rounded-full bg-white shadow-sm',
+                archiveOnStop ? 'ml-auto' : 'ml-0',
+              )}
+            />
+          </button>
+        </section>
       </div>
 
       {/* the pinned footer — the validity line lives here, always */}
