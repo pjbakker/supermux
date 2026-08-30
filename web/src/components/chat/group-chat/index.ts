@@ -1,13 +1,24 @@
 /**
  * The company group chat (spec §7) — a CHANNEL built out of the chat surface's
  * shipped primitives. `channel.tsx` is presentational; `use-company-channel.ts`
- * is the one app-aware resolution; `entry.tsx` is the compact overview row that
- * OPENS the full-bleed `/company/:id/chat` page; `types.ts` is the display shape
- * the groupchat WS adapter maps onto.
+ * is the one app-aware resolution; `entry.tsx` is the compact PHONE doorway that
+ * OPENS the full-bleed `/company/:id/chat` page; `channel-row.tsx` is the DESKTOP
+ * doorway — a pinned roster row that opens the channel in the right pane;
+ * `surface.ts` decides which of the two a viewport gets; `types.ts` is the
+ * display shape the groupchat WS adapter maps onto.
  */
 export { ChatChannel, type ChatChannelProps } from './channel'
 export { ChannelComposer, type ChannelComposerProps } from './channel-composer'
 export { GroupChatEntry, type GroupChatEntryProps } from './entry'
+export { CompanyChannelRow, type CompanyChannelRowProps } from './channel-row'
+export {
+  channelPreview,
+  channelPreviewLine,
+  channelRowMatches,
+  groupChatSurface,
+  CHANNEL_ROW_LABEL,
+  type GroupChatSurface,
+} from './surface'
 export {
   useCompanyChannel,
   routerName,
