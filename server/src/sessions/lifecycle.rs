@@ -1606,6 +1606,54 @@ pub(super) async fn start_if_stopped(
     Ok(HealStart::Started(res.ready))
 }
 
+/// STALE-RESUME GUARD — drop a `--resume` link whose transcript is gone, so that
+/// pressing Start actually starts something.
+///
+/// [`build_launch_command`] turns a stored `cc_conversation_id` into
+/// `claude --resume '<id>'`. When that conversation's transcript no longer
+/// exists, claude answers "No conversation found with session ID: …" and EXITS
+/// immediately — the pane comes back as a bare shell wearing the session's name,
+/// which the detector then settles as `idle`, and EVERY later Start resumes the
+/// same dead id, so the session can never be brought back from the UI. (Found
+/// live on `iwd-nl`: the pane showed the launch line, the refusal, then `$`.)
+///
+/// A human pressing Start is asking for this session to RUN, and a link that
+/// points at nothing is not history worth keeping: clear it — in the column AND
+/// in the in-memory row the launch builder reads — and let the launch fall
+/// through to a clean `--name` start. That also keeps `resume_intended` FALSE,
+/// which is what lets [`wait_for_agent_ready`] escape a resume picker it never
+/// asked for instead of parking in it.
+///
+/// Deliberately narrow. [`super::auto_actions::dead_resume_link`] stays the ONE
+/// owner of "is this link dead?" (claude rows only; a `cc_session_name` link is
+/// resolved by claude's own name index rather than a file we can stat, and a row
+/// with no link at all is an ordinary fresh start — neither is touched). And a
+/// REMOTE session is skipped entirely: its transcripts live on the remote host,
+/// while `resumable::project_dir_for` can only stat THIS host's `~/.claude`, so
+/// "missing here" would be a lie about a link that is perfectly alive there.
+///
+/// Returns the id that was dropped (for the tests; the log line is emitted here).
+async fn clear_stale_resume_link(
+    state: &AppState,
+    name: &str,
+    s: &mut Session,
+) -> Result<Option<String>, AppError> {
+    if s.host_id.is_some() {
+        return Ok(None);
+    }
+    let Some(conv) = super::auto_actions::dead_resume_link(s).map(str::to_string) else {
+        return Ok(None);
+    };
+    db::sessions::clear_cc_conversation_id(&state.pool, name).await?;
+    s.cc_conversation_id.clear();
+    tracing::info!(
+        session = name,
+        conversation = %conv,
+        "start: the resume link's transcript is gone — cleared it and starting clean",
+    );
+    Ok(Some(conv))
+}
+
 /// The body of [`start`], assuming the per-session lock is ALREADY held. Split
 /// out so [`start_if_stopped`] can wrap it with an atomic precondition without
 /// re-entering the (non-reentrant) lock.
@@ -1632,6 +1680,13 @@ async fn start_locked(
             s.provider
         )));
     }
+
+    // START MUST ACTUALLY START. A resume link whose transcript is gone would
+    // exit claude straight back to a shell (see [`clear_stale_resume_link`]), so
+    // drop it BEFORE anything is spawned or launched. Every start path funnels
+    // through `start_locked`, so this one call covers the Start button, the
+    // restart, the recover and the scheduler alike.
+    clear_stale_resume_link(state, name, &mut s).await?;
 
     // NATIVE-BY-DEFAULT MIGRATION. The tmux-less runtime is the product default;
     // a legacy `runtime='tmux'` row upgrades AT THE FIRST FRESH START — i.e. when
@@ -4662,6 +4717,140 @@ mod link_liveness_tests {
             "unlinked session must not re-publish the board"
         );
 
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod stale_resume_tests {
+    //! THE START BUTTON MUST START. `claude --resume <id>` against a transcript
+    //! that no longer exists prints "No conversation found with session ID: …"
+    //! and exits, so the pane comes back as a bare shell wearing the session's
+    //! name and the row settles `idle` — the exact shape `iwd-nl` was stuck in.
+    //! [`clear_stale_resume_link`] is the guard; these exercise it against a real
+    //! DB row and a real (temp) claude project dir, without driving a pty.
+
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    async fn test_state() -> (AppState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("supermux-stale-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            extra_binds: vec![],
+            tls: Default::default(),
+            auth_token: "test-token".to_string(),
+            provider_defaults: Default::default(),
+            ws: Default::default(),
+            remote_callback_url: None,
+            push_sub: None,
+            github_token: None,
+            statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
+            extra_origins: Vec::new(),
+        };
+        let pool = crate::db::init(&config).await.expect("init pool");
+        (AppState::new(pool, config), dir)
+    }
+
+    /// Point `CLAUDE_CONFIG_DIR` at a throwaway root and lay down ONE transcript
+    /// for `session_dir` — mirrors the helper the auto-heal tests use, so both
+    /// sides of the "is this link dead?" question are proved the same way.
+    fn with_transcript(session_dir: &str, conv: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("supermux-cc-lc-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("CLAUDE_CONFIG_DIR", &root);
+        let proj = crate::sessions::resumable::project_dir_for(session_dir);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(format!("{conv}.jsonl")), b"{}\n").unwrap();
+        root
+    }
+
+    fn drop_transcript(root: PathBuf) {
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A dead link is dropped (column + in-memory row) so the launch that
+    /// follows is a CLEAN `--name` start; a link whose transcript is still there
+    /// is left completely alone and still launches as `--resume '<id>'`.
+    #[tokio::test]
+    async fn a_dead_link_is_cleared_and_a_live_one_is_kept() {
+        let _serial = crate::sessions::native::test_serial().await;
+        let (state, dir) = test_state().await;
+        for name in ["gone", "kept"] {
+            db::sessions::insert_minimal(&state.pool, name, "/tmp", "claude")
+                .await
+                .unwrap();
+        }
+        db::sessions::set_cc_conversation_id(&state.pool, "gone", "conv-vanished").await.unwrap();
+        db::sessions::set_cc_conversation_id(&state.pool, "kept", "conv-here").await.unwrap();
+        let cc = with_transcript("/tmp", "conv-here");
+
+        // ── the dead one ────────────────────────────────────────────────────
+        let mut gone = db::sessions::get(&state.pool, "gone").await.unwrap().unwrap();
+        assert_eq!(
+            clear_stale_resume_link(&state, "gone", &mut gone).await.unwrap().as_deref(),
+            Some("conv-vanished"),
+            "a link whose transcript is gone must be dropped, and NAMED for the log",
+        );
+        assert!(gone.cc_conversation_id.is_empty(), "the in-memory row the launch builder reads is cleared");
+        let persisted = db::sessions::get(&state.pool, "gone").await.unwrap().unwrap();
+        assert!(persisted.cc_conversation_id.is_empty(), "…and so is the column, so the NEXT Start is clean too");
+        let (cmd, resume_intended) = build_launch_command(&state.config, &gone, &[]);
+        assert!(!cmd.contains("--resume"), "the launch must not resume a conversation that is gone: {cmd}");
+        assert!(cmd.contains("--name gone"), "it starts a fresh named conversation instead: {cmd}");
+        assert!(!resume_intended, "a clean start is NOT resume-intended — the picker escape stays available");
+
+        // ── the live one ────────────────────────────────────────────────────
+        let mut kept = db::sessions::get(&state.pool, "kept").await.unwrap().unwrap();
+        assert_eq!(
+            clear_stale_resume_link(&state, "kept", &mut kept).await.unwrap(),
+            None,
+            "a link with its transcript still on disk is untouched",
+        );
+        assert_eq!(kept.cc_conversation_id, "conv-here");
+        let (cmd, resume_intended) = build_launch_command(&state.config, &kept, &[]);
+        assert!(cmd.contains("--resume 'conv-here'"), "it still resumes the real conversation: {cmd}");
+        assert!(resume_intended, "…and that IS resume-intended");
+
+        drop_transcript(cc);
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A REMOTE session keeps its link even when this host cannot see the
+    /// transcript: the file lives on the remote box, so "missing here" says
+    /// nothing about the link, and clearing it would destroy a live conversation.
+    #[tokio::test]
+    async fn a_remote_session_keeps_a_link_this_host_cannot_see() {
+        let _serial = crate::sessions::native::test_serial().await;
+        let (state, dir) = test_state().await;
+        db::sessions::insert_minimal(&state.pool, "remote", "/tmp", "claude")
+            .await
+            .unwrap();
+        db::sessions::set_cc_conversation_id(&state.pool, "remote", "conv-on-the-other-box")
+            .await
+            .unwrap();
+        // An empty root: NOTHING is on disk here for that conversation.
+        let cc = with_transcript("/tmp", "some-other-conv");
+
+        let mut s = db::sessions::get(&state.pool, "remote").await.unwrap().unwrap();
+        s.host_id = Some(1);
+        assert_eq!(
+            clear_stale_resume_link(&state, "remote", &mut s).await.unwrap(),
+            None,
+            "a remote row is skipped — its transcripts are not on this filesystem",
+        );
+        assert_eq!(s.cc_conversation_id, "conv-on-the-other-box");
+        let persisted = db::sessions::get(&state.pool, "remote").await.unwrap().unwrap();
+        assert_eq!(persisted.cc_conversation_id, "conv-on-the-other-box", "the column survives too");
+
+        drop_transcript(cc);
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
     }
