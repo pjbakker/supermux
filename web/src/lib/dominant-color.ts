@@ -84,9 +84,20 @@ export async function dominantColor(src: string): Promise<Hex | null> {
     cb += b * w
     cn += w
   }
-  if (cn > 0) return toHex(cr / cn, cg / cn, cb / cn)
-  if (an > 0) return toHex(ar / an, ag / an, ab / an)
-  return null
+  const [r, g, b] =
+    cn > 0 ? [cr / cn, cg / cn, cb / cn] : an > 0 ? [ar / an, ag / an, ab / an] : [NaN, NaN, NaN]
+  if (Number.isNaN(r)) return null
+  // Reject an UNUSABLE accent: a black or white line-art favicon (e.g. a mono
+  // glyph) samples to near-black / near-white / flat grey, which is invisible as
+  // a ring or chip. Returning null leaves the pleasant generated slug hue in
+  // place — the accent only overrides when the logo actually carries a colour.
+  const max = Math.max(r, g, b)
+  const min = Math.min(r, g, b)
+  const sat = max === 0 ? 0 : (max - min) / max
+  if (max < 48) return null // near-black
+  if (min > 216) return null // near-white
+  if (sat < 0.15) return null // flat grey — no brand hue to lift
+  return toHex(r, g, b)
 }
 
 /** Convenience: sample straight from a File (object-URL created + revoked). */
