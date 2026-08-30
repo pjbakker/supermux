@@ -599,20 +599,22 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             } else {
                 false
             };
-            // The store's `connect(service)` affordance (spec §8): its descriptor
-            // carries `requiresUserInteraction`, so Claude routes it to the human
-            // prompt and the turn stops. Recognise it here and raise the inline
-            // Connect card via `session.connect_request` (the credential never
-            // touches this plane — the card POSTs it straight to the vault).
+            // The store's `connect(service)` affordance (spec §8). This hook is the
+            // ONLY thing that raises the card: the tool itself is allow-listed and
+            // marker-free (it must NOT stop the turn — chat cannot answer Claude's
+            // terminal permission dialog), so it returns while the human answers
+            // here. The credential never touches this plane — the card POSTs it
+            // straight to the vault.
             let connect = match connect_ask::parse(payload) {
                 Some(ask) => state.set_connect_request(session, ask),
                 None => false,
             };
             // The Shared Browser connector's `request_human_takeover(reason)`
-            // affordance — the same `requiresUserInteraction` shape, so the call
-            // stops for the human here too. Raise the in-chat "take the wheel"
-            // card via `session.browser_takeover`; the takeover panel it opens
-            // is what actually drives the page.
+            // affordance. Unlike `connect` above, this one DOES keep the
+            // `requiresUserInteraction` marker and parks the call: the stall IS
+            // the drive lock, so the agent cannot touch the page while the human
+            // has the wheel. Raise the in-chat "take the wheel" card via
+            // `session.browser_takeover`; the panel it opens drives the page.
             let takeover = match takeover_ask::parse(payload, session) {
                 Some(ask) => state.set_browser_takeover(session, ask),
                 None => false,

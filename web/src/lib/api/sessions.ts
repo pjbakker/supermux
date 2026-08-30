@@ -416,8 +416,8 @@ export interface ApiSession {
    *  same `sessions` SSE delta (`null` clears). Every string in it is authored
    *  by the MCP server — see `components/chat/elicitation.ts`. */
   elicitation?: ElicitationAsk | null
-  /** **A bot's `connect(service)` tool is asking for a human** (the `_meta`
-   *  `requiresUserInteraction` marker reached the prompt). supermux renders the
+  /** **A bot's `connect(service)` tool is asking for a human** (the server's
+   *  PreToolUse detector saw the call; the tool itself does not stall). supermux renders the
    *  inline Connect card from this — a secure sign-in / API-key paste that POSTs
    *  straight to the vault, NEVER an MCP elicitation (spec forbids elicitation
    *  for secrets). Rides the same `sessions` SSE delta (`null` clears). The

@@ -41,17 +41,30 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-/// The `_meta` key that forces a tool to the human-in-the-loop prompt even when
-/// an allow-rule matches (Claude Code ≥ 2.1.199). supermux renders such a tool
-/// call as the inline Connect card (spec §8 step 2).
+/// The `_meta` key that forces a tool to Claude Code's OWN permission prompt —
+/// in the TERMINAL — even when an allow-rule matches and even under
+/// `--permission-mode bypassPermissions` (Claude Code ≥ 2.1.199).
+///
+/// Use it ONLY for a tool whose whole point is to STALL until a human acts: the
+/// Shared Browser's `request_human_takeover`, whose drive-lock depends on the
+/// call parking ([`crate::connectors::browser::mcp`]). It is deliberately NOT on
+/// `connect` — see [`connect_tool_descriptor`].
 pub const REQUIRES_USER_INTERACTION_META: &str = "anthropic/requiresUserInteraction";
 
-/// Build the MCP tool descriptor for a connector's `connect(service)` tool,
-/// carrying the `_meta` marker that always reaches the human prompt. This is the
-/// SERVER-SIDE plumbing (spec §8 step 2): the actual connect MCP server binary is
-/// a later phase, but the descriptor shape — and the marker that makes supermux
-/// render the inline Connect card instead of auto-running it — is fixed here so
-/// both the future server and the web card agree on it.
+/// Build the MCP tool descriptor for a connector's `connect(service)` tool. This
+/// is the SERVER-SIDE plumbing (spec §8 step 2) whose shape the embedded
+/// `connect_server.py` and the web card both agree on.
+///
+/// **No `requiresUserInteraction` marker, on purpose.** It used to carry one, and
+/// that forced Claude Code's own permission dialog into the terminal — a dialog
+/// the chat renderer cannot answer (it only classifies Bash/Edit/Write permission
+/// footers), so a bot that called `connect` sat parked for hours while the chat
+/// ConnectCard above it already read "Added". The card does not need the marker:
+/// it is raised by the PreToolUse detector ([`crate::sessions::connect_ask`]),
+/// which keys on the tool name plus a non-empty `service`. Without the marker the
+/// allow-listed call returns at once, the bot keeps working, and the chat card is
+/// the ONLY surface. The human is still in the loop where it matters — the GRANT
+/// only happens when they tap the card.
 pub fn connect_tool_descriptor(service: &str) -> Value {
     json!({
         "name": "connect",
@@ -62,8 +75,7 @@ pub fn connect_tool_descriptor(service: &str) -> Value {
                 "service": { "type": "string", "description": "The connector id to connect." }
             },
             "required": ["service"]
-        },
-        "_meta": { REQUIRES_USER_INTERACTION_META: true }
+        }
     })
 }
 
@@ -105,11 +117,18 @@ pub fn router_for(state: AppState) -> Router {
 mod tests {
     use super::*;
 
+    /// The marker forces Claude Code's own TERMINAL permission dialog, which the
+    /// chat renderer cannot answer — a bot that called `connect` parked there
+    /// forever. The chat card comes from the PreToolUse detector instead, so the
+    /// descriptor must stay marker-free.
     #[test]
-    fn connect_descriptor_carries_interaction_marker() {
+    fn connect_descriptor_has_no_interaction_marker() {
         let d = connect_tool_descriptor("icloud-mail");
         assert_eq!(d["name"], json!("connect"));
-        assert_eq!(d["_meta"][REQUIRES_USER_INTERACTION_META], json!(true));
+        assert!(
+            d.get("_meta").is_none(),
+            "connect must NOT carry {REQUIRES_USER_INTERACTION_META} — it would park the bot on a terminal dialog the chat cannot answer"
+        );
         assert!(d["description"].as_str().unwrap().contains("icloud-mail"));
     }
 }
