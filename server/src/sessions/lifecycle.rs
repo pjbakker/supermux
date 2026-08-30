@@ -2735,8 +2735,11 @@ fn cap_bytes_from_tail(s: String, max: usize) -> String {
 /// shared hook behind "disposable sessions clean themselves up when they
 /// stop". Best-effort and idempotent: the `archive_pending` gate (row live AND
 /// flagged AND not already archived) means a duplicate call -- e.g. an explicit
-/// Stop racing the Claude `SessionEnd` hook -- is a no-op, so there is never a
-/// double audit row or double SSE. `archive()` takes no session lock, so this is
+/// Stop racing the Claude `SessionEnd` hook -- is a no-op in practice: the gate
+/// suppresses it. The check and the flip are separate statements, so a rare
+/// exactly-simultaneous race could still write one extra `session.archive` audit
+/// row, but the SSE delta and teardown are both idempotent. `archive()` takes no
+/// session lock, so this is
 /// safe to call from `stop()` while it still holds one. Errors are logged, never
 /// propagated (archiving is a courtesy, not part of the stop contract).
 pub async fn maybe_archive_on_stop(state: &AppState, name: &str) {
