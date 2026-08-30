@@ -331,6 +331,25 @@ export const workflowsApi = {
   /** `GET /api/workflows/commands` — the REAL installed agent commands. */
   commands: (cwd?: string | null): Promise<WorkflowCommand[]> =>
     wfRequest(cwd ? `/api/workflows/commands?cwd=${enc(cwd)}` : '/api/workflows/commands'),
+
+  /** `GET /api/workflows/import-log` — the 0038 schedules-port archive: every
+   *  pre-drop `schedules` row, ported or refused. The destination behind the
+   *  post-upgrade `/settings#imported-schedules` notification. */
+  importLog: (): Promise<ImportedSchedule[]> => wfRequest('/api/workflows/import-log'),
+}
+
+/** One archived `schedules` row from the 0038 port. `row` is the complete
+ *  pre-drop row, already parsed server-side (null when the stored JSON was
+ *  unreadable — treat every field as optional). */
+export interface ImportedSchedule {
+  old_id: string
+  /** true = became a workflow; false = refused (the rows a user must act on). */
+  ported: boolean
+  /** '' when ported cleanly; else why not. */
+  reason: string
+  row: Record<string, unknown> | null
+  /** Unix seconds — when 0038 archived the row. */
+  at: number
 }
 
 // ── stored-JSON readers ───────────────────────────────────────────────────────

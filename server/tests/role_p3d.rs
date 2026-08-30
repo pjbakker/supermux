@@ -350,6 +350,22 @@ async fn member_cannot_reach_global_admin_routers() {
         get_cookie(&f.app, "/api/workflowsx", &alice).await, nf,
         "member 404s /api/workflowsx (segment boundary)",
     );
+    // …but two workflows subpaths stay global-admin: the installed-command
+    // digest (global skills/commands/MCP names + an operator-directed `?cwd=`
+    // filesystem read — its predecessor `/api/schedules/commands` was
+    // admin-gated) and the schedules-port archive (pre-company global rows).
+    assert_eq!(
+        get_cookie(&f.app, "/api/workflows/commands", &alice).await, nf,
+        "member 404s GET /api/workflows/commands (admin-only digest)",
+    );
+    assert_eq!(
+        get_cookie(&f.app, "/api/workflows/commands?cwd=/etc", &alice).await, nf,
+        "member 404s the digest regardless of ?cwd=",
+    );
+    assert_eq!(
+        get_cookie(&f.app, "/api/workflows/import-log", &alice).await, nf,
+        "member 404s GET /api/workflows/import-log (admin-only archive)",
+    );
 }
 
 #[tokio::test]

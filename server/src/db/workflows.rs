@@ -876,6 +876,33 @@ pub async fn resync_company_ids(pool: &SqlitePool) -> sqlx::Result<u64> {
     Ok(res.rows_affected())
 }
 
+/// One archived `schedules` row from the 0038 port (`workflows_import_log`).
+/// `row_json` stays the raw TEXT here; the HTTP layer parses it for the reader.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct ImportLogRow {
+    pub old_id: String,
+    /// 1 = became a workflow, 0 = refused.
+    pub ported: i64,
+    /// '' when ported cleanly; else why not.
+    pub reason: String,
+    /// The complete pre-drop `schedules` row as JSON.
+    pub row_json: String,
+    pub at: i64,
+}
+
+/// The whole schedules-port archive, refused rows first (those are the ones a
+/// user must act on), then by drop time. The table is written exactly once, by
+/// migration 0038, and never grows — no pagination needed.
+pub async fn import_log(pool: &SqlitePool) -> sqlx::Result<Vec<ImportLogRow>> {
+    sqlx::query_as::<_, ImportLogRow>(
+        "SELECT old_id, ported, reason, row_json, at
+           FROM workflows_import_log
+          ORDER BY ported ASC, at ASC, old_id ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
