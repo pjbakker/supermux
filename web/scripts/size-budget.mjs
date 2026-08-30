@@ -1225,7 +1225,26 @@ const BUDGET_ENTRY_JS = 161 * KB
 //             `lib/mark-status`, which IS on the hero path) measured 161.02 and
 //             was rejected for exactly that reason.
 // ceil(measured 440.32) + headroom = 441, the same rule every bump above used.
-const BUDGET_APP_JS = 441 * KB
+//
+// RATCHETED 441 → 442 by the invite wizard's honesty + instruction fixes
+// (fix/invite-quick-tunnel). The 441 above was ceil(440.32), and the branch
+// parent measures 440.90 — 0.10 KB of headroom, the tripwire state this ledger
+// keeps documenting. Measured 441.35, and the +0.45 KB is COPY, not surface:
+//   +~0.3 KB  the rewritten "Connect your own domain" step. The old version was
+//             four lines that sent a person into a zone's menu hunting for a
+//             "Cloudflare Tunnel" item that lives at ACCOUNT level; it is now
+//             seven numbered taps naming the real 2026 pages (My Profile → API
+//             Tokens / Manage Account → API Tokens) and the four permission rows
+//             with what each one buys. The owner could not complete the step
+//             without it, so the bytes ARE the feature.
+//   +~0.15 KB the temporary link's honest STOPPED state — the panel that says
+//             "the tunnel stopped" instead of silently re-rendering the chooser,
+//             plus `lib/quick-tunnel`'s three-state view.
+// ALL of it lands OFF the hero path: `<InviteWizardSheet>` is `React.lazy` behind
+// the switcher's "Invite a teammate" row (its chunk grew 9.03 → 9.31 KB). The
+// gate that guards first paint is UNMOVED and green at 160.69 / 161 KB.
+// ceil(measured 441.35) + headroom = 442, the same rule every bump above used.
+const BUDGET_APP_JS = 442 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

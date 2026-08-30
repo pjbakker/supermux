@@ -68,6 +68,7 @@ import {
   type StepMeta,
 } from '@/components/companies/wizard-primitives'
 import type { ExternalStatus, QuickTunnelStatus } from '@/lib/api'
+import { quickTunnelView } from '@/lib/quick-tunnel'
 
 /** The minimal company identity the wizard needs. */
 export interface WizardCompany {
@@ -304,8 +305,58 @@ function inboxChipFor(status?: ExternalStatus): { state: ChipState; label: strin
 
 // ── Step 1 — Domain / external access ─────────────────────────────────────────
 
-const CF_SCOPES =
-  'Account · Cloudflare Tunnel: Edit\nZone · DNS: Edit\nZone · Zone: Read\nZone · Email Routing Rules: Edit'
+/** The permission rows to add in Cloudflare's token editor. Each row is that
+ *  editor's three dropdowns — group, permission, level — so they are LISTED for
+ *  the operator to pick, never offered as text to paste (there is nowhere to
+ *  paste them). `why` says what supermux does with each one; the last row is
+ *  only needed for the optional agent email address.
+ *
+ *  Kept in lockstep with what the code actually calls: Tunnel:Edit for
+ *  `POST /accounts/{id}/cfd_tunnel` (external_access/cf.rs), DNS:Edit for the
+ *  wildcard CNAME, Zone:Read to find the zone, Email Routing Rules:Edit for the
+ *  agent inbox. */
+/** The taps, in order. `*…*` marks what the operator reads off the Cloudflare UI
+ *  (a menu item, a button, a field) so the eye can find it — one authored list
+ *  instead of seven hand-built paragraphs. */
+const CF_TOKEN_STEPS: string[] = [
+  'Open *dash.cloudflare.com* in another tab and sign in.',
+  'Go to *My Profile → API Tokens*, or *Manage Account → API Tokens*. Both kinds of token work here.',
+  'Tap *Create Token*, then *Create Custom Token*.',
+  'Under *Permissions*, add these rows. Each row is three dropdowns:',
+  'Under *Zone Resources*, choose *Include → Specific zone* and pick your domain.',
+  'Tap *Continue to summary*, then *Create Token*.',
+  'Copy the token straight away — Cloudflare shows it one time — and paste it below.',
+]
+/** Which step the permission rows hang under (0-based). */
+const PERMISSIONS_STEP = 3
+
+/** Render one step, lifting `*marked*` fragments to foreground weight. */
+function Steps({ text }: { text: string }) {
+  return (
+    <>
+      {text.split('*').map((part, i) =>
+        i % 2 === 1 ? (
+          <span key={i} className="text-foreground">
+            {part}
+          </span>
+        ) : (
+          <React.Fragment key={i}>{part}</React.Fragment>
+        ),
+      )}
+    </>
+  )
+}
+
+const CF_PERMISSIONS: { row: string; why: string; optional?: boolean }[] = [
+  { row: 'Account · Cloudflare Tunnel · Edit', why: 'creates the tunnel to your box' },
+  { row: 'Zone · DNS · Edit', why: 'points your domain at that tunnel' },
+  { row: 'Zone · Zone · Read', why: 'lists your domains so you can pick one' },
+  {
+    row: 'Zone · Email Routing Rules · Edit',
+    why: 'only for the agent email address',
+    optional: true,
+  },
+]
 
 function DomainStep({
   status,
@@ -332,12 +383,21 @@ function DomainStep({
   const baseDomain = status?.box_status.base_domain ?? null
   const tunnel = status?.box_status.tunnel ?? 'none'
   const done = tunnel === 'healthy'
+  const startTunnel = () => startQuick.mutate(undefined, { onSuccess: () => refetch() })
 
-  // A temporary link is live → the ephemeral panel (upgrade / stop from here).
-  if (qt?.active) {
+  // The box knows about a temporary link → the ephemeral panel, LIVE or not.
+  // A tunnel that stopped is its own state (`quickTunnelView`), never a silent
+  // fall-back to the chooser: the operator asked for a link and one was created,
+  // so the panel has to say what became of it.
+  const qtView = quickTunnelView(qt)
+  if (qt && qtView !== 'none') {
     return (
       <QuickTunnelPanel
         qt={qt}
+        live={qtView === 'live'}
+        retrying={startQuick.isPending}
+        retryError={startQuick.isError ? errText(startQuick.error) : null}
+        onRetry={startTunnel}
         stopping={stopQuick.isPending}
         error={stopQuick.isError ? errText(stopQuick.error) : null}
         onStop={() => stopQuick.mutate(undefined, { onSuccess: () => refetch() })}
@@ -351,8 +411,11 @@ function DomainStep({
     return (
       <QuickTunnelChoice
         starting={startQuick.isPending}
+        // The POST returned a URL but `status` has not caught up yet — hold the
+        // working state instead of re-offering the button that just succeeded.
+        settling={startQuick.isSuccess && qtView === 'none'}
         error={startQuick.isError ? errText(startQuick.error) : null}
-        onQuick={() => startQuick.mutate(undefined, { onSuccess: () => refetch() })}
+        onQuick={startTunnel}
         onDomain={() => setPath('domain')}
       />
     )
@@ -370,6 +433,13 @@ function DomainStep({
   }
 
   // Sub-step 1a — no token yet.
+  //
+  // The copy here is the whole feature for a non-expert: the owner followed the
+  // previous version into a zone's menu looking for a "Cloudflare Tunnel" item
+  // that does not live there (tunnels are ACCOUNT-level — dash.cloudflare.com →
+  // Networking → Tunnels). supermux creates the tunnel over the API, so the
+  // honest instruction is simply "make a token", spelled as numbered taps with
+  // the real 2026 menu names.
   if (!cfValid) {
     return (
       <div className="flex flex-col gap-4">
@@ -381,33 +451,58 @@ function DomainStep({
           <ArrowLeft className="size-3.5" /> Other options
         </button>
         <p className="text-sm text-muted-foreground">
-          Give your colleagues a web address to reach this supermux. First connect the Cloudflare
-          account that manages your domain.
+          Your colleagues will reach this supermux at an address on your own domain, like{' '}
+          <span className="font-mono text-foreground">team.acme.com</span>. supermux builds the
+          Cloudflare tunnel and the DNS record for you. The one thing it needs from you is an API
+          token.
         </p>
+
+        <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
+          <p className="text-sm font-medium text-foreground">Make the token in Cloudflare</p>
+          <ol className="flex flex-col gap-2 text-[12.5px] leading-snug text-muted-foreground">
+            {CF_TOKEN_STEPS.map((step, i) => (
+              <li key={step}>
+                <span className="font-medium text-foreground">{i + 1}.</span>{' '}
+                <Steps text={step} />
+                {/* The permission rows belong inside the step that asks for them. */}
+                {i === PERMISSIONS_STEP && (
+                  <ul className="mt-1.5 flex flex-col gap-1.5">
+                    {CF_PERMISSIONS.map((p) => (
+                      <li key={p.row} className="rounded-lg bg-[var(--gr-sel)] px-2.5 py-1.5">
+                        <span className="font-mono text-[12px] text-foreground">{p.row}</span>
+                        <span className="block text-[11.5px] text-muted-foreground">
+                          {p.optional ? 'Optional — ' : ''}
+                          {p.why}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+
         <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
           <label htmlFor="cf-token" className="text-sm font-medium text-foreground">
-            Cloudflare API token
+            Paste your Cloudflare API token
           </label>
-          <p className="text-[12.5px] leading-snug text-muted-foreground">
-            Create a token scoped to the zone for your domain with these permissions, then paste it
-            here. Cloudflare shows the token once — copy it before you close that page.
-          </p>
-          <CopyField value={CF_SCOPES.replace(/\n/g, '  ·  ')} label="Copy the required scopes" />
           <SecretInput id="cf-token" value={token} onChange={setToken} placeholder="Paste the token" invalid={cf.isError} />
           {cf.isError && <p className="text-sm text-destructive">{errText(cf.error)}</p>}
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[12px] text-muted-foreground">
-              dash.cloudflare.com → My Profile → API Tokens
-            </span>
+          <div className="flex items-center justify-end gap-2">
             <Button
               type="button"
               size="sm"
               onClick={() => cf.mutate(token)}
               disabled={token.trim().length < 8 || cf.isPending}
             >
-              {cf.isPending ? 'Verifying…' : 'Verify token'}
+              {cf.isPending ? 'Checking…' : 'Check the token'}
             </Button>
           </div>
+          <p className="text-[12px] leading-snug text-muted-foreground">
+            supermux stores the token on your own box, readable only by supermux, and never shows it
+            again.
+          </p>
         </div>
       </div>
     )
@@ -469,15 +564,19 @@ function DomainStep({
  *  existing permanent BYO-domain + Google flow. Honest about the trade either way. */
 function QuickTunnelChoice({
   starting,
+  settling,
   error,
   onQuick,
   onDomain,
 }: {
   starting: boolean
+  /** The start call returned; the box has not reported the tunnel back yet. */
+  settling: boolean
   error: string | null
   onQuick: () => void
   onDomain: () => void
 }) {
+  const busy = starting || settling
   return (
     <div data-vr="qt-choice" className="flex flex-col gap-3">
       <p className="text-sm text-muted-foreground">
@@ -512,14 +611,18 @@ function QuickTunnelChoice({
         <Button
           type="button"
           onClick={onQuick}
-          disabled={starting}
+          disabled={busy}
           className="h-11 w-full"
           style={{ background: 'var(--sm-accent-fill)', color: 'var(--gr-onaccent)' }}
         >
-          {starting ? 'Creating your link…' : 'Create a temporary link'}
+          {starting ? 'Creating your link…' : settling ? 'Confirming your link…' : 'Create a temporary link'}
         </Button>
-        {starting && (
-          <StatusChip state="working" label="Starting the tunnel — a few seconds…" className="self-start" />
+        {busy && (
+          <StatusChip
+            state="working"
+            label={starting ? 'Starting the tunnel — a few seconds…' : 'Link created — waiting for supermux to confirm it…'}
+            className="self-start"
+          />
         )}
       </div>
 
@@ -544,6 +647,8 @@ function QuickTunnelChoice({
           type="button"
           variant="outline"
           onClick={onDomain}
+          // Only a request actually in flight blocks this — `settling` must never
+          // trap the operator on a card whose primary button is disabled.
           disabled={starting}
           className="h-11 w-full"
         >
@@ -559,65 +664,117 @@ function QuickTunnelChoice({
   )
 }
 
-// ── Step 1 (quick tunnel active) — the temporary-link panel ───────────────────
+// ── Step 1 (a quick tunnel exists) — the temporary-link panel ────────────────
 
-/** The live ephemeral link (design §5.2). Shows the trycloudflare URL prominently
- *  + copyable, a persistent (non-scary) honesty note, and a Stop/upgrade control. */
+/** The ephemeral link panel (design §5.2). Two honest faces:
+ *  - LIVE: the trycloudflare URL prominently + copyable, a persistent
+ *    (non-scary) honesty note, and a Stop/upgrade control.
+ *  - STOPPED: the box has a quick-tunnel record but the tunnel is NOT running,
+ *    so the address is dead. It says exactly that and offers "Try again" —
+ *    it never shows a copyable link the colleague cannot reach, and it never
+ *    pretends nothing happened.
+ */
 function QuickTunnelPanel({
   qt,
+  live,
+  retrying,
+  retryError,
+  onRetry,
   stopping,
   error,
   onStop,
 }: {
   qt: QuickTunnelStatus
+  live: boolean
+  retrying: boolean
+  retryError: string | null
+  onRetry: () => void
   stopping: boolean
   error: string | null
   onStop: () => void
 }) {
+  const tone = live ? 'var(--gr-work)' : 'var(--destructive)'
   return (
-    <div data-vr="qt-success" className="flex flex-col gap-4">
+    <div data-vr={live ? 'qt-success' : 'qt-stopped'} className="flex flex-col gap-4">
       <div
         className="flex flex-col gap-3 rounded-2xl border p-4"
         style={{
-          borderColor: 'color-mix(in oklab, var(--gr-work) 40%, var(--gr-line))',
-          background: 'color-mix(in oklab, var(--gr-work) 7%, transparent)',
+          borderColor: `color-mix(in oklab, ${tone} 40%, var(--gr-line))`,
+          background: `color-mix(in oklab, ${tone} 7%, transparent)`,
         }}
       >
         <StatusChip
-          state="done"
-          label="Temporary link — active"
+          state={live ? 'done' : 'error'}
+          label={live ? 'Temporary link — active' : 'Temporary link — not running'}
           className="self-start"
         />
-        <div className="flex flex-col gap-1.5">
-          <span className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
-            <Clock aria-hidden className="size-3.5" /> Your temporary web address
-          </span>
-          <CopyField value={qt.url} label="Copy the temporary link" />
-        </div>
+
+        {live ? (
+          <div className="flex flex-col gap-1.5">
+            <span className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
+              <Clock aria-hidden className="size-3.5" /> Your temporary web address
+            </span>
+            <CopyField value={qt.url} label="Copy the temporary link" />
+          </div>
+        ) : (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[12px] text-muted-foreground">
+              The address supermux created — nobody can reach it right now:
+            </span>
+            <span className="break-all font-mono text-[12.5px] text-muted-foreground line-through">
+              {qt.host}
+            </span>
+          </div>
+        )}
 
         <div
           className="flex items-start gap-2 rounded-xl px-3 py-2.5 text-[12.5px] leading-snug"
-          style={{ background: 'color-mix(in oklab, var(--gr-work) 12%, transparent)', color: 'var(--foreground)' }}
+          style={{ background: `color-mix(in oklab, ${tone} 12%, transparent)`, color: 'var(--foreground)' }}
         >
-          <AlertTriangle aria-hidden className="mt-0.5 size-4 shrink-0" style={{ color: 'var(--gr-work)' }} />
-          <span>
-            <span className="font-medium">Temporary</span> — this link changes each time supermux
-            restarts. Connect your own domain for a permanent address.
-          </span>
+          <AlertTriangle aria-hidden className="mt-0.5 size-4 shrink-0" style={{ color: tone }} />
+          {live ? (
+            <span>
+              <span className="font-medium">Temporary</span> — this link changes each time supermux
+              restarts. Connect your own domain for a permanent address.
+            </span>
+          ) : (
+            <span>
+              <span className="font-medium">The tunnel stopped.</span> supermux created this link,
+              but the process that serves it is no longer running, so the address is dead. Try again
+              — if it keeps stopping, connect your own domain instead.
+            </span>
+          )}
         </div>
       </div>
 
-      <p className="text-sm text-muted-foreground">
-        Continue to add colleagues — each gets their own link to join, no sign-in needed.
-      </p>
+      {live ? (
+        <p className="text-sm text-muted-foreground">
+          Continue to add colleagues — each gets their own link to join, no sign-in needed.
+        </p>
+      ) : (
+        <>
+          {retryError && <p className="text-sm text-destructive">{retryError}</p>}
+          <Button
+            type="button"
+            onClick={onRetry}
+            disabled={retrying || stopping}
+            className="self-start"
+            style={{ background: 'var(--sm-accent-fill)', color: 'var(--gr-onaccent)' }}
+          >
+            {retrying ? 'Creating your link…' : 'Try again'}
+          </Button>
+        </>
+      )}
 
       {error && <p className="text-sm text-destructive">{error}</p>}
       <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" variant="ghost" size="sm" onClick={onStop} disabled={stopping}>
-          {stopping ? 'Stopping…' : 'Stop / replace link'}
+        <Button type="button" variant="ghost" size="sm" onClick={onStop} disabled={stopping || retrying}>
+          {stopping ? 'Stopping…' : live ? 'Stop / replace link' : 'Clear this link'}
         </Button>
         <span className="text-[12px] text-muted-foreground">
-          Stopping lets you connect your own domain for a permanent address.
+          {live
+            ? 'Stopping lets you connect your own domain for a permanent address.'
+            : 'Clearing it takes you back to the two setup options.'}
         </span>
       </div>
     </div>
