@@ -1225,7 +1225,29 @@ const BUDGET_ENTRY_JS = 161 * KB
 //             `lib/mark-status`, which IS on the hero path) measured 161.02 and
 //             was rejected for exactly that reason.
 // ceil(measured 440.32) + headroom = 441, the same rule every bump above used.
-const BUDGET_APP_JS = 441 * KB
+//
+// RATCHETED 441 → 442 by "Keep me signed in" (the shared browser's per-tab
+// keep-alive). The branch parent measured 440.40 — 0.60 KB of headroom — and
+// this feature measures 441.41, so the +1.01 KB is attributed here rather than
+// guessed at. It lands in ONE lazy chunk and the hero path did not move:
+//   +0.91 KB  `browser` (15.25 → 16.16), the lazily-imported workspace route.
+//             All of it: the pure copy module (`lib/browser/keep-signed-in`, the
+//             seven detail lines and their precedence), the ⋯ row's second-line
+//             branch in `browser-menu`, the sheet row in `tab-grant-sheet`, and
+//             the four wire fields. Nothing was added to a shared or entry
+//             module — `grep` finds none of these symbols in `index-*.js`.
+//   +0.03 KB  the ENTRY chunk (160.70 → 160.73), hash churn in the import map
+//             from re-rolling the `browser` chunk's content hash. The gate that
+//             actually guards first paint stays GREEN at 160.73 / 161 KB and did
+//             NOT move to make room for anything.
+//   ~+0.07 KB the remainder, ±0.01-0.03 rounding spread over eight untouched
+//             lazy chunks.
+// Cheaper placements were considered and rejected for reasons this file already
+// records elsewhere: the copy cannot live in `lib/api/browser` (that module IS
+// on the hero path), and inlining it into the component would cost the same
+// bytes while losing the pure-function test that pins all seven lines.
+// ceil(measured 441.41) + headroom = 442, the same rule every bump above used.
+const BUDGET_APP_JS = 442 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

@@ -429,7 +429,14 @@ One more row in `tab-grant-sheet.tsx`, directly under the Pin row and cloning it
 
 ### 5.3 390 px
 
-The ⋯ menu is a fixed 232 px popup with flip-and-clamp (not a bottom sheet) — verified at `browser-menu.tsx:65,150-200`. The row is a full-width 56 px tap target; the detail line wraps to at most two lines (`line-clamp-2`) and is written to fit: **every `detail` string is ≤ 88 characters**, asserted in the unit test. The sheet row is the same `min-h-11` primitive already shipping at 390 px.
+The ⋯ menu is a fixed 232 px popup with flip-and-clamp (not a bottom sheet) — verified at `browser-menu.tsx:65,150-200`. The row is a full-width 56 px tap target; the detail line wraps to at most two lines (`line-clamp-2`) and is written to fit.
+
+> **Measured correction (build, 2026-08-30).** This spec estimated the fit at **88 characters**; the built row measures **54**. On the 390 px bench the detail column is **176 px** wide (the row's padding plus the 16 px icon and its gap take the rest of the 232) at 11.5 px / 15.8 px line height, so two clamped lines hold ~27 characters each. A 61-character line already truncated — the rig read `scrollHeight 47` against `clientHeight 32` on *"Refresh crm.example in the background so bots stay signed in."*, i.e. the honest half of the sentence going invisible on exactly the device this feature is for. `DETAIL_MAX` is therefore **54**, and two lines were rewritten to fit it:
+>
+> * off: *"Refresh bol.com so bots stay signed in."* (was "…in the background so bots stay signed in.")
+> * watch: *"Watching only — this site signs out in minutes."* (was "…expires sessions in minutes; refreshing would fight that.")
+>
+> The dropped clause — that refreshing would fight a deliberate security control — is not lost: it is the sheet's watch copy, which has the room. Verified un-truncated on the 390 px rig for all three states, with zero horizontal overflow. The sheet row is the same `min-h-11` primitive already shipping at 390 px.
 
 **Not built:** no interval picker, no advanced section, no badge, no banner, no new dot, no countdown, no post-takeover "stay signed in?" toast. The feature is offered once in the menu and is then silent until it can no longer do its job.
 
@@ -480,7 +487,7 @@ pub fn spawn(state: AppState) {
 
 * `a_soft_ping_slides_a_cookie_expiry_without_navigating` — read `expires` and `Page.getNavigationHistory().entries.len()`, run `PING_JS`, assert the expiry moved forward and the history length is unchanged. This is exactly the experiment that ran green in the scratchpad probe (M5 + M6).
 
-**`web/tests/unit/browser-keep-signed-in.test.ts`:** every row of the copy table with a frozen clock; the stale threshold flips exactly at `3 × every × 60`; `Starting —` appears only when `last_keepalive_at === null`; a non-http url disables the row and keeps its hint; the interval formatter gives `"45 min"` / `"6 h"`; **every produced `detail` is ≤ 88 characters**.
+**`web/tests/unit/browser-keep-signed-in.test.ts`:** every row of the copy table with a frozen clock; the stale threshold flips exactly at `3 × every × 60`; `Starting —` appears only when `last_keepalive_at === null`; a non-http url disables the row and keeps its hint; the interval formatter gives `"45 min"` / `"6 h"`; **every produced `detail` is ≤ `DETAIL_MAX`** (54 — see the measured correction in §5.3).
 
 **`web/tests/unit/` component test:** `browser-menu` renders `detail` as a second line inside the same single `<button role="menuitem">`, keeps roving focus and `disabled` behaviour, and rows without `detail` render unchanged; `pageRows()` includes `keepalive`, disabled when there is no active tab.
 
@@ -533,7 +540,7 @@ A reviewer can check every one of these.
 **UI**
 
 19. `BrowserMenuItem.detail` is optional and every existing menu row renders unchanged (component test).
-20. The ⋯ row's label is `Keep me signed in` when off and `Stop keeping signed in` when on; the seven detail strings match §5.1 verbatim and each is ≤ 88 characters.
+20. The ⋯ row's label is `Keep me signed in` when off and `Stop keeping signed in` when on; the seven detail strings match §5.1 (with the two rewrites in §5.3's measured correction) and each is ≤ `DETAIL_MAX` = 54 characters — the value the 390 px rig measured, not the 88 this spec estimated.
 21. No countdown, no interval control, no badge, no new status dot anywhere in the diff.
 22. A 390 px screenshot from `/dev/browser-workspace` shows the row with both lines legible and no horizontal overflow.
 
