@@ -16,6 +16,7 @@
 import type { ApiSession } from '@/lib/api'
 import type { Team } from '@/lib/api/teams'
 import { needsYouCount, taskProgress } from '@/lib/api/teams'
+import { subagentsClause } from '@/lib/mark-status'
 
 /** The four attention-ordered sections — the same keys `grok-roster` buckets
  *  sessions into, so a team row drops straight in beside the bots. */
@@ -88,16 +89,6 @@ export function groupTeamsByTier(
   return buckets
 }
 
-function isSameDay(a: number, b: number): boolean {
-  const da = new Date(a)
-  const db = new Date(b)
-  return (
-    da.getFullYear() === db.getFullYear() &&
-    da.getMonth() === db.getMonth() &&
-    da.getDate() === db.getDate()
-  )
-}
-
 /** Bucket the sorted BOT roster into the same four attention-ordered sections
  *  team rows fold into. A plain module function so the `Date.now()` default lives
  *  OUTSIDE component render (the shape `attention-tiers.ts` uses) — a `Date.now()`
@@ -110,30 +101,76 @@ export function groupSessions(
   now: number = Date.now(),
 ): Record<GroupKey, ApiSession[]> {
   const buckets: Record<GroupKey, ApiSession[]> = { needs: [], active: [], done: [], idle: [] }
-  for (const s of sorted) {
-    if (needNames.has(s.name)) {
-      buckets.needs.push(s)
-      continue
-    }
-    if (s.status === 'active' || s.status === 'starting') {
-      buckets.active.push(s)
-      continue
-    }
-    // A background workflow is provably running even though the main agent
-    // returned to its prompt: bucket it ACTIVE, never done/idle. This is the
-    // frontend half of the `subagents_live` signal — the server holds an Active
-    // turn while subagents churn, and here a left-open workflow whose server
-    // status has already settled still reads as working.
-    if (s.subagents_live) {
-      buckets.active.push(s)
-      continue
-    }
-    const t = s.updated_at ? Date.parse(s.updated_at) : NaN
-    if (s.status === 'idle' && !Number.isNaN(t) && isSameDay(t, now)) {
-      buckets.done.push(s)
-      continue
-    }
-    buckets.idle.push(s)
-  }
+  for (const s of sorted) buckets[groupOf(s, needNames.has(s.name), now)].push(s)
   return buckets
+}
+
+function isSameDay(a: number, b: number): boolean {
+  const da = new Date(a)
+  const db = new Date(b)
+  return (
+    da.getFullYear() === db.getFullYear() &&
+    da.getMonth() === db.getMonth() &&
+    da.getDate() === db.getDate()
+  )
+}
+
+/** ONE session's section — the arithmetic `groupSessions` runs per row.
+ *
+ *  Split out of `groupSessions` because the bot PANEL needs the same answer for
+ *  a single bot and has no roster to bucket. `needs` is passed in rather than
+ *  derived, because the roster reads it off the precomputed attention rollup and
+ *  the panel off `useSessionAttention` — one arithmetic, two ways in.
+ *
+ *  A plain module function so the `Date.now()` default lives OUTSIDE component
+ *  render (the shape `attention-tiers.ts` uses) — a `Date.now()` in a `useMemo`
+ *  body reads as an impurity to `react-hooks/purity`, and rightly so. */
+export function groupOf(s: ApiSession, needs: boolean, now: number = Date.now()): GroupKey {
+  if (needs) return 'needs'
+  if (s.status === 'active' || s.status === 'starting') return 'active'
+  // A background workflow is provably running even though the main agent
+  // returned to its prompt: bucket it ACTIVE, never done/idle. This is the
+  // frontend half of the `subagents_live` signal — the server holds an Active
+  // turn while subagents churn, and here a left-open workflow whose server
+  // status has already settled still reads as working.
+  if (s.subagents_live) return 'active'
+  const t = s.updated_at ? Date.parse(s.updated_at) : NaN
+  if (s.status === 'idle' && !Number.isNaN(t) && isSameDay(t, now)) return 'done'
+  return 'idle'
+}
+
+/** The product's word for a session's state, and the class the roster paints it
+ *  with. TWO surfaces render this fact — the roster row and the bot panel it
+ *  opens — and the second copy is how they came to disagree: the panel printed
+ *  `session.status` capitalised, so `mena` read `done` in the left roster and
+ *  `Idle` in the right panel at the same instant.
+ *
+ *  `word` and `agents` are separate on purpose: the roster prints both, while the
+ *  bot panel prints the word alone because its `<ActivityLine>` already draws the
+ *  same parallelism clause from the same `agents_live`. */
+export interface StateWord {
+  word: string
+  /** The ` · N agents` clause, or `''` when this bot has no children out. */
+  agents: string
+  /** The `st-*` class of the roster's coloured word (grok-scoped CSS). */
+  cls: string
+}
+
+/** The coloured state WORD — the firewall's status half, never the agent hue
+ *  (overview.md §3 law 3: state is a coloured word + the mark's face). */
+export function stateWordFor(s: ApiSession, group: GroupKey): StateWord {
+  const agents = subagentsClause(s.agents_live)
+  if (group === 'needs') {
+    if (s.status === 'error' || s.blocked) return { word: 'blocked', agents: '', cls: 'st-block' }
+    return { word: 'needs you', agents: '', cls: 'st-need' }
+  }
+  if (s.status === 'active' || s.status === 'starting') return { word: 'working', agents, cls: 'st-work' }
+  if (s.status === 'error') return { word: 'blocked', agents: '', cls: 'st-block' }
+  if (s.status === 'stopped') return { word: 'stopped', agents: '', cls: 'st-idle' }
+  // A background workflow still running after the main turn settled: the row is
+  // bucketed active by `groupSessions`, so say WORKING (with the parallelism
+  // clause when it is available) rather than done/idle.
+  if (s.subagents_live) return { word: 'working', agents, cls: 'st-work' }
+  if (group === 'done') return { word: 'done', agents: '', cls: 'st-done' }
+  return { word: 'idle', agents: '', cls: 'st-idle' }
 }

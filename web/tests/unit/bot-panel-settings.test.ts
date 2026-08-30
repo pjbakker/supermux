@@ -408,6 +408,73 @@ describe('lastExchange', () => {
     expect(out.receipts[1].ok).toBe(true)
   })
 
+  /* THE TURN BOUND. The card files everything this selects under ONE prompt and
+     one timestamp — `lastSend` — so an entry from a different turn rendered
+     beneath it is a false grouping. All three fixtures below are the shapes that
+     were measured live before the fix. */
+
+  test('with no lastSend the walk stops at the turn boundary', () => {
+    const out = lastExchange([
+      entry({ kind: 'assistant', text: 'Shipped it.' }),
+      entry({ kind: 'tool_use', text: 'Bash cargo check' }),
+      entry({ kind: 'prompt', text: 'ship it' }),
+      // Everything below belongs to the turn BEFORE the one being rendered.
+      entry({ kind: 'assistant', text: 'An older answer.' }),
+      entry({ kind: 'tool_use', text: 'Read /never/rendered.ts' }),
+    ])
+    expect(out.answer).toBe('Shipped it.')
+    expect(out.receipts).toHaveLength(1)
+  })
+
+  test('receipts older than the prompt above them are NOT its receipts', () => {
+    // `Mail`, verbatim: the reply landed after the send, the three tool calls did
+    // not, and all four were rendered under one "You asked · 12d ago".
+    const sent: LastSend = { text: 'Done', sentAt: new Date(1_787_064_835 * 1000) }
+    const out = lastExchange(
+      [
+        entry({ kind: 'assistant', ts: 1_787_064_878, text: 'Weer verbonden.' }),
+        entry({ kind: 'tool_use', ts: 1_787_064_832, text: 'Bash cat devicelogin.txt' }),
+        entry({ kind: 'tool_use', ts: 1_787_064_754, text: 'Bash F=devicelogin.txt' }),
+      ],
+      sent,
+    )
+    expect(out.answer).toBe('Weer verbonden.')
+    expect(out.receipts).toEqual([])
+  })
+
+  test('a LATER user turn is walked past, not treated as the end of the page', () => {
+    // `Research`: a `/exit` typed after the prompt the row recorded. Its own turn
+    // produced nothing, and stopping at it would blank a card whose answer sits
+    // one row further down.
+    const sent: LastSend = { text: 'claude update', sentAt: new Date(1_787_609_207 * 1000) }
+    const out = lastExchange(
+      [
+        entry({ kind: 'command', ts: 1_787_609_243, text: '/exit' }),
+        entry({ kind: 'assistant', ts: 1_787_609_211, text: 'Up-to-date — niks te doen.' }),
+        entry({ kind: 'assistant', ts: 1_787_609_191, text: 'An older answer.' }),
+      ],
+      sent,
+    )
+    expect(out.answer).toBe('Up-to-date — niks te doen.')
+  })
+
+  test('…and what that later turn DID produce is not filed under this prompt', () => {
+    const sent: LastSend = { text: 'ship it', sentAt: new Date(1_787_609_207 * 1000) }
+    const out = lastExchange(
+      [
+        entry({ kind: 'assistant', ts: 1_787_609_260, text: 'Answer to the LATER question.' }),
+        entry({ kind: 'tool_use', ts: 1_787_609_250, text: 'Read /never/rendered.ts' }),
+        entry({ kind: 'command', ts: 1_787_609_243, text: '/exit' }),
+        entry({ kind: 'assistant', ts: 1_787_609_211, text: 'Shipped it.' }),
+        entry({ kind: 'tool_use', ts: 1_787_609_210, text: 'Bash cargo check' }),
+      ],
+      sent,
+    )
+    expect(out.answer).toBe('Shipped it.')
+    expect(out.receipts).toHaveLength(1)
+    expect(out.receipts[0].label).toContain('cargo check')
+  })
+
   test('kinds the panel does not render are ignored — a delegation included', () => {
     // The sender of an inbound delegation is NOT read out of the recall page any
     // more: the graph owns that fact (see `handoffView` below), so one source

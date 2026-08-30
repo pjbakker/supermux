@@ -57,7 +57,7 @@ import { NewSessionSheet } from '@/components/session-tile/new-session-sheet'
 import { SessionFace } from '@/components/roster/session-face'
 import { TeamCrewChip } from '@/components/team/team-crew-chip'
 import { SessionMark } from '@/brand/marks'
-import { attentionFor, markStateForSession, subagentsClause } from '@/lib/mark-status'
+import { attentionFor, markStateForSession } from '@/lib/mark-status'
 import { smartSort, nameSort } from '@/lib/overview-layout'
 import { useArmedConfirm } from '@/hooks/use-armed-confirm'
 import { useToast } from '@/components/ui/use-toast'
@@ -73,6 +73,8 @@ import {
 import {
   groupSessions,
   groupTeamsByTier,
+  stateWordFor,
+  type GroupKey,
   type LeadSignal,
 } from '@/lib/team-attention'
 import { useUI } from '@/stores/ui-store'
@@ -223,31 +225,6 @@ function rcClass(pct: number): string {
   return pct < 50 ? 'rc-ok' : pct < 80 ? 'rc-mid' : 'rc-hot'
 }
 
-type GroupKey = 'needs' | 'active' | 'done' | 'idle'
-
-interface StateWord {
-  word: string
-  cls: string
-}
-
-/** The coloured state WORD — the firewall's status half, never the agent hue
- *  (overview.md §3 law 3: state is a coloured word + the mark's face). */
-function stateWordFor(s: ApiSession, group: GroupKey): StateWord {
-  if (group === 'needs') {
-    if (s.status === 'error' || s.blocked) return { word: 'blocked', cls: 'st-block' }
-    return { word: 'needs you', cls: 'st-need' }
-  }
-  if (s.status === 'active' || s.status === 'starting') return { word: 'working' + subagentsClause(s.agents_live), cls: 'st-work' }
-  if (s.status === 'error') return { word: 'blocked', cls: 'st-block' }
-  if (s.status === 'stopped') return { word: 'stopped', cls: 'st-idle' }
-  // A background workflow still running after the main turn settled: the row is
-  // bucketed active by `groupSessions`, so say WORKING (with the parallelism
-  // clause when it is available) rather than done/idle.
-  if (s.subagents_live) return { word: 'working' + subagentsClause(s.agents_live), cls: 'st-work' }
-  if (group === 'done') return { word: 'done', cls: 'st-done' }
-  return { word: 'idle', cls: 'st-idle' }
-}
-
 function matches(s: ApiSession, needle: string): boolean {
   if (!needle) return true
   if (s.name.toLowerCase().includes(needle)) return true
@@ -337,7 +314,7 @@ export const GrokRow = React.memo(function GrokRow({ session, group, active, onO
           }
         }}
         aria-keyshortcuts="Shift+F10"
-        aria-label={`Open ${name} — ${sw.word}`}
+        aria-label={`Open ${name} — ${sw.word}${sw.agents}`}
       />
       {/* The anchored actions menu (restored). Its hover kebab is the desktop
           affordance; on touch it is opened by the long-press above and by
@@ -372,7 +349,7 @@ export const GrokRow = React.memo(function GrokRow({ session, group, active, onO
           </span>
           <span className="l2">
             <span className="pv">
-              <span className={`st ${sw.cls}`}>{sw.word}</span>
+              <span className={`st ${sw.cls}`}>{sw.word}{sw.agents}</span>
               {preview ? <> · {preview}</> : null}
             </span>
             {tokens && <span className="cost">{tokens}</span>}

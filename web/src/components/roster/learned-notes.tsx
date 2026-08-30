@@ -11,7 +11,9 @@
  * the SAME lexical scorer the per-turn recall hook selects with, so the order
  * shown is the order the bot would actually recall — not a second, cosmetic
  * search that would quietly disagree with its memory. An empty box lists the
- * whole union (private ∪ role), freshest first.
+ * whole union (private ∪ role), freshest first. The box is only offered where
+ * there IS a store — on a bot whose tier is off it would be a control that
+ * cannot do what it promises, and its result line said so out loud.
  *
  * Three states, not two. "This bot cannot write notes" and "it can, and has
  * written none yet" are different facts, and printing the second for the first is
@@ -62,6 +64,29 @@ const TYPE_DOT: Record<string, string> = {
 /** Long enough that a fast typist fires one request, short enough to feel live. */
 const SEARCH_DEBOUNCE_MS = 250
 
+/** Which sentence a note-less panel shows. */
+export type NotesEmpty = 'not-a-bot' | 'restart-to-wire' | 'no-match' | 'none-yet'
+
+/** The empty state, as a decision rather than the order of a ternary chain.
+ *
+ *  The order IS the bug this pins: `searching` used to be tested first, so
+ *  typing "deploy" into the box on a bot with no store replaced the honest
+ *  "Memory isn't on for this bot yet" with `No note matches “deploy”` — a claim
+ *  about a search that never ran, and the same not-wired/nothing-written
+ *  conflation the three-state design exists to remove. The STATE OF THE STORE
+ *  outranks the box: there is nothing to match when there is nothing to search.
+ *
+ *  Pure and exported so `learned-notes-wired.test.ts` holds the precedence
+ *  without a DOM — the shape `bot-panel.tsx` uses for its own selectors. */
+export function emptyState(opts: {
+  notWired: boolean
+  eligible: boolean
+  searching: boolean
+}): NotesEmpty {
+  if (opts.notWired) return opts.eligible ? 'restart-to-wire' : 'not-a-bot'
+  return opts.searching ? 'no-match' : 'none-yet'
+}
+
 export function LearnedNotes({ name }: { name: string }) {
   const [q, setQ] = React.useState('')
   const [debounced, setDebounced] = React.useState('')
@@ -93,6 +118,7 @@ export function LearnedNotes({ name }: { name: string }) {
   // session that is not a bot yet it does nothing, so that state names the step
   // that comes first instead of offering the restart.
   const eligible = Boolean(data?.eligible)
+  const empty = emptyState({ notWired, eligible, searching })
   // Derived, not synced: a row the current result set no longer contains simply
   // renders collapsed. Storing that in an effect would be a second source of
   // truth for the same fact, one render behind.
@@ -107,44 +133,49 @@ export function LearnedNotes({ name }: { name: string }) {
         </p>
       </div>
 
-      <div className="relative flex items-center">
-        <Search className="pointer-events-none absolute left-3 size-3.5 text-muted-foreground" aria-hidden />
-        <input
-          type="search"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder="Search what this bot has learned"
-          aria-label="Search learned notes"
-          className="h-10 w-full rounded-xl border border-input bg-background pl-9 pr-3 text-[13px] text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-        />
-      </div>
+      {/* No box while the tier is OFF. There is no store to rank, so the input
+          is a control that cannot do what it promises — and typing in it made
+          the panel state it outright: the honest "Memory isn't on for this bot
+          yet" was replaced by `No note matches “deploy”`, which is the exact
+          not-wired/nothing-written conflation this component exists to remove. */}
+      {!notWired && (
+        <div className="relative flex items-center">
+          <Search className="pointer-events-none absolute left-3 size-3.5 text-muted-foreground" aria-hidden />
+          <input
+            type="search"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search what this bot has learned"
+            aria-label="Search learned notes"
+            className="h-10 w-full rounded-xl border border-input bg-background pl-9 pr-3 text-[13px] text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          />
+        </div>
+      )}
 
       {isLoading ? (
         <div className="h-16 animate-pulse rounded-xl border border-border bg-muted/30" />
       ) : notes.length === 0 ? (
         <div className="flex flex-col items-start gap-2.5 rounded-xl border border-dashed border-border bg-muted/20 px-4 py-4 text-[13px] leading-relaxed text-muted-foreground">
-          {searching ? (
+          {/* The hook rides the session's launch overlay, so RESTART is the
+              action — but ONLY for a bot a restart can actually change. A
+              session the route 404'd is not a bot yet (`session_has_memory` is
+              false: no company, no role, no core notes), so restarting it wires
+              nothing; offering the button there is a control that cannot do
+              what the sentence beside it promises. That bot gets the reachable
+              action instead, and no button. */}
+          {empty === 'restart-to-wire' ? (
+            <>
+              Memory isn’t on for this bot yet — the recall hook is wired when it starts.
+              Restart it to switch memory on.
+              <RestartToApply name={name} />
+            </>
+          ) : empty === 'not-a-bot' ? (
+            <>
+              Memory isn’t on for this bot yet. Give it a role or a company above, then
+              restart it — after that it writes what it learns here.
+            </>
+          ) : empty === 'no-match' ? (
             <>No note matches “{debounced}”.</>
-          ) : notWired ? (
-            /* The hook rides the session's launch overlay, so RESTART is the
-               action — but ONLY for a bot a restart can actually change. A
-               session the route 404'd is not a bot yet (`session_has_memory` is
-               false: no company, no role, no core notes), so restarting it wires
-               nothing; offering the button there is a control that cannot do
-               what the sentence beside it promises. That bot gets the reachable
-               action instead, and no button. */
-            eligible ? (
-              <>
-                Memory isn’t on for this bot yet — the recall hook is wired when it starts.
-                Restart it to switch memory on.
-                <RestartToApply name={name} />
-              </>
-            ) : (
-              <>
-                Memory isn’t on for this bot yet. Give it a role or a company above, then
-                restart it — after that it writes what it learns here.
-              </>
-            )
           ) : (
             <>
               This bot hasn’t written any notes yet — the core notes above are its curated index.
