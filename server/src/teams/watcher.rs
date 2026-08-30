@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::db;
+use crate::sessions::status::Status;
 use crate::sessions::tmux::Tmux;
 use crate::state::{AppState, SseEvent};
 
@@ -216,6 +217,35 @@ pub async fn scan_and_enrich_raw(state: &AppState) -> Vec<Team> {
                     team = %team.team_name,
                     "teams watcher: dismissed-set load failed; showing all members this tick",
                 );
+            }
+        }
+
+        // Auto-reconcile the roster of a STOPPED host: hide every teammate that
+        // no longer has a live pane. Claude Code tears its own roster down one
+        // member at a time on a graceful team shutdown, but `lifecycle::stop`
+        // hard-kills the lead after a short grace window, so that cleanup dies
+        // mid-flight and the orphaned `members[]` entries stay in Claude's
+        // `config.json` forever — rendering as dead "offline" cards under a
+        // session that is not even running (measured: 20 ghost cards under one
+        // stopped session) until the user trashes each one by hand.
+        //
+        // A pure DISPLAY filter, deliberately NOT a `teams_dismissed` write:
+        // nothing is persisted, so there is no stale row to un-arm later. A
+        // mis-attributed host self-heals the instant its status stops reading
+        // `stopped`, and restarting the lead brings the whole crew back with
+        // zero DB surgery. `tmux_pane_id` is already re-validated against the
+        // host's LIVE panes this tick (`validate_pane_ids` above), so `Some(_)`
+        // means the pane genuinely exists right now — an in-flight teammate is
+        // never hidden.
+        //
+        // Runs AFTER `rosterless` is read, so the backlink writer below keeps
+        // keying off Claude's on-disk truth (a real team whose crew this filter
+        // emptied must not lose its `team_name` backlink, or `archive` would
+        // stop parking its dir). Board sync reads `members` only for a card's
+        // colour tag — the same exposure the dismissed filter already has.
+        if let Some(host_name) = host.as_deref() {
+            if host_settled_stopped(state, host_name).await {
+                retain_live_paned(team);
             }
         }
 
@@ -440,6 +470,51 @@ fn retain_undismissed(team: &mut Team, dismissed: &[String]) {
     }
     team.members
         .retain(|m| !dismissed.iter().any(|d| d == &m.agent_id));
+}
+
+/// How long a host session must have read `stopped` before its paneless
+/// teammates are hidden. The settle window is the whole reason this is not an
+/// instant filter: a stop→start bounce writes `stopped` and then `starting`
+/// (`lifecycle::stop` then `lifecycle::start`) within a second or two, and a
+/// watcher tick landing in that gap would blink the entire crew out of the
+/// roster and back — with the team card itself vanishing via `drop_rosterless`
+/// on the way through.
+const STOPPED_SETTLE_SECS: i64 = 10;
+
+/// Whether the host session's runtime row has been settled `stopped` for at
+/// least [`STOPPED_SETTLE_SECS`]. Pure over the row + the clock, so the gate is
+/// unit-testable apart from the DB.
+fn settled_stopped(rt: &db::sessions::SessionRuntime, now: i64) -> bool {
+    rt.last_status == Status::Stopped.as_str()
+        && now.saturating_sub(rt.last_status_at) >= STOPPED_SETTLE_SECS
+}
+
+/// DB wrapper over [`settled_stopped`]: read the host's `session_runtime` row
+/// and answer the gate. Fails toward `false` (leave the roster exactly as it is)
+/// on a read error or a missing row — hiding members is the more surprising
+/// outcome, so an unknown host status must never trigger it.
+async fn host_settled_stopped(state: &AppState, host_name: &str) -> bool {
+    match db::sessions::runtime(&state.pool, host_name).await {
+        Ok(Some(rt)) => settled_stopped(&rt, chrono::Utc::now().timestamp()),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                host = %host_name,
+                "teams watcher: host runtime read failed; leaving the roster untouched this tick",
+            );
+            false
+        }
+    }
+}
+
+/// Drop every member whose pane is gone — the dead crew of a stopped lead. Pure,
+/// so the reconcile policy is unit-testable apart from the DB. `tmux_pane_id` is
+/// `Some` only for a pane validated against the host's LIVE panes this tick
+/// (`scan::validate_pane_ids`), so a teammate that is still running survives even
+/// while the gate is open.
+fn retain_live_paned(team: &mut Team) {
+    team.members.retain(|m| m.tmux_pane_id.is_some());
 }
 
 /// Cheap-deduped UPDATE: only fire when the session's current team_name
@@ -2033,5 +2108,114 @@ mod tests {
             prev.contains("other-host") && !prev.contains("supermux"),
             "a successful read refreshes the carried set",
         );
+    }
+
+    /// A `session_runtime` row as the settle gate reads it. Only the two fields
+    /// [`settled_stopped`] looks at carry meaning.
+    fn runtime_row(status: &str, at: i64) -> db::sessions::SessionRuntime {
+        db::sessions::SessionRuntime {
+            name: "host".into(),
+            rate_limit_reset_at: 0,
+            hibernated: 0,
+            restarting: 0,
+            last_claude_alive_pid: 0,
+            last_status: status.into(),
+            last_status_at: at,
+            last_capture: String::new(),
+            last_capture_ansi: String::new(),
+            hook_token: String::new(),
+        }
+    }
+
+    /// The settle gate: only a host that has read `stopped` for at least
+    /// STOPPED_SETTLE_SECS opens it. A stop→start bounce (9s in, and any
+    /// non-`stopped` status at all) leaves the roster alone.
+    #[test]
+    fn settle_gate_needs_a_settled_stopped_host() {
+        let now = 1_000_000i64;
+
+        assert!(
+            !settled_stopped(&runtime_row("stopped", now - 9), now),
+            "9s after the stop the gate is still shut (a restart bounce must not blink the crew)",
+        );
+        assert!(
+            settled_stopped(&runtime_row("stopped", now - 11), now),
+            "11s after the stop the gate is open",
+        );
+        assert!(
+            settled_stopped(&runtime_row("stopped", now - STOPPED_SETTLE_SECS), now),
+            "the boundary itself counts as settled",
+        );
+        for alive in ["active", "idle", "waiting", "starting", "unknown"] {
+            assert!(
+                !settled_stopped(&runtime_row(alive, now - 3600), now),
+                "a `{alive}` host is never reconciled, however long it has held that status",
+            );
+        }
+    }
+
+    /// The reconcile itself: a stopped lead's paneless ghosts go, a teammate whose
+    /// `%id` is still live this tick stays. Pure, so no tmux/DB is involved.
+    #[test]
+    fn retain_live_paned_drops_only_the_paneless() {
+        let mut ghost = member_with("ghost@sq", MemberStatus::Offline);
+        let mut alive = member_with("alive@sq", MemberStatus::Working);
+        alive.tmux_pane_id = Some("%7".into());
+        let mut team = host_team("sq", Some("lead"), vec![ghost.clone(), alive], 0);
+
+        retain_live_paned(&mut team);
+
+        let names: Vec<&str> = team.members.iter().map(|m| m.agent_id.as_str()).collect();
+        assert_eq!(names, vec!["alive@sq"], "only the live-paned teammate survives");
+
+        // A crew that is dead to the last member empties the roster — which is the
+        // POINT: `drop_rosterless` then removes the stale team card too, and the
+        // stopped session renders as a plain tile again.
+        ghost.tmux_pane_id = None;
+        let mut all_dead = host_team("sq", Some("lead"), vec![ghost], 0);
+        retain_live_paned(&mut all_dead);
+        assert!(all_dead.members.is_empty());
+        assert!(drop_rosterless(vec![all_dead]).is_empty(), "the ghost team card goes too");
+    }
+
+    /// The DB wiring: the gate reads the HOST's runtime row. A live host, a host
+    /// that only just stopped, and a host with no runtime row at all all answer
+    /// `false` (fail toward leaving the roster exactly as it is); only a host that
+    /// stopped longer ago than the settle window answers `true`.
+    #[tokio::test]
+    async fn host_settled_stopped_reads_the_host_runtime_row() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "lead", "[\"team\"]", "team").await;
+
+        assert!(
+            !host_settled_stopped(&state, "lead").await,
+            "no runtime row yet → never reconcile",
+        );
+        assert!(
+            !host_settled_stopped(&state, "no-such-session").await,
+            "an unresolvable host → never reconcile",
+        );
+
+        db::sessions::ensure_runtime(&state.pool, "lead", "tok").await.unwrap();
+        db::sessions::set_last_status(&state.pool, "lead", "active").await.unwrap();
+        assert!(!host_settled_stopped(&state, "lead").await, "a running lead is untouched");
+
+        // Just stopped: inside the settle window, so still shut.
+        db::sessions::set_last_status(&state.pool, "lead", "stopped").await.unwrap();
+        assert!(!host_settled_stopped(&state, "lead").await, "inside the settle window");
+
+        // Backdate the stamp past the window — the only way to age it without
+        // sleeping in a test.
+        let aged = chrono::Utc::now().timestamp() - STOPPED_SETTLE_SECS - 1;
+        sqlx::query("UPDATE session_runtime SET last_status_at = ? WHERE name = ?")
+            .bind(aged)
+            .bind("lead")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(host_settled_stopped(&state, "lead").await, "settled stopped → reconcile");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
