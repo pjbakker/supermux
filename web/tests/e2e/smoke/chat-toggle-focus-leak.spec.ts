@@ -49,7 +49,26 @@ test.describe('the renderer toggle never leaks keystrokes into the pty', () => {
     await backend?.dispose()
   })
 
-  test('chat → terminal → chat: the caret is in the composer and the pty sees nothing', async ({
+  // @quarantine — BROKEN, NOT SLOW, and the distinction is the whole point of
+  // the tag. This spec has never been observed green: red on main in run
+  // 32700541733 (both retries), red on this branch in 33320742166,
+  // 33321339241 and 33321899002, red locally on a hardened runner. It times out
+  // on its FIRST action — `getByTestId('renderer-terminal')` — because the
+  // renderer switch is not in the chat header on the page it lands on at all;
+  // everything after that line is unreached.
+  //
+  // It costs 180 s of a TEN-MINUTE PR budget on every pull request, which is 3
+  // of the 10 minutes spent re-proving something already known, and it is the
+  // single reason shard 1 was 6.3 min while the other three were 2.1-3.6.
+  //
+  // Quarantine is not deletion and it is not @extended. `@extended` means "slow
+  // by construction, still passing"; `@quarantine` means "this is a real defect
+  // in the spec or the product and nobody has finished diagnosing it". It runs
+  // every night in `nightly.yml` (which excludes only `@slow` / `@needs-claude`),
+  // so the failure stays visible in a place where it is the headline instead of
+  // background noise on a gate people have learned to ignore. Take the tag off
+  // in the same commit that makes it pass.
+  test('@quarantine chat → terminal → chat: the caret is in the composer and the pty sees nothing', async ({
     page,
   }) => {
     test.setTimeout(180_000)

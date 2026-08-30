@@ -15,6 +15,13 @@
 
 import { expect, test } from '@playwright/test'
 import { api, injectGlobals, startBackend, type Backend } from './harness'
+// The step's copy comes from the SOURCE, not from a string pasted here.
+// `fefe47f8` rewrote step 3 from "Schedules live in Settings now…" to "Workflows
+// are in Settings — …" and this spec went on waiting for the old sentence: a
+// copy edit failed a test about ANCHORING, which tells a reader nothing true.
+// Importing it means a future rewording moves the assertion with it, while a
+// step that stops naming Settings still fails here (see below).
+import { ONBOARDING } from '../../../src/brand/copy'
 
 test.describe('onboarding tour', () => {
   let backend: Backend
@@ -62,8 +69,13 @@ test.describe('onboarding tour', () => {
       page.getByRole('dialog', { name: /Tour step 3 of \d/ }),
     ).toBeVisible({ timeout: 10_000 })
 
-    // The copy names its new home.
-    await expect(page.getByText(/Schedules live in Settings now/)).toBeVisible()
+    // The step-3 card is really step 3's — and its copy still names the home the
+    // anchor points at. Both halves matter: the first says the tour reached the
+    // step under test, the second says the step is still ABOUT Settings, which
+    // is the only thing that makes anchoring on the Settings nav item correct.
+    const step3 = ONBOARDING.tour[2]
+    await expect(page.getByText(step3.body, { exact: false })).toBeVisible()
+    expect(step3.body, 'step 3 still sends the user to Settings').toMatch(/Settings/)
 
     // ── The load-bearing assertion: anchored, not centred ───────────────────
     const geom = await page.evaluate(() => {

@@ -1266,12 +1266,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wire_seal_is_the_only_constructor() {
-        // Compile-time pin: if someone adds a public constructor or makes fields pub,
-        // this test's module-level `assert_impl` breaks. See model.rs's private mod.
-        assert!(!WireEntry::seal(0, &ChatEntry::test_text("u", "hi")).truncated());
-    }
+    // NOTE: "seal is the only constructor" is a property of `model.rs`'s private
+    // `mod sealed` — every field is `pub(super)`, so the compiler is the pin.
+    // There is no test that can fail for it; a real pin would be a trybuild
+    // compile-fail case, not an assertion here.
 
     #[test]
     fn wire_seal_survives_a_pathological_escape_heavy_payload() {

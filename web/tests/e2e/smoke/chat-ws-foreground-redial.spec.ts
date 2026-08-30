@@ -53,7 +53,10 @@ test.describe('chat WS — the foreground redial (A6 T3.3)', () => {
     await backend?.dispose()
   })
 
-  test('a page that gave up while backgrounded reconnects when it comes forward', async ({
+  // @extended — same reason as `chat-ws-staleness-ceiling`: this waits out the
+  // same 90-second product clock (measured 90 s in CI) before the redial it
+  // asserts can even be attempted. It runs every night in `nightly.yml`.
+  test('@extended a page that gave up while backgrounded reconnects when it comes forward', async ({
     page,
   }) => {
     test.setTimeout(420_000)

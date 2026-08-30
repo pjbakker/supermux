@@ -5,12 +5,13 @@
  * the whole point of the roster-wide assignment, and a reroll that could collide
  * would undo it one click at a time. The sheet's picker is
  * `freeTokens(pins)[(reroll - 1) % free.length]`, so what has to hold is: the
- * free list excludes every worn token, the cycle is stable and total, and a
- * session with NO override is byte-identical to today.
+ * free list excludes every worn token, and the cycle is stable and total. (That a
+ * session with NO override keeps its derived face is a property of
+ * `decodeMarkPin(null) === undefined`, pinned by roster-marks.test.ts, plus the
+ * seed-determinism tests in marks-character.test.ts.)
  */
 import { describe, expect, test } from 'bun:test'
 
-import { characterFromSeed } from '../../src/brand/marks/character'
 import {
   encodeMarkPin,
   decodeMarkPin,
@@ -70,15 +71,6 @@ describe('a reroll can never collide', () => {
 describe('no reroll ⇒ nothing changes', () => {
   test('reroll 0 stores no pin at all', () => {
     expect(pick(rosterPins(roster(NAMES)), 0)).toBeUndefined()
-  })
-
-  test('a session with no override renders its derived face, byte-identically', () => {
-    // The face a session gets with `mark_pin = NULL` is exactly the roster
-    // assignment — the column changes nothing until someone rerolls.
-    const pins = rosterPins(roster(NAMES))
-    const derived = characterFromSeed('strato', pins.get('strato'))
-    const withNullColumn = characterFromSeed('strato', decodeMarkPin(null) ?? pins.get('strato'))
-    expect(withNullColumn).toEqual(derived)
   })
 })
 

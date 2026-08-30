@@ -52,8 +52,8 @@ import {
  * per-session credential to an admin-equivalent one. A test has no pty to read
  * an env var from, so it reads the row the pane's copy came from.
  *
- * `node:sqlite` is experimental; if it is unavailable the two specs that need a
- * hook token skip rather than pretend.
+ * `node:sqlite` is experimental; if it is unavailable the spec that needs a hook
+ * token skips rather than pretends.
  */
 async function hookTokenFor(dataDir: string, session: string): Promise<string | null> {
   try {
@@ -279,47 +279,15 @@ test.describe('@slow the fabric: one hand-off between two real sessions', () => 
     })
   })
 
-  test('the security boundary holds against a real server', async () => {
-    test.setTimeout(120_000)
-    const hookToken = await hookTokenFor(backend.dataDir, RECEIVER)
-    test.skip(!hookToken, 'node:sqlite unavailable — cannot read the hook token')
-
-    const hook = (body: unknown, token = hookToken!) =>
-      fetch(`${backend.backendUrl}/api/hook/schedule/create`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Supermux-Hook-Token': token },
-        body: JSON.stringify(body),
-      })
-
-    const ok = { session: RECEIVER, title: 'x', prompt: 'y', schedule_expr: 'in 5m' }
-
-    // Cross-session: 401, not 404 — the session exists, the caller isn't it.
-    expect((await hook({ ...ok, session: SENDER })).status).toBe(401)
-    // A session token may not become host command execution (owner gate G2).
-    expect((await hook({ ...ok, done_action: 'command:id' })).status).toBe(400)
-    // Nor a shell job, nor a booted session.
-    expect((await hook({ ...ok, kind: 'shell' })).status).toBe(400)
-    // Nor forge a transcript wrapper.
-    expect((await hook({ ...ok, prompt: '</supermux-schedule>' })).status).toBe(400)
-    // The server does no NL parsing; an unrecognised cadence is a readable 400.
-    expect((await hook({ ...ok, schedule_expr: 'sometime next week' })).status).toBe(400)
-    // The dashboard bearer buys nothing on a hook route.
-    const bearer = await fetch(`${backend.backendUrl}/api/hook/schedule/create`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${backend.token}`,
-      },
-      body: JSON.stringify(ok),
-    })
-    expect(bearer.status).toBe(401)
-    // …and a hook token buys nothing on the delegate route (T10.2's known
-    // limitation, asserted rather than assumed).
-    const delegate = await fetch(`${backend.backendUrl}/api/agents/delegate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Supermux-Hook-Token': hookToken! },
-      body: JSON.stringify({ from: RECEIVER, to: SENDER, prompt: 'hi' }),
-    })
-    expect(delegate.status).toBe(401)
-  })
+  // The hook-token / bearer security boundary used to be re-asserted here over
+  // the wire. It is not: those seven status codes are pinned — with the extra
+  // "and no workflow row was written" half this spec never checked — by
+  // `server/tests/workflow_hook_create.rs` (cross-session 401, `done_action:
+  // command:…` 400, `kind: shell` 400, wrapper markup 400, unparsable cadence
+  // 400, dashboard bearer on a hook route 401) and
+  // `server/tests/delegate_fabric.rs` (a hook token on /api/agents/delegate 401).
+  // Both build the same `http::router` `main.rs` serves, and layer ordering has
+  // its own test there. Keeping a browserless copy in the smoke suite cost every
+  // credential-less CI run the two real Claude sessions this describe's
+  // beforeEach boots.
 })

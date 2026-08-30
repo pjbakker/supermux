@@ -42,7 +42,13 @@ test.describe('chat WS — the staleness ceiling (A6 T3.2)', () => {
     await backend?.dispose()
   })
 
-  test('goes stale past the ceiling without the socket ever dropping', async ({ page }) => {
+  // @extended — NOT flaky and NOT excluded from the gate; it is moved off the
+  // PR path to `nightly.yml` because its cost is a PRODUCT TIMER, not a test
+  // smell: the ceiling under test is 90 s (`connection.ts:41-53`), so the
+  // fastest honest version of this spec is 90 s of waiting. Measured at 126 s in
+  // CI it was the single most expensive passing test in the suite, ~22% of the
+  // whole passing budget. Nightly runs it unfiltered.
+  test('@extended goes stale past the ceiling without the socket ever dropping', async ({ page }) => {
     test.setTimeout(420_000)
 
     const fx = await chatSession(backend, 'a6t3-stale')

@@ -62,14 +62,26 @@ test.describe('workflows', () => {
       timeout: 15_000,
     })
 
-    await page.getByLabel(/Title|What should this do/i).first().fill('e2e-workflow')
+    // The composer's own accessible names — `workflow-composer.tsx` labels the
+    // name field "Workflow name" (the visible caption above it says "Called")
+    // and the bot picker through `SessionPicker`'s `ariaLabel`. Matching on
+    // those is the point: a rename that breaks a screen reader breaks this test
+    // too, which is exactly what the loose `/Title|.../` guess did NOT do — it
+    // simply stopped matching anything when the editor panel was rebuilt, and
+    // the spec timed out on a page that was working fine.
+    await page.getByLabel('Workflow name').fill('e2e-workflow')
 
-    // The bot it belongs to.
-    await page.getByRole('button', { name: new RegExp(bot) }).first().click().catch(async () => {
-      // The picker renders as a select on some widths; either affordance is fine
-      // as long as the bot ends up chosen.
-      await page.getByRole('combobox').first().selectOption(bot)
-    })
+    // The bot it belongs to. `SessionPicker` is a dropdown of radio items on a
+    // desktop width (the viewport this spec sets) and a Vaul sheet of buttons on
+    // a phone; the trigger carries the same aria-label in both.
+    await page.getByRole('button', { name: /Which bot runs this/ }).click()
+    await page
+      .getByRole('menuitemradio', { name: new RegExp(bot) })
+      .click()
+      .catch(async () => {
+        // Phone form: the sheet lists plain buttons.
+        await page.getByRole('button', { name: new RegExp(bot) }).last().click()
+      })
 
     // ── TWO STEPS — the thing a schedule could never hold ────────────────────
     const stepText = page.getByPlaceholder(/What should .* do/i)
@@ -78,6 +90,15 @@ test.describe('workflows', () => {
     await stepText.last().fill('say the second thing')
 
     await page.getByRole('button', { name: /^Save|Create workflow/ }).first().click()
+
+    // Saving lands on the workflow's OWN page, not back on the list — the
+    // composer navigates to `workflowHref(savedId)`. Assert that, then walk to
+    // the list, which is where the card + rail + toggle + row menu live.
+    await expect(page, 'saving opens the workflow it just created').toHaveURL(
+      /\/workflows\/[^/]+$/,
+      { timeout: 20_000 },
+    )
+    await page.goto(`${backend.baseUrl}/workflows`)
 
     // ── LIST — the card, with its step rail ─────────────────────────────────
     const card = page.locator('li', { hasText: 'e2e-workflow' }).first()
@@ -104,10 +125,18 @@ test.describe('workflows', () => {
     // The rail is the whole reason the redesign exists: a cron table could say
     // "it ran", never "it is on step 2 of 4". The assertion is on the live
     // position, pushed over SSE — not on a refetch this test triggered.
-    await card.getByRole('button', { name: /^Run$|Run now/ }).first().click()
-    await expect(card.getByText(/step \d+\/2|running now/), 'the rail advanced').toBeVisible({
-      timeout: 30_000,
-    })
+    // "Run now" is a row-menu item, not a button on the card face — the card
+    // face carries the title, the rail and the enable switch, and nothing else.
+    await card.getByRole('button', { name: /^More for/ }).click()
+    await page.getByRole('menuitem', { name: /Run now/ }).click()
+    // `.first()`: the card says it twice on purpose — the live position rides
+    // beside the rail, and the hint line underneath swaps "next …" for "running
+    // now". Either one is the proof; a strict locator would only be proof that
+    // the card is redundant.
+    await expect(
+      card.getByText(/step \d+\/2|running now/).first(),
+      'the rail advanced',
+    ).toBeVisible({ timeout: 30_000 })
 
     // ── THE RUN TIMELINE — on the workflow's own page ───────────────────────
     await card.getByText('e2e-workflow').first().click()
@@ -120,9 +149,14 @@ test.describe('workflows', () => {
     ).toBeVisible({ timeout: 30_000 })
 
     // ── DELETE — behind the armed confirm, then gone from the list ──────────
-    await page.getByRole('button', { name: /More|Actions/ }).first().click()
-    await page.getByRole('menuitem', { name: /Delete/ }).click()
-    await page.getByRole('button', { name: /Delete/ }).last().click()
+    // Back on the list, and through the row menu's ArmedButton: press once to
+    // arm ("Delete"), once more to fire ("Delete it"). It is a button inside the
+    // menu, deliberately not a menuitem — a one-press destructive menuitem is
+    // exactly what `use-armed-confirm` exists to stop.
+    await page.goto(`${backend.baseUrl}/workflows`)
+    await page.getByRole('button', { name: /^More for e2e-workflow$/ }).click()
+    await page.getByRole('button', { name: 'Delete', exact: true }).click()
+    await page.getByRole('button', { name: 'Delete it' }).click()
 
     await page.goto(`${backend.baseUrl}/workflows`)
     await expect(
