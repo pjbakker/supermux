@@ -1064,15 +1064,45 @@ fn selection_screen(screen: &str) -> bool {
 /// row. The caret alone is the composer's glyph and the number alone is prose,
 /// so it takes both.
 fn is_selection_row(line: &str) -> bool {
-    let rest = match strip_caret(line) {
+    let rest = match strip_selection_caret(line) {
         Some(rest) => rest,
         None => return false,
     };
     numbered_row(rest)
 }
 
+/// The SELECTION cursor glyphs — a strict superset of [`strip_caret`]'s, adding
+/// `›` (U+203A).
+///
+/// Kept separate on purpose, because the two callers want opposite risk. `›` is
+/// Codex's cursor (and Claude Code draws it too — `keys_to_accept_trust` has
+/// always matched both), so without it `is_selection_row` was blind to EVERY
+/// Codex selector and `selection_screen` could only recognise one through its
+/// ENGLISH key-legend list. That was merely over-cautious while this fed
+/// `send_block`, where an unrecognised dialog just refuses a send; but
+/// [`submit_state`] INVERTS the polarity — an unrecognised selector reads `Stuck`,
+/// and `deliver_prompt` answers `Stuck` by pressing Enter, onto whatever row the
+/// dialog has highlighted. A Codex approval prompt whose command preview pushes
+/// its legend out of the 10-line [`current_screen_tail`] window is exactly that
+/// screen: `› 1. Yes / › 2. No` and nothing else.
+///
+/// It is NOT folded into [`strip_caret`] because that one also feeds
+/// [`agent_composer_visible`], where a matched glyph PERMITS a send. Widening
+/// both would trade a blind Enter for a blind send onto a `›`-drawn non-numbered
+/// dialog line. Widening only the selection side is monotonic: strictly more
+/// screens are recognised as dialogs, so the send guard only ever gets more
+/// conservative.
+fn strip_selection_caret(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    strip_caret(line).or_else(|| t.strip_prefix('›'))
+}
+
 /// The line's leading caret glyph removed, or `None` when it does not open with
 /// one. Leading whitespace is the terminal's left margin, not a signal.
+///
+/// The COMPOSER glyphs only (`❯`, `❱`). Codex's `›` is deliberately absent here:
+/// this feeds [`agent_composer_visible`], where a match PERMITS a send. Selection
+/// detection wants the wider set and uses [`strip_selection_caret`].
 fn strip_caret(line: &str) -> Option<&str> {
     let t = line.trim_start();
     t.strip_prefix('❯').or_else(|| t.strip_prefix('❱'))
@@ -1251,7 +1281,14 @@ fn line_is_prompt_echo(line: &str, prompt: &str) -> bool {
             .collect()
     };
     let l = strip_cursor(line);
-    !l.is_empty() && strip_cursor(prompt).contains(&l)
+    // The match is an UNANCHORED substring, so a SHORT line is matched by
+    // coincidence rather than by evidence: `1. Yes` is swallowed as "echo" by any
+    // prompt that happens to contain those five characters, and swallowing it
+    // hides the very selector row that stops a retry Enter. Below the floor a line
+    // is never treated as echo — which errs toward `Submitted` (no extra Enter),
+    // the safe direction. A genuine wrapped echo line is far longer than this.
+    const MIN_ECHO_CHARS: usize = 12;
+    l.chars().count() >= MIN_ECHO_CHARS && strip_cursor(prompt).contains(&l)
 }
 
 /// Heuristic: are we stuck in a `--resume` session picker (Claude OR Codex)?
@@ -4408,6 +4445,76 @@ mod agent_ready_heuristics_tests {
                 "run the deploy script",
             ),
             SubmitState::Submitted,
+        );
+    }
+
+    /// THE ONE THAT MATTERS. The fixture above passes on its "Press enter to
+    /// confirm" LEGEND, not on its `›` rows — delete that one line and it went
+    /// `Stuck`, so the selector arm could be completely blind to Codex and the suite
+    /// would stay green. Codex previews the proposed command ABOVE the options; a
+    /// preview a few lines tall pushes the legend out of the 10-line
+    /// [`current_screen_tail`] window (while `agent_busy` still reads all 30),
+    /// leaving nothing but the rows themselves.
+    ///
+    /// Before [`strip_selection_caret`] learned `›` this scored `Stuck`, and
+    /// `deliver_prompt` answers `Stuck` with up to three Enters — CONFIRMING the
+    /// highlighted option of an approval dialog nobody read.
+    #[test]
+    fn a_codex_selector_with_no_key_legend_is_still_submitted() {
+        // The dangerous screen in full. The prompt is ECHOED (which is what makes
+        // the fallback arm score `Stuck` rather than the harmless `Unknown`), the
+        // command preview is tall enough to push the legend out of the 10-line
+        // window, and the approval rows are all that is left.
+        let preview =
+            (1..=8).map(|i| format!("  preview line {i}")).collect::<Vec<_>>().join("\n");
+        let cap = format!(
+            "Press enter to confirm\n{preview}\n› run the deploy script\nDo you want to run this command?\n› 1. Yes, run it\n  2. No",
+        );
+        assert!(
+            !current_screen_tail(&cap).to_lowercase().contains("enter to confirm"),
+            "fixture is only meaningful if the legend really is out of the window",
+        );
+        // Without the glyph this is `Stuck` — and `deliver_prompt` answers `Stuck`
+        // by pressing Enter, onto `1. Yes, run it`.
+        assert_eq!(submit_state(&cap, "run the deploy script"), SubmitState::Submitted);
+
+        // The bare rows with nothing else on screen: no echo, so the fallback can
+        // only reach `Unknown`, but the selector must still be SEEN.
+        let bare = format!("› 1. Yes, run it\n› 2. No, keep chatting");
+        assert_eq!(submit_state(&bare, "run the deploy script"), SubmitState::Submitted);
+    }
+
+    /// The widened glyph belongs to SELECTION detection ONLY. `agent_composer_visible`
+    /// still takes just the two Claude composer glyphs, so a `›`-drawn NON-numbered
+    /// dialog line cannot begin to read as "the agent is at its text composer" and
+    /// permit a send. Pins the asymmetry the split exists for.
+    #[test]
+    fn the_codex_glyph_widens_selection_but_not_composer_permission() {
+        assert!(is_selection_row("› 1. Yes"));
+        assert!(strip_selection_caret("› 1. Yes").is_some());
+        assert!(strip_caret("› 1. Yes").is_none());
+        assert!(!agent_composer_visible("› Do you want to proceed?"));
+        // Both Claude glyphs keep working on both sides.
+        assert!(is_selection_row("❯ 1. Yes"));
+        assert!(agent_composer_visible("❯ write me a haiku"));
+    }
+
+    /// A short GENUINE option row must not be eaten by the echo filter merely because
+    /// its handful of characters occur somewhere in the prompt. `line_is_prompt_echo`
+    /// is an UNANCHORED substring test, so without the length floor `1. Yes` vanishes
+    /// from the screen whenever the prompt happens to contain it — taking the selector
+    /// with it and turning a live approval dialog into `Stuck` plus a blind Enter.
+    #[test]
+    fn a_short_option_row_is_not_swallowed_as_prompt_echo() {
+        let prompt = "reply with 1. Yes or 2. No when the deploy finishes";
+        assert!(!line_is_prompt_echo("› 1. Yes", prompt));
+        assert!(!line_is_prompt_echo("  2. No", prompt));
+        // A real wrapped echo line is well past the floor and is still filtered.
+        assert!(line_is_prompt_echo("❯ reply with 1. Yes or 2. No when", prompt));
+        assert_eq!(
+            submit_state("› 1. Yes\n  2. No", prompt),
+            SubmitState::Submitted,
+            "the dialog must survive the echo filter",
         );
     }
 
