@@ -41,6 +41,7 @@ export type TabVerb =
   | 'wake'
   | 'sleep'
   | 'pin'
+  | 'keepalive'
   | 'update'
   | 'close'
   | 'grant'
@@ -53,6 +54,7 @@ const VERB_LEAD: Record<TabVerb, string> = {
   wake: "Couldn't wake the tab",
   sleep: "Couldn't close the page",
   pin: "Couldn't change the pin",
+  keepalive: 'Could not change keep-signed-in for this tab',
   update: "Couldn't save that change",
   close: "Couldn't close the tab",
   grant: 'Grant failed',
@@ -137,6 +139,11 @@ export interface BrowserTabActions {
   sleep: (id: string) => Promise<BrowserTab | null>
   /** Pin / unpin — a pinned tab is not reaped and sorts first. */
   setPinned: (id: string, pinned: boolean) => Promise<boolean>
+  /** "Keep me signed in". A pure DB write server-side — the first check lands
+   *  within a minute, and the sweep learns the cadence from the cookie jar.
+   *  `false` = the server refused (a non-web page, or the fifth tab), and the
+   *  human has already been told why. */
+  setKeepAlive: (id: string, on: boolean, host?: string) => Promise<boolean>
   patch: (id: string, patch: TabPatch) => Promise<boolean>
   /** Close the tab. Does NOT sign anything out — same jar, same cookies. */
   close: (id: string) => Promise<boolean>
@@ -246,6 +253,23 @@ export function useBrowserTabActions(): BrowserTabActions {
     sleep: (id) => settled(sleepM.mutateAsync(id)),
     setPinned: async (id, pinned) =>
       (await settled(patchM.mutateAsync({ id, patch: { pinned }, verb: 'pin' }))) !== null,
+    // The ⋯ menu CLOSES on select, so a success that changes nothing on screen
+    // needs a word. Failures already speak through `patchM`'s `fail(verb)`,
+    // which is how the server's two refusals reach the owner.
+    setKeepAlive: async (id, on, host) => {
+      const out = await settled(
+        patchM.mutateAsync({ id, patch: { keepalive_enabled: on }, verb: 'keepalive' }),
+      )
+      if (out === null) return false
+      const what = host ?? 'this tab'
+      toast({
+        message: on
+          ? `Keeping ${what} signed in — first check within a minute.`
+          : `Stopped keeping ${what} signed in.`,
+        duration: 4000,
+      })
+      return true
+    },
     patch: async (id, patch) =>
       (await settled(patchM.mutateAsync({ id, patch, verb: 'update' }))) !== null,
     close: async (id) => (await settled(closeM.mutateAsync(id))) !== null,

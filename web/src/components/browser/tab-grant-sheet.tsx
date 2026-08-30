@@ -17,7 +17,7 @@
 // close-tab note says a delete is not a sign-out — because it is not.
 import * as React from 'react'
 
-import { Loader2, Pin, PinOff, Plus, X } from 'lucide-react'
+import { Loader2, Pin, PinOff, Plus, Shield, ShieldCheck, X } from 'lucide-react'
 
 import { ALL_AGENTS, companyGrantKey } from '@/lib/api/connectors'
 import {
@@ -30,6 +30,7 @@ import {
   type BrowserTab,
   type GrantCandidate,
 } from '@/lib/api/browser'
+import { canKeepSignedIn, keepAliveSheetRow } from '@/lib/browser/keep-signed-in'
 import { GrantControl, type GrantScope } from '@/components/store/grant-control'
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
 import { SessionPicker } from '@/components/session/session-picker'
@@ -46,6 +47,8 @@ export interface TabGrantSheetProps {
   onGrant: (grantee: string) => Promise<unknown>
   onRevoke: (grantee: string) => Promise<unknown>
   onPin: (pinned: boolean) => void
+  /** "Keep me signed in". Omit to hide the row (a host with no such verb). */
+  onKeepAlive?: (on: boolean) => void
   /** Replace the origin allowlist. Omit to render it read-only. */
   onOrigins?: (origins: string[]) => void
   /** Offline bench only — see `ResponsiveSheet.contentTheme`. */
@@ -60,6 +63,7 @@ export function TabGrantSheet({
   onGrant,
   onRevoke,
   onPin,
+  onKeepAlive,
   onOrigins,
   contentTheme,
 }: TabGrantSheetProps) {
@@ -175,6 +179,33 @@ export function TabGrantSheet({
               <Pin className="size-4 shrink-0 text-muted-foreground" aria-hidden />
             )}
           </button>
+
+          {/* KEEP ME SIGNED IN — the same primitive as Pin, one row down.
+              State-first here (the ⋯ menu says the verb), because this is where
+              there is room for the COST: an enabled tab is held open, and a
+              held-open tab keeps the browser process up. Say so. */}
+          {onKeepAlive && canKeepSignedIn(tab.url) && (
+            <button
+              type="button"
+              data-tab-keepalive={tab.id}
+              onClick={() => onKeepAlive(!tab.keepalive_enabled)}
+              className="flex min-h-11 items-center justify-between gap-3 rounded-xl border border-border px-3 text-left transition-colors hover:bg-secondary/60 motion-reduce:transition-none"
+            >
+              <span className="flex min-w-0 flex-col">
+                <span className="text-[13px] font-medium text-foreground">
+                  {keepAliveSheetRow(tab).title}
+                </span>
+                <span className="text-[11.5px] text-muted-foreground">
+                  {keepAliveSheetRow(tab).detail}
+                </span>
+              </span>
+              {tab.keepalive_enabled ? (
+                <ShieldCheck className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+              ) : (
+                <Shield className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+              )}
+            </button>
+          )}
 
           {/* GIVE A BOT ACCESS — the easy path. The same roster picker the
               workflows composer uses (chic pill + faces, a DropdownMenu on a

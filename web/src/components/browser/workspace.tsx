@@ -76,6 +76,8 @@ import {
   Pin,
   RotateCw,
   Search,
+  Shield,
+  ShieldCheck,
   TextSelect,
   Users,
   X,
@@ -106,6 +108,7 @@ import {
 } from '@/lib/browser/closed-tabs'
 import { applyOrder } from '@/lib/browser/tab-order'
 import { NO_CAPS, NO_FIND, copyText, type FindResult, type PageCaps } from '@/lib/browser/page-tools'
+import { keepAliveRow } from '@/lib/browser/keep-signed-in'
 import { signInGate } from '@/lib/browser/sign-in-state'
 import type { LoginScan } from '@/lib/browser/login-detect'
 
@@ -148,6 +151,10 @@ export interface BrowserWorkspaceProps {
   onStop?: (id: string) => void
   onClose: (id: string) => void
   onPin: (id: string, pinned: boolean) => void
+  /** "Keep me signed in" — refresh this tab's session in the background so the
+   *  bots that use it do not wake up logged out. Absent = the host has no such
+   *  verb, and the row is not offered. */
+  onKeepAlive?: (id: string, on: boolean) => void
   onGrant: (id: string, grantee: string) => Promise<unknown>
   onRevoke: (id: string, grantee: string) => Promise<unknown>
   onOrigins?: (id: string, origins: string[]) => void
@@ -188,6 +195,7 @@ export function BrowserWorkspace({
   onStop,
   onClose,
   onPin,
+  onKeepAlive,
   onGrant,
   onRevoke,
   onOrigins,
@@ -473,6 +481,19 @@ export function BrowserWorkspace({
       disabled: !caps.copy,
       hint: caps.copy ? undefined : 'Reading the page selection needs a server update',
     },
+    // "Keep me signed in". The label is the VERB (the Pin/Unpin precedent at the
+    // top of this file); the second line is the evidence, because a phone has no
+    // hover and `hint` is only a `title=`.
+    ...(onKeepAlive
+      ? [
+          {
+            id: 'keepalive',
+            icon: active?.keepalive_enabled ? ShieldCheck : Shield,
+            separated: true,
+            ...keepAliveRow(active),
+          } satisfies BrowserMenuItem,
+        ]
+      : []),
     { id: 'sharing', label: 'Sharing & settings…', icon: Users, separated: true, disabled: !active },
   ]
 
@@ -538,6 +559,9 @@ export function BrowserWorkspace({
         return
       case 'copy-selection':
         copySelection()
+        return
+      case 'keepalive':
+        if (active) onKeepAlive?.(active.id, !active.keepalive_enabled)
         return
       case 'sharing':
         if (active) setSheetFor(active.id)
@@ -747,6 +771,9 @@ export function BrowserWorkspace({
         onGrant={(g) => (sheetTab ? onGrant(sheetTab.id, g) : Promise.resolve())}
         onRevoke={(g) => (sheetTab ? onRevoke(sheetTab.id, g) : Promise.resolve())}
         onPin={(pinned) => sheetTab && onPin(sheetTab.id, pinned)}
+        onKeepAlive={
+          onKeepAlive && sheetTab ? (on) => onKeepAlive(sheetTab.id, on) : undefined
+        }
         onOrigins={
           onOrigins && sheetTab ? (origins) => onOrigins(sheetTab.id, origins) : undefined
         }

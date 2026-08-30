@@ -10,6 +10,7 @@
 // takeover canvas + socket, which no other route needs.
 import * as React from 'react'
 
+import { tabHost } from '@/lib/api/browser'
 import { BrowserWorkspace } from '@/components/browser/workspace'
 import { useCompanyScope } from '@/components/roster/use-company-scope'
 import { useBrowserTabActions, useBrowserTabs } from '@/hooks/use-browser-tabs'
@@ -93,6 +94,15 @@ export function BrowserRoute() {
         busy={actions.pending}
         onClose={(id) => void actions.close(id)}
         onPin={(id, pinned) => void actions.setPinned(id, pinned)}
+        // "Keep me signed in". The host goes with it so the receipt names the
+        // site the owner just acted on, not "this tab".
+        onKeepAlive={(id, on) =>
+          void actions.setKeepAlive(
+            id,
+            on,
+            tabHost(tabs.find((t) => t.id === id)?.url ?? ''),
+          )
+        }
         onGrant={(id, grantee) => actions.grant(id, grantee)}
         onRevoke={(id, grantee) => actions.revoke(id, grantee)}
         onOrigins={(id, origins) => void actions.patch(id, { origins })}
