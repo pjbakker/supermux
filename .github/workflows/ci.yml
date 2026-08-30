@@ -1,5 +1,41 @@
 name: ci
 
+# THE BUDGET: a pull request's CI must finish inside TEN MINUTES of wall clock.
+#
+# That is an owner requirement, not an aspiration, and it is the reason for
+# every trade-off below. Where this workflow was on 2026-08-30 (run
+# 33318390754, the last run before this commit) and where the numbers came from:
+#
+#   job                     before     what it was
+#   web                      1.3 min   build + unit + size + lint
+#   fmt                      0.1 min   advisory
+#   server (check + test)    9.1 min   cache 1.5 / check 0.8 / no-run 1.5 / test 4.7
+#   build-server             4.6 min   one debug binary, from scratch every run
+#   e2e shard (worst)       13.2 min   19 tests, 12.4 min of them inside playwright
+#   ------------------------------------------------------------------------
+#   WALL CLOCK              17.9 min   = build-server 4.6 + worst shard 13.2
+#
+# The critical path was `build-server -> e2e`, and inside e2e the dominant cost
+# was not the tests that PASS. Measured per-test from the four shard logs of that
+# run: 44 passing tests cost 569 s in total, and 23 FAILING tests cost 1795 s —
+# 76% of all e2e time was spent waiting out the 90-second timeout of tests that
+# were already broken. So the levers, in the order the numbers justify them:
+#
+#   1. fix the failures (a first-run overlay from #123 covered `/` in every
+#      spec — see `web/tests/e2e/smoke/harness.ts`); the 1795 s largely goes away
+#   2. cache the e2e server BINARY, not just its target dir, so `build-server`
+#      is seconds on any PR that does not touch `server/` (this one)
+#   3. bound what being wrong costs: the per-test timeout is 60 s, measured
+#      against a 32 s slowest self-unbudgeted passing test
+#   4. move what is slow BY CONSTRUCTION off the PR path into `nightly.yml`
+#      (two chat-WS specs that sit out the product's own 90 s clock)
+#   5. delete duplicated work rather than coverage (`cargo check --all-targets`
+#      was recompiled verbatim by `cargo test --no-run` one step later)
+#
+# Nothing here was dropped silently. Everything moved off the PR gate runs in
+# `nightly.yml` (and, for the installer matrix, on `install-smoke.yml`'s own
+# schedule), and each move says WHY at its call site.
+
 on:
   push:
     branches: [main]
@@ -85,12 +121,37 @@ jobs:
     timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      # THE BINARY ITSELF IS THE CACHE ENTRY, not the target dir.
+      #
+      # Measured on run 33318390754: this job was 4.6 min (3.3 min of it the
+      # cargo build) and it sits IN FRONT of all four e2e shards, so it is 4.6
+      # min of the PR's 10-minute budget spent before a single test starts. The
+      # thing the shards need is one 25 MB executable, and that executable is a
+      # pure function of the server sources + the lockfile + the toolchain file.
+      # So key a cache on exactly those and skip cargo entirely on a hit: a PR
+      # that touches only `web/` or `.github/` pays seconds instead of minutes.
+      #
+      # `server/static` is NOT in the key on purpose — this binary is built
+      # without a web bundle (the harness serves the app from Vite), so the
+      # embedded assets cannot change what the shards run.
+      - name: Cache key inputs
+        id: bin-key
+        run: |
+          echo "hash=${{ runner.os }}-e2e-bin-${{ hashFiles('server/src/**', 'server/Cargo.lock', 'server/Cargo.toml', 'server/build.rs', 'server/migrations/**', 'server/rust-toolchain.toml') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: bin-cache
+        with:
+          path: server/target/debug/supermux-server
+          key: ${{ steps.bin-key.outputs.hash }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch
+        if: steps.bin-cache.outputs.cache-hit != 'true'
         with:
           toolchain: stable
       - uses: actions/cache@v4
+        if: steps.bin-cache.outputs.cache-hit != 'true'
         with:
           path: |
             ~/.cargo/registry
@@ -104,6 +165,7 @@ jobs:
       # CLAUDE.md forbids --release. No web bundle is embedded on purpose: the
       # harness serves the app from Vite, not from the binary's static assets.
       - name: Build the server binary
+        if: steps.bin-cache.outputs.cache-hit != 'true'
         working-directory: server
         run: cargo build --bin supermux-server
       - uses: actions/upload-artifact@v4
@@ -119,9 +181,13 @@ jobs:
     name: e2e (smoke ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     needs: build-server
-    # One shard is roughly a quarter of a ~25m suite; the headroom is for a cold
-    # Playwright browser download and the artifact fetch.
-    timeout-minutes: 25
+    # A shard is ~18 tests. With the first-run fix in place the whole suite's
+    # measured passing time is ~570 s minus the 216 s now tagged `@extended`, so
+    # a shard is ~1.5 min of tests plus ~1 min of fixed cost. Fifteen minutes is
+    # therefore a HANG detector, not a budget: if a shard is still going at 15
+    # min something is stuck, and killing it early is what keeps the PR inside
+    # ten minutes instead of letting one wedged runner spend twenty-five.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -175,9 +241,18 @@ jobs:
       #
       # Measured split of the 73 eligible tests: 19 / 19 / 17 / 18. Retries are no
       # longer global — see playwright.config.ts.
+      # `@extended` joins `@slow` / `@needs-claude` in the exclusion, and for a
+      # DIFFERENT reason: those two cannot pass here, `@extended` can — it is
+      # simply slow BY CONSTRUCTION rather than by risk density. Measured on run
+      # 33318390754, two specs cost 216 s of a 569 s passing-suite:
+      # `chat-ws-staleness-ceiling` (126 s) has to sit out the product's real
+      # 90-second staleness ceiling and `chat-ws-foreground-redial` (90 s) waits
+      # out the same clock. No amount of test cleverness shortens a timer the
+      # product owns. They still run every night in `nightly.yml`, unsharded and
+      # unfiltered, so the coverage moves rather than disappears.
       - name: Smoke suite (shard ${{ matrix.shard }}/4)
         working-directory: web
-        run: bun x playwright test tests/e2e/smoke --shard=${{ matrix.shard }}/4 --grep-invert "@slow|@needs-claude"
+        run: bun x playwright test tests/e2e/smoke --shard=${{ matrix.shard }}/4 --grep-invert "@slow|@needs-claude|@extended"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -208,6 +283,11 @@ jobs:
       # GitHub-hosted ubuntu-latest. Tests still run + pass; we only lose
       # file:line in panic backtraces in CI logs, which is fine.
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # A runner never reuses an incremental-compilation dir within a job, and
+      # `server/target` IS the cache payload — so `incremental/` is hundreds of
+      # megabytes that only ever make the restore and the save slower. Measured:
+      # the cache restore alone was 1.5 min on run 33318390754.
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         working-directory: server
@@ -238,7 +318,14 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
       # Debug builds only — CLAUDE.md forbids --release in CI (OOM risk on
       # small hosts and the published binary is built natively by deploy.sh).
-      - run: cargo check --all-targets
+      #
+      # `cargo check --all-targets` USED TO RUN HERE and was pure duplication:
+      # this crate has no benches and no examples (`server/Cargo.toml` declares
+      # one `[[bin]]`), so `--all-targets` is exactly lib + bin + the 69 test
+      # targets — every one of which `cargo test --no-run` then COMPILES from
+      # scratch a step later. Measured on run 33318390754 that step cost 0.8 min
+      # and caught nothing the next step could miss. Removed, not weakened: a
+      # type error in any target still fails `cargo test --no-run`.
       - run: cargo test --no-run
       - run: cargo test
 

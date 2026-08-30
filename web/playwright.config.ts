@@ -33,8 +33,23 @@ export default defineConfig({
   // nondeterministic spec pass on the second try forever, unnoticed, which is
   // how a suite rots into "just re-run it". A spec that flakes earns the tag.
   retries: 0,
-  // Generous: booting a Rust binary + Vite + tmux pane settle dominates.
-  timeout: 90_000,
+  // 60 s, and the number is a MEASUREMENT of the ceiling a failure is allowed
+  // to cost, not a guess at how long a test needs.
+  //
+  // Measured over all four shards of CI run 33318390754: the slowest passing
+  // test that does NOT set its own budget finished in 32 s; every test above
+  // that (126 s, 90 s, 66 s) already calls `test.setTimeout` because it waits
+  // out a product clock. So 60 s is ~1.9x the real worst case and no passing
+  // test is anywhere near it.
+  //
+  // What it buys is the failure path. That same run spent 1795 s — 76% of ALL
+  // e2e test time — on tests that failed, each one sitting out the old 90 s
+  // before Playwright would call it. In a ten-minute PR budget the cost of
+  // being wrong has to be bounded too: a spec that has already hung for a
+  // minute is not going to recover, it is going to be read by a human. A test
+  // that genuinely needs longer says so in its own file, where the reason is
+  // visible next to the code.
+  timeout: 60_000,
   expect: { timeout: 10_000 },
   reporter: process.env.CI ? [['github'], ['list']] : 'list',
   use: {
