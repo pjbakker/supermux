@@ -11,9 +11,9 @@
  *  1. The validation rule, which must mirror the server's `is_dns_label`
  *     (`server/src/config.rs`) EXACTLY — a client that accepts what the API
  *     refuses turns a typo into a failed POST instead of an inline hint. One
- *     label, `a-z0-9-`, no leading/trailing hyphen, ≤63 chars. No dots: every
- *     company address rides one wildcard `*.<base>` CNAME, which covers exactly
- *     one level.
+ *     label, `a-z0-9-`, no leading/trailing hyphen, ≤63 chars. No dots:
+ *     Cloudflare's Universal SSL covers one level, so a deeper name would resolve
+ *     and then fail TLS.
  *
  *  2. The POST body. `subdomain` must be OMITTED when the caller has no opinion,
  *     because the server reads an absent field as "keep the label this company
@@ -28,6 +28,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import { externalAccessApi } from '@/lib/api'
 import {
+  dnsPlanLine,
   hostPayload,
   labelOf,
   previewHost,
@@ -54,7 +55,7 @@ describe('subdomainError', () => {
     expect(subdomainError('   ')).toBe('Pick a name for the address')
     expect(subdomainError('-team')).toBe('Cannot start or end with a hyphen')
     expect(subdomainError('team-')).toBe('Cannot start or end with a hyphen')
-    // A dot is a SECOND level — the one wildcard CNAME would never serve it.
+    // A dot is a SECOND level — outside Universal SSL's coverage.
     expect(subdomainError('eu.team')).toBe('Use only letters, numbers and hyphens')
     expect(subdomainError('team_eu')).toBe('Use only letters, numbers and hyphens')
     expect(subdomainError('team eu')).toBe('Use only letters, numbers and hyphens')
@@ -117,6 +118,27 @@ describe('labelOf', () => {
     expect(labelOf('team.other.test', 'example.com')).toBe('')
     expect(labelOf('eu.team.example.com', 'example.com')).toBe('')
     expect(labelOf('', 'example.com')).toBe('')
+  })
+})
+
+/**
+ * The footprint promise. supermux used to write ONE wildcard record
+ * (`*.<zone>`), which pointed every undefined name on the operator's real domain
+ * at this box — cheap for us, far too much of their zone for a product that needs
+ * one hostname per company. It now writes one record per company address, and the
+ * wizard has to SAY which one before the click; this pins that sentence (and that
+ * it never contains a `*`).
+ */
+describe('dnsPlanLine', () => {
+  test('names the single record that will be created', () => {
+    expect(dnsPlanLine('team', 'example.com')).toBe('Creates one DNS record: team.example.com')
+    expect(dnsPlanLine('  Team ', 'example.com')).toBe('Creates one DNS record: team.example.com')
+  })
+
+  test('never promises a wildcard', () => {
+    for (const label of ['team', '', 'hq']) {
+      expect(dnsPlanLine(label, 'example.com')).not.toContain('*')
+    }
   })
 })
 

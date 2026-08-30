@@ -18,8 +18,9 @@ export const MAX_LABEL_LEN = 63
  *
  *  Mirrors the server's `is_dns_label`: 1..63 characters of `a-z`, `0-9` and `-`,
  *  never starting or ending with `-`. Deliberately narrower than a hostname in
- *  general (no dots): every company address rides ONE wildcard `*.<base>` CNAME,
- *  which covers exactly one level, so `eu.team` could never resolve.
+ *  general (no dots): Cloudflare's Universal SSL certificate covers one level
+ *  (`<label>.<zone>`), so `eu.team` would resolve and then fail its TLS
+ *  handshake.
  *
  *  Callers pass the RAW input — trimming + lower-casing is what the server does
  *  too (`Team ` is accepted and stored as `team`), so the field never scolds
@@ -76,4 +77,13 @@ export function labelOf(host: string, zone: string): string {
   if (!h.endsWith(suffix)) return ''
   const label = h.slice(0, -suffix.length)
   return subdomainError(label) ? '' : label
+}
+
+/** The promise the wizard makes BEFORE the click: exactly what supermux will add
+ *  to the operator's Cloudflare zone. One record, named in full — never a vague
+ *  "we'll set up DNS", and never a wildcard (`*.<zone>`), which is what this
+ *  product used to write and what made the footprint indefensible: it pointed
+ *  every undefined name on someone's real domain at one box. */
+export function dnsPlanLine(label: string, zone: string | null): string {
+  return `Creates one DNS record: ${previewHost(label, zone)}`
 }

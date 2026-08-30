@@ -32,6 +32,7 @@ import type {
   ProvisionResult,
   QuickTunnelResult,
   QuickTunnelTeardownResult,
+  TightenDnsResult,
   VerifyLoginResult,
   ZonesResult,
 } from '@/lib/api'
@@ -72,6 +73,14 @@ function multiZones(): boolean {
   return new URLSearchParams(window.location.search).get('zones') === 'multi'
 }
 
+/** `?wildcard=1` seeds a box provisioned by an OLD build: it still holds a
+ *  `*.<base>` record, so the wizard's "tighten" affordance is reviewable
+ *  offline. */
+function wildcardSeed(): boolean {
+  if (typeof window === 'undefined') return false
+  return new URLSearchParams(window.location.search).get('wildcard') === '1'
+}
+
 interface QuickTunnelMock {
   host: string
   companyId: number
@@ -91,6 +100,7 @@ interface MockState {
   quickTunnel: QuickTunnelMock | null // the "try without a domain" branch
   agentInbox: { address: string; destination: string } | null // CF agent-inbox
   agentInboxAttempts: number // first provision pending; a re-run ("Check again") verifies
+  wildcardDns: boolean // a legacy `*.<base>` record this box still has (?wildcard=1)
   seededAt: number
 }
 
@@ -122,6 +132,7 @@ function initialState(entry: Entry): MockState {
     quickTunnel: null,
     agentInbox: null,
     agentInboxAttempts: 0,
+    wildcardDns: wildcardSeed(),
     seededAt: now,
   }
   // Q — the "try without a domain" branch. No CF token, no base domain, no Google:
@@ -206,6 +217,9 @@ export const externalAccessMock = {
         dns_ok: tunnel === 'healthy',
         google: state.google,
         base_domain: state.baseDomain,
+        wildcard_dns: state.wildcardDns && state.baseDomain != null,
+        // One record per company host — and nothing until an address is written.
+        dns_records: state.hostWritten && host ? [host] : [],
         quick_tunnel: qt
           ? {
               active: qt.active,
@@ -279,10 +293,14 @@ export const externalAccessMock = {
   async provisionTunnel(): Promise<ProvisionResult> {
     await wait(500)
     state.provisionedAt = Date.now()
+    // Per-host records only: provisioning creates one CNAME for each company
+    // address already chosen — never a `*.<base>` wildcard.
+    const records = state.hostWritten ? [derived(state.baseDomain).host] : []
     return {
       tunnel_id: 'e1a2b3c4-5678-90ab-cdef-1234567890ab',
       connector: 'started',
-      reachable_host: `*.${state.baseDomain ?? 'example.com'}`,
+      reachable_host: records.join(', '),
+      dns_records: records,
     }
   },
 
@@ -315,6 +333,14 @@ export const externalAccessMock = {
     return { configured: true }
   },
 
+  async tightenDns(): Promise<TightenDnsResult> {
+    await wait(700)
+    const records = state.hostWritten ? [derived(state.baseDomain).host] : []
+    const wildcard_removed = state.wildcardDns
+    state.wildcardDns = false
+    return { records, wildcard_removed }
+  },
+
   async host(_companyId?: number, subdomain?: string): Promise<HostResult> {
     await wait(400)
     const before = derived(state.baseDomain).host
@@ -330,6 +356,9 @@ export const externalAccessMock = {
       redirect_uri: redirect,
       // Only when the address actually moved — same honesty as the server.
       previous_host: before && before !== host ? before : null,
+      // No tunnel yet ⇒ the record is created by "Set up access", not here.
+      dns: state.provisionedAt == null ? 'pending' : before === host ? 'exists' : 'created',
+      previous_dns_removed: Boolean(before) && before !== host && state.provisionedAt != null,
     }
   },
 

@@ -190,8 +190,16 @@ async fn provision_tunnel_creates_once_and_reuses_on_rerun() {
         .expect("first provision ok");
     assert_eq!(first.0.data.tunnel_id, "tunnel-xyz");
     assert_eq!(first.0.data.connector, "started");
-    // The wildcard reachable host is derived from the chosen base domain.
-    assert_eq!(first.0.data.reachable_host, "*.example.com");
+    // ZERO DNS on a box with no company hosts yet — and NEVER a wildcard: the
+    // operator's zone gets a record only when a company actually needs one.
+    assert!(first.0.data.dns_records.is_empty(), "no records: {:?}", first.0.data.dns_records);
+    assert_eq!(first.0.data.reachable_host, "");
+    assert!(cf.dns_names().is_empty(), "provision wrote DNS: {:?}", cf.dns_names());
+    assert!(
+        cf.ingress_hosts().is_empty(),
+        "ingress should be the 404 catch-all only: {:?}",
+        cf.ingress_hosts()
+    );
     assert_eq!(cf.create_count(), 1, "created exactly once");
 
     // Re-run: the existing tunnel is reused, no second create.
@@ -561,8 +569,8 @@ async fn company_host_rename_replaces_the_entry_and_reports_the_old_address() {
     cleanup(state, dir).await;
 }
 
-/// Uniform 400s for anything that is not a single DNS label — nothing that could
-/// never resolve under the one wildcard `*.<base>` CNAME reaches the store.
+/// Uniform 400s for anything that is not a single DNS label — a name that could
+/// not get a record (or a Universal SSL certificate) never reaches the store.
 #[tokio::test]
 async fn company_host_refuses_an_illegal_subdomain() {
     let (state, dir) = test_state().await;
@@ -736,6 +744,319 @@ async fn a_stale_base_domain_de_canonicalises_the_entry() {
         .await
         .unwrap();
     assert!(!v.0.data.ok, "verify must not be green under a stale base");
+    cleanup(state, dir).await;
+}
+
+// ── per-host DNS (the wildcard replacement) ──────────────────────────────────
+
+/// Token + base domain + a provisioned tunnel: the state every DNS test needs.
+/// Returns the CF mock so the zone's records can be seeded and asserted.
+async fn provisioned_box(state: &AppState, dir: &std::path::Path) -> Arc<MockCfApi> {
+    let cf = inject_cf(state);
+    inject_host(state);
+    crate::config::write_token_0600(&dir.join(super::CF_TOKEN_FILE), "valid-cf-token").unwrap();
+    set_base(state).await;
+    provision_tunnel_handler(State(state.clone()), OptCtx(None))
+        .await
+        .expect("provision ok");
+    cf
+}
+
+const OUR_TARGET: &str = "tunnel-xyz.cfargotunnel.com";
+
+/// The core of the footprint change: ONE record and ONE ingress rule for the
+/// company's own address — never `*.<base>`, which would have pointed every
+/// undefined name on the operator's domain at this box.
+#[tokio::test]
+async fn company_host_creates_one_record_and_one_ingress_rule() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    let co = crate::db::companies::create(&state.pool, "enverder", "Enverder", "/tmp/enverder")
+        .await
+        .unwrap();
+    let res = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("team".into()),
+        })),
+    )
+    .await
+    .expect("host ok");
+    assert_eq!(res.0.data.host, "team.example.com");
+    assert_eq!(res.0.data.dns, "created");
+    assert_eq!(cf.dns_names(), vec!["team.example.com".to_string()]);
+    assert_eq!(cf.ingress_hosts(), vec!["team.example.com".to_string()]);
+    assert!(
+        !cf.dns_names().iter().any(|n| n.starts_with('*')),
+        "no wildcard may ever be written"
+    );
+
+    // Re-asserting the same address is idempotent: no second record, no error.
+    let again = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .expect("re-assert ok");
+    assert_eq!(again.0.data.dns, "exists");
+    assert_eq!(cf.created_names().len(), 1, "created exactly once");
+
+    // A SECOND company adds its own record and joins the ingress document.
+    let two = crate::db::companies::create(&state.pool, "beta", "Beta", "/tmp/beta")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(two.id), None)
+        .await
+        .expect("second company ok");
+    assert_eq!(
+        cf.ingress_hosts(),
+        vec!["beta.example.com".to_string(), "team.example.com".to_string()],
+        "ingress enumerates every company host"
+    );
+    cleanup(state, dir).await;
+}
+
+/// A rename moves the record: the new name is created, the OLD one is deleted
+/// (it pointed at our tunnel), and the ingress document follows.
+#[tokio::test]
+async fn company_host_rename_moves_the_record_and_the_ingress() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    assert_eq!(cf.dns_names(), vec!["acme.example.com".to_string()]);
+
+    let renamed = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await
+    .expect("rename ok");
+    assert_eq!(renamed.0.data.host, "hq.example.com");
+    assert_eq!(renamed.0.data.dns, "created");
+    assert!(renamed.0.data.previous_dns_removed, "the old record must go");
+    assert_eq!(cf.dns_names(), vec!["hq.example.com".to_string()]);
+    assert_eq!(cf.ingress_hosts(), vec!["hq.example.com".to_string()]);
+    cleanup(state, dir).await;
+}
+
+/// The guard that makes this safe to point at someone's real domain: a name the
+/// OPERATOR already uses is refused, never re-pointed — and nothing is persisted.
+#[tokio::test]
+async fn company_host_refuses_a_name_the_operator_already_uses() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    cf.seed_dns("team.example.com", "someone-elses-app.pages.dev");
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let res = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("team".into()),
+        })),
+    )
+    .await;
+    match res {
+        Err(AppError::Conflict(m)) => {
+            assert!(m.contains("team.example.com"), "{m}");
+            assert!(m.contains("someone-elses-app.pages.dev"), "names the current target: {m}");
+        }
+        other => panic!("expected a conflict naming the existing record, got {other:?}"),
+    }
+    // Untouched, and no allowlist entry written on a refusal.
+    assert_eq!(
+        cf.dns.lock().unwrap()[0].content,
+        "someone-elses-app.pages.dev",
+        "the operator's record must be left exactly as it was"
+    );
+    assert!(cf.dns_deleted.lock().unwrap().is_empty(), "nothing deleted");
+    assert!(state.human_auth_cfg().company_entry(co.id).is_none());
+    cleanup(state, dir).await;
+}
+
+/// Deleting a company releases its address: allowlist entry, DNS record, ingress
+/// rule — and NOTHING that is not ours.
+#[tokio::test]
+async fn releasing_a_company_removes_only_our_record() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    // A record the operator owns, on a name supermux never claimed.
+    cf.seed_dns("www.example.com", "their-site.pages.dev");
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let two = crate::db::companies::create(&state.pool, "beta", "Beta", "/tmp/beta")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(two.id), None)
+        .await
+        .unwrap();
+
+    let warning = super::release_company_host(&state, co.id).await;
+    assert!(warning.is_none(), "clean release: {warning:?}");
+    // Ours is gone; the other company's and the operator's own record remain.
+    let mut names = cf.dns_names();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["beta.example.com".to_string(), "www.example.com".to_string()]
+    );
+    assert_eq!(cf.ingress_hosts(), vec!["beta.example.com".to_string()]);
+    // …and the login surface is retired with it.
+    assert!(state.human_auth_cfg().company_entry(co.id).is_none());
+    assert!(state.human_auth_cfg().host_entry("acme.example.com").is_none());
+    cleanup(state, dir).await;
+}
+
+/// A record that is NOT ours survives a release of the company that claimed that
+/// name — supermux deletes what it created and nothing else.
+#[tokio::test]
+async fn releasing_a_company_never_deletes_a_foreign_record() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    // The operator re-points that name at their own thing behind our back.
+    {
+        let mut dns = cf.dns.lock().unwrap();
+        dns[0].content = "their-own-thing.example.net".to_string();
+    }
+    let warning = super::release_company_host(&state, co.id).await;
+    assert!(warning.is_none(), "{warning:?}");
+    assert_eq!(cf.dns_names(), vec!["acme.example.com".to_string()], "left alone");
+    assert!(cf.dns_deleted.lock().unwrap().is_empty(), "no delete issued");
+    cleanup(state, dir).await;
+}
+
+/// Back-compat: a box provisioned by the old build still has `*.<base>`. It is
+/// SURFACED, kept working (its ingress rule stays), and only replaced when the
+/// operator asks — never implicitly.
+#[tokio::test]
+async fn a_legacy_wildcard_is_surfaced_then_tightened_on_request() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    cf.seed_dns("*.example.com", OUR_TARGET); // what an older build wrote
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    // The wildcard KEEPS its ingress rule until it is explicitly tightened — a
+    // company reachable only through it must not go dark behind our back.
+    assert_eq!(
+        cf.ingress_hosts(),
+        vec!["*.example.com".to_string(), "acme.example.com".to_string()]
+    );
+
+    // Status says so, so the wizard can offer the one-click fix.
+    let st = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery { company_id: None }),
+    )
+    .await
+    .unwrap();
+    assert!(st.0.data.box_status.wildcard_dns, "the wildcard must be surfaced");
+    assert_eq!(st.0.data.box_status.dns_records, vec!["acme.example.com".to_string()]);
+
+    // Tighten: per-company records first, then the narrowed ingress, then the
+    // wildcard record last.
+    let t = tighten_dns_handler(State(state.clone()), OptCtx(None))
+        .await
+        .expect("tighten ok");
+    assert!(t.0.data.wildcard_removed);
+    assert_eq!(t.0.data.records, vec!["acme.example.com".to_string()]);
+    assert_eq!(cf.dns_names(), vec!["acme.example.com".to_string()]);
+    assert_eq!(cf.ingress_hosts(), vec!["acme.example.com".to_string()]);
+
+    let after = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery { company_id: None }),
+    )
+    .await
+    .unwrap();
+    assert!(!after.0.data.box_status.wildcard_dns, "gone after tightening");
+    cleanup(state, dir).await;
+}
+
+/// A `*.<base>` record that points somewhere ELSE is the operator's own wildcard.
+/// Tightening narrows OUR ingress but must not delete their record.
+#[tokio::test]
+async fn tighten_never_deletes_a_wildcard_that_is_not_ours() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    cf.seed_dns("*.example.com", "their-catch-all.pages.dev");
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    let t = tighten_dns_handler(State(state.clone()), OptCtx(None))
+        .await
+        .expect("tighten ok");
+    assert!(!t.0.data.wildcard_removed, "not ours ⇒ not deleted");
+    assert!(
+        cf.dns_names().contains(&"*.example.com".to_string()),
+        "the operator's wildcard survives: {:?}",
+        cf.dns_names()
+    );
+    // And it was never treated as ours in the ingress either.
+    assert_eq!(cf.ingress_hosts(), vec!["acme.example.com".to_string()]);
+    cleanup(state, dir).await;
+}
+
+/// Order-independence: choosing the address BEFORE the tunnel exists is the
+/// wizard's actual flow. The record is `pending` then, and provisioning creates
+/// exactly it — still no wildcard.
+#[tokio::test]
+async fn an_address_chosen_before_provisioning_gets_its_record_at_provision() {
+    let (state, dir) = test_state().await;
+    let cf = inject_cf(&state);
+    inject_host(&state);
+    crate::config::write_token_0600(&dir.join(super::CF_TOKEN_FILE), "valid-cf-token").unwrap();
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let res = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("team".into()),
+        })),
+    )
+    .await
+    .expect("host ok before provisioning");
+    assert_eq!(res.0.data.dns, "pending", "no tunnel yet ⇒ nothing written");
+    assert!(cf.dns_names().is_empty());
+
+    let p = provision_tunnel_handler(State(state.clone()), OptCtx(None))
+        .await
+        .expect("provision ok");
+    assert_eq!(p.0.data.dns_records, vec!["team.example.com".to_string()]);
+    assert_eq!(cf.dns_names(), vec!["team.example.com".to_string()]);
+    assert_eq!(cf.ingress_hosts(), vec!["team.example.com".to_string()]);
     cleanup(state, dir).await;
 }
 

@@ -186,6 +186,18 @@ export function useSetBaseDomain(companyId?: number) {
   })
 }
 
+/** `POST /api/external-access/tighten-dns` — swap a legacy wildcard for
+ *  per-company records. Invalidates status so the wildcard banner disappears the
+ *  moment the zone is actually narrowed. */
+export function useTightenDns(companyId?: number) {
+  const invalidate = useInvalidateStatus(companyId)
+  return useMutation({
+    mutationFn: () =>
+      route(() => externalAccessApi.tightenDns(), (m) => m.tightenDns()),
+    onSuccess: invalidate,
+  })
+}
+
 // ── Step 2 — Google login ─────────────────────────────────────────────────────
 
 export function useGoogleConfig(companyId?: number) {

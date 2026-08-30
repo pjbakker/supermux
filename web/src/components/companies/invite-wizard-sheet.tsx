@@ -43,6 +43,7 @@ import {
   useAgentInbox,
   useCfToken,
   useCompanyHost,
+  useTightenDns,
   useCompanyHumans,
   useDeleteAgentInbox,
   useExternalStatus,
@@ -69,6 +70,7 @@ import {
 } from '@/components/companies/wizard-primitives'
 import type { ExternalStatus, QuickTunnelStatus } from '@/lib/api'
 import {
+  dnsPlanLine,
   labelOf,
   previewHost,
   subdomainError,
@@ -391,6 +393,10 @@ function DomainStep({
   // already-configured box) reaches the connected card with none, and must get a
   // chance to name it rather than silently inheriting the slug.
   const hostWritten = status?.company?.company_host_written ?? false
+  // A box provisioned by an older build still holds `*.<base>`; surface it here
+  // (never act on it implicitly) so the owner can narrow their zone in one tap.
+  const wildcardDns = status?.box_status.wildcard_dns ?? false
+  const dnsRecords = status?.box_status.dns_records ?? []
   const tunnel = status?.box_status.tunnel ?? 'none'
   const done = tunnel === 'healthy'
   const startTunnel = () => startQuick.mutate(undefined, { onSuccess: () => refetch() })
@@ -433,6 +439,15 @@ function DomainStep({
 
   if (done) {
     return (
+      <div className="flex flex-col gap-4">
+        {wildcardDns && baseDomain && (
+          <WildcardNotice
+            zone={baseDomain}
+            records={dnsRecords}
+            companyId={company.id}
+            refetch={refetch}
+          />
+        )}
       <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
         <StatusChip
           state={hostWritten ? 'done' : 'idle'}
@@ -456,6 +471,7 @@ function DomainStep({
             refetch={refetch}
           />
         )}
+      </div>
       </div>
     )
   }
@@ -548,6 +564,14 @@ function DomainStep({
         Your colleagues will reach this supermux at{' '}
         <span className="font-mono text-foreground">{host}</span>.
       </p>
+      {wildcardDns && (
+        <WildcardNotice
+          zone={baseDomain}
+          records={dnsRecords}
+          companyId={company.id}
+          refetch={refetch}
+        />
+      )}
       <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
         <StatusChip state="done" label={`Domain set · ${baseDomain}`} />
         <AddressEditor
@@ -572,8 +596,15 @@ function DomainStep({
         ) : (
           <div className="flex flex-col gap-2">
             <p className="text-sm text-muted-foreground">
-              One click sets up a wildcard tunnel + DNS and starts the connector — no terminal
-              commands.
+              One click creates the tunnel, starts the connector, and adds{' '}
+              {host ? (
+                <>
+                  one DNS record — <span className="font-mono text-foreground">{host}</span>
+                </>
+              ) : (
+                'one DNS record per company address'
+              )}
+              . Nothing else on <span className="font-mono">{baseDomain}</span> changes.
             </p>
             {provision.isError && <p className="text-sm text-destructive">{errText(provision.error)}</p>}
             <Button
@@ -817,6 +848,58 @@ function QuickTunnelPanel({
   )
 }
 
+// ── A legacy wildcard, and the one-click way out of it ────────────────────────
+
+/** Boxes set up by an older supermux wrote a `*.<domain>` DNS record: every
+ *  undefined name on the operator's own domain resolved here. That is far more of
+ *  someone's zone than this needs, so new boxes get one record per company — but
+ *  an existing wildcard is NEVER deleted behind the owner's back. It is named,
+ *  explained, and replaced only when they press the button. */
+function WildcardNotice({
+  zone,
+  records,
+  companyId,
+  refetch,
+}: {
+  zone: string
+  records: string[]
+  companyId: number
+  refetch: () => void
+}) {
+  const tighten = useTightenDns(companyId)
+  return (
+    <div className="cs-card flex flex-col gap-2 rounded-xl border border-border p-4">
+      <StatusChip state="idle" label="Wildcard DNS record" />
+      <p className="text-[12.5px] leading-snug text-muted-foreground">
+        An older setup added <span className="font-mono text-foreground">*.{zone}</span> to your
+        Cloudflare zone, so every name under <span className="font-mono">{zone}</span> points at
+        this box. supermux only needs{' '}
+        {records.length > 0 ? (
+          <span className="font-mono text-foreground">{records.join(', ')}</span>
+        ) : (
+          'the addresses your companies actually use'
+        )}
+        .
+      </p>
+      {tighten.isError && <p className="text-sm text-destructive">{errText(tighten.error)}</p>}
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="self-start"
+        disabled={tighten.isPending}
+        onClick={() => tighten.mutate(undefined, { onSuccess: () => refetch() })}
+      >
+        {tighten.isPending ? 'Tightening…' : 'Replace it with one record per company'}
+      </Button>
+      <p className="text-[12px] leading-snug text-muted-foreground">
+        Adds the per-company records first, then removes the wildcard — and only if it still points
+        at this box.
+      </p>
+    </div>
+  )
+}
+
 // ── The company's address (the editable subdomain) ────────────────────────────
 
 /** `<label>.<zone>` as ONE control: a text field for the part the owner owns and
@@ -875,6 +958,14 @@ function SubdomainField({
           </>
         )}
       </p>
+      {/* Say exactly what lands on their zone BEFORE they commit — one record,
+          named. supermux never writes a wildcard. */}
+      {!error && (
+        <p className="text-[12px] leading-snug text-muted-foreground">
+          {dnsPlanLine(value, zone)} — nothing else on{' '}
+          <span className="font-mono">{zone}</span> is touched.
+        </p>
+      )}
     </div>
   )
 }
@@ -929,7 +1020,8 @@ function AddressEditor({
       {moving && (
         <p className="text-[12px] leading-snug text-muted-foreground">
           <span className="font-mono text-foreground">{currentHost}</span> stops working when you
-          save, and Google needs the new redirect URI added before anyone can sign in.
+          save — its DNS record is removed and the new one added — and Google needs the new
+          redirect URI before anyone can sign in.
         </p>
       )}
       {host.isError && <p className="text-sm text-destructive">{errText(host.error)}</p>}

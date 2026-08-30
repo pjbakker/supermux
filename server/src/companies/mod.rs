@@ -644,6 +644,15 @@ async fn cascade_delete(
         }
     }
 
+    // 5b. THE PUBLIC ADDRESS — the `company_hosts` allowlist entry, its DNS record
+    //     (only when that record points at OUR tunnel; an operator's own record is
+    //     never collateral of a delete) and its tunnel ingress rule. A deleted
+    //     company must not keep a live login host, and must not leave a stray
+    //     record behind on someone's zone.
+    if let Some(w) = crate::external_access::release_company_host(state, id).await {
+        warnings.push(w);
+    }
+
     // 6. THE COMPANIES ROW — LAST. The `trg_company_delete_sessions` trigger
     //    (0032) NULLs any straggler session. Then a forensic audit row, matching
     //    the hard-destructive convention on `sessions::delete`.

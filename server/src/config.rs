@@ -304,10 +304,11 @@ pub fn company_canonical_host(label: &str, base_domain: &str) -> String {
 /// base domain (`<label>.example.com`)?
 ///
 /// 1..=63 characters of lowercase `a-z`, `0-9` and `-`, never starting or ending
-/// with `-`. Deliberately NARROWER than RFC 1123 (no uppercase, no leading digit
-/// debate, no dots): the label rides ONE wildcard `*.<base>` CNAME, which covers
-/// exactly one level, so a dotted "label" could never resolve. Callers lower-case
-/// + trim before asking.
+/// with `-`. Deliberately NARROWER than RFC 1123 (no uppercase, no dots): ONE
+/// level is what Cloudflare's Universal SSL certificate covers
+/// (`<label>.<zone>`, not `<a>.<b>.<zone>`), so a dotted "label" would resolve
+/// and then fail its TLS handshake — a worse outcome than refusing it here.
+/// Callers lower-case + trim before asking.
 pub fn is_dns_label(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 63
@@ -351,8 +352,8 @@ pub struct CompanyHost {
 impl CompanyHost {
     /// The single DNS label this entry publishes under `base_domain` — `host`
     /// minus the `.<base_domain>` suffix — or `None` when the entry does not sit
-    /// directly under that base (a stale/foreign base, or a multi-level host the
-    /// one wildcard CNAME could never serve).
+    /// directly under that base (a stale/foreign base, or a multi-level host
+    /// Universal SSL would not cover).
     pub fn label_under(&self, base_domain: &str) -> Option<String> {
         let host = self.host.trim().to_ascii_lowercase();
         let suffix = format!(".{}", base_domain.trim().to_ascii_lowercase());

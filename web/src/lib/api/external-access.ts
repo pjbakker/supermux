@@ -40,7 +40,11 @@ export interface ProvisionResult {
   tunnel_id: string
   connector: string
   connector_detail?: string
+  /** The hostnames now reachable, comma-joined. */
   reachable_host: string
+  /** Exactly the DNS records supermux owns in the operator's zone after this
+   *  call — one per company host. (It used to be a single `*.<base>` wildcard.) */
+  dns_records: string[]
 }
 
 /** The active zero-config quick tunnel (ephemeral). Present on `box_status` only
@@ -71,6 +75,13 @@ export interface BoxStatus {
   /** The active quick tunnel (the "try without a domain" branch). Absent ⇒ no
    *  temporary trial is running. */
   quick_tunnel?: QuickTunnelStatus | null
+  /** True when a legacy `*.<base_domain>` CNAME pointing at this box still
+   *  exists — every undefined name on the operator's domain resolves here. Only
+   *  boxes provisioned by an older build have one; `tightenDns()` replaces it. */
+  wildcard_dns?: boolean
+  /** The DNS records supermux owns in the operator's zone (one per company
+   *  host). What the wizard shows so the footprint is never a surprise. */
+  dns_records?: string[]
 }
 
 /** `POST /api/external-access/quick-tunnel` result — the freshly-started ephemeral
@@ -134,6 +145,22 @@ export interface HostResult {
   /** The address this company published BEFORE the call, when the label actually
    *  changed. Absent ⇒ nothing moved. */
   previous_host?: string | null
+  /** What happened to this host's DNS record in the operator's zone:
+   *  `created` | `exists` | `pending` (no tunnel yet — "Set up access" creates
+   *  it) | `unavailable` (no Cloudflare token on this box). */
+  dns?: string
+  /** True when a rename deleted the old record (only ever done when that record
+   *  pointed at this box's own tunnel). */
+  previous_dns_removed?: boolean
+}
+
+/** `POST /api/external-access/tighten-dns` result. */
+export interface TightenDnsResult {
+  /** The per-company records that exist after the call. */
+  records: string[]
+  /** Whether the `*.<base>` record was actually removed (false when there was
+   *  none, or when the one there was not ours to delete). */
+  wildcard_removed: boolean
 }
 
 export interface VerifyLoginResult {
@@ -211,8 +238,10 @@ export const externalAccessApi = {
       body: JSON.stringify({ base_domain }),
     }),
 
-  /** `POST /api/external-access/provision-tunnel` — idempotent one-time wildcard
-   *  tunnel + DNS + connector unit. Poll `status.tunnel` for health after. */
+  /** `POST /api/external-access/provision-tunnel` — idempotent one-time tunnel +
+   *  connector unit, plus ONE DNS record per company host already configured (no
+   *  wildcard: nothing else on the operator's domain is touched). Poll
+   *  `status.tunnel` for health after. */
   provisionTunnel: (): Promise<ProvisionResult> =>
     sessionRequest('/api/external-access/provision-tunnel', { method: 'POST' }),
 
@@ -275,6 +304,13 @@ export const externalAccessApi = {
       method: 'POST',
       body: JSON.stringify(hostPayload(subdomain)),
     }),
+
+  /** `POST /api/external-access/tighten-dns` — replace a legacy `*.<base>`
+   *  wildcard with one record per company host: creates the records, narrows the
+   *  tunnel ingress, then deletes the wildcard (only when it points at this box's
+   *  tunnel — a wildcard the operator made themselves is never touched). */
+  tightenDns: (): Promise<TightenDnsResult> =>
+    sessionRequest('/api/external-access/tighten-dns', { method: 'POST' }),
 
   /** `POST /api/companies/{id}/verify-login` — real authorize round-trip; surfaces
    *  the exact URI to register on `redirect_uri_mismatch`. */
