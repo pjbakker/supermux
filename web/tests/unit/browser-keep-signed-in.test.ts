@@ -121,7 +121,7 @@ describe('the ⋯ row', () => {
       }),
       NOW,
     )
-    expect(row.detail).toBe('Every 45 min · checked 12 min ago.')
+    expect(row.detail).toBe('Checked 12 min ago · next in ~33 min.')
   })
 
   test('"checked" means a PING, never a tick — the false green light', () => {
@@ -285,7 +285,7 @@ describe('the ⋯ row', () => {
       }),
       NOW,
     )
-    expect(fresh.detail).toBe('Every 45 min · checked 2 h ago.')
+    expect(fresh.detail).toBe('Checked 2 h ago · next in ~45 min.')
 
     const stale = keepAliveRow(
       tab({
