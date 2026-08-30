@@ -548,6 +548,11 @@
   }
   [data-grok] [data-shell-rail] {
     border-radius: var(--sm-r-window) 0 0 var(--sm-r-window);
+    /* NOTE — this `overflow: hidden` (it rounds the window's left corners) CLIPS
+       every absolutely-positioned descendant to the 64px rail box, and the rail
+       shares `z-index: 1` with the later-painting content column. Anything the
+       rail docks that must open OUT of it (the scope circle's company menu) has
+       to portal + position `fixed`; an `absolute` popup here is invisible. */
     overflow: hidden;
   }
   [data-grok] [data-shell-main] {
