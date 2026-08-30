@@ -105,6 +105,7 @@ async fn spawn_harness(name: &str) -> Harness {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
@@ -146,6 +147,8 @@ impl Harness {
                 runtime: "native".to_string(),
                 model: String::new(),
                 company_id: None,
+                archive_on_stop: false,
+                config_dir: String::new(),
             },
         )
         .await

@@ -381,6 +381,14 @@ async fn provision_group_chat(state: &AppState, company: &Company) {
             runtime: None,
             model: None,
             company_id: Some(company.id),
+            archive_on_stop: None,
+            // The router is created and briefed by this path itself; no
+            // create-time prompt, no singleton guard.
+            prompt: None,
+            unless_live_prefix: None,
+            max_quiet_secs: None,
+            // Boots on the daemon default Claude login.
+            config_dir: None,
         },
     )
     .await;
@@ -671,6 +679,7 @@ mod tests {
             std::env::temp_dir().join(format!("supermux-companies-http-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = Config {
+            swarm_reaper: Default::default(),
             data_dir: dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             extra_binds: vec![],

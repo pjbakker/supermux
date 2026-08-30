@@ -88,6 +88,7 @@ async fn spawn_harness() -> Harness {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
@@ -127,6 +128,8 @@ async fn make_session(h: &Harness, name: &str, provider: &str, host_id: Option<i
             runtime: "native".to_string(),
             model: String::new(),
             company_id: None,
+            archive_on_stop: false,
+            config_dir: String::new(),
         },
     )
     .await

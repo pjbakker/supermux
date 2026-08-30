@@ -195,8 +195,10 @@ pub async fn move_to_company(
     // Transcript-dir collision: a `~/.claude/projects/<new-encoded>` that already
     // exists for a DIFFERENT session would orphan/merge history. Only a fresh move
     // (source still present) can be a real collision; a resume (source gone) is us.
-    let old_proj = project_dir_for(&old_dir); // resolves while old_dir still exists
-    let new_proj = project_dir_for(&new_dir);
+    // Both resolve under the SESSION's config dir (migration 0041): a bot on a
+    // second Claude account keeps its history under that account's dir.
+    let old_proj = project_dir_for(&row.config_dir, &old_dir); // resolves while old_dir still exists
+    let new_proj = project_dir_for(&row.config_dir, &new_dir);
     let proj_differs = old_proj != new_proj;
     if proj_differs && old_exists && new_proj.exists() {
         return Err(AppError::Conflict(format!(

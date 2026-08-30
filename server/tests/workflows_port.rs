@@ -703,6 +703,7 @@ use supermux_server::workflows;
 async fn ported_state() -> (AppState, PathBuf) {
     let (pool, dir) = ported().await;
     let config = Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.clone(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],

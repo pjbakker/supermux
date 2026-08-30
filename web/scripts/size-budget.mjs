@@ -50,7 +50,26 @@ const DIST = join(DIST_ROOT, 'assets')
 // attached is the point"), the honest fix is ceil(measured)=161 with the
 // measurement here — not clawing 92 unrelated bytes off the hero path. It is still
 // the tightest gate in this file and still guards first paint (now 160.09/161).
-const BUDGET_ENTRY_JS = 161 * KB
+//
+// v0.6.1 pjbakker INTEGRATION: 161 -> 163. Measured 162.01 on the integration
+// branch (nine fork branches folded onto 004ccbfe); origin/main built the same
+// way measures 160.62, so the wave costs +1.39 KB gz on the hero path. Where it
+// goes, largest first:
+//   • the Archived-sessions FILTER (`components/archived/archived-filter.ts` +
+//     the field, its debounce, its Escape arbitration and imperative handle, and
+//     `NoArchivedMatches`). The archived sheet is SHELL-MOUNTED, so this lands
+//     on the entry chunk rather than on a lazy route — that placement, not the
+//     feature's size, is why the hero gate moved at all.
+//   • the session-tile Claude-account tag (`config_dir`'s last path segment).
+//   • the workflow composer's archive-on-stop row. Net of swapping its
+//     hand-rolled switch for the shared `Switch` primitive, which gave some of
+//     it back.
+// Per this file's own "measured × 1.02" policy that would allow 165; ceil
+// (measured) = 163 is taken instead, so the gate stays tight enough to notice
+// the next regression. Set from the FINAL integration measurement on purpose:
+// budgeting against any single branch of the wave would have been under water
+// again as soon as the others landed.
+const BUDGET_ENTRY_JS = 163 * KB
 // TOTAL app JS (entry + lazy app chunks; vendor cached separately).
 //
 // RATCHETED 232 → 210 by fase B2, the PR that deletes the Board page. #70 set
@@ -1244,7 +1263,25 @@ const BUDGET_ENTRY_JS = 161 * KB
 // the switcher's "Invite a teammate" row (its chunk grew 9.03 → 9.31 KB). The
 // gate that guards first paint is UNMOVED and green at 160.69 / 161 KB.
 // ceil(measured 441.35) + headroom = 442, the same rule every bump above used.
-const BUDGET_APP_JS = 442 * KB
+// v0.6.1 pjbakker INTEGRATION: 441 -> 443. Measured 442.67 against 440.30 on
+// origin/main built the same way, i.e. +2.37 KB gz for the whole nine-branch
+// wave. The entry-chunk share of that is itemised at `BUDGET_ENTRY_JS` above;
+// the remainder is the archived filter's own rules module and the two small
+// lazy-route additions (the tile's account tag, the composer's archive-on-stop
+// row). Set from the FINAL integration measurement rather than from any one
+// branch, since four of the nine add web bytes to these same two counters.
+//
+// CORRECTED to 451 before merge. 443 was ceil(measured) — the ENTRY gate's rule,
+// applied to the wrong gate. The 2026-08-17 policy recorded above draws the
+// distinction explicitly: "the ENTRY gate above is the designed hard limit
+// protecting the hero path; this total is a floating awareness ceiling at
+// measured+2%". ceil() left 0.31 KB of headroom on a shared, per-PR gate, so the
+// next ~300 bytes added to ANY lazy route would have red-lighted an unrelated
+// v0.6.1 PR with a failure that says nothing about that PR. Final measurement
+// 442.69 (which includes the archive-on-stop copy fix disclosing that the marker
+// is a per-BOT property and fires on a manual stop); 442.69 x 1.02 = 451.5, so
+// 451. Still an awareness ceiling: every PR that moves it justifies its bytes.
+const BUDGET_APP_JS = 451 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating
@@ -1292,7 +1329,16 @@ const BUDGET_APP_JS = 442 * KB
 // RATCHETED 34 → 36 by the shared-browser mobile wave (the takeover chrome,
 // safe-area rules on the remaining full-screen panels, and the sign-in sheet).
 // Measured 34.83; ceil + headroom = 36, same rule as above. ENTRY gate unmoved.
-const BUDGET_CSS = 36 * KB
+//
+// RATCHETED 36 -> 37 by the v0.6.1 pjbakker integration. This gate was the one
+// the nine-branch wave moved WITHOUT a ledger entry: it arrived at 35.97 / 36.00,
+// i.e. 0.03 KB of headroom, so the gate was passing by 30 bytes and the next
+// stylesheet rule in the release would have broken an unrelated PR. The bytes are
+// the archived-sessions filter field and the workflow composer's archive-on-stop
+// row (both new markup carrying existing utility classes, plus the index.css hash
+// re-roll). ceil + headroom = 37, the same rule the ratchets above use, and the
+// measurement is recorded here so the crawl is visible rather than silent.
+const BUDGET_CSS = 37 * KB
 
 function gzipSize(path) {
   return gzipSync(readFileSync(path), { level: 9 }).length

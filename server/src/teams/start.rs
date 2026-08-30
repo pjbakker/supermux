@@ -287,6 +287,14 @@ pub async fn start_team(
             // P3d — the LEAD inherits the caller's company (the handler already
             // forced a member's to their own; `None` for the owner path).
             company_id: input.company_id,
+            archive_on_stop: None,
+            // Team start drives its own boot and briefing; no create-time
+            // prompt, no singleton guard.
+            prompt: None,
+            unless_live_prefix: None,
+            max_quiet_secs: None,
+            // Boots on the daemon default Claude login.
+            config_dir: None,
         },
     )
     .await?;
@@ -649,6 +657,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -708,6 +717,9 @@ mod tests {
                 runtime: Some("native".into()),
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                config_dir: None,
+                ..Default::default()
             },
         )
         .await
@@ -759,6 +771,9 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                config_dir: None,
+                ..Default::default()
             },
         )
         .await
@@ -799,6 +814,9 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                config_dir: None,
+                ..Default::default()
             },
         )
         .await
@@ -846,6 +864,9 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                config_dir: None,
+                ..Default::default()
             },
         )
         .await

@@ -123,6 +123,17 @@ pub struct HookPayload {
     /// every child hook. Display-only, and never the presence test — a
     /// main-thread hook can be absent both, but only `agent_id` is documented as
     /// the discriminator.
+    ///
+    /// One more producer, one more consumer: an IN-PROCESS TEAMMATE is its own
+    /// main loop (not a subagent), so its lifecycle payloads carry this key
+    /// WITHOUT an `agent_id` — and a lead launched as `claude --agent <name>`
+    /// carries it on its own payloads too. `hooks::is_foreign_agent_payload`
+    /// therefore pairs it with the session's tracked conversation id as the
+    /// tie-breaker to tell a teammate's lifecycle from the lead's own.
+    ///
+    /// NOTE: this is not the same `agentType` as the team STATE FILE parsed by
+    /// `teams::scan`, whose polarity is inverted (there it marks a LEAD, and real
+    /// teammates carry no such field).
     #[serde(default)]
     pub agent_type: Option<String>,
 }

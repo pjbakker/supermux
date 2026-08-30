@@ -35,6 +35,7 @@ fn temp_config() -> (Config, PathBuf) {
     let dir = std::env::temp_dir().join(format!("supermux-arch-wf-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.clone(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],
@@ -77,6 +78,8 @@ fn new_session(name: &str, dir: &std::path::Path) -> db::sessions::NewSession {
         runtime: "native".to_string(),
         model: String::new(),
         company_id: None,
+        archive_on_stop: false,
+        config_dir: String::new(),
     }
 }
 

@@ -38,6 +38,7 @@ pub mod status;
 /// the `PreToolUse` payload that raises the in-chat "take the wheel" card.
 pub mod takeover_ask;
 pub mod steering;
+pub mod swarm;
 pub mod teams;
 pub mod tmux;
 pub mod transport;
@@ -333,6 +334,16 @@ pub struct SessionView {
     /// unchanged — it is purely the PATCH result's advisory bit.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub restart_required: bool,
+    /// The disposable marker (migration 0025): archive this session the moment
+    /// it stops. Surfaced so the workflows editor's "archive on stop" toggle can
+    /// read the marker it writes (the workflows create/patch plumbing stamps
+    /// this very column on the target session).
+    pub archive_on_stop: bool,
+    /// The Claude config dir this session boots on (migration 0041); the empty
+    /// string means the daemon default. ADDITIVE field, always present. The web
+    /// tile renders its last path segment as a small tag so the account a
+    /// session runs on is visible without opening the info panel.
+    pub config_dir: String,
     /// Last 6 lines of `last_capture`, ANSI-stripped.
     pub preview_lines: Vec<String>,
     /// Same last 6 lines, with SGR escape sequences preserved — the colour-true
@@ -677,6 +688,8 @@ fn view(
         // Only ever flipped true by `config_patch` on a launch-line change; every
         // other construction path (get/list/SSE) leaves it false → omitted.
         restart_required: false,
+        archive_on_stop: s.archive_on_stop != 0,
+        config_dir: s.config_dir.clone(),
         preview_lines: preview_lines(last_capture),
         preview_ansi: last_n_lines(last_capture_ansi, 20),
         activity: act.as_ref().and_then(|a| a.activity.clone()),
@@ -813,6 +826,23 @@ pub(crate) fn is_retired_provider(provider: &str) -> bool {
 /// be `-` — the session name flows through to argv for the provider CLI
 /// (`claude --session-id <name>` etc.), and a leading dash would be parsed as
 /// an option flag (CLI-flag injection).
+/// Is `prefix` usable as a spawn-guard key (`CreateInput.unless_live_prefix`)?
+///
+/// Same length cap and charset as [`valid_name`], because that is what the
+/// prefix is matched against: `live_with_prefix` runs a `LIKE 'prefix%'` over
+/// session NAMES, so a string that could never prefix a valid name can never
+/// match anything.
+///
+/// Enforced for MEMORY, not only for hygiene. `AppState::spawn_guards` is keyed
+/// by this string, is never swept, and `spawn_guard_for` inserts before the
+/// create's own `exists` / 409 checks — so an unvalidated prefix let an authed
+/// client grow the map without bound with creates that all failed. Deliberately
+/// looser than `valid_name` in one way: a leading `-` and the bare `.` / `..` are
+/// fine here, because a prefix is never used as a path segment or a CLI argument.
+pub(crate) fn valid_guard_prefix(prefix: &str) -> bool {
+    !prefix.is_empty() && prefix.len() <= 100 && NAME_RE.is_match(prefix)
+}
+
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 100
@@ -842,6 +872,41 @@ static CC_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9._-]{1,128}$
 /// string the charset admits that walks out of the project directory.
 pub(crate) fn valid_cc_id(id: &str) -> bool {
     CC_ID_RE.is_match(id) && !id.bytes().all(|b| b == b'.')
+}
+
+// The session's Claude config dir is interpolated into a shell launch line
+// (`export CLAUDE_CONFIG_DIR='<dir>'`, see `lifecycle::build_launch_command`),
+// so the charset is pinned at the boundary: letters, digits, `.`, `_`, `/`,
+// `-`. That excludes whitespace, quotes, `$`, backtick, `;`, `|`, `&` - the
+// whole shell-meta surface. The launch line quotes the value anyway; both
+// defences stay.
+static CONFIG_DIR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9._/-]{1,512}$").unwrap());
+
+/// Validate a session's Claude config dir: an ABSOLUTE path over
+/// `[A-Za-z0-9._/-]`, at most 512 chars, that exists on this host and is a
+/// directory. Returns the cleaned value (trimmed, no trailing `/`, so the web
+/// tag reads `.claude-second` rather than an empty segment) or the reason to
+/// put in the 400.
+pub(crate) fn valid_config_dir(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('/') {
+        return Err(format!("config_dir '{trimmed}' must be an absolute path"));
+    }
+    if !CONFIG_DIR_RE.is_match(trimmed) {
+        return Err(
+            "invalid config_dir (allowed: letters, digits, '.', '_', '/', '-'; max 512 chars)"
+                .to_string(),
+        );
+    }
+    let cleaned = trimmed.trim_end_matches('/');
+    // A path of only slashes trims to nothing; that is the root dir.
+    let cleaned = if cleaned.is_empty() { "/" } else { cleaned };
+    // `is_dir` follows symlinks and answers false for a missing path, so this
+    // one call covers both "must exist" and "must be a directory".
+    if !std::path::Path::new(cleaned).is_dir() {
+        return Err(format!("config_dir '{cleaned}' is not an existing directory"));
+    }
+    Ok(cleaned.to_string())
 }
 
 fn valid_provider(provider: &str) -> bool {
@@ -1111,7 +1176,7 @@ pub async fn purge(state: &AppState, name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CreateInput {
     pub name: String,
     /// Human label for the UI (migration 0019). Free-form; the immutable slug
@@ -1175,6 +1240,17 @@ pub struct CreateInput {
     /// value is a 400 and writes no row). Absent = provider default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Which Claude login this session boots on: the directory exported as
+    /// `CLAUDE_CONFIG_DIR` in the launch line (migration 0041). Absolute path,
+    /// existing directory, charset `[A-Za-z0-9._/-]`; anything else is a 400
+    /// (see [`valid_config_dir`]). LOCAL sessions only: combined with a
+    /// `host_id` it is a 400, because the directory is probed on this box while
+    /// the launch line would run on the remote host. Absent or blank keeps the
+    /// daemon default, which is what every existing client body does. Stored for
+    /// any provider; only a session that launches claude acts on it (see
+    /// [`lifecycle::launches_claude`]).
+    #[serde(default)]
+    pub config_dir: Option<String>,
     /// The company a new session is created into (migration 0032). Absent /
     /// null => a main bot (`company_id` NULL). When set, the create path forces
     /// `dir` under the company's `root_dir/<name>/`, IGNORING (overriding, never
@@ -1183,7 +1259,35 @@ pub struct CreateInput {
     /// `company_id`, so `PATCH …/config` cannot reassign it.
     #[serde(default)]
     pub company_id: Option<i64>,
+    /// Auto-archive this session when it stops (migration 0025): the
+    /// disposable-spawn marker read by the stop hook. `Some(true)` only for
+    /// callers spawning throwaway sessions; `None`/`false` for every other
+    /// caller (opt-in, default off).
+    #[serde(default)]
+    pub archive_on_stop: Option<bool>,
+    /// Deliver this prompt and start the agent right after create (the
+    /// create + start sequence every scheduler boot already does), so one
+    /// API call replaces the disabled-stub-schedule + run-now pattern.
+    /// Consumed by the HTTP handler, not by [`create`] itself.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Server-side singleton guard: refuse (409) when a non-archived
+    /// session whose name starts with this prefix is still live. Checked
+    /// and inserted under a per-prefix lock, so concurrent spawns with the
+    /// same prefix cannot double-boot. An empty string is treated as absent
+    /// (it would match every session name).
+    #[serde(default)]
+    pub unless_live_prefix: Option<String>,
+    /// Quiet bound for the guard's idle/waiting classification, seconds.
+    /// Default [`GUARD_QUIET_SECS`].
+    #[serde(default)]
+    pub max_quiet_secs: Option<i64>,
 }
+
+/// Default quiet bound for `unless_live_prefix`, seconds: 120 minutes,
+/// proven in production dispatcher use. An idle session that has said nothing
+/// for longer than this no longer blocks a respawn of its identity.
+pub const GUARD_QUIET_SECS: i64 = 7200;
 
 pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView, AppError> {
     let name = input.name.trim().to_string();
@@ -1231,6 +1335,71 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
                 .into(),
         ));
     }
+    // Spawn guard (`unless_live_prefix`). The lock is taken BEFORE the liveness
+    // check and released only after the INSERT: check-then-insert has to be one
+    // critical section per prefix, or two dispatch cycles racing on the same
+    // identity both read "nothing live" and both boot. An empty prefix is
+    // treated as absent, because it matches every session name: honoring it
+    // would block every create instead of one identity's.
+    let guard_prefix = input
+        .unless_live_prefix
+        .as_deref()
+        .filter(|p| !p.is_empty());
+    // The prefix is the ONE `CreateInput` string that reached `spawn_guard_for`
+    // unvalidated, and that map is keyed by it, never swept, and written BEFORE
+    // the `exists` / 409 checks below — so even a rejected create left a
+    // permanent entry. An authed client looping creates with a fresh 100 KB
+    // prefix each time therefore grew server memory without bound. It is matched
+    // against session NAMES (`live_with_prefix` does a `LIKE 'prefix%'`), so a
+    // string that could never prefix a valid name is meaningless anyway: hold it
+    // to the same length cap and charset as `valid_name`, and reject before the
+    // entry is created. Bounded key space, and a typo'd prefix now fails loudly
+    // instead of silently matching nothing.
+    if let Some(prefix) = guard_prefix {
+        if !valid_guard_prefix(prefix) {
+            return Err(AppError::BadRequest(
+                "invalid unless_live_prefix (max 100 chars, charset [A-Za-z0-9_.-])".into(),
+            ));
+        }
+    }
+    let guard_lock = guard_prefix.map(|prefix| state.spawn_guard_for(prefix));
+    // `held` is the critical section; it lives until the explicit `drop` below.
+    let held = match guard_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if let Some(prefix) = guard_prefix {
+        let quiet = input.max_quiet_secs.unwrap_or(GUARD_QUIET_SECS).max(0);
+        if let Some(live) = db::sessions::live_with_prefix(&state.pool, prefix, quiet).await? {
+            return Err(AppError::Conflict(format!(
+                "live session '{live}' matches prefix '{prefix}'"
+            )));
+        }
+    }
+    // Per-session Claude config dir (migration 0041). Absent or blank keeps the
+    // daemon default; a present value is validated HERE so a bad path is a 400
+    // before any row exists, and so nothing shell-meta can ever reach the
+    // launch line.
+    let config_dir = match input.config_dir.as_deref().map(str::trim) {
+        None | Some("") => String::new(),
+        Some(raw) => {
+            // Local sessions only. `valid_config_dir` probes THIS box's
+            // filesystem, but a remote session's launch line runs over SSH on
+            // the host, where that path means nothing: we would refuse a dir
+            // that exists there and accept one that does not. Refuse the
+            // combination up front, the way native + host_id is refused above,
+            // rather than store a value the remote launch cannot honour.
+            if input.host_id.is_some() {
+                return Err(AppError::BadRequest(
+                    "config_dir is only supported for local sessions: a remote host's config \
+                     dir cannot be validated from here; drop host_id or drop config_dir"
+                        .into(),
+                ));
+            }
+            valid_config_dir(raw).map_err(AppError::BadRequest)?
+        }
+    };
+
     if db::sessions::exists(&state.pool, &name).await? {
         return Err(AppError::Conflict(format!(
             "session '{name}' already exists"
@@ -1321,8 +1490,16 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         company_id: input.company_id,
         runtime: runtime_kind,
         model,
+        archive_on_stop: input.archive_on_stop.unwrap_or(false),
+        // Empty = the daemon default Claude config dir; a non-empty value is
+        // the validated absolute path this session's Claude boots on.
+        config_dir,
     };
     db::sessions::create(&state.pool, &new).await?;
+    // End of the guarded section: the row exists now, so a concurrent spawn on
+    // the same prefix reads it as live and backs off. Everything below is slow
+    // (runtime setup, loop spawns) and must not be serialized behind this lock.
+    drop(held);
     let hook_token = gen_hook_token();
     db::sessions::ensure_runtime(&state.pool, &name, &hook_token).await?;
     state.hook_tokens.insert(name.clone(), hook_token);
@@ -1388,6 +1565,12 @@ pub async fn delete(state: &AppState, name: &str) -> Result<(), AppError> {
     // never block deleting the row.
     let is_native = !state.is_tmux_runtime(name).await;
     if let Ok(rt) = state.runtime_for(name).await {
+        // capture before the kill; teardown waits for the lead to die
+        if crate::sessions::swarm::teardown_enabled(state) {
+            if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                crate::sessions::swarm::spawn_teardown_for_lead(pid);
+            }
+        }
         let _ = rt.kill().await;
     }
     // A native session owns a directory under the data dir (spool, `meta.json`,
@@ -1924,6 +2107,21 @@ async fn get_handler(
     Ok(ok(get(&state, &name).await?))
 }
 
+/// `POST /api/sessions`. With a non-blank `prompt` this also boots the session,
+/// so one call does what previously took a disabled stub schedule plus a
+/// run-now. The split of duties is deliberate: [`create`] owns the
+/// `unless_live_prefix` guard (it has to, the check and the INSERT are one
+/// critical section), and this handler owns the boot, which must stay OUTSIDE
+/// that lock.
+///
+/// A blank or whitespace-only prompt counts as absent, so a client that always
+/// sends the field gets exactly the old behaviour when it has nothing to say.
+///
+/// A failed start propagates (5xx) and the session row REMAINS: no rollback.
+/// The row is the record that the spawn was requested, and it is what the
+/// caller retries against; deleting it would also make the guard forget the
+/// identity it just claimed. The returned view is the PRE-start snapshot, so
+/// callers watch the status endpoints for the boot, not this response.
 async fn create_handler(
     State(state): State<AppState>,
     ctx: crate::scope::OptCtx,
@@ -1943,7 +2141,11 @@ async fn create_handler(
             }
         }
     }
+    let prompt = input.prompt.take().filter(|p| !p.trim().is_empty());
     let v = create(&state, input).await?;
+    if let Some(p) = prompt {
+        lifecycle::start(&state, &v.name, Some(&p)).await?;
+    }
     Ok((StatusCode::CREATED, ok(v)))
 }
 
@@ -2507,8 +2709,17 @@ async fn resumable_handler(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("session '{name}'")))?;
     let dir = s.dir.clone();
+    // Same rule as the launch line (migration 0041): the session's own config
+    // dir only applies when the session actually boots claude. A codex/kimi/
+    // shell row that carries one (via `duplicate`) reads the daemon's
+    // transcripts, exactly as it did before the column existed.
+    let config_dir = if lifecycle::launches_claude(&s.provider) {
+        s.config_dir.clone()
+    } else {
+        String::new()
+    };
     // Filesystem scan can touch large transcripts → off the async runtime.
-    let list = tokio::task::spawn_blocking(move || resumable::list_for_dir(&dir))
+    let list = tokio::task::spawn_blocking(move || resumable::list_for_dir(&config_dir, &dir))
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("resumable scan join failed: {e}")))?;
     Ok(Json(json!({ "ok": true, "data": list })))
@@ -2712,6 +2923,23 @@ mod tests {
     }
 
     #[test]
+    fn guard_prefix_is_bounded_and_charset_checked() {
+        // Real prefixes an operator dispatches with.
+        for ok in &["router-", "acme.bot", "team_01", "a", "-lead", "..", "A1.b2-c3"] {
+            assert!(valid_guard_prefix(ok), "{ok:?} should validate");
+        }
+        assert!(valid_guard_prefix(&"n".repeat(100)), "exactly at the cap is fine");
+        // The unbounded-key-space bug: a long or exotic prefix must never reach
+        // `spawn_guard_for`, which inserts a permanent map entry keyed by it.
+        assert!(!valid_guard_prefix(&"n".repeat(101)));
+        assert!(!valid_guard_prefix(&"x".repeat(100_000)));
+        assert!(!valid_guard_prefix(""));
+        for bad in &["has space", "semi;colon", "back`tick", "dollar$", "sl/ash", "quo\"te"] {
+            assert!(!valid_guard_prefix(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
     fn valid_name_basics_and_leading_dash() {
         // Accept: ordinary slugs plus internal `-`, `.`, `_`.
         for ok in &["a", "alpha", "team_01", "host.local", "abc-def", "A1.b2-c3"] {
@@ -2774,6 +3002,31 @@ mod tests {
         assert!(!valid_cc_id(&too_long));
     }
 
+    /// `valid_config_dir` cleans what it accepts. The 400 cases that need a
+    /// live filesystem (missing dir, a file, shell-meta) are pinned end to end
+    /// in `tests/session_config_dir.rs`; this covers the pure-string edges that
+    /// an HTTP test cannot reach: surrounding whitespace, a trailing `/`, the
+    /// root dir, and the length cap.
+    #[test]
+    fn valid_config_dir_cleans_the_value() {
+        // `/tmp` exists on every host that runs this suite.
+        assert_eq!(valid_config_dir("/tmp").unwrap(), "/tmp");
+        assert_eq!(valid_config_dir("  /tmp  ").unwrap(), "/tmp");
+        // Trailing slashes go, so the web tag reads the last real segment.
+        assert_eq!(valid_config_dir("/tmp//").unwrap(), "/tmp");
+        // A path of only slashes IS the root dir, not an empty string.
+        assert_eq!(valid_config_dir("///").unwrap(), "/");
+        // Relative paths never reach the charset check.
+        assert!(valid_config_dir(".claude-second")
+            .unwrap_err()
+            .contains("absolute"));
+        // Length cap (>512 rejected) before the filesystem is touched.
+        let too_long: String = std::iter::once('/')
+            .chain(std::iter::repeat('a').take(512))
+            .collect();
+        assert!(valid_config_dir(&too_long).unwrap_err().contains("512"));
+    }
+
     // ── runtime seam: the `runtime` column, end to end ───────────────────────
 
     async fn test_state() -> (AppState, std::path::PathBuf) {
@@ -2788,6 +3041,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -2818,6 +3072,9 @@ mod tests {
             runtime: None,
             model: None,
             company_id: None,
+            archive_on_stop: None,
+            config_dir: None,
+            ..Default::default()
         }
     }
 

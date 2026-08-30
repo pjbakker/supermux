@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::db;
+use crate::sessions::status::Status;
 use crate::sessions::tmux::Tmux;
 use crate::state::{AppState, SseEvent};
 
@@ -216,6 +217,35 @@ pub async fn scan_and_enrich_raw(state: &AppState) -> Vec<Team> {
                     team = %team.team_name,
                     "teams watcher: dismissed-set load failed; showing all members this tick",
                 );
+            }
+        }
+
+        // Auto-reconcile the roster of a STOPPED host: hide every teammate that
+        // no longer has a live pane. Claude Code tears its own roster down one
+        // member at a time on a graceful team shutdown, but `lifecycle::stop`
+        // hard-kills the lead after a short grace window, so that cleanup dies
+        // mid-flight and the orphaned `members[]` entries stay in Claude's
+        // `config.json` forever — rendering as dead "offline" cards under a
+        // session that is not even running (measured: 20 ghost cards under one
+        // stopped session) until the user trashes each one by hand.
+        //
+        // A pure DISPLAY filter, deliberately NOT a `teams_dismissed` write:
+        // nothing is persisted, so there is no stale row to un-arm later. A
+        // mis-attributed host self-heals the instant its status stops reading
+        // `stopped`, and restarting the lead brings the whole crew back with
+        // zero DB surgery. `tmux_pane_id` is already re-validated against the
+        // host's LIVE panes this tick (`validate_pane_ids` above), so `Some(_)`
+        // means the pane genuinely exists right now — an in-flight teammate is
+        // never hidden.
+        //
+        // Runs AFTER `rosterless` is read, so the backlink writer below keeps
+        // keying off Claude's on-disk truth (a real team whose crew this filter
+        // emptied must not lose its `team_name` backlink, or `archive` would
+        // stop parking its dir). Board sync reads `members` only for a card's
+        // colour tag — the same exposure the dismissed filter already has.
+        if let Some(host_name) = host.as_deref() {
+            if should_reconcile_host(state, team, host_name).await {
+                retain_live_paned(team);
             }
         }
 
@@ -442,6 +472,108 @@ fn retain_undismissed(team: &mut Team, dismissed: &[String]) {
         .retain(|m| !dismissed.iter().any(|d| d == &m.agent_id));
 }
 
+/// How long a host session must have read `stopped` before its paneless
+/// teammates are hidden. The settle window is the whole reason this is not an
+/// instant filter: a stop→start bounce writes `stopped` and then `starting`
+/// (`lifecycle::stop` then `lifecycle::start`) within a second or two, and a
+/// watcher tick landing in that gap would blink the entire crew out of the
+/// roster and back — with the team card itself vanishing via `drop_rosterless`
+/// on the way through.
+const STOPPED_SETTLE_SECS: i64 = 10;
+
+/// Whether the host session's runtime row has been settled `stopped` for at
+/// least [`STOPPED_SETTLE_SECS`]. Pure over the row + the clock, so the gate is
+/// unit-testable apart from the DB.
+fn settled_stopped(rt: &db::sessions::SessionRuntime, now: i64) -> bool {
+    rt.last_status == Status::Stopped.as_str()
+        && now.saturating_sub(rt.last_status_at) >= STOPPED_SETTLE_SECS
+}
+
+/// Should this tick reconcile `host_name`'s roster down to its live panes?
+///
+/// Two gates, cheapest first. Both fail toward `false` (leave the roster exactly
+/// as it is): hiding members is the more surprising outcome, so anything unknown
+/// must never trigger it.
+///
+/// 1. SETTLE GATE — the host's `session_runtime` row has read `stopped` for at
+///    least [`STOPPED_SETTLE_SECS`] ([`settled_stopped`]). Read first so a
+///    healthy or running team costs exactly one narrow row read per tick and
+///    never reaches the list read below.
+///
+/// 2. AMBIGUITY GUARD — a stopped session has no tmux window, so it can never be
+///    resolved by any of the pane-map steps in `resolve_host_session`: a settled
+///    stopped host is ALWAYS attributed by cwd. [`match_host_by_cwd`] takes the
+///    FIRST claude session whose dir matches, in list order (pinned, then last
+///    send) and with NO liveness preference, so when two claude sessions share
+///    that dir the winner is decided by sort order rather than by evidence — and
+///    a stopped sibling can be handed a still-RUNNING lead's team. The damage
+///    then compounds: `live_ids` comes from the RESOLVED host's panes, so a
+///    mis-attributed host nulls every member's `%id`, this filter empties the
+///    roster, and `drop_rosterless` deletes the live team's card outright. So:
+///    reconcile nothing while the cwd attribution is ambiguous. The guard
+///    relaxes by itself once one of the colliding sessions goes away.
+///
+/// Ported from Paul's `pjbakker/feat/teams-auto-dismiss` (537a43827, 6bf3bcf4),
+/// whose persistence model we did not take but whose guard is the hole ours had.
+async fn should_reconcile_host(state: &AppState, team: &Team, host_name: &str) -> bool {
+    let settled = match db::sessions::runtime(&state.pool, host_name).await {
+        Ok(Some(rt)) => settled_stopped(&rt, chrono::Utc::now().timestamp()),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                host = %host_name,
+                "teams watcher: host runtime read failed; leaving the roster untouched this tick",
+            );
+            false
+        }
+    };
+    if !settled {
+        return false;
+    }
+
+    // Best-effort like the rest: an unreadable session list reconciles nothing.
+    match db::sessions::list(&state.pool).await {
+        Ok(sessions) => {
+            let matches = cwd_host_match_count(
+                team,
+                sessions.iter().map(|s| SessionRef {
+                    name: &s.name,
+                    dir: &s.dir,
+                    provider: &s.provider,
+                }),
+            );
+            if matches > 1 {
+                tracing::debug!(
+                    team = %team.team_name,
+                    host = %host_name,
+                    matches,
+                    "teams watcher: ambiguous cwd host attribution; leaving the roster untouched",
+                );
+                return false;
+            }
+            true
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                team = %team.team_name,
+                "teams watcher: session list failed; leaving the roster untouched this tick",
+            );
+            false
+        }
+    }
+}
+
+/// Drop every member whose pane is gone — the dead crew of a stopped lead. Pure,
+/// so the reconcile policy is unit-testable apart from the DB. `tmux_pane_id` is
+/// `Some` only for a pane validated against the host's LIVE panes this tick
+/// (`scan::validate_pane_ids`), so a teammate that is still running survives even
+/// while the gate is open.
+fn retain_live_paned(team: &mut Team) {
+    team.members.retain(|m| m.tmux_pane_id.is_some());
+}
+
 /// Cheap-deduped UPDATE: only fire when the session's current team_name
 /// differs from the team we just mapped to it. A DB error is logged at debug
 /// and swallowed — the cleanup-on-archive degrades to "leaves a stale config
@@ -611,6 +743,53 @@ fn norm_dir(s: &str) -> &str {
     s.trim().trim_end_matches('/')
 }
 
+/// The directories that may legitimately claim this team in a cwd-based host
+/// attribution: the LEAD's own cwd when known (authoritative), else the unique
+/// non-empty teammate cwds. Shared by [`match_host_by_cwd`], which PICKS a host
+/// from them, and [`cwd_host_match_count`], which measures how ambiguous that
+/// pick was — extracted so the picker and the ambiguity measure can never drift
+/// apart. Normalized via [`norm_dir`]; compared case-insensitively.
+fn host_cwd_candidates(team: &Team) -> Vec<&str> {
+    // Authoritative candidate: the lead's own cwd. Fall back to the unique
+    // non-empty teammate cwds ONLY when the lead cwd is unknown.
+    let lead = norm_dir(&team.lead_cwd);
+    if !lead.is_empty() {
+        return vec![lead];
+    }
+    let mut cwds: Vec<&str> = team
+        .members
+        .iter()
+        .map(|m| norm_dir(&m.cwd))
+        .filter(|c| !c.is_empty())
+        .collect();
+    cwds.sort_unstable();
+    cwds.dedup();
+    cwds
+}
+
+/// How many claude sessions a cwd-based host attribution has to choose from.
+/// Counts every NON-ARCHIVED claude session on the team's cwd, stopped ones
+/// included: the caller feeds it `db::sessions::list` (archived rows excluded,
+/// running and stopped alike), and counting the stopped siblings is the whole
+/// point, since a stopped session is exactly what can win the pick and be handed
+/// a running lead's team. [`match_host_by_cwd`] returns the FIRST match in list
+/// order (pinned, then most recently sent to) with no liveness preference, so a
+/// count above 1 means the winner was decided by list order, not by evidence.
+/// Pure, so the ambiguity policy is unit-testable apart from the DB.
+fn cwd_host_match_count<'a>(team: &Team, sessions: impl Iterator<Item = SessionRef<'a>>) -> usize {
+    let candidates = host_cwd_candidates(team);
+    if candidates.is_empty() {
+        return 0;
+    }
+    sessions
+        .filter(|s| s.provider == "claude")
+        .filter(|s| {
+            let d = norm_dir(s.dir);
+            !d.is_empty() && candidates.iter().any(|c| c.eq_ignore_ascii_case(d))
+        })
+        .count()
+}
+
 /// Pure cwd→session matcher (no DB), so the host-attribution policy is unit
 /// testable. Given the live sessions as [`SessionRef`]s, return the first
 /// `provider == "claude"` session whose `dir` equals the team's host cwd.
@@ -628,22 +807,7 @@ fn match_host_by_cwd<'a>(
     team: &Team,
     sessions: impl Iterator<Item = SessionRef<'a>>,
 ) -> Option<String> {
-    // Authoritative candidate: the lead's own cwd. Fall back to the unique
-    // non-empty teammate cwds ONLY when the lead cwd is unknown.
-    let lead = norm_dir(&team.lead_cwd);
-    let candidates: Vec<&str> = if !lead.is_empty() {
-        vec![lead]
-    } else {
-        let mut cwds: Vec<&str> = team
-            .members
-            .iter()
-            .map(|m| norm_dir(&m.cwd))
-            .filter(|c| !c.is_empty())
-            .collect();
-        cwds.sort_unstable();
-        cwds.dedup();
-        cwds
-    };
+    let candidates = host_cwd_candidates(team);
     if candidates.is_empty() {
         return None;
     }
@@ -907,6 +1071,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -1096,6 +1261,9 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                config_dir: None,
+                ..Default::default()
             },
         )
         .await
@@ -1142,6 +1310,9 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                config_dir: None,
+                ..Default::default()
             },
         )
         .await
@@ -1212,6 +1383,9 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                config_dir: None,
+                ..Default::default()
             },
         )
         .await
@@ -1280,6 +1454,9 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
+                config_dir: None,
+                ..Default::default()
             },
         )
         .await
@@ -1358,6 +1535,9 @@ mod tests {
             runtime: None,
             model: None,
             company_id: None,
+            archive_on_stop: None,
+            config_dir: None,
+            ..Default::default()
         };
         crate::sessions::create(&state, mk("old-host", "/old")).await.unwrap();
         crate::sessions::create(&state, mk("new-host", "/new")).await.unwrap();
@@ -1874,6 +2054,38 @@ mod tests {
 
     // ── opt-in gate: normal subagent sessions stay normal ───────────────────────
 
+    /// Seed a claude session row on an EXPLICIT dir, for the cwd-ambiguity guard.
+    /// Deliberately `db::sessions::create` and nothing else: the service-layer
+    /// `sessions::create` spawns the status + deliver loops, whose detector writes
+    /// the very `session_runtime.last_status` column this gate reads.
+    async fn seed_session_in(state: &AppState, name: &str, dir: &str) {
+        db::sessions::create(
+            &state.pool,
+            &db::sessions::NewSession {
+                name: name.into(),
+                display_name: name.into(),
+                dir: dir.into(),
+                desc: String::new(),
+                provider: "claude".into(),
+                creator: "team".into(),
+                flags: String::new(),
+                tags: "[]".into(),
+                branch: String::new(),
+                mcp: String::new(),
+                worktree: false,
+                worktree_repo: String::new(),
+                host_id: None,
+                runtime: "native".into(),
+                model: String::new(),
+                company_id: None,
+                archive_on_stop: false,
+                config_dir: String::new(),
+            },
+        )
+        .await
+        .expect("seed session");
+    }
+
     /// Seed a session row with the given `tags` JSON and `creator` so the opt-in
     /// gate has a DB to read. Uses the full create path so both discriminators
     /// (`tags` + `creator`) are persisted.
@@ -1897,6 +2109,8 @@ mod tests {
                 runtime: "native".into(),
                 model: String::new(),
                 company_id: None,
+                archive_on_stop: false,
+                config_dir: String::new(),
             },
         )
         .await
@@ -2033,5 +2247,227 @@ mod tests {
             prev.contains("other-host") && !prev.contains("supermux"),
             "a successful read refreshes the carried set",
         );
+    }
+
+    /// A `session_runtime` row as the settle gate reads it. Only the two fields
+    /// [`settled_stopped`] looks at carry meaning.
+    fn runtime_row(status: &str, at: i64) -> db::sessions::SessionRuntime {
+        db::sessions::SessionRuntime {
+            name: "host".into(),
+            rate_limit_reset_at: 0,
+            hibernated: 0,
+            restarting: 0,
+            last_claude_alive_pid: 0,
+            last_status: status.into(),
+            last_status_at: at,
+            last_capture: String::new(),
+            last_capture_ansi: String::new(),
+            hook_token: String::new(),
+        }
+    }
+
+    /// The settle gate: only a host that has read `stopped` for at least
+    /// STOPPED_SETTLE_SECS opens it. A stop→start bounce (9s in, and any
+    /// non-`stopped` status at all) leaves the roster alone.
+    #[test]
+    fn settle_gate_needs_a_settled_stopped_host() {
+        let now = 1_000_000i64;
+
+        assert!(
+            !settled_stopped(&runtime_row("stopped", now - 9), now),
+            "9s after the stop the gate is still shut (a restart bounce must not blink the crew)",
+        );
+        assert!(
+            settled_stopped(&runtime_row("stopped", now - 11), now),
+            "11s after the stop the gate is open",
+        );
+        assert!(
+            settled_stopped(&runtime_row("stopped", now - STOPPED_SETTLE_SECS), now),
+            "the boundary itself counts as settled",
+        );
+        for alive in ["active", "idle", "waiting", "starting", "unknown"] {
+            assert!(
+                !settled_stopped(&runtime_row(alive, now - 3600), now),
+                "a `{alive}` host is never reconciled, however long it has held that status",
+            );
+        }
+    }
+
+    /// The reconcile itself: a stopped lead's paneless ghosts go, a teammate whose
+    /// `%id` is still live this tick stays. Pure, so no tmux/DB is involved.
+    #[test]
+    fn retain_live_paned_drops_only_the_paneless() {
+        let mut ghost = member_with("ghost@sq", MemberStatus::Offline);
+        let mut alive = member_with("alive@sq", MemberStatus::Working);
+        alive.tmux_pane_id = Some("%7".into());
+        let mut team = host_team("sq", Some("lead"), vec![ghost.clone(), alive], 0);
+
+        retain_live_paned(&mut team);
+
+        let names: Vec<&str> = team.members.iter().map(|m| m.agent_id.as_str()).collect();
+        assert_eq!(names, vec!["alive@sq"], "only the live-paned teammate survives");
+
+        // A crew that is dead to the last member empties the roster — which is the
+        // POINT: `drop_rosterless` then removes the stale team card too, and the
+        // stopped session renders as a plain tile again.
+        ghost.tmux_pane_id = None;
+        let mut all_dead = host_team("sq", Some("lead"), vec![ghost], 0);
+        retain_live_paned(&mut all_dead);
+        assert!(all_dead.members.is_empty());
+        assert!(drop_rosterless(vec![all_dead]).is_empty(), "the ghost team card goes too");
+    }
+
+    /// The DB wiring: the gate reads the HOST's runtime row. A live host, a host
+    /// that only just stopped, and a host with no runtime row at all all answer
+    /// `false` (fail toward leaving the roster exactly as it is); only a host that
+    /// stopped longer ago than the settle window answers `true`.
+    #[tokio::test]
+    async fn host_settled_stopped_reads_the_host_runtime_row() {
+        let (state, dir) = test_state().await;
+        seed_session(&state, "lead", "[\"team\"]", "team").await;
+        // `seed_session` puts the row on /tmp/<name>, so this team's cwd is
+        // claimed by exactly one claude session and the ambiguity guard is open.
+        let team = lead_cwd_team("sq", "/tmp/lead", "");
+
+        assert!(
+            !should_reconcile_host(&state, &team, "lead").await,
+            "no runtime row yet → never reconcile",
+        );
+        assert!(
+            !should_reconcile_host(&state, &team, "no-such-session").await,
+            "an unresolvable host → never reconcile",
+        );
+
+        db::sessions::ensure_runtime(&state.pool, "lead", "tok").await.unwrap();
+        db::sessions::set_last_status(&state.pool, "lead", "active").await.unwrap();
+        assert!(
+            !should_reconcile_host(&state, &team, "lead").await,
+            "a running lead is untouched"
+        );
+
+        // Just stopped: inside the settle window, so still shut.
+        db::sessions::set_last_status(&state.pool, "lead", "stopped").await.unwrap();
+        assert!(
+            !should_reconcile_host(&state, &team, "lead").await,
+            "inside the settle window"
+        );
+
+        // Backdate the stamp past the window — the only way to age it without
+        // sleeping in a test.
+        let aged = chrono::Utc::now().timestamp() - STOPPED_SETTLE_SECS - 1;
+        sqlx::query("UPDATE session_runtime SET last_status_at = ? WHERE name = ?")
+            .bind(aged)
+            .bind("lead")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(
+            should_reconcile_host(&state, &team, "lead").await,
+            "settled stopped → reconcile"
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Ported from Paul's branch (537a43827): the pure half of the ambiguity
+    /// guard. Only claude sessions on one of the team's cwd candidates count,
+    /// trailing-slash differences normalize away, and a team with no cwd
+    /// candidate at all is not "ambiguous" — its host came from a stronger
+    /// signal than cwd, so the guard has nothing to say about it.
+    #[test]
+    fn cwd_host_match_count_counts_only_claude_sessions_on_the_team_cwd() {
+        let dir = "/home/p/projects/mobsters-united";
+        let team = lead_cwd_team("session-abc", dir, "");
+        let rows = sess(&[
+            ("live-lead", dir, "claude"),
+            ("stopped-sibling", &format!("{dir}/"), "claude"),
+            ("a-shell", dir, "shell"),
+            ("elsewhere", "/opt/other", "claude"),
+        ]);
+        let count = cwd_host_match_count(
+            &team,
+            rows.iter().map(|(n, d, p)| SessionRef { name: n, dir: d, provider: p }),
+        );
+        assert_eq!(count, 2, "two claude sessions share the cwd (the shell doesn't count)");
+
+        let only_one = sess(&[("live-lead", dir, "claude"), ("elsewhere", "/opt/other", "claude")]);
+        assert_eq!(
+            cwd_host_match_count(
+                &team,
+                only_one.iter().map(|(n, d, p)| SessionRef { name: n, dir: d, provider: p }),
+            ),
+            1,
+            "one claimant → unambiguous",
+        );
+
+        let no_cwd = lead_cwd_team("session-xyz", "", "");
+        assert_eq!(
+            cwd_host_match_count(
+                &no_cwd,
+                rows.iter().map(|(n, d, p)| SessionRef { name: n, dir: d, provider: p }),
+            ),
+            0,
+            "no cwd candidates → not ambiguous (the host came from a stronger signal)",
+        );
+    }
+
+    /// THE mis-attribution guard, end to end. A settled-stopped host is ALWAYS
+    /// attributed by cwd, and `match_host_by_cwd` takes the FIRST claude session
+    /// with that dir in list order — so a stopped sibling sharing the directory
+    /// can be handed a running lead's team. Reconciling there would empty a LIVE
+    /// team's roster and let `drop_rosterless` delete its card. The positive
+    /// control in the same test proves the guard is not a blanket off-switch: the
+    /// identical team on a cwd only ONE session claims still reconciles.
+    ///
+    /// Ported from Paul's branch (537a43827) onto our display filter; the fixture
+    /// uses `seed_session_in` (a pure `db::sessions::create`) rather than his
+    /// service-layer helper, which would spawn the status + deliver loops that
+    /// race the very `last_status` column this gate reads.
+    #[tokio::test]
+    async fn reconcile_skips_when_two_claude_sessions_share_the_team_cwd() {
+        let (state, dir) = test_state().await;
+        let shared = "/work/shared";
+
+        // Two claude sessions on the SAME dir: the stopped one is what a cwd
+        // attribution can wrongly hand the running one's team to.
+        seed_session_in(&state, "stopped-sibling", shared).await;
+        seed_session_in(&state, "running-lead", shared).await;
+        for name in ["stopped-sibling", "running-lead"] {
+            db::sessions::ensure_runtime(&state.pool, name, "tok").await.unwrap();
+            db::sessions::set_last_status(&state.pool, name, "stopped").await.unwrap();
+        }
+        let aged = chrono::Utc::now().timestamp() - STOPPED_SETTLE_SECS - 1;
+        sqlx::query("UPDATE session_runtime SET last_status_at = ?")
+            .bind(aged)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let ambiguous = lead_cwd_team("sq", shared, "");
+        assert!(
+            !should_reconcile_host(&state, &ambiguous, "stopped-sibling").await,
+            "two claude sessions claim this cwd → the attribution is a coin flip, reconcile nothing",
+        );
+
+        // Positive control: the same settled-stopped host on a cwd only it
+        // claims still reconciles, so the guard has not turned the feature off.
+        seed_session_in(&state, "solo", "/work/solo").await;
+        db::sessions::ensure_runtime(&state.pool, "solo", "tok").await.unwrap();
+        db::sessions::set_last_status(&state.pool, "solo", "stopped").await.unwrap();
+        sqlx::query("UPDATE session_runtime SET last_status_at = ? WHERE name = ?")
+            .bind(aged)
+            .bind("solo")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let solo = lead_cwd_team("sq2", "/work/solo", "");
+        assert!(
+            should_reconcile_host(&state, &solo, "solo").await,
+            "one claimant → unambiguous, reconcile as before",
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

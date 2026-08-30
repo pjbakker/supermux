@@ -38,6 +38,14 @@ pub struct StartResult {
     pub started: bool,
     /// The agent UI / shell prompt was observed within the wait-for-ready window.
     pub ready: bool,
+    /// Did the OPENING PROMPT actually submit? `Some(true)`: observed (a turn
+    /// started, or the agent parked on a selector it could only reach by
+    /// answering). `Some(false)`: the whole verify window was observed and the
+    /// prompt still looked unsubmitted — the session is left running for
+    /// recovery. `None`: no prompt was delivered, or delivery could not be
+    /// verified (see [`deliver_prompt`]). A caller may NOT read `None` as a
+    /// failure.
+    pub prompt_submitted: Option<bool>,
     /// `supermux-<name>` — the tmux target.
     pub target: String,
 }
@@ -179,7 +187,11 @@ pub fn scrub_inherited_agent_env() -> Vec<&'static str> {
 /// all, `codex` launches its own binary and ignores `CLAUDE_CODE_*`, and the
 /// RETIRED `kimi` (see [`crate::sessions::RETIRED_PROVIDERS`]) can never be
 /// launched again — none of the three is a Claude pane.
-fn launches_claude(provider: &str) -> bool {
+///
+/// This is also the rule for a session's `config_dir` (migration 0041): the
+/// launch line's `CLAUDE_CONFIG_DIR` export, the Resume picker and recall all
+/// read this predicate, so all three agree on whose transcripts a session owns.
+pub(crate) fn launches_claude(provider: &str) -> bool {
     !matches!(provider, "codex" | "kimi" | "shell")
 }
 
@@ -564,6 +576,28 @@ fn build_env(
     env
 }
 
+/// The `export CLAUDE_CONFIG_DIR=...` prefix for a session that launches claude
+/// (migration 0041), or the empty string when the session carries no config dir
+/// (the daemon default, byte-identical to the pre-0041 launch line). The value
+/// is charset-validated at the HTTP boundary (`sessions::valid_config_dir`) and
+/// single-quoted here as well, so nothing can break out of the line.
+///
+/// Gated on [`launches_claude`], which is the same gate the Claude-only env in
+/// [`build_env`] uses. It matters for the RETIRED `kimi`: since that provider's
+/// launch arm was removed, a legacy kimi row reaching this builder would fall
+/// through to the claude arm, and a row that gets no `CLAUDE_CODE_*` env and
+/// whose picker reads the daemon's transcripts must not get the export either.
+/// `start` refuses a retired provider long before this, so no live row is
+/// affected either way.
+fn config_dir_export(s: &Session) -> String {
+    let dir = s.config_dir.trim();
+    if dir.is_empty() || !launches_claude(&s.provider) {
+        String::new()
+    } else {
+        format!("export CLAUDE_CONFIG_DIR='{dir}'; ")
+    }
+}
+
 /// Build the agent launch command sent into the freshly-spawned shell. Profiles
 /// are sourced first so `claude`/`codex` are on PATH in a non-login pane.
 /// Claude resumes via `cc_session_name` → `cc_conversation_id` → fresh `--name`.
@@ -589,7 +623,10 @@ fn build_launch_command(
     s: &Session,
     mcp_flags: &[String],
 ) -> (String, bool) {
-    let (agent, resume_intended) = match s.provider.as_str() {
+    // Third element: the `CLAUDE_CONFIG_DIR` export (migration 0041), built by
+    // the arm that actually launches the agent so the command and the export can
+    // never disagree about which account this session boots on.
+    let (agent, resume_intended, config_dir_export) = match s.provider.as_str() {
         "codex" => {
             // Keep Codex in the normal terminal buffer so the browser terminal
             // retains scrollback. This is Codex CLI's documented TUI flag.
@@ -662,7 +699,8 @@ fn build_launch_command(
             );
             // Codex has no supermux-driven resume: the command never carries
             // `--resume`, so `wait_for_agent_ready` treats it as a fresh start.
-            (agent, false)
+            // No config-dir export either: Codex does not read CLAUDE_CONFIG_DIR.
+            (agent, false, String::new())
         }
         // `shell` never reaches this builder, and a RETIRED provider is refused
         // in `start` long before it gets here (see `is_retired_provider`), so
@@ -741,7 +779,9 @@ fn build_launch_command(
             for word in mcp_flags {
                 parts.push(shell_escape::unix::escape(std::borrow::Cow::Borrowed(word)).into_owned());
             }
-            (parts.join(" "), resume_intended)
+            // This arm runs `claude`, so this is where the session's own Claude
+            // login applies (migration 0041).
+            (parts.join(" "), resume_intended, config_dir_export(s))
         }
     };
     // "Edit in native editor": point `$EDITOR`/
@@ -761,10 +801,15 @@ fn build_launch_command(
     // BOT_MEMORY_* is unset.
     let bin_dir = config.data_dir.join("bin");
     let bin_dir = bin_dir.display();
+    // Per-session Claude login (migration 0041). A session can be pointed at a
+    // second account's config dir. The export was built by the launch arm
+    // above; it lands AFTER the profile sources so a user `~/.zprofile` that
+    // sets its own CLAUDE_CONFIG_DIR cannot override it, and BEFORE `{agent}`
+    // so the launched provider inherits it.
     let command = format!(
         "source ~/.zprofile 2>/dev/null; source ~/.bash_profile 2>/dev/null; \
          source ~/.profile 2>/dev/null; export EDITOR='{bridge}' VISUAL='{bridge}'; \
-         export PATH='{bin_dir}':\"$PATH\"; {agent}"
+         export PATH='{bin_dir}':\"$PATH\"; {config_dir_export}{agent}"
     );
     (command, resume_intended)
 }
@@ -1019,15 +1064,45 @@ fn selection_screen(screen: &str) -> bool {
 /// row. The caret alone is the composer's glyph and the number alone is prose,
 /// so it takes both.
 fn is_selection_row(line: &str) -> bool {
-    let rest = match strip_caret(line) {
+    let rest = match strip_selection_caret(line) {
         Some(rest) => rest,
         None => return false,
     };
     numbered_row(rest)
 }
 
+/// The SELECTION cursor glyphs — a strict superset of [`strip_caret`]'s, adding
+/// `›` (U+203A).
+///
+/// Kept separate on purpose, because the two callers want opposite risk. `›` is
+/// Codex's cursor (and Claude Code draws it too — `keys_to_accept_trust` has
+/// always matched both), so without it `is_selection_row` was blind to EVERY
+/// Codex selector and `selection_screen` could only recognise one through its
+/// ENGLISH key-legend list. That was merely over-cautious while this fed
+/// `send_block`, where an unrecognised dialog just refuses a send; but
+/// [`submit_state`] INVERTS the polarity — an unrecognised selector reads `Stuck`,
+/// and `deliver_prompt` answers `Stuck` by pressing Enter, onto whatever row the
+/// dialog has highlighted. A Codex approval prompt whose command preview pushes
+/// its legend out of the 10-line [`current_screen_tail`] window is exactly that
+/// screen: `› 1. Yes / › 2. No` and nothing else.
+///
+/// It is NOT folded into [`strip_caret`] because that one also feeds
+/// [`agent_composer_visible`], where a matched glyph PERMITS a send. Widening
+/// both would trade a blind Enter for a blind send onto a `›`-drawn non-numbered
+/// dialog line. Widening only the selection side is monotonic: strictly more
+/// screens are recognised as dialogs, so the send guard only ever gets more
+/// conservative.
+fn strip_selection_caret(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    strip_caret(line).or_else(|| t.strip_prefix('›'))
+}
+
 /// The line's leading caret glyph removed, or `None` when it does not open with
 /// one. Leading whitespace is the terminal's left margin, not a signal.
+///
+/// The COMPOSER glyphs only (`❯`, `❱`). Codex's `›` is deliberately absent here:
+/// this feeds [`agent_composer_visible`], where a match PERMITS a send. Selection
+/// detection wants the wider set and uses [`strip_selection_caret`].
 fn strip_caret(line: &str) -> Option<&str> {
     let t = line.trim_start();
     t.strip_prefix('❯').or_else(|| t.strip_prefix('❱'))
@@ -1095,6 +1170,125 @@ fn current_screen_tail(capture: &str) -> String {
     }
     let start = lines.len().saturating_sub(SEND_SCREEN_TAIL_LINES);
     lines[start..].join("\n")
+}
+
+// ── opening-prompt submission check ──────────────────────────────────────────
+
+/// What one capture says about the OPENING PROMPT we just typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitState {
+    /// The input was CONSUMED: a turn is running, or the agent is parked on a
+    /// selector it could only have reached by answering the prompt.
+    Submitted,
+    /// The prompt's own text is still on screen with no turn running — either the
+    /// composer still holds it (the swallowed Enter) or a finished turn echoed it
+    /// into the transcript. The caller resolves that ambiguity by pressing Enter
+    /// again, which is a no-op in the second case.
+    Stuck,
+    /// Neither marker: a cleared or mid-repaint screen. Keep polling.
+    Unknown,
+}
+
+/// Did the opening prompt submit? Pure over one capture, so it is unit-tested
+/// without a terminal exactly like [`send_block`]'s heuristics.
+///
+/// Two positive arms, both reusing the send guard's own vocabulary:
+///   1. [`agent_busy`] — Claude/Codex pin `esc to interrupt` for the whole turn.
+///      Read over the WHOLE capture (not the tail) for the same reason
+///      [`agent_footer_live`] is: a teammate roster drawn below the footer can
+///      push it out of the tail. The stale-scrollback worry that keeps
+///      `send_block` narrow does not apply here — this runs seconds after a boot
+///      whose agent we just watched take the wheel;
+///   2. [`selection_screen`] on the current screen — an approval menu / question
+///      PROVES the input was consumed: the agent read the prompt, ran, and is now
+///      waiting on a human. Nothing is "working" during that wait, so without this
+///      arm the classifier says Stuck and the retry Enter CONFIRMS whatever row is
+///      highlighted (a `rm -rf`, an edit, a plan). This arm is what makes retrying
+///      safe at all.
+///
+/// The selector arm must not fire on THE PROMPT'S OWN ECHO. `is_selection_row`
+/// matches `❯ <n>. …`, which is exactly how the composer draws a prompt that
+/// starts "1. check the queue", and the key-legend markers are unanchored
+/// substrings a prompt can carry verbatim. So echoed lines are dropped BEFORE the
+/// screen is classified. Per line, because no marker spans a newline — which
+/// keeps a genuine selector drawn UNDER an echoed prompt working.
+///
+/// Otherwise: the prompt tail still squashes into the capture → Stuck.
+fn submit_state(capture: &str, prompt: &str) -> SubmitState {
+    if agent_busy(capture) {
+        return SubmitState::Submitted;
+    }
+    let screen = current_screen_tail(capture);
+    let without_echo = screen
+        .lines()
+        .filter(|l| !line_is_prompt_echo(l, prompt))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if selection_screen(&without_echo) {
+        return SubmitState::Submitted;
+    }
+    let tail = prompt_tail(prompt);
+    if !tail.is_empty() && squash(capture).contains(&tail) {
+        SubmitState::Stuck
+    } else {
+        SubmitState::Unknown
+    }
+}
+
+/// How many trailing characters of the (squashed) prompt the Stuck match keys on.
+/// Long enough that ordinary transcript prose cannot collide with it, short
+/// enough that a one-line prompt still has a tail.
+const PROMPT_TAIL_CHARS: usize = 60;
+
+/// The last [`PROMPT_TAIL_CHARS`] characters of the squashed prompt — the needle
+/// the Stuck arm looks for in the squashed capture.
+fn prompt_tail(prompt: &str) -> String {
+    let p = squash(prompt);
+    let start = p
+        .char_indices()
+        .rev()
+        .nth(PROMPT_TAIL_CHARS - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    p[start..].to_string()
+}
+
+/// Drop everything the composer's LAYOUT inserts into text: all whitespace (it
+/// hard-wraps at pane width, at positions we cannot predict) and every
+/// box-drawing glyph. Claude fences each wrapped line with `│` inside a `╭─╮` box,
+/// so the borders land in the middle of the text too — squashing whitespace alone
+/// would leave `…bootedbythe││scheduler…`, which never matches the prompt.
+/// U+2500..U+257F is the whole box-drawing block, so any border style a provider
+/// switches to is covered without hard-coding glyphs.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '\u{2500}'..='\u{257F}'))
+        .collect()
+}
+
+/// Is `line` nothing but a piece of `prompt` drawn back onto the screen?
+///
+/// Deliberately loose: the composer breaks the prompt at unpredictable points, so
+/// any single drawn line is some contiguous run of it. The composer CURSOR glyphs
+/// are stripped on both sides as well — the first drawn line opens `❯ `, which the
+/// prompt itself never contained and which is what makes it look like a selector.
+/// An empty line is never an echo (it is never evidence of anything either).
+fn line_is_prompt_echo(line: &str, prompt: &str) -> bool {
+    let strip_cursor = |s: &str| -> String {
+        squash(s)
+            .chars()
+            .filter(|c| !matches!(c, '❯' | '❱' | '›' | '>'))
+            .collect()
+    };
+    let l = strip_cursor(line);
+    // The match is an UNANCHORED substring, so a SHORT line is matched by
+    // coincidence rather than by evidence: `1. Yes` is swallowed as "echo" by any
+    // prompt that happens to contain those five characters, and swallowing it
+    // hides the very selector row that stops a retry Enter. Below the floor a line
+    // is never treated as echo — which errs toward `Submitted` (no extra Enter),
+    // the safe direction. A genuine wrapped echo line is far longer than this.
+    const MIN_ECHO_CHARS: usize = 12;
+    l.chars().count() >= MIN_ECHO_CHARS && strip_cursor(prompt).contains(&l)
 }
 
 /// Heuristic: are we stuck in a `--resume` session picker (Claude OR Codex)?
@@ -1316,6 +1510,114 @@ async fn wait_for_agent_ready(
         }
     }
     false
+}
+
+/// Verify bounds for [`deliver_prompt`]. Worst case is
+/// `VERIFY_POLLS * VERIFY_POLL` = 3s of extra wall-clock, and `start()` holds the
+/// per-session lock across all of it — so these stay tight and are pinned by a
+/// test. Even a healthy boot pays ONE `VERIFY_POLL` (~500ms): the first capture is
+/// taken after the sleep, because a submit that landed still needs a frame to be
+/// drawn.
+const VERIFY_POLLS: usize = 6;
+const VERIFY_POLL: Duration = Duration::from_millis(500);
+/// How many extra Enters a stuck composer may receive. A spurious Enter on an
+/// idle or busy composer is a no-op; on a SELECTOR it is a confirmation, which is
+/// why [`submit_state`] stops the loop there.
+const MAX_EXTRA_ENTERS: usize = 3;
+
+/// Type the opening prompt, then VERIFY it actually submitted and press Enter
+/// again — capped — when it did not.
+///
+/// THE BUG. `wait_for_agent_ready` returns Ready on the FIRST tick the agent UI is
+/// at the wheel, and the agent's own glyphs are drawn before its input handler has
+/// mounted. The Enter after the typed prompt is then occasionally swallowed (or
+/// read as part of the paste, which is what `submit_gap` addresses), and the
+/// prompt sits in the composer forever. Nothing downstream notices: `start()` has
+/// already written `active` and `set_last_send` records the prompt as sent, so the
+/// scheduler / board / a company's Router boot all believe work started while the
+/// agent is idle at a full composer.
+///
+/// Send failures propagate — a real I/O error is a boot failure, as before.
+/// Verification failure is NOT fatal: the session stays up so a human (or the next
+/// send) can recover it.
+///
+/// The return value keeps "could not look" separate from "looked, and it is bad",
+/// because those must not be reported the same way:
+///
+/// * `Ok(Some(true))` — observed submitted.
+/// * `Ok(Some(false))` — the whole window was observed and the prompt still looks
+///   stuck. The ONLY case the caller warns about.
+/// * `Ok(None)` — delivered, not verifiable. Three cases, all deliberate:
+///   a SHELL session (verification is built entirely on agent TUI signals; a shell
+///   has no busy footer and echoes every command it runs, so every classification
+///   would land on Stuck — firing retry Enters into the foreground process's stdin
+///   and reporting a false negative on a perfectly good start); a composer that was
+///   ALREADY BUSY before we typed (the double-launch guard delivers into a live
+///   agent, where the busy footer is on screen from the first poll no matter what
+///   our Enter did — the check would rubber-stamp a submit it never observed); and
+///   a window in which every capture failed (we never saw the pane, so the
+///   untouched `Unknown` must not be read as a cleared composer).
+async fn deliver_prompt(
+    rt: &dyn SessionRuntime,
+    provider: &str,
+    prompt: &str,
+) -> Result<Option<bool>, AppError> {
+    if provider == "shell" {
+        rt.send_text(prompt).await?;
+        submit_gap(rt).await;
+        rt.send_key("Enter").await?;
+        return Ok(None);
+    }
+
+    let pre_busy = rt
+        .capture_plain(status::CAPTURE_LINES)
+        .await
+        .map(|c| agent_busy(&c))
+        .unwrap_or(false);
+
+    rt.send_text(prompt).await?;
+    submit_gap(rt).await;
+    rt.send_key("Enter").await?;
+
+    if pre_busy {
+        tracing::info!(
+            provider = %provider,
+            "deliver_prompt: agent was already mid-turn; prompt queued without verification",
+        );
+        return Ok(None);
+    }
+
+    let mut extra_enters = 0usize;
+    let mut observed = false;
+    let mut last = SubmitState::Unknown;
+    for _ in 0..VERIFY_POLLS {
+        tokio::time::sleep(VERIFY_POLL).await;
+        let Ok(cap) = rt.capture_plain(status::CAPTURE_LINES).await else {
+            continue; // capture hiccup: tells us nothing, keep polling
+        };
+        observed = true;
+        last = submit_state(&cap, prompt);
+        match last {
+            SubmitState::Submitted => return Ok(Some(true)),
+            SubmitState::Stuck if extra_enters < MAX_EXTRA_ENTERS => {
+                extra_enters += 1;
+                tracing::info!(
+                    provider = %provider,
+                    attempt = extra_enters,
+                    "deliver_prompt: opening prompt still unsubmitted, pressing Enter again",
+                );
+                rt.send_key("Enter").await?;
+            }
+            // Cap reached, or nothing readable: keep watching out the window.
+            SubmitState::Stuck | SubmitState::Unknown => {}
+        }
+    }
+    if !observed {
+        return Ok(None);
+    }
+    // The window closed on an Unknown: the prompt text is gone from the screen and
+    // no turn is running — the composer cleared, so it submitted.
+    Ok(Some(last == SubmitState::Unknown))
 }
 
 /// SIGTERM then (after a grace) SIGKILL the pane process group.
@@ -1557,6 +1859,11 @@ async fn emit_board_if_linked(state: &AppState, name: &str) {
 // ── public lifecycle API ────────────────────────────────────────────────────
 
 /// Spawn (or re-attach to) the session's tmux session and launch the agent.
+///
+/// Thin wrapper over [`start_locked`], which runs [`mark_boot_failed`] on every
+/// failure exit before the error propagates. The per-session lock is taken
+/// HERE, not inside, so the failure stamp lands in the same critical section as
+/// the boot it is correcting.
 pub async fn start(
     state: &AppState,
     name: &str,
@@ -1565,6 +1872,70 @@ pub async fn start(
     let lock = state.lock_for(name);
     let _guard = lock.lock().await;
     start_locked(state, name, prompt).await
+}
+
+/// Best-effort: record a failed boot as `stopped` so the row stops reading LIVE.
+///
+/// Without this a failed `start` leaves the runtime status at one of two values,
+/// and `db::sessions::live_with_prefix` reads BOTH as live:
+///   * `''` (the `ensure_runtime` default) when the failure beat the `starting`
+///     write below. Empty falls to the freshness arm, and `created_at` is
+///     seconds old, so the dead row blocks its own prefix for the whole quiet
+///     window (2h by default).
+///   * `starting` for any failure after that write. That one is live
+///     unconditionally, so it blocks forever.
+///
+/// Either way the spawn guard would refuse to respawn the identity whose boot
+/// just died, which is exactly backwards. The status detector cannot repair it
+/// either: it declines to reclassify a session whose runtime is not alive.
+///
+/// `stopped`, not `error`: the `session_runtime` status CHECK (migration 0009)
+/// rejects `error`.
+///
+/// Skipped when the runtime is in fact alive. A failure that leaves the agent
+/// running (a send that did not land, say) belongs to the detector, and writing
+/// `stopped` over a live session would be a lie its next tick has to undo.
+/// Everything here is best-effort: the caller propagates the ORIGINAL error, so
+/// a failed stamp is logged and never raised.
+///
+/// A stamped failure also runs the normal stop-time cleanup
+/// ([`maybe_archive_on_stop`]), because a dead row is only half the problem: the
+/// status detector and the steering deliver loop both hang off `exists_active`,
+/// which filters `archived = 0`, so an unarchived dead row keeps two tokio loops
+/// alive for the life of the process. The gate is `archive_on_stop = 1`, i.e.
+/// exactly the scheduler/dispatcher's disposable spawns; human-, board- and
+/// team-created sessions stay visible for inspection. Safe under the per-session
+/// lock `start()` holds around this call for the same reason `stop()`'s call is:
+/// `archive()` takes no session lock and its teardown is async-job-shaped, so it
+/// never waits on this task.
+async fn mark_boot_failed(state: &AppState, name: &str) {
+    // No runtime row means no session to stamp (a start that failed on
+    // `require_session`), and the write would be a silent no-op anyway.
+    match db::sessions::runtime(&state.pool, name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "mark_boot_failed: runtime lookup failed");
+            return;
+        }
+    }
+    if let Ok(rt) = state.runtime_for(name).await {
+        if rt.alive().await {
+            return;
+        }
+    }
+    match db::sessions::set_last_status(&state.pool, name, "stopped").await {
+        Ok(()) => {
+            broadcast_status(state, name, "stopped");
+            // A failed boot IS a stop, so it gets the same cleanup: disposable
+            // spawns archive themselves, which also ends their detector and
+            // steering loops.
+            maybe_archive_on_stop(state, name).await;
+        }
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "mark_boot_failed: could not stamp 'stopped'; the spawn guard may block this prefix until the quiet window elapses")
+        }
+    }
 }
 
 /// Outcome of [`start_if_stopped`]: either we started (carrying `start`'s
@@ -1657,7 +2028,26 @@ async fn clear_stale_resume_link(
 /// The body of [`start`], assuming the per-session lock is ALREADY held. Split
 /// out so [`start_if_stopped`] can wrap it with an atomic precondition without
 /// re-entering the (non-reentrant) lock.
+///
+/// Every failure exit runs [`mark_boot_failed`] before the error propagates, so
+/// a boot that died never leaves its row reading LIVE to the spawn guard. It
+/// sits here rather than in [`start`] so the auto-heal path
+/// ([`start_if_stopped`]), which calls this directly, is covered too.
 async fn start_locked(
+    state: &AppState,
+    name: &str,
+    prompt: Option<&str>,
+) -> Result<StartResult, AppError> {
+    match start_locked_inner(state, name, prompt).await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            mark_boot_failed(state, name).await;
+            Err(e)
+        }
+    }
+}
+
+async fn start_locked_inner(
     state: &AppState,
     name: &str,
     prompt: Option<&str>,
@@ -1788,8 +2178,24 @@ async fn start_locked(
             Some(id) => Arc::new(SshFileTransport::new(state.host_pool.clone(), HostId(id))),
             None => Arc::new(LocalFileTransport),
         };
-        if let Err(e) =
-            crate::claude_config::install_hooks(name, &hook_token, transport.as_ref(), None).await
+        // A session booting on its OWN Claude account (migration 0041) reads
+        // `<config_dir>/settings.json`, not the daemon's — so installing the
+        // hooks into the daemon's file would leave that session with no hook
+        // reporting at all, falling back to the regex bank + pty heartbeat (the
+        // known "stuck active" failure mode). `install_hooks` already takes an
+        // explicit settings path for exactly this kind of override; point it at
+        // the session's account so a second-account session is a first-class
+        // one. Local only: `config_dir` is refused for remote rows on create,
+        // and the remote branch resolves a relative path against the far $HOME.
+        let settings_override = (!s.config_dir.is_empty() && s.host_id.is_none())
+            .then(|| std::path::Path::new(&s.config_dir).join("settings.json"));
+        if let Err(e) = crate::claude_config::install_hooks(
+            name,
+            &hook_token,
+            transport.as_ref(),
+            settings_override.as_deref(),
+        )
+        .await
         {
             tracing::warn!(name = %name, error = %e, "install_hooks failed; status falls back to regex/heartbeat");
         }
@@ -1922,6 +2328,32 @@ async fn start_locked(
         // ("a fault reads as gone"), so a transient probe glitch on a session
         // that is actually running now lands here — and must not tear down that
         // live session's cached stream on the way to a spawn that fails.
+
+        // THE GROUND UNDER US. The sibling `holder_bin` guard above names a
+        // missing BINARY; this one names a missing CWD. A stored `dir` that no
+        // longer exists (a worktree removed, a project moved) fails ENOENT
+        // inside `cmd.spawn()` down in the runtime, and `AppError::Internal`
+        // deliberately answers a bare 500 "internal server error" — so the one
+        // fact the user can actually act on never reaches the wire. Say it here.
+        //
+        // LOCAL ROWS ONLY: a remote session's `dir` lives on the far side of the
+        // SSH ControlMaster, where this `is_dir()` would measure the wrong box.
+        // Gated on `host_id`, not runtime, so a local tmux row is covered too —
+        // and it needs to be: the same opaque 500 was reachable on a local tmux
+        // row as well, where the ENOENT surfaces as a "spawn pty holder" or a
+        // bare tmux error rather than as anything the user can act on.
+        //
+        // INSIDE `freshly_spawned` deliberately: a start on an already-alive
+        // session (resume, or a plain no-op) never spawns and stays
+        // byte-identical, so a dir deleted under a RUNNING agent does not
+        // newly fail the resume that still works.
+        if s.host_id.is_none() && !dir.is_dir() {
+            return Err(AppError::BadRequest(format!(
+                "session directory '{}' does not exist; create it or update the session's directory",
+                s.dir
+            )));
+        }
+
         // COMPANY ISOLATION (companies §4.4). Build the per-spawn confinement
         // plan for a company session (`None` for a main/PA bot or under
         // isolation_mode=off) and spawn through the confining seam. On THIS box
@@ -2044,6 +2476,7 @@ async fn start_locked(
             name: name.to_string(),
             started: true,
             ready,
+            prompt_submitted: None, // nothing was typed on this path
             target: rt.target(),
         });
     }
@@ -2063,11 +2496,21 @@ async fn start_locked(
     // in the booting affordance for up to 2s after the agent UI is ready).
     state.wake_detector(name);
 
+    let mut prompt_submitted = None;
     if let Some(p) = prompt {
         if !p.trim().is_empty() {
-            rt.send_text(p).await?;
-            submit_gap(rt.as_ref()).await;
-            rt.send_key("Enter").await?;
+            prompt_submitted = deliver_prompt(rt.as_ref(), &s.provider, p).await?;
+            if prompt_submitted == Some(false) {
+                // Honest, and only where it was actually looked at: the boot ran,
+                // the session is up, but the first turn never started. Every caller
+                // of `start(prompt)` — scheduler, board, a company's Router boot —
+                // otherwise reads the `active` row we just wrote as "working".
+                tracing::warn!(
+                    name = %name,
+                    "start: opening prompt still looked unsubmitted after capped Enter retries; \
+                     session left running for recovery",
+                );
+            }
             let (preview, at) = db::sessions::set_last_send(&state.pool, name, p).await?;
             broadcast_send(state, name, &preview, at);
         }
@@ -2077,6 +2520,7 @@ async fn start_locked(
         name: name.to_string(),
         started: true,
         ready,
+        prompt_submitted,
         target: rt.target(),
     })
 }
@@ -2111,10 +2555,21 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     // hard-kill and the definitive teardown are all backend-agnostic.
     let rt = state.runtime_for(name).await?;
 
+    // Capture the lead agent PID while the pane is still up: the agent-team
+    // tmux server is named `claude-swarm-<lead pid>` and after teardown the
+    // pid is unrecoverable. Teardown itself waits for the lead to die.
+    let swarm_lead = if crate::sessions::swarm::teardown_enabled(state) {
+        crate::sessions::swarm::lead_pid_of(rt.as_ref()).await
+    } else {
+        None
+    };
+
     if !rt.alive().await {
         db::sessions::set_last_status(&state.pool, name, "stopped").await?;
         broadcast_status(state, name, "stopped");
         emit_board_if_linked(state, name).await;
+        // Disposable (archive_on_stop) sessions archive themselves on stop.
+        maybe_archive_on_stop(state, name).await;
         return Ok(());
     }
 
@@ -2192,6 +2647,14 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     // the board card mirrors the linked session's state — re-publish so a linked
     // card reflects the now-stopped session rather than a stale running dot.
     emit_board_if_linked(state, name).await;
+    // The team's swarm server is reaped off the pid captured before the kill,
+    // ahead of the archive below: `archive` runs its own teardown, but by then
+    // the pane is gone and there is no foreground pid left to read.
+    if let Some(pid) = swarm_lead {
+        crate::sessions::swarm::spawn_teardown_for_lead(pid);
+    }
+    // Disposable (archive_on_stop) sessions archive themselves on stop.
+    maybe_archive_on_stop(state, name).await;
     Ok(())
 }
 
@@ -2727,6 +3190,31 @@ fn cap_bytes_from_tail(s: String, max: usize) -> String {
     }
 }
 
+/// Archive `name` IFF it is a live, `archive_on_stop`-flagged session -- the
+/// shared hook behind "disposable sessions clean themselves up when they
+/// stop". Best-effort and idempotent: the `archive_pending` gate (row live AND
+/// flagged AND not already archived) means a duplicate call -- e.g. an explicit
+/// Stop racing the Claude `SessionEnd` hook -- is a no-op in practice: the gate
+/// suppresses it. The check and the flip are separate statements, so a rare
+/// exactly-simultaneous race could still write one extra `session.archive` audit
+/// row, but the SSE delta and teardown are both idempotent. `archive()` takes no
+/// session lock, so this is
+/// safe to call from `stop()` while it still holds one. Errors are logged, never
+/// propagated (archiving is a courtesy, not part of the stop contract).
+pub async fn maybe_archive_on_stop(state: &AppState, name: &str) {
+    match db::sessions::archive_pending(&state.pool, name).await {
+        Ok(true) => {
+            if let Err(e) = archive(state, name).await {
+                tracing::warn!(name = %name, error = %e, "auto-archive on stop failed");
+            } else {
+                tracing::info!(name = %name, "auto-archived disposable session on stop");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::debug!(name = %name, error = %e, "archive_pending check failed"),
+    }
+}
+
 /// Archive (async-job-shaped): returns a `job_id` immediately; the
 /// scrollback dump + teardown run in the background, completion via SSE `alerts`.
 ///
@@ -2834,6 +3322,12 @@ pub async fn archive(state: &AppState, name: &str) -> Result<String, AppError> {
         // Definitive teardown through the seam (best-effort — the archive row
         // is already flipped and the job already answered 202).
         if let Ok(rt) = state.runtime_for(&name).await {
+            // capture before the kill; teardown waits for the lead to die
+            if crate::sessions::swarm::teardown_enabled(&state) {
+                if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                    crate::sessions::swarm::spawn_teardown_for_lead(pid);
+                }
+            }
             let _ = rt.kill().await;
         }
 
@@ -3848,6 +4342,235 @@ mod agent_ready_heuristics_tests {
             "the Claude idle composer must remain a ready send target (unchanged)",
         );
     }
+
+    // ── opening-prompt submission classifier ─────────────────────────────────
+
+    #[test]
+    fn a_running_turn_reads_as_submitted() {
+        let prompt = "You are the operator, boot now";
+        assert_eq!(
+            submit_state("❯ You are the operator, boot now\n✻ Thinking… (esc to interrupt · 3s)", prompt),
+            SubmitState::Submitted,
+        );
+    }
+
+    /// The busy footer is read over the WHOLE capture: a teammate roster drawn
+    /// BELOW it pushes it clean out of the 10-line current screen (the same shape
+    /// that broke the send guard), and a missed busy footer here means retry
+    /// Enters into a working agent.
+    #[test]
+    fn a_running_turn_under_a_teammate_roster_still_reads_as_submitted() {
+        let cap = "✻ Thinking… (esc to interrupt · 3s)\n\
+                   View teammates:\n● main\n◯ bot-a\n◯ bot-b\n◯ bot-c\n\
+                   ◯ bot-d\n◯ bot-e\n◯ bot-f\n◯ bot-g\n◯ bot-h\n↓ 4 more";
+        assert_eq!(submit_state(cap, "boot now"), SubmitState::Submitted);
+    }
+
+    /// THE BUG ITSELF: the Enter was swallowed and the prompt is still sitting in
+    /// the composer, hard-wrapped inside Claude's box. The tail match has to survive
+    /// both the line breaks and the `│` borders drawn through the text.
+    #[test]
+    fn a_prompt_still_in_the_wrapped_composer_reads_as_stuck() {
+        let prompt = "You are the platform operator, booted by the scheduler. \
+                      Read prompts/platform.md next to it, then follow it exactly.";
+        let cap = "╭──────────────────────────────────────────╮\n\
+                   │ ❯ You are the platform operator, booted  │\n\
+                   │   by the scheduler. Read                 │\n\
+                   │   prompts/platform.md next to it, then   │\n\
+                   │   follow it exactly.                     │\n\
+                   ╰──────────────────────────────────────────╯\n\
+                   ⏵⏵ bypass permissions on";
+        assert_eq!(submit_state(cap, prompt), SubmitState::Stuck);
+    }
+
+    #[test]
+    fn a_cleared_composer_reads_as_unknown() {
+        assert_eq!(
+            submit_state("❯ Try \"fix tests\"\n  ? for shortcuts", "boot the operator and report"),
+            SubmitState::Unknown,
+        );
+    }
+
+    /// The arm that makes retrying safe at all. The prompt submitted, the agent ran
+    /// and is now parked on a permission menu: nothing is working, so without this
+    /// the classifier says Stuck and the retry Enter CONFIRMS the highlighted row.
+    #[test]
+    fn an_approval_selector_reads_as_submitted_so_no_enter_confirms_it() {
+        let cap = "  Bash(rm -rf ./build)\n  Do you want to proceed?\n\
+                   ❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\
+                   Enter to confirm · Esc to cancel";
+        assert_eq!(submit_state(cap, "clean the build dir and rerun the tests"), SubmitState::Submitted);
+    }
+
+    /// A prompt that OPENS with a numbered item is drawn `❯ 1. …` — the exact shape
+    /// `is_selection_row` matches. Read as a selector it would report a confident
+    /// Submitted with zero retries on a genuinely stuck boot.
+    #[test]
+    fn a_numbered_prompt_echo_is_not_mistaken_for_a_selector() {
+        let prompt = "1. check the queue, 2. answer the oldest issue";
+        let cap = "❯ 1. check the queue, 2. answer the oldest issue\n  ? for shortcuts";
+        assert_eq!(submit_state(cap, prompt), SubmitState::Stuck);
+    }
+
+    /// Same trap through the key-legend markers, which are unanchored substrings a
+    /// prompt can carry verbatim.
+    #[test]
+    fn a_prompt_echo_carrying_a_key_legend_is_not_mistaken_for_a_selector() {
+        let prompt = "if the deploy hangs, tell the user to press esc to cancel";
+        let cap = "❯ if the deploy hangs, tell the user to press esc to cancel\n  ? for shortcuts";
+        assert_eq!(submit_state(cap, prompt), SubmitState::Stuck);
+    }
+
+    /// The echo filter runs per LINE, so a GENUINE selector drawn underneath an
+    /// echoed prompt is still seen — guarding on the prompt as a whole would switch
+    /// the safe arm off for exactly the prompts that carry a token.
+    #[test]
+    fn a_real_selector_under_an_echoed_prompt_still_reads_as_submitted() {
+        let prompt = "1. check the queue, 2. answer the oldest issue";
+        let cap = "❯ 1. check the queue, 2. answer the oldest issue\n\
+                   Do you want to proceed?\n❯ 1. Yes\n  2. No, keep going";
+        assert_eq!(submit_state(cap, prompt), SubmitState::Submitted);
+    }
+
+    /// Codex coverage, ported from pjbakker/feat/prompt-delivery-verification.
+    /// Codex draws its approval selector under a `›` cursor and confirms with
+    /// "Press enter to confirm", so the selector arm has to fire on a glyph the
+    /// Claude fixtures never exercise — that arm is the only thing stopping a
+    /// retry Enter from confirming a highlighted destructive default.
+    #[test]
+    fn submit_state_reads_a_codex_approval_selector_as_submitted() {
+        assert_eq!(
+            submit_state(
+                "› run the deploy script\n› 1. Yes\n› 2. No\nPress enter to confirm",
+                "run the deploy script",
+            ),
+            SubmitState::Submitted,
+        );
+    }
+
+    /// THE ONE THAT MATTERS. The fixture above passes on its "Press enter to
+    /// confirm" LEGEND, not on its `›` rows — delete that one line and it went
+    /// `Stuck`, so the selector arm could be completely blind to Codex and the suite
+    /// would stay green. Codex previews the proposed command ABOVE the options; a
+    /// preview a few lines tall pushes the legend out of the 10-line
+    /// [`current_screen_tail`] window (while `agent_busy` still reads all 30),
+    /// leaving nothing but the rows themselves.
+    ///
+    /// Before [`strip_selection_caret`] learned `›` this scored `Stuck`, and
+    /// `deliver_prompt` answers `Stuck` with up to three Enters — CONFIRMING the
+    /// highlighted option of an approval dialog nobody read.
+    #[test]
+    fn a_codex_selector_with_no_key_legend_is_still_submitted() {
+        // The dangerous screen in full. The prompt is ECHOED (which is what makes
+        // the fallback arm score `Stuck` rather than the harmless `Unknown`), the
+        // command preview is tall enough to push the legend out of the 10-line
+        // window, and the approval rows are all that is left.
+        let preview =
+            (1..=8).map(|i| format!("  preview line {i}")).collect::<Vec<_>>().join("\n");
+        let cap = format!(
+            "Press enter to confirm\n{preview}\n› run the deploy script\nDo you want to run this command?\n› 1. Yes, run it\n  2. No",
+        );
+        assert!(
+            !current_screen_tail(&cap).to_lowercase().contains("enter to confirm"),
+            "fixture is only meaningful if the legend really is out of the window",
+        );
+        // Without the glyph this is `Stuck` — and `deliver_prompt` answers `Stuck`
+        // by pressing Enter, onto `1. Yes, run it`.
+        assert_eq!(submit_state(&cap, "run the deploy script"), SubmitState::Submitted);
+
+        // The bare rows with nothing else on screen: no echo, so the fallback can
+        // only reach `Unknown`, but the selector must still be SEEN.
+        let bare = format!("› 1. Yes, run it\n› 2. No, keep chatting");
+        assert_eq!(submit_state(&bare, "run the deploy script"), SubmitState::Submitted);
+    }
+
+    /// The widened glyph belongs to SELECTION detection ONLY. `agent_composer_visible`
+    /// still takes just the two Claude composer glyphs, so a `›`-drawn NON-numbered
+    /// dialog line cannot begin to read as "the agent is at its text composer" and
+    /// permit a send. Pins the asymmetry the split exists for.
+    #[test]
+    fn the_codex_glyph_widens_selection_but_not_composer_permission() {
+        assert!(is_selection_row("› 1. Yes"));
+        assert!(strip_selection_caret("› 1. Yes").is_some());
+        assert!(strip_caret("› 1. Yes").is_none());
+        assert!(!agent_composer_visible("› Do you want to proceed?"));
+        // Both Claude glyphs keep working on both sides.
+        assert!(is_selection_row("❯ 1. Yes"));
+        assert!(agent_composer_visible("❯ write me a haiku"));
+    }
+
+    /// A short GENUINE option row must not be eaten by the echo filter merely because
+    /// its handful of characters occur somewhere in the prompt. `line_is_prompt_echo`
+    /// is an UNANCHORED substring test, so without the length floor `1. Yes` vanishes
+    /// from the screen whenever the prompt happens to contain it — taking the selector
+    /// with it and turning a live approval dialog into `Stuck` plus a blind Enter.
+    #[test]
+    fn a_short_option_row_is_not_swallowed_as_prompt_echo() {
+        let prompt = "reply with 1. Yes or 2. No when the deploy finishes";
+        assert!(!line_is_prompt_echo("› 1. Yes", prompt));
+        assert!(!line_is_prompt_echo("  2. No", prompt));
+        // A real wrapped echo line is well past the floor and is still filtered.
+        assert!(line_is_prompt_echo("❯ reply with 1. Yes or 2. No when", prompt));
+        assert_eq!(
+            submit_state("› 1. Yes\n  2. No", prompt),
+            SubmitState::Submitted,
+            "the dialog must survive the echo filter",
+        );
+    }
+
+    /// The regression Paul's own version failed: a codex composer echoing a
+    /// NUMBERED prompt draws `› 1. …`, which is shaped exactly like his codex
+    /// selector fixture. `line_is_prompt_echo` has to strip `›` as well as `❯`,
+    /// or a stuck codex boot reports a confident Submitted with zero retries.
+    /// His fixture passed only because it had no digit after the cursor.
+    #[test]
+    fn a_numbered_codex_prompt_echo_is_not_mistaken_for_a_selector() {
+        assert_eq!(
+            submit_state("› 1. check the queue 2. drain it\n? for shortcuts", "1. check the queue 2. drain it"),
+            SubmitState::Stuck,
+        );
+    }
+
+    /// The accepted ambiguity, pinned rather than left in a doc comment (ported
+    /// from Paul's branch). A fast turn that already finished can echo the prompt
+    /// into the TRANSCRIPT above an empty composer, which is indistinguishable
+    /// from a swallowed Enter. It reads Stuck, so the session collects up to
+    /// three harmless extra Enters on an idle composer — the safe direction.
+    #[test]
+    fn submit_state_transcript_echo_reads_stuck_not_unknown() {
+        assert_eq!(
+            submit_state(
+                "❯ You are the operator, boot now\nDone. Summary posted.\n❯ ",
+                "You are the operator, boot now",
+            ),
+            SubmitState::Stuck,
+        );
+    }
+
+    /// The short-prompt path through `prompt_tail`'s `.unwrap_or(0)`: a prompt
+    /// under PROMPT_TAIL_CHARS is matched whole rather than by its tail. Ported
+    /// from Paul's branch, with the busy fixture rewritten — ours classifies off
+    /// `agent_busy`, which requires the literal "esc to interrupt", not off the
+    /// looser status ACTIVE_BANK his version reused.
+    #[test]
+    fn submit_state_short_prompt_is_matched_whole() {
+        assert_eq!(submit_state("❯ hi there", "hi there"), SubmitState::Stuck);
+        assert_eq!(
+            submit_state("✻ Pondering… (esc to interrupt · 2s)", "hi there"),
+            SubmitState::Submitted,
+        );
+    }
+
+    /// `start()` holds the per-session lock across delivery, so the verify window is
+    /// a lock-held cost on EVERY prompted boot. Pin the bounds.
+    #[test]
+    fn the_verify_window_stays_within_three_seconds() {
+        assert!(
+            VERIFY_POLL * VERIFY_POLLS as u32 <= Duration::from_secs(3),
+            "the verify loop is paid under start()'s session lock — keep it bounded",
+        );
+        assert!(MAX_EXTRA_ENTERS <= 3, "retry Enters stay capped");
+    }
 }
 
 #[cfg(test)]
@@ -3868,6 +4591,7 @@ mod build_env_tests {
             auth_token: "t".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -4043,6 +4767,8 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
+            config_dir: String::new(),
         };
 
         let (command, resume_intended) = build_launch_command(&config, &session, &[]);
@@ -4109,6 +4835,8 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
+            config_dir: String::new(),
         };
 
         // Fresh: no cc handles → `--name`, not resume-intended.
@@ -4132,6 +4860,152 @@ mod build_env_tests {
         let (cmd, resume) = build_launch_command(&config, &by_name, &[]);
         assert!(cmd.contains("--resume 'my-chat'"));
         assert!(resume);
+    }
+
+    /// A session with a `config_dir` boots Claude under that account: the export
+    /// lands AFTER the profile sources (so a user `~/.zprofile` cannot win) and
+    /// BEFORE the agent (so `claude` inherits it). Claude-only, single-quoted,
+    /// and absent entirely when the session has no config dir.
+    #[test]
+    fn claude_launch_exports_the_session_config_dir() {
+        let config = cfg();
+        let base = Session {
+            name: "acct".into(),
+            display_name: "Acct".into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "claude".into(),
+            flags: String::new(),
+            pinned: 0,
+            archived: 0,
+            auto_continue: 0,
+            auto_continue_msg: String::new(),
+            rate_limit_resume_text: String::new(),
+            tags: "[]".into(),
+            creator: String::new(),
+            branch: String::new(),
+            worktree: 0,
+            worktree_repo: String::new(),
+            mcp: String::new(),
+            created_at: 0,
+            start_count: 0,
+            last_started: 0,
+            last_send: 0,
+            last_send_text: String::new(),
+            task_summary: String::new(),
+            cc_session_name: String::new(),
+            cc_conversation_id: String::new(),
+            codex_session_id: String::new(),
+            start_error: String::new(),
+            team_name: None,
+            host_id: None,
+            company_id: None,
+            runtime: "native".into(),
+            mark_pin: None,
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
+            archive_on_stop: 0,
+            config_dir: "/home/agent/.claude-second".into(),
+        };
+
+        let (command, _resume) = build_launch_command(&config, &base, &[]);
+        assert!(
+            command.contains("export CLAUDE_CONFIG_DIR='/home/agent/.claude-second';"),
+            "missing single-quoted export: {command}"
+        );
+        let profile_at = command.find("source ~/.profile").expect("profile sourced");
+        let export_at = command.find("export CLAUDE_CONFIG_DIR=").expect("export present");
+        let agent_at = command.find("claude --name acct").expect("agent launched");
+        assert!(
+            profile_at < export_at && export_at < agent_at,
+            "export must sit between the profile sources and the agent: {command}"
+        );
+        // The whole line still parses as shell.
+        let status = std::process::Command::new("bash")
+            .args(["-n", "-c", &command])
+            .status()
+            .expect("bash must be available to validate the launch command");
+        assert!(status.success(), "launch line must parse as shell: {command}");
+
+        // No config dir -> byte-identical to today: nothing exported at all.
+        let plain = Session { config_dir: String::new(), ..base.clone() };
+        let (command, _resume) = build_launch_command(&config, &plain, &[]);
+        assert!(!command.contains("CLAUDE_CONFIG_DIR"), "{command}");
+    }
+
+    /// The export decision lives in the launch arms, so it cannot disagree with
+    /// the command it prefixes. Codex and Kimi run their own CLI and never get
+    /// it, even when the row carries a config dir (a duplicate of a Claude
+    /// session, say). An unknown/legacy provider falls through to the claude arm
+    /// and DOES get it, because that row really does boot claude.
+    /// [`launches_claude`] is the same rule for the Resume picker and recall, so
+    /// assert the two stay in step.
+    #[test]
+    fn the_config_dir_export_follows_the_arm_that_launches_claude() {
+        let config = cfg();
+        let base = Session {
+            name: "acct".into(),
+            display_name: "Acct".into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "codex".into(),
+            flags: String::new(),
+            pinned: 0,
+            archived: 0,
+            auto_continue: 0,
+            auto_continue_msg: String::new(),
+            rate_limit_resume_text: String::new(),
+            tags: "[]".into(),
+            creator: String::new(),
+            branch: String::new(),
+            worktree: 0,
+            worktree_repo: String::new(),
+            mcp: String::new(),
+            created_at: 0,
+            start_count: 0,
+            last_started: 0,
+            last_send: 0,
+            last_send_text: String::new(),
+            task_summary: String::new(),
+            cc_session_name: String::new(),
+            cc_conversation_id: String::new(),
+            codex_session_id: String::new(),
+            start_error: String::new(),
+            team_name: None,
+            host_id: None,
+            company_id: None,
+            runtime: "tmux".into(),
+            mark_pin: None,
+            notif: "inherit".into(),
+            seen_ts: None,
+            seen_count: None,
+            seen_epoch: None,
+            model: String::new(),
+            memory: String::new(),
+            skills: "[]".into(),
+            role_id: None,
+            archive_on_stop: 0,
+            config_dir: "/home/agent/.claude-second".into(),
+        };
+        // `shell` is deliberately absent: `start` settles a shell session
+        // without ever calling this builder, so there is no launch line to
+        // assert. The predicate still answers false for it.
+        for provider in ["claude", "legacy-agent", "codex", "kimi"] {
+            let session = Session { provider: provider.into(), ..base.clone() };
+            let (command, _resume) = build_launch_command(&config, &session, &[]);
+            assert_eq!(
+                command.contains("export CLAUDE_CONFIG_DIR='/home/agent/.claude-second';"),
+                launches_claude(provider),
+                "provider '{provider}': the export must follow the launch arm: {command}"
+            );
+        }
+        assert!(!launches_claude("shell"), "shell never launches claude");
     }
 
     #[test]
@@ -4178,6 +5052,8 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
+            config_dir: String::new(),
         };
 
         let (command, _resume) = build_launch_command(&config, &session, &[]);
@@ -4411,6 +5287,8 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
+            config_dir: String::new(),
         }
     }
 
@@ -4652,6 +5530,7 @@ mod link_liveness_tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -4739,6 +5618,7 @@ mod stale_resume_tests {
         let dir = std::env::temp_dir().join(format!("supermux-stale-resume-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = Config {
+            swarm_reaper: Default::default(),
             data_dir: dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             extra_binds: vec![],
@@ -4764,7 +5644,7 @@ mod stale_resume_tests {
     fn with_transcript(session_dir: &str, conv: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("supermux-cc-lc-{}", uuid::Uuid::new_v4()));
         std::env::set_var("CLAUDE_CONFIG_DIR", &root);
-        let proj = crate::sessions::resumable::project_dir_for(session_dir);
+        let proj = crate::sessions::resumable::project_dir_for("", session_dir);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join(format!("{conv}.jsonl")), b"{}\n").unwrap();
         root
@@ -5009,6 +5889,7 @@ mod write_runtime_tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -5088,17 +5969,25 @@ mod write_runtime_tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     struct StubRuntime {
         capture: String,
         /// When true, `capture_plain` returns an Err — the send-guard fail-closed
         /// path (wave-8).
         capture_err: bool,
+        /// A SCRIPTED pane: one screen per `capture_plain` call, the last entry
+        /// repeating once the script runs out (so a "permanently stuck" pane needs
+        /// one line). Empty = the static `capture`, which is what every send-guard
+        /// test uses. Exists for `deliver_prompt`, whose whole job is reading a
+        /// pane that CHANGES between polls.
+        script: Mutex<Vec<String>>,
         /// What `shell_is_foreground` reports. `None` = "can't tell" (the tmux
         /// default, which forces the text guard); `Some(true)` = a bare shell.
         shell_fg: Option<bool>,
         text_calls: AtomicUsize,
         key_calls: AtomicUsize,
+        capture_calls: AtomicUsize,
     }
 
     impl StubRuntime {
@@ -5106,9 +5995,11 @@ mod write_runtime_tests {
             Arc::new(Self {
                 capture: capture.to_string(),
                 capture_err: false,
+                script: Mutex::new(Vec::new()),
                 shell_fg: None,
                 text_calls: AtomicUsize::new(0),
                 key_calls: AtomicUsize::new(0),
+                capture_calls: AtomicUsize::new(0),
             })
         }
         /// A runtime whose `capture_plain` always fails — exercises the send
@@ -5117,9 +6008,11 @@ mod write_runtime_tests {
             Arc::new(Self {
                 capture: String::new(),
                 capture_err: true,
+                script: Mutex::new(Vec::new()),
                 shell_fg: None,
                 text_calls: AtomicUsize::new(0),
                 key_calls: AtomicUsize::new(0),
+                capture_calls: AtomicUsize::new(0),
             })
         }
         /// A native-shaped runtime that reports it is sitting at a BARE SHELL
@@ -5129,10 +6022,27 @@ mod write_runtime_tests {
             Arc::new(Self {
                 capture: capture.to_string(),
                 capture_err: false,
+                script: Mutex::new(Vec::new()),
                 shell_fg: Some(true),
                 text_calls: AtomicUsize::new(0),
                 key_calls: AtomicUsize::new(0),
+                capture_calls: AtomicUsize::new(0),
             })
+        }
+        /// A pane that shows each of `screens` in turn, then holds the last one.
+        fn showing(screens: &[&str]) -> Arc<Self> {
+            let rt = Self::parked_at("");
+            *rt.script.lock().unwrap() = screens.iter().map(|s| s.to_string()).collect();
+            rt
+        }
+        /// The next scripted screen, or the static capture when nothing is scripted.
+        fn next_screen(&self) -> String {
+            let mut q = self.script.lock().unwrap();
+            match q.len() {
+                0 => self.capture.clone(),
+                1 => q[0].clone(),
+                _ => q.remove(0),
+            }
         }
     }
 
@@ -5162,10 +6072,11 @@ mod write_runtime_tests {
             Ok(())
         }
         async fn capture_plain(&self, _lines: usize) -> anyhow::Result<String> {
+            self.capture_calls.fetch_add(1, Ordering::SeqCst);
             if self.capture_err {
                 anyhow::bail!("stub: capture unavailable");
             }
-            Ok(self.capture.clone())
+            Ok(self.next_screen())
         }
         async fn capture_ansi(&self, _lines: usize) -> anyhow::Result<String> {
             Ok(self.capture.clone())
@@ -5446,5 +6357,110 @@ mod write_runtime_tests {
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── opening-prompt delivery (`deliver_prompt`) ────────────────────────────
+    //
+    // The whole point of these is the KEY COUNT: how many Enters a boot presses,
+    // and into what. Reachable only through a live terminal before the scripted
+    // `StubRuntime`; `start_paused` makes the 500ms verify polls free.
+
+    const PROMPT: &str = "boot the operator and work the queue";
+
+    /// A SHELL is typed and submitted exactly once and never looked at: it has no
+    /// busy footer and echoes back every command it runs, so verification would
+    /// classify every good start as Stuck and fire retry Enters into the
+    /// foreground process's stdin.
+    #[tokio::test(start_paused = true)]
+    async fn a_shell_prompt_is_delivered_once_and_never_verified() {
+        let rt = StubRuntime::parked_at("$ ");
+        let out = deliver_prompt(rt.as_ref(), "shell", PROMPT).await.unwrap();
+        assert_eq!(out, None, "a shell start is unverifiable, not failed");
+        assert_eq!(rt.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1, "exactly one Enter, as before");
+        assert_eq!(rt.capture_calls.load(Ordering::SeqCst), 0, "the pane is never read");
+    }
+
+    /// The healthy boot: the turn is running at the first poll → verified with no
+    /// extra Enter.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_started_verifies_without_a_retry() {
+        let rt = StubRuntime::showing(&["❯ \n  ? for shortcuts", "✻ Thinking… (esc to interrupt · 2s)"]);
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, Some(true));
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1, "no retry Enter on a healthy boot");
+    }
+
+    /// THE SWALLOWED ENTER: the prompt sits in the composer poll after poll. One
+    /// retry Enter is enough, and it must be the ONLY one.
+    #[tokio::test(start_paused = true)]
+    async fn a_swallowed_enter_is_retried_and_then_verifies() {
+        let stuck = format!("❯ {PROMPT}\n  ? for shortcuts");
+        let rt = StubRuntime::showing(&[
+            "❯ \n  ? for shortcuts",             // pre-send: idle composer
+            &stuck,                               // poll 1: the Enter was swallowed
+            "✻ Thinking… (esc to interrupt · 1s)", // poll 2: the retry landed
+        ]);
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, Some(true));
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 2, "the submit plus exactly one retry");
+    }
+
+    /// A pane that never budges: retries stop at the cap and the boot reports an
+    /// OBSERVED failure (which is what `start()` warns on).
+    #[tokio::test(start_paused = true)]
+    async fn a_permanently_stuck_composer_stops_at_the_retry_cap() {
+        let rt = StubRuntime::parked_at(&format!("❯ {PROMPT}\n  ? for shortcuts"));
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, Some(false), "observed the whole window and it never submitted");
+        assert_eq!(
+            rt.key_calls.load(Ordering::SeqCst),
+            1 + MAX_EXTRA_ENTERS,
+            "the submit plus at most MAX_EXTRA_ENTERS retries — never one per poll",
+        );
+    }
+
+    /// THE DANGEROUS ONE. The prompt submitted and the agent is now parked on a
+    /// permission menu with its default highlighted; the prompt is still echoed
+    /// above it. A retry Enter here CONFIRMS that default, so the selector must
+    /// stop the loop dead.
+    #[tokio::test(start_paused = true)]
+    async fn an_approval_selector_never_receives_a_retry_enter() {
+        let selector = format!(
+            "❯ {PROMPT}\n  Bash(rm -rf ./build)\n  Do you want to proceed?\n\
+             ❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\
+             Enter to confirm · Esc to cancel",
+        );
+        let rt = StubRuntime::showing(&["❯ \n  ? for shortcuts", &selector]);
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, Some(true), "a selector proves the prompt was consumed");
+        assert_eq!(
+            rt.key_calls.load(Ordering::SeqCst),
+            1,
+            "NO extra Enter may be pressed into a highlighted destructive default",
+        );
+    }
+
+    /// Never saw the pane at all → unverifiable, NOT a failure (and no retries: an
+    /// unread screen could be anything, including a selector).
+    #[tokio::test(start_paused = true)]
+    async fn a_window_of_failed_captures_is_unverifiable_not_failed() {
+        let rt = StubRuntime::capture_fails();
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, None, "we never looked, so we may not claim it failed");
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1, "one submit, no blind retries");
+    }
+
+    /// The double-launch guard delivers into an agent that is already mid-turn:
+    /// its busy footer is on screen from the first poll whatever our Enter did, so
+    /// the check would rubber-stamp a submit it never observed. Deliver, and say so.
+    #[tokio::test(start_paused = true)]
+    async fn an_already_busy_agent_is_delivered_but_not_verified() {
+        let rt = StubRuntime::parked_at("✻ Thinking… (esc to interrupt · 40s)");
+        let out = deliver_prompt(rt.as_ref(), "claude", PROMPT).await.unwrap();
+        assert_eq!(out, None, "busy before we typed: honest unknown, not a claimed true");
+        assert_eq!(rt.text_calls.load(Ordering::SeqCst), 1, "the prompt is still queued to the agent");
+        assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rt.capture_calls.load(Ordering::SeqCst), 1, "the pre-send sample only");
     }
 }

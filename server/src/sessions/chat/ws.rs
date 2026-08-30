@@ -136,13 +136,13 @@ async fn eligible_row(state: &AppState, name: &str) -> Result<db::sessions::Sess
 /// reader below treats as "empty", never as an error. Split out from
 /// [`transcript_path`] because the seed path follows the CURRENT conversation
 /// (which can move under an open socket) rather than the row snapshot.
-fn transcript_path_of(dir: &str, conv: &str) -> PathBuf {
-    resumable::project_dir_for(dir).join(format!("{conv}.jsonl"))
+fn transcript_path_of(config_dir: &str, dir: &str, conv: &str) -> PathBuf {
+    resumable::project_dir_for(config_dir, dir).join(format!("{conv}.jsonl"))
 }
 
 /// The session's transcript file, per the DB conversation pointer.
 fn transcript_path(row: &db::sessions::Session) -> PathBuf {
-    transcript_path_of(&row.dir, &row.cc_conversation_id)
+    transcript_path_of(&row.config_dir, &row.dir, &row.cc_conversation_id)
 }
 
 // ── the history cursor ──────────────────────────────────────────────────────
@@ -691,6 +691,7 @@ fn status_frame(kind: &str, status: TailStatus, extra: &[(&str, Value)]) -> Valu
 async fn push_seed(
     socket: &mut WebSocket,
     store: &ChatStore,
+    config_dir: &str,
     dir: &str,
     conv: &str,
     status: TailStatus,
@@ -709,7 +710,7 @@ async fn push_seed(
     // The seed compose runs on the blocking pool: it is the same disk-backed
     // read the history route already spawn_blocking's, and even the ring-only
     // path serializes every ring entry to measure the byte budget.
-    let path = transcript_path_of(dir, conv);
+    let path = transcript_path_of(config_dir, dir, conv);
     let conv_owned = conv.to_string();
     let ring = att.ring;
     let oldest = att.oldest_main_offset;
@@ -880,7 +881,7 @@ async fn chat_socket(
         return;
     }
     let Some((mut high_water, mut rx)) =
-        push_seed(&mut socket, &store, &row.dir, &conv, status, None).await
+        push_seed(&mut socket, &store, &row.config_dir, &row.dir, &conv, status, None).await
     else {
         return;
     };
@@ -913,7 +914,7 @@ async fn chat_socket(
                     Forward::Skip => {}
                     Forward::Resync => {
                         refresh_conv(&state, &name, &mut conv).await;
-                        match push_seed(&mut socket, &store, &row.dir, &conv, lease.status(), Some("lagged")).await {
+                        match push_seed(&mut socket, &store, &row.config_dir, &row.dir, &conv, lease.status(), Some("lagged")).await {
                             Some((hw, fresh)) => { high_water = hw; rx = fresh; }
                             None => break,
                         }
@@ -940,7 +941,7 @@ async fn chat_socket(
                             // NEW id or the history route will 409 it.
                             epoch = status.resync_epoch;
                             refresh_conv(&state, &name, &mut conv).await;
-                            match push_seed(&mut socket, &store, &row.dir, &conv, status, Some("conversation changed")).await {
+                            match push_seed(&mut socket, &store, &row.config_dir, &row.dir, &conv, status, Some("conversation changed")).await {
                                 Some((hw, fresh)) => { high_water = hw; rx = fresh; }
                                 None => break,
                             }
@@ -1026,7 +1027,7 @@ pub async fn entry_handler(
     let row = eligible_row(&state, &name).await?;
     // A6 T4.1 — the whole conversation, not just the main transcript. A 404
     // from here now means "no such entry", which is what a 404 should mean.
-    let project_dir = resumable::project_dir_for(&row.dir);
+    let project_dir = resumable::project_dir_for(&row.config_dir, &row.dir);
     let conv = row.cc_conversation_id.clone();
     let wanted = uuid.clone();
     let found =

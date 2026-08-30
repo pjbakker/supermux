@@ -100,6 +100,30 @@ export function useArchivedSessions(
     onSettled: (_d, _e, name) => mark(name, false),
   })
 
+  // Everything from here down is memoized so the returned object is
+  // referentially stable across renders that changed nothing in it. The Archived
+  // sheet hands this whole object to every row, and the rows are `React.memo`'d;
+  // a fresh object literal (or a fresh `restore` closure) per render defeats that
+  // memo, and at ~1100 archived rows the sheet's filter box would then re-render
+  // the entire list on every keystroke. `mutateAsync` and `refetch` are stable
+  // identities from TanStack Query, so the callbacks below settle after mount.
+  const archived = React.useMemo(() => query.data ?? [], [query.data])
+
+  const { refetch: queryRefetch } = query
+  const refetch = React.useCallback(() => void queryRefetch(), [queryRefetch])
+
+  const { mutateAsync: restoreAsync } = restoreMut
+  const restore = React.useCallback(
+    (name: string) => restoreAsync(name),
+    [restoreAsync],
+  )
+
+  const { mutateAsync: purgeAsync } = purgeMut
+  const purge = React.useCallback(
+    (name: string) => purgeAsync(name),
+    [purgeAsync],
+  )
+
   // "Delete all": fan out individual purge mutations in parallel so each
   // row drops from the archived cache (via `purgeMut.onSuccess`) the moment
   // ITS request resolves — the sheet empties progressively rather than waiting
@@ -111,10 +135,8 @@ export function useArchivedSessions(
   //      without touching the sheet.
   // `allSettled` (not `all`) so one row's failure never short-circuits the rest.
   const purgeAll = React.useCallback(async () => {
-    const names = (query.data ?? []).map((s) => s.name)
-    const results = await Promise.allSettled(
-      names.map((n) => purgeMut.mutateAsync(n)),
-    )
+    const names = archived.map((s) => s.name)
+    const results = await Promise.allSettled(names.map((n) => purgeAsync(n)))
     let ok = 0
     let failed = 0
     for (const r of results) {
@@ -122,16 +144,28 @@ export function useArchivedSessions(
       else failed += 1
     }
     return { ok, failed }
-  }, [query.data, purgeMut])
+  }, [archived, purgeAsync])
 
-  return {
-    archived: query.data ?? [],
-    isLoading: query.isLoading,
-    isError: query.isError,
-    refetch: () => void query.refetch(),
-    restore: (name) => restoreMut.mutateAsync(name),
-    purge: (name) => purgeMut.mutateAsync(name),
-    purgeAll,
-    pending,
-  }
+  return React.useMemo(
+    () => ({
+      archived,
+      isLoading: query.isLoading,
+      isError: query.isError,
+      refetch,
+      restore,
+      purge,
+      purgeAll,
+      pending,
+    }),
+    [
+      archived,
+      query.isLoading,
+      query.isError,
+      refetch,
+      restore,
+      purge,
+      purgeAll,
+      pending,
+    ],
+  )
 }
