@@ -95,29 +95,35 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      # TWELVE JOBS ON A SCHEDULE, THREE ON A PULL REQUEST.
+      # EIGHTEEN JOBS ON A SCHEDULE, FIVE ON A PULL REQUEST.
       #
-      # The full 3x4 grid is the honest coverage of the installer and it still
+      # The full 3x6 grid is the honest coverage of the installer and it still
       # runs — nightly, and on every push to main, which is the commit an actual
       # release is cut from. What a PULL REQUEST gates is the subset that can
-      # catch a defect the other nine cannot:
+      # catch a defect the others cannot:
       #
       #   * `fresh` and `upgrade` on ubuntu-24.04 are where installer logic
       #     lives: unit files, the deploy runner, the data-dir migration. A bug
       #     in `install.sh` shows up here first, on every distro.
+      #   * `upgrade-seeded` is the only lane that tests a REAL upgrade: it
+      #     installs a released pre-0038 version, seeds a populated scheduler
+      #     DB, upgrades to this build's tarball, and asserts the destructive
+      #     migration's exact ported/refused split + data intact. (`upgrade`
+      #     installs the same tarball twice, so its migrations only ever see an
+      #     empty DB.) Needs network access to the pinned GitHub release.
+      #   * `runner-rollback` is the only lane that exercises the deploy
+      #     runner's failure path: a bad self-deploy must roll back the binary
+      #     AND the data.db snapshot (migrations are one-way; a binary-only
+      #     rollback bricks the service).
       #   * `dry-run` is seconds and proves the script parses and plans without
       #     touching the box — the cheapest real assertion in the workflow.
       #   * `port-conflict` and the two extra distros are VARIATION on paths the
-      #     three above already walk. They catch distro-specific regressions,
+      #     lanes above already walk. They catch distro-specific regressions,
       #     which are real but rare, and they are worth a night's latency rather
       #     than a place in a ten-minute PR budget.
-      #
-      # Measured: this workflow is 4.2 min of wall clock (run 33318390920) and
-      # is NOT the critical path — `ci.yml` is. So this trim buys runner cost and
-      # queue pressure, not PR wall clock, and it is listed as such.
       matrix:
         distro: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-24.04"]') || fromJSON('["ubuntu-24.04","ubuntu-22.04","debian-12"]') }}
-        scenario: ${{ github.event_name == 'pull_request' && fromJSON('["dry-run","fresh","upgrade"]') || fromJSON('["dry-run","fresh","upgrade","port-conflict"]') }}
+        scenario: ${{ github.event_name == 'pull_request' && fromJSON('["dry-run","fresh","upgrade","upgrade-seeded","runner-rollback"]') || fromJSON('["dry-run","fresh","upgrade","upgrade-seeded","runner-rollback","port-conflict"]') }}
     steps:
       - uses: actions/checkout@v7
 
