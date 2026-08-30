@@ -31,6 +31,19 @@ name: ci
 #      (two chat-WS specs that sit out the product's own 90 s clock)
 #   5. delete duplicated work rather than coverage (`cargo check --all-targets`
 #      was recompiled verbatim by `cargo test --no-run` one step later)
+#   6. split the server tests across two runners once they became the critical
+#      path — `cargo test` runs 70 binaries strictly in sequence and the lib's
+#      1542 unit tests have nothing to say to the 69 integration binaries
+#
+# Measured after (run 33320742166, before the server split): wall clock 8.85 min
+# — build-server 1.9, worst e2e shard 6.2, server 8.8. The server split is what
+# takes the last job off the ceiling.
+#
+# NOTE FOR WHOEVER MERGES THIS: `main`'s branch protection requires the CONTEXT
+# `server (cargo check + test)`, which this commit replaces with `server (lib
+# unit tests)` + `server (integration tests)`. Protection already requires a
+# second context that no job reports (`web (bun build)`), so the required list
+# needs an owner edit regardless — see the PR body for the exact call.
 #
 # Nothing here was dropped silently. Everything moved off the PR gate runs in
 # `nightly.yml` (and, for the installer matrix, on `install-smoke.yml`'s own
@@ -263,18 +276,68 @@ jobs:
             web/playwright-report
           retention-days: 7
 
-  server:
-    name: server (cargo check + test)
+  # ── server tests: TWO jobs, in parallel, because the compile is not the cost ─
+  #
+  # Measured on run 33320742166: one `server` job was 8.8 min — cache 1.1, `cargo
+  # test --no-run` 2.1, `cargo test` 5.1 — and with the e2e path down to 8.1 min
+  # it had become the critical path and the whole reason the PR could not fit
+  # inside ten minutes. `cargo test` runs the 70 test binaries STRICTLY IN
+  # SEQUENCE, and the two halves of that sequence have nothing to say to each
+  # other: 1542 lib unit tests (69 s of run time) and 69 integration binaries
+  # (~120 s). Splitting them across two runners costs one machine and a second
+  # compile of the lib, and turns 8.8 min into two jobs of roughly 4 and 6.
+  #
+  # NOTHING IS DEMOTED. Every server test that ran on a PR before still runs on
+  # a PR. This is a shape change, not a coverage change — which is exactly why it
+  # is preferred over the alternative of moving the 69 integration binaries to
+  # nightly: they hold the delivery, scope and status-detector guarantees, and
+  # a server regression that only nightly catches is a server regression that
+  # ships.
+  #
+  # Raising `--test-threads` or reaching for `cargo nextest` would parallelise
+  # inside one runner and look cheaper still — do not. These tests spawn REAL
+  # tmux sessions and bind real ports; the isolation that makes them honest is
+  # the same isolation that makes them collide when run concurrently on one box.
+  # Two runners give parallelism that costs nothing in flakiness.
+  server-unit:
+    name: server (lib unit tests)
     runs-on: ubuntu-latest
-    # A cold debug build (check ~5m + test-compile ~3.5m) plus the test run can
-    # exceed 10m on a cache miss, which cancels the gating job mid-`cargo test`.
-    # Give headroom. Debug only — CLAUDE.md forbids --release (OOM on small hosts).
-    #
-    # This job deliberately does NOT consume `build-server`'s artifact. That
-    # artifact is one binary with no web bundle embedded; this job needs every
-    # `--all-targets` object and ~40 test binaries, compiled against a
-    # server/static that rust-embed reads at compile time. There is nothing to
-    # reuse, so it keeps its own cache and its own build.
+    timeout-minutes: 20
+    env:
+      # See the note on `server-integration` — dropping debug info is what keeps
+      # the lld link inside the runner's memory ceiling.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      # No `bun run build` + embed here on purpose: the web bundle exists for
+      # `tests/static_assets.rs`, which is an INTEGRATION test and runs in the
+      # other job. rust-embed tolerates an absent `server/static` (that is how
+      # `build-server` produces a bundle-less binary for the e2e shards), so
+      # this job skips ~20 s of frontend build it cannot use.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch
+        with:
+          toolchain: stable
+      # Its own cache key: two jobs sharing one key race on the save and one of
+      # them silently wins. Both still fall back to the shared prefix.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server/target
+          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-unit-
+            ${{ runner.os }}-cargo-
+      - run: cargo test --lib
+
+  server-integration:
+    name: server (integration tests)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       # Drop debug info on the dev profile so the lld link of the many
@@ -285,8 +348,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       # A runner never reuses an incremental-compilation dir within a job, and
       # `server/target` IS the cache payload — so `incremental/` is hundreds of
-      # megabytes that only ever make the restore and the save slower. Measured:
-      # the cache restore alone was 1.5 min on run 33318390754.
+      # megabytes that only ever make the restore and the save slower.
       CARGO_INCREMENTAL: "0"
     defaults:
       run:
@@ -322,12 +384,17 @@ jobs:
       # `cargo check --all-targets` USED TO RUN HERE and was pure duplication:
       # this crate has no benches and no examples (`server/Cargo.toml` declares
       # one `[[bin]]`), so `--all-targets` is exactly lib + bin + the 69 test
-      # targets — every one of which `cargo test --no-run` then COMPILES from
-      # scratch a step later. Measured on run 33318390754 that step cost 0.8 min
-      # and caught nothing the next step could miss. Removed, not weakened: a
-      # type error in any target still fails `cargo test --no-run`.
-      - run: cargo test --no-run
-      - run: cargo test
+      # targets — every one of which the compile below then produces anyway.
+      # Measured on run 33318390754 it cost 0.8 min and caught nothing the next
+      # step could miss. Removed, not weakened: a type error in any target still
+      # fails the build here.
+      #
+      # `--tests` is the 69 integration binaries; the lib's own unit tests are
+      # `server-unit`'s job. Between the two, every `cargo test` target still
+      # runs on every PR. (Doctests are neither job's: the crate has three and
+      # all three are `ignore`d — `cargo test` reported "0 passed; 3 ignored".)
+      - run: cargo test --tests --no-run
+      - run: cargo test --tests
 
   fmt:
     name: fmt (rustfmt, advisory)
