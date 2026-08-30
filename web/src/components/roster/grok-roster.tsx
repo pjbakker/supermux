@@ -658,21 +658,28 @@ export default function GrokRoster() {
 
   // ── Companies (Bot Mode) — the active company scope the whole rail reads ──────
   const { resolvedTheme } = useTheme()
-  const { companies } = useCompanies()
+  const { companies, isLoading: companiesLoading, isError: companiesError } = useCompanies()
   const activeCompany = useUI((s) => s.activeCompany)
   const setActiveCompany = useUI((s) => s.setActiveCompany)
   // Reconcile a stale persisted `activeCompany` against the live set: an id that
   // no longer maps to a company (deleted/archived, or a localStorage value from
   // another install) falls back to HQ. Runs as an effect off the live ids, never
   // in render (pure guard is `resolveActiveCompany`, unit-tested).
+  //
+  // ONLY once the list actually resolved. On a cold load (and on a transient
+  // fetch error) `companies` is `[]` — not "there are no companies", just "we
+  // don't know yet". Reconciling against that empty set would WRITE HQ into the
+  // persisted store and silently throw the user out of their company scope on
+  // every hard refresh (the race gcdesk hit on the rig).
   React.useEffect(() => {
+    if (companiesLoading || companiesError) return
     if (activeCompany === null) return
     const resolved = resolveActiveCompany(
       activeCompany,
       companies.map((c) => c.id),
     )
     if (resolved !== activeCompany) setActiveCompany(resolved)
-  }, [activeCompany, companies, setActiveCompany])
+  }, [activeCompany, companies, companiesLoading, companiesError, setActiveCompany])
   // The active company's slug → its identity hue → the `--sm-agent-*` write on
   // the RAIL only (so it never overrides the chat pane's per-session hue). HQ
   // writes nothing → a byte-identically neutral rail (the firewall's tell).
