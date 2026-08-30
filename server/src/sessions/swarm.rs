@@ -362,9 +362,9 @@ pub struct SweepOutcome {
 /// `dry_run` every decision is reported and nothing is touched.
 pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> Result<SweepOutcome> {
     let mut out = SweepOutcome::default();
-    let servers = discover_servers(tmux_tmpdir);
-
-    for srv in &servers {
+    // Consumed by value: `servers` is never read after the loop, so the socket
+    // names can MOVE into `kept`/`killed` instead of being cloned per server.
+    for srv in discover_servers(tmux_tmpdir) {
         let lead_alive = pid_alive(srv.lead_pid);
         // clients only matter when the lead is dead; skip the subprocess otherwise
         let clients = if lead_alive {
@@ -374,7 +374,7 @@ pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> R
                 Ok(c) => c,
                 Err(e) => {
                     out.errors.push(format!("{}: clients check failed: {e}", srv.socket_name));
-                    out.kept.push((srv.socket_name.clone(), "clients-check-failed"));
+                    out.kept.push((srv.socket_name, "clients-check-failed"));
                     continue;
                 }
             }
@@ -382,7 +382,7 @@ pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> R
         match decide(lead_alive, clients, srv.age, grace) {
             Verdict::Keep(why) => {
                 tracing::debug!(socket = %srv.socket_name, why, "swarm sweep: keeping server");
-                out.kept.push((srv.socket_name.clone(), why));
+                out.kept.push((srv.socket_name, why));
             }
             Verdict::Kill => {
                 tracing::info!(
@@ -399,7 +399,7 @@ pub async fn sweep_once(tmux_tmpdir: &Path, grace: Duration, dry_run: bool) -> R
                         continue;
                     }
                 }
-                out.killed.push(srv.socket_name.clone());
+                out.killed.push(srv.socket_name);
             }
         }
     }
@@ -513,6 +513,24 @@ pub async fn teardown_for_lead(tmux_tmpdir: &Path, lead_pid: u32) -> Result<bool
     Ok(true)
 }
 
+/// Does the `[swarm_reaper]` switch cover the TARGETED teardown paths
+/// (stop / archive / delete / SessionEnd), and not only the periodic sweep?
+///
+/// WHY it does: `enabled = false` is precisely what an operator reaches for
+/// after this feature has burned them once. A switch that silences the
+/// background sweep but leaves the four session-end paths still SIGKILLing a
+/// tmux server on every stop means "off, mostly" — and the targeted kills are
+/// the half a user actually notices, because they fire on an action they just
+/// took rather than on a half-hourly timer. One switch, one meaning: off is off.
+/// The periodic sweep is still the thing that reclaims anything missed while
+/// the feature was disabled, once it is turned back on.
+///
+/// Gating the CAPTURE as well as the kill also keeps the extra `tmux list-panes`
+/// subprocess off the stop hot path for operators who have turned this off.
+pub fn teardown_enabled(state: &crate::state::AppState) -> bool {
+    state.config.swarm_reaper.enabled
+}
+
 /// Fire-and-forget wrapper for the session-end paths: must never block or
 /// fail a stop/archive/delete. TMUX_TMPDIR is process-wide (set in main.rs);
 /// its absence (tests, bare dev runs) falls back to tmux's default /tmp.
@@ -566,13 +584,24 @@ pub fn spawn_reaper(state: crate::state::AppState) -> tokio::task::JoinHandle<()
             tracing::info!("swarm reaper disabled by config");
             return;
         }
-        let grace = Duration::from_secs(cfg.grace_secs);
+        // WHY clamped, like the interval below it: `grace` is the ONLY thing
+        // standing between a lead that exited two seconds ago and a SIGKILL of
+        // the tmux server its teammates are still flushing through. A
+        // `grace_secs = 0` in config.toml — a typo, or someone reading it as
+        // "no delay between sweeps" — would silently turn a conservative
+        // background reaper into an instant killer of every dead-lead server it
+        // sees, including the one whose teammates are mid-write. A 60s floor
+        // keeps a misconfiguration merely aggressive instead of destructive;
+        // the effective value is logged so an operator can see the clamp.
+        let effective_grace_secs = cfg.grace_secs.max(60);
+        let grace = Duration::from_secs(effective_grace_secs);
         // clamped: a config asking for a tighter cadence than 60s does not get one
         let effective_interval_secs = cfg.interval_secs.max(60);
         let mut tick = tokio::time::interval(Duration::from_secs(effective_interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tracing::info!(
             grace_secs = cfg.grace_secs,
+            effective_grace_secs,
             interval_secs = cfg.interval_secs,
             effective_interval_secs,
             "swarm reaper started"
@@ -801,5 +830,17 @@ mod tests {
         assert_eq!(a.grace, Some(Duration::from_secs(60)));
         assert!(CliArgs::parse(["--bogus".to_string()].into_iter()).is_err());
         assert!(CliArgs::parse(["--grace-secs".to_string()].into_iter()).is_err());
+    }
+
+    /// The sweep's blast radius is decided ENTIRELY by this predicate: anything
+    /// it calls reapable can be SIGKILLed. supermux's own tmux socket must never
+    /// be one of them, and nothing else asserts that.
+    #[test]
+    fn only_swarm_and_test_socket_names_are_reapable() {
+        assert!(is_reapable_socket_name("claude-swarm-42"));
+        assert!(is_reapable_socket_name("supermux-sync-test-42"));
+        // supermux's own session socket must survive every sweep
+        assert!(!is_reapable_socket_name("default"));
+        assert!(!is_reapable_socket_name("supermux"));
     }
 }

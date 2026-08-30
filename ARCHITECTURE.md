@@ -133,12 +133,14 @@ Configuration is the `[swarm_reaper]` block in `~/.supermux/config.toml`:
 
 ```toml
 [swarm_reaper]
-enabled = true        # master switch for the periodic sweep
-grace_secs = 7200     # never kill a server younger than this
+enabled = true        # master switch: periodic sweep AND targeted teardown
+grace_secs = 7200     # never kill a server younger than this, clamped to at least 60
 interval_secs = 1800  # sweep cadence, clamped to at least 60
 ```
 
-Targeted teardown at session end is part of the session lifecycle, so it stays on even with `enabled = false`.
+`enabled = false` turns the whole feature off — the periodic sweep and the targeted teardown at stop/archive/delete/`SessionEnd` alike. That switch exists for an operator who has been burned by it, and a switch that silenced only the timer while every stop still killed a tmux server would mean "off, mostly". Turning it back on reclaims whatever leaked in the meantime on the next sweep.
+
+Both durations are clamped to a 60-second floor. `grace_secs` is the only thing between a lead that exited seconds ago and a SIGKILL of the server its teammates are still flushing through, so a `grace_secs = 0` typo is clamped rather than honoured; the effective values are logged at startup.
 
 For a sweep by hand there is `supermux-server swarm-reaper [--dry-run] [--grace-secs N]`. It needs no DB and no listener, and like `pty-holder` it takes no `--help` by convention. It does not read the `[swarm_reaper]` block: without `--grace-secs` it uses the built-in default of 7200 seconds, so a config that widened or narrowed the grace period has to be repeated on the command line. Dry-run reports what a real run would do and changes nothing; it cannot always predict which socket files a real run would remove, because the servers it only marks for killing are still alive and still answering on their sockets. INFO tracing goes to the same terminal as the stdout report, so use `RUST_LOG=warn` for a clean one.
 

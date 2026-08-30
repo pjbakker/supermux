@@ -2502,7 +2502,11 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     // Capture the lead agent PID while the pane is still up: the agent-team
     // tmux server is named `claude-swarm-<lead pid>` and after teardown the
     // pid is unrecoverable. Teardown itself waits for the lead to die.
-    let swarm_lead = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await;
+    let swarm_lead = if crate::sessions::swarm::teardown_enabled(state) {
+        crate::sessions::swarm::lead_pid_of(rt.as_ref()).await
+    } else {
+        None
+    };
 
     if !rt.alive().await {
         db::sessions::set_last_status(&state.pool, name, "stopped").await?;
@@ -3263,8 +3267,10 @@ pub async fn archive(state: &AppState, name: &str) -> Result<String, AppError> {
         // is already flipped and the job already answered 202).
         if let Ok(rt) = state.runtime_for(&name).await {
             // capture before the kill; teardown waits for the lead to die
-            if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
-                crate::sessions::swarm::spawn_teardown_for_lead(pid);
+            if crate::sessions::swarm::teardown_enabled(&state) {
+                if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                    crate::sessions::swarm::spawn_teardown_for_lead(pid);
+                }
             }
             let _ = rt.kill().await;
         }

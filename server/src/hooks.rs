@@ -222,17 +222,23 @@ async fn hook_handler(
     // rather than through a fixed struct.
     let raw_payload = body.payload.unwrap_or(Value::Null);
 
-    // A live agent file-write becomes a `files` SSE frame, so a file a bot
-    // wrote seconds ago appears in the Files surface without a reload. Only the
-    // qualifying subset of PostToolUse pays the extra indexed SELECT (every hook
-    // already pays one for `verify_hook_token`).
-    emit_agent_file_write(&state, &body.session, &body.event, &raw_payload).await;
-
     // Is this POST the LEAD's own event, or one fired by an in-process teammate
     // running under the same pane token? Decided ONCE per POST (the predicate is
-    // read twice below) and only when the payload carries an `agent_type` at all,
-    // so the overwhelmingly common no-agent_type path costs no extra DB read.
-    let foreign_agent = if has_agent_type(&raw_payload) {
+    // read twice below).
+    //
+    // Gated on the EVENT as well as on `agent_type`, and both halves matter.
+    // `foreign_agent` is consumed in exactly three places — the lifecycle gate
+    // and the `user_prompt` arm inside `apply_payload`, and the pointer gate
+    // below — all of which are `is_lifecycle_event` or `is_pointer_event`. The
+    // `agent_type` half alone would NOT keep this off the hot path: since the
+    // per-agent rows landed, every child tool hook (`pre_tool`, `post_tool`,
+    // `subagent_*`) carries an `agent_type` beside its `agent_id` — that is what
+    // `touch_agent_row` reads — so a subagent-heavy turn would pay an extra
+    // indexed SELECT per tool call on a `--max-time 1` request, for a value
+    // those events can never consume.
+    let foreign_agent = if (is_lifecycle_event(&body.event) || is_pointer_event(&body.event))
+        && has_agent_type(&raw_payload)
+    {
         let tracked = db::sessions::cc_conversation_id(&state.pool, &body.session)
             .await
             .ok()
@@ -243,6 +249,16 @@ async fn hook_handler(
     };
 
     apply_payload(&state, &body.session, &body.event, &raw_payload, foreign_agent);
+
+    // A live agent file-write becomes a `files` SSE frame, so a file a bot
+    // wrote seconds ago appears in the Files surface without a reload. Only the
+    // qualifying subset of PostToolUse pays the extra indexed SELECT (every hook
+    // already pays one for `verify_hook_token`).
+    //
+    // Stays AFTER `apply_payload`, as on main: a file-writing PostToolUse must
+    // publish its `sessions` activity delta before the `files` frame, or a
+    // client sees the file appear on a session that still looks idle.
+    emit_agent_file_write(&state, &body.session, &body.event, &raw_payload).await;
 
     // NEVER follow the pointer for an in-process teammate's own SessionStart OR
     // UserPromptSubmit: those payloads carry the TEAMMATE's session id, so
@@ -1095,9 +1111,11 @@ fn force_stopped(state: &AppState, session: &str) {
         // and `lead_pid_of` reads the pane's foreground pgid — once the pane is
         // gone there is no pid left to hand the teardown, and the team's tmux
         // server would leak exactly on the disposable sessions that churn most.
-        if let Ok(rt) = state.runtime_for(&session).await {
-            if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
-                crate::sessions::swarm::spawn_teardown_for_lead(pid);
+        if crate::sessions::swarm::teardown_enabled(&state) {
+            if let Ok(rt) = state.runtime_for(&session).await {
+                if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                    crate::sessions::swarm::spawn_teardown_for_lead(pid);
+                }
             }
         }
         // Disposable (archive_on_stop) sessions archive themselves when their
