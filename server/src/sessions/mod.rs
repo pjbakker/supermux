@@ -999,7 +999,7 @@ pub async fn list(state: &AppState) -> Result<Vec<SessionView>, AppError> {
                 rt_map.get(&s.name),
                 state.session_activity(&s.name),
                 state.subagents_live(&s.name),
-                state.agent_rows(&s.name, std::time::Instant::now()),
+                state.agent_rows_now(&s.name),
                 state.statusline(&s.name),
             )
         })
@@ -1016,7 +1016,7 @@ pub async fn get(state: &AppState, name: &str) -> Result<SessionView, AppError> 
         rt.as_ref(),
         state.session_activity(name),
         state.subagents_live(name),
-        state.agent_rows(name, std::time::Instant::now()),
+        state.agent_rows_now(name),
         state.statusline(name),
     ))
 }
@@ -1040,7 +1040,7 @@ pub async fn list_archived(state: &AppState) -> Result<Vec<SessionView>, AppErro
                 rt_map.get(&s.name),
                 state.session_activity(&s.name),
                 state.subagents_live(&s.name),
-                state.agent_rows(&s.name, std::time::Instant::now()),
+                state.agent_rows_now(&s.name),
                 state.statusline(&s.name),
             )
         })

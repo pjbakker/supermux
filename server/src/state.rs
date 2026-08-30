@@ -235,10 +235,18 @@ impl AgentRun {
 }
 
 /// The WIRE shape of one [`AgentRun`] — what `SessionView.agents` and the
-/// `sessions` SSE delta carry. Both durations are milliseconds resolved against
-/// the server clock at serialization time, so the client needs no clock of its
-/// own: it renders `since_ms` as a self-advancing elapsed leaf and reads
-/// `quiet_ms` for the live/quiet distinction.
+/// `sessions` SSE delta carry.
+///
+/// Both stamps are ABSOLUTE server-clock epoch milliseconds, the same domain as
+/// the delta's own `activity_at` (which is where the client's skew estimate
+/// comes from). They were durations once, and that was a bug in two directions:
+/// a duration is only true at the instant it was serialized, so the client had
+/// to re-anchor it against its own clock on every render — which reset the
+/// elapsed leaf back to the last delta's value — and a row could never cross
+/// from live into quiet unless a NEW delta happened to arrive, which in the one
+/// case the ladder exists for (every child silent inside a long `Bash`) is
+/// exactly what does not happen. A stamp is true whenever it is read, so the
+/// client ages the row itself and the server sends nothing extra.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AgentRow {
     /// Claude's `agent_id` — the React key, and the reason two rows can never
@@ -248,12 +256,13 @@ pub struct AgentRow {
     pub agent_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Milliseconds since the first hook carrying this id.
-    pub since_ms: u64,
-    /// Milliseconds since the NEWEST hook carrying it. The client dims a row
-    /// past [`AGENT_LIVE_WINDOW`] and says the FACT (`no tool call for 3m`) —
-    /// never "stopped", never "done", never a verdict.
-    pub quiet_ms: u64,
+    /// When the first hook carrying this id arrived (server-clock epoch ms).
+    /// The client counts this row's elapsed from here.
+    pub started_ms: i64,
+    /// When the NEWEST hook carrying it arrived, same clock. The client dims a
+    /// row past [`AGENT_LIVE_WINDOW`] and says the FACT (`no tool call for 3m`)
+    /// — never "stopped", never "done", never a verdict.
+    pub last_evidence_ms: i64,
 }
 
 /// One server-sent event: `{ type, payload }`.
@@ -1524,24 +1533,33 @@ impl AppState {
     ///   straggler must not resurrect a finished agent (see [`AgentRun::stopped`]).
     /// * **`label: None` never erases a label.** `SubagentStart` carries no tool,
     ///   and a re-notified agent must not lose the sentence it already earned.
-    pub fn touch_agent(&self, name: &str, id: &str, agent_type: Option<&str>, label: Option<String>) {
+    ///
+    /// Returns whether a READER would see something different — a new row, a new
+    /// label/kind, or a quiet row speaking again. A live row's evidence clock
+    /// merely moving is NOT a change: the wire carries stamps, so the client is
+    /// already rendering that second without being told.
+    pub fn touch_agent(&self, name: &str, id: &str, agent_type: Option<&str>, label: Option<String>) -> bool {
         if id.is_empty() {
-            return;
+            return false;
         }
         let now = Instant::now();
         let mut runs = self.agents.entry(name.to_string()).or_default();
         if let Some(run) = runs.get_mut(id) {
             if run.stopped {
-                return;
+                return false;
             }
+            // The dim→live edge, which only this write can produce.
+            let mut changed = now.saturating_duration_since(run.last_evidence) >= AGENT_LIVE_WINDOW;
             run.last_evidence = now;
             if let Some(l) = label {
+                changed |= run.label.as_deref() != Some(l.as_str());
                 run.label = Some(l);
             }
             if let Some(t) = agent_type.filter(|t| !t.is_empty()) {
+                changed |= run.agent_type != t;
                 run.agent_type = t.to_string();
             }
-            return;
+            return changed;
         }
         // A NEW id. Enforce the cap before inserting, evicting the row whose
         // evidence is oldest — which is always a quiet or tombstoned one, since
@@ -1568,6 +1586,7 @@ impl AppState {
                 stopped: false,
             },
         );
+        true
     }
 
     /// `SubagentStop` for `id`: tombstone the row so it stops rendering and can
@@ -1577,22 +1596,34 @@ impl AppState {
     /// An UNKNOWN id is deliberately not inserted: with no row there is nothing
     /// to hide, and allocating a tombstone for a child we never saw work would
     /// spend a slot of the cap on a signal that renders nothing.
-    pub fn stop_agent(&self, name: &str, id: &str) {
+    ///
+    /// Returns whether a row actually stopped rendering, so the caller can
+    /// broadcast. That return is load-bearing: the stop's OTHER effect
+    /// ([`Self::dec_subagents`]) is `false` whenever the count is already 0,
+    /// which is the normal case for a workflow child (no `SubagentStart` fires
+    /// for one) and for any child outliving a `UserPromptSubmit` — so without it
+    /// the row vanished server-side and stayed on screen.
+    pub fn stop_agent(&self, name: &str, id: &str) -> bool {
+        let mut stopped = false;
         if let Some(mut runs) = self.agents.get_mut(name) {
             if let Some(run) = runs.get_mut(id) {
+                stopped = !run.stopped;
                 run.stopped = true;
             }
         }
+        stopped
     }
 
     /// The rows of `name` that still have fresh first-hand evidence, as of `now`
-    /// — freshest first, so the live children lead and the quiet ones sink.
+    /// — live children first, then in spawn order.
     ///
-    /// `now` is a parameter rather than `Instant::now()` so the staleness ladder
-    /// is testable without sleeping. Reclaims gone rows on the way through (the
-    /// sweep is a read, not a task) and drops the session entry once it is empty,
-    /// so an idle session leaks nothing.
-    pub fn agent_rows(&self, name: &str, now: Instant) -> Vec<AgentRow> {
+    /// `now` (monotonic, for the ladder) and `now_ms` (wall clock, for the wire)
+    /// are BOTH parameters rather than read here so the staleness ladder is
+    /// testable without sleeping; [`Self::agent_rows_now`] is the production
+    /// call. Reclaims gone rows on the way through (the sweep is a read, not a
+    /// task) and drops the session entry once it is empty, so an idle session
+    /// leaks nothing.
+    pub fn agent_rows(&self, name: &str, now: Instant, now_ms: i64) -> Vec<AgentRow> {
         let mut rows = Vec::new();
         let mut empty = false;
         if let Some(mut runs) = self.agents.get_mut(name) {
@@ -1604,8 +1635,9 @@ impl AppState {
                     id: id.clone(),
                     agent_type: r.agent_type.clone(),
                     label: r.label.clone(),
-                    since_ms: now.saturating_duration_since(r.started).as_millis() as u64,
-                    quiet_ms: now.saturating_duration_since(r.last_evidence).as_millis() as u64,
+                    started_ms: now_ms - now.saturating_duration_since(r.started).as_millis() as i64,
+                    last_evidence_ms: now_ms
+                        - now.saturating_duration_since(r.last_evidence).as_millis() as i64,
                 })
                 .collect();
             empty = runs.is_empty();
@@ -1613,10 +1645,31 @@ impl AppState {
         if empty {
             self.agents.remove(name);
         }
-        // Freshest first, then by id so the order is stable across ticks (a list
-        // that reshuffles under a reader is its own kind of lie).
-        rows.sort_by(|a, b| a.quiet_ms.cmp(&b.quiet_ms).then_with(|| a.id.cmp(&b.id)));
+        // LIVE rows first, then oldest child first — never by recency of
+        // evidence. The client draws only the first six of a fan-out that can be
+        // thirty, so a rank that moves whenever any child posts a hook rotates
+        // the visible six under the reader's thumb and no single agent can be
+        // followed. `started` is fixed for the life of a row, so the ONLY rank
+        // change left is the one the reader is meant to see: a row crossing into
+        // quiet and sinking below the ones still working.
+        let quiet_after = AGENT_LIVE_WINDOW.as_millis() as i64;
+        rows.sort_by(|a, b| {
+            let (qa, qb) = (
+                now_ms - a.last_evidence_ms >= quiet_after,
+                now_ms - b.last_evidence_ms >= quiet_after,
+            );
+            qa.cmp(&qb)
+                .then_with(|| a.started_ms.cmp(&b.started_ms))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         rows
+    }
+
+    /// [`Self::agent_rows`] against the real clock — every production caller.
+    /// The wall-clock stamp is taken from the same `chrono` clock the delta's
+    /// `activity_at` uses, which is what makes the two comparable on the client.
+    pub fn agent_rows_now(&self, name: &str) -> Vec<AgentRow> {
+        self.agent_rows(name, Instant::now(), chrono::Utc::now().timestamp_millis())
     }
 
     /// A new prompt: drop every row that is not PROVABLY still working as of
@@ -1625,23 +1678,31 @@ impl AppState {
     /// workflow whose children are mid-tool survives the human's next prompt,
     /// because it really is still running; everything else belongs to the turn
     /// that just ended and must not be carried into the new one.
-    pub fn prune_agents_for_prompt(&self, name: &str, now: Instant) {
+    ///
+    /// Returns whether the map actually lost a row, so the caller can broadcast
+    /// the shorter list (see [`Self::stop_agent`] for why that matters).
+    pub fn prune_agents_for_prompt(&self, name: &str, now: Instant) -> bool {
         let mut empty = false;
+        let mut dropped = false;
         if let Some(mut runs) = self.agents.get_mut(name) {
+            let before = runs.len();
             runs.retain(|_, r| {
                 !r.stopped && now.saturating_duration_since(r.last_evidence) < AGENT_LIVE_WINDOW
             });
+            dropped = runs.len() != before;
             empty = runs.is_empty();
         }
         if empty {
             self.agents.remove(name);
         }
+        dropped
     }
 
     /// Drop every row for `name` — `SessionStart` / `SessionEnd`. A brand-new (or
-    /// finished) Claude process inherits no children.
-    pub fn clear_agents(&self, name: &str) {
-        self.agents.remove(name);
+    /// finished) Claude process inherits no children. Returns whether there were
+    /// any rows to drop.
+    pub fn clear_agents(&self, name: &str) -> bool {
+        self.agents.remove(name).is_some_and(|(_, runs)| !runs.is_empty())
     }
 
     /// Set `name`'s live permission request (from a `PermissionRequest` payload:
