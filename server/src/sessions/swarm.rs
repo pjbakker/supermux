@@ -574,6 +574,23 @@ pub async fn lead_pid_of(rt: &dyn crate::sessions::runtime::SessionRuntime) -> O
     (fg != shell).then_some(fg)
 }
 
+/// The floor under every grace period, config block and `--grace-secs` alike.
+pub const GRACE_FLOOR_SECS: u64 = 60;
+
+/// `requested`, never below [`GRACE_FLOOR_SECS`].
+///
+/// WHY there is a floor at all: `grace` is the ONLY thing standing between a lead
+/// that exited two seconds ago and a SIGKILL of the tmux server its teammates are
+/// still flushing through. A `grace_secs = 0` — a typo, or someone reading it as
+/// "no delay between sweeps" — would silently turn a conservative background
+/// reaper into an instant killer of every dead-lead server it sees, mid-write
+/// ones included. The floor keeps a misconfiguration merely aggressive instead of
+/// destructive. Callers log or print the effective value, so the clamp is never
+/// invisible.
+pub fn effective_grace_secs(requested: u64) -> u64 {
+    requested.max(GRACE_FLOOR_SECS)
+}
+
 /// Periodic safety net: sweep on a config cadence. The FIRST tick fires
 /// immediately (tokio interval semantics), which doubles as the boot sweep
 /// that reclaims servers orphaned by a supermux crash or OOM kill.
@@ -584,16 +601,7 @@ pub fn spawn_reaper(state: crate::state::AppState) -> tokio::task::JoinHandle<()
             tracing::info!("swarm reaper disabled by config");
             return;
         }
-        // WHY clamped, like the interval below it: `grace` is the ONLY thing
-        // standing between a lead that exited two seconds ago and a SIGKILL of
-        // the tmux server its teammates are still flushing through. A
-        // `grace_secs = 0` in config.toml — a typo, or someone reading it as
-        // "no delay between sweeps" — would silently turn a conservative
-        // background reaper into an instant killer of every dead-lead server it
-        // sees, including the one whose teammates are mid-write. A 60s floor
-        // keeps a misconfiguration merely aggressive instead of destructive;
-        // the effective value is logged so an operator can see the clamp.
-        let effective_grace_secs = cfg.grace_secs.max(60);
+        let effective_grace_secs = effective_grace_secs(cfg.grace_secs);
         let grace = Duration::from_secs(effective_grace_secs);
         // clamped: a config asking for a tighter cadence than 60s does not get one
         let effective_interval_secs = cfg.interval_secs.max(60);
@@ -698,9 +706,23 @@ pub async fn cli<I: Iterator<Item = String>>(argv: I) -> Result<()> {
         Some(d) => PathBuf::from(d),
         None => crate::config::load()?.data_dir.join("tmux"),
     };
-    let grace = args.grace.unwrap_or(Duration::from_secs(
-        crate::config::SwarmReaperConfig::default().grace_secs,
-    ));
+    // Same 60s floor the daemon applies to `grace_secs` (see `spawn_reaper`), for
+    // the same reason and so the documented contract ("both durations are clamped
+    // to a 60-second floor") holds on BOTH entry points. Without it
+    // `swarm-reaper --grace-secs 0` — the identical typo, one keystroke away from
+    // `--dry-run` — instantly SIGKILLs every dead-lead server on the box,
+    // including one whose teammates are still flushing. Reported rather than
+    // silently swapped, because the operator asked for a number and gets another.
+    let requested = args
+        .grace
+        .unwrap_or(Duration::from_secs(crate::config::SwarmReaperConfig::default().grace_secs));
+    let grace = Duration::from_secs(effective_grace_secs(requested.as_secs()));
+    if grace != requested {
+        println!(
+            "NOTE        --grace-secs {} raised to the {GRACE_FLOOR_SECS}s floor",
+            requested.as_secs(),
+        );
+    }
     let out = sweep_once(&dir, grace, args.dry_run).await?;
     for (name, why) in &out.kept {
         println!("KEEP        {name}  ({why})");
@@ -732,6 +754,20 @@ pub async fn cli<I: Iterator<Item = String>>(argv: I) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// The floor is the whole safety story for a `grace_secs = 0` typo, and it
+    /// shipped untested. Pinned on the SHARED helper, so the config path and the
+    /// `--grace-secs` flag cannot drift apart again (they had, and the docs
+    /// promised one floor for both).
+    #[test]
+    fn a_zero_grace_is_clamped_to_the_floor() {
+        assert_eq!(effective_grace_secs(0), GRACE_FLOOR_SECS);
+        assert_eq!(effective_grace_secs(1), GRACE_FLOOR_SECS);
+        assert_eq!(effective_grace_secs(59), GRACE_FLOOR_SECS);
+        // At and above the floor the operator's number is honoured verbatim.
+        assert_eq!(effective_grace_secs(60), 60);
+        assert_eq!(effective_grace_secs(7200), 7200);
+    }
 
     #[test]
     fn parses_lead_pid_from_socket_name() {

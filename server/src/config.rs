@@ -367,8 +367,15 @@ impl Default for WsConfig {
 /// [`crate::sessions::swarm`] for the kill rules.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SwarmReaperConfig {
-    /// Master switch for the periodic sweep (targeted teardown at session end
-    /// is always on; it is part of the session lifecycle, not the reaper).
+    /// Master switch for the WHOLE feature: the periodic sweep AND the targeted
+    /// teardown at stop / archive / delete / `SessionEnd`.
+    ///
+    /// This is the doc an operator reads when deciding whether `enabled = false`
+    /// is enough, so it must not undersell the switch. It used to say the
+    /// targeted teardown was "always on"; that stopped being true when the four
+    /// session-end paths were put behind
+    /// [`crate::sessions::swarm::teardown_enabled`] — off is now off, on both
+    /// paths. See that function for why.
     #[serde(default = "default_reaper_enabled")]
     pub enabled: bool,
     /// Never kill a server younger than this, even with a dead lead (seconds).

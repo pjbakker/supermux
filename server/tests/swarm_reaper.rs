@@ -672,3 +672,35 @@ fn swarm_reaper_config_partial_toml() {
     assert_eq!(raw.grace_secs, 60);
     assert_eq!(raw.interval_secs, 1800);
 }
+
+/// `enabled = false` must silence the TARGETED teardown too, not only the
+/// periodic sweep.
+///
+/// That inversion is the behaviour change an operator reaches for after this
+/// feature has burned them once, it gates four destructive call sites
+/// (`lifecycle::stop` / archive / delete and the `SessionEnd` hook), and it
+/// shipped with no test at all — so nothing but a doc sentence stood between a
+/// refactor and a switch that means "off, mostly". Both polarities pinned,
+/// because a predicate stuck on `true` passes any one-sided assertion.
+#[tokio::test]
+async fn the_reaper_switch_gates_targeted_teardown_in_both_directions() {
+    let (state, _app, dir) = test_app().await;
+    assert!(
+        state.config.swarm_reaper.enabled,
+        "default-on is itself the risky half of this feature; if this flips, the \
+         four teardown call sites silently stop firing"
+    );
+    assert!(swarm::teardown_enabled(&state));
+
+    let mut off = (*state.config).clone();
+    off.swarm_reaper.enabled = false;
+    let state_off = AppState::new(state.pool.clone(), off);
+    assert!(
+        !swarm::teardown_enabled(&state_off),
+        "enabled = false must stop the stop/archive/delete/SessionEnd teardown, \
+         not just the half-hourly sweep"
+    );
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
