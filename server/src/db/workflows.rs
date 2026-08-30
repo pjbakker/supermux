@@ -714,6 +714,28 @@ pub async fn claim_run_key(
     Ok(res.rows_affected() > 0)
 }
 
+/// When the `(workflow_id, scheduled_for_ts)` key was claimed (unix seconds), or
+/// `None` when nobody ever claimed it.
+///
+/// A lost claim only tells the caller that SOMEONE holds the key; it does not
+/// say whether that holder is still alive. Since `next_run` is advanced by the
+/// holder alone, a key whose claimant died leaves the workflow due forever — so
+/// the tick needs to read the key back, not just fail to take it. `fired_at` has
+/// been written by [`claim_run_key`] since 0038 and was never read until now.
+pub async fn run_key_fired_at(
+    pool: &SqlitePool,
+    workflow_id: &str,
+    scheduled_for_ts: i64,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT fired_at FROM workflow_run_keys WHERE workflow_id = ? AND scheduled_for_ts = ?",
+    )
+    .bind(workflow_id)
+    .bind(scheduled_for_ts)
+    .fetch_optional(pool)
+    .await
+}
+
 // ── session cascades ────────────────────────────────────────────────────────
 //
 // `workflows.session` has NO foreign key (0038, deliberately — spec §2.4), so
