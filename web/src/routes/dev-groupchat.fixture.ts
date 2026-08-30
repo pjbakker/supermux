@@ -2,7 +2,8 @@
 //
 // Realistic SUPERMUX content, not lorem: company "Canary", two working bots
 // (`render-bug`, `chat-dataplane`), the auto-created Main Assistant
-// (`canary-assistant`), and the owner (`Sander`) as a human colleague. Every
+// (`canary-assistant`), and a human colleague (`Sam` — a stand-in name, never a
+// real person, so the capture is reproducible and PII-safe by construction). Every
 // message kind the spec names is present exactly once, in the order they
 // actually occur — milestone, workflow completion, human request, the
 // Assistant's routing line @tagging two bots, a tagged bot's reply — so a
@@ -52,8 +53,8 @@ export const CANARY_ROWS: GroupChatRow[] = [
     ts: T0 + 900,
     kind: 'request',
     authorKind: 'human',
-    authorSeed: 'user-sander',
-    authorName: 'Sander',
+    authorSeed: 'user-sam',
+    authorName: 'Sam',
     body: 'Chat comes up empty after a restart when the last transcript line is huge. Can someone take that, and check the composer still sends while we’re in there?',
   },
   {
@@ -73,7 +74,7 @@ export const CANARY_ROWS: GroupChatRow[] = [
     authorKind: 'bot',
     authorSeed: 'chat-dataplane',
     authorName: 'chat-dataplane',
-    body: 'Reproduced. The ring is empty and there is no disk fallback when the final JSONL line is ≥512KiB, so the seed returns nothing and the pane sticks on “No conversation yet.” Seeding from disk fixes it — @Sander do you want the fallback capped at the same 500-row ring, or the full tail?',
+    body: 'Reproduced. The ring is empty and there is no disk fallback when the final JSONL line is ≥512KiB, so the seed returns nothing and the pane sticks on “No conversation yet.” Seeding from disk fixes it — @Sam do you want the fallback capped at the same 500-row ring, or the full tail?',
   },
   {
     seq: 6,

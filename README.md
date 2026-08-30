@@ -64,13 +64,19 @@ Then stand up your first company:
 A bot has a name, an avatar, and a role you assign — *Ada the developer*, *Iris the marketer*, *Sol in sales*. Each one gets **its own folder** on the box (its filesystem, scoped to what it's allowed to touch) and **its own connectors**. It's a full Claude Code agent with a job, not a scratch chat window.
 
 <p align="center">
+  <a href="docs/screenshots/hire-sheet-phone.png"><img src="docs/screenshots/hire-sheet-phone.png" alt="The hire-a-teammate sheet on a phone: the bot named Ada above 'Tap the avatar to reroll', and under 'What should your teammate do?' the job typed into the focused field — 'Watch the nightly build and open a PR when it breaks.' — with an Advanced disclosure for engine, model and folder, and Cancel / Continue at the foot" width="300"></a>
+</p>
+
+<p align="center"><sub><em>Hiring a bot is one sentence.</em></sub></p>
+
+<p align="center">
   <a href="docs/screenshots/chat-phone.png"><img src="docs/screenshots/chat-phone.png" alt="A bot's thread on a phone: two finished tool calls — Read money.rs and Grep parse_locale — with cargo test --lib money still spinning under a live timer, below the reply the owner just sent" width="300"></a>
 </p>
 
 <p align="center"><sub><em>Every tool call, as it happens.</em></sub></p>
 
 <p align="center">
-  <a href="docs/screenshots/chat-desktop.png"><img src="docs/screenshots/chat-desktop.png" alt="The same company on a desktop: a rail of seven named threads with Patch mid-reply and an unread dot on Quill, a 'Message from Patch' divider arriving inside another bot's thread, and a live 'asking Patch…' pill above the composer" width="900"></a>
+  <a href="docs/screenshots/chat-desktop.png"><img src="docs/screenshots/chat-desktop.png" alt="The same company on a desktop: a rail of seven named threads with Patch mid-reply and an unread dot on Quill; in the thread, the owner's question, the bot's four tool receipts (cargo check clean, 212 tests passed, v0.6.0 tagged, one image read), the screenshot it attached, then a 'Message from Patch' divider where another bot answers inside this thread, and a live 'asking Patch…' pill above the composer" width="900"></a>
 </p>
 
 <p align="center"><sub><em>Seven bots, one rail — and they can talk to each other.</em></sub></p>
@@ -90,7 +96,7 @@ Group bots into a **company** and they share connectors, a central **company cha
 Plug bots into the tools you already use — Gmail, GitHub, your database, anything — **with or without an MCP server or API**, via the connect concierge and one-tap sign-in. Grants are per-bot: a bot only reaches the connectors you hand it.
 
 <p align="center">
-  <a href="docs/screenshots/connector-store.png"><img src="docs/screenshots/connector-store.png" alt="The connector store with the Browse tab open and the All category chip selected: GitHub with 21 tools, Notion with 12, and Stripe, each with its own Connect button, under a row of category filters" width="900"></a>
+  <a href="docs/screenshots/connector-store.png"><img src="docs/screenshots/connector-store.png" alt="The connector store with the Browse tab open and the All category chip selected: a row of category filters over two rows of cards — featured GitHub with 21 tools, Notion with 12 and Stripe, then PayPal, Plaid and Square — each with its own Connect button" width="900"></a>
 </p>
 
 <p align="center"><sub><em>A store of tools, granted per bot — not per box.</em></sub></p>
@@ -110,7 +116,7 @@ A **workflow** is an ordered list of prompts a bot runs on a trigger: chain the 
 One real Chrome the company shares — **log in once**, then lend individual tabs to named bots. When a bot hits a login wall you can **take the wheel**, sign in, and hand the tab back.
 
 <p align="center">
-  <a href="docs/screenshots/browser-drive.png"><img src="docs/screenshots/browser-drive.png" alt="The company's shared browser with the Drive control engaged: a rail of company tabs, the tab signed in and verified six minutes ago, and the page it hit asking a human to verify — 'The agent hit a challenge it can't solve. Take the wheel.'" width="900"></a>
+  <a href="docs/screenshots/browser-drive.png"><img src="docs/screenshots/browser-drive.png" alt="The company's shared browser with Drive engaged instead of Watch: a rail of six company tabs, the open tab signed in and verified six minutes ago, and inside it the third-party page the bot got stuck on — 'Verify it's you — The agent hit a challenge it can't solve. Take the wheel.' over an email and a one-time-code field" width="900"></a>
 </p>
 
 <p align="center"><sub><em>When it's stuck, take the wheel — then hand it back.</em></sub></p>
@@ -151,7 +157,7 @@ The pitch that made Grok bots go viral — a team of agents that never sleeps �
 Bot Mode runs on top of a real product. Underneath the companies is the thing supermux has always been: **the easiest way to run a roomful of Claude Code agents from your phone** — live overview, real push, resume, files, MCP/skills, remote hosts.
 
 <p align="center">
-  <a href="docs/screenshots/overview-desktop.png"><img src="docs/screenshots/overview-desktop.png" alt="The overview with a bot selected: the roster on the left grouped into who needs you and who's active, and the selected bot's panel open on the right with Open terminal and its Overview, Setup and Workflows tabs" width="900"></a>
+  <a href="docs/screenshots/overview-desktop.png"><img src="docs/screenshots/overview-desktop.png" alt="The overview after clicking a row: the HQ bar with New bot, search, sort and density; the roster's NEEDS YOU group holding a five-bot team and codex-app at 11% context; and the bot's panel open on the right with Open terminal and its Overview, Setup and Workflows tabs" width="900"></a>
 </p>
 
 <p align="center"><sub><em>Every bot, ranked by who needs you.</em></sub></p>
@@ -170,6 +176,12 @@ Bot Mode runs on top of a real product. Underneath the companies is the thing su
 - **A terminal made for Claude Code.** Attach a file or photo and it drops the path at Claude's prompt; Markdown and code render with real syntax highlighting; edit prompts in a native textarea; tap Claude-specific actions (cycle permission mode, rewind, approve) a plain SSH app can't know about.
 - **Mixed fleets welcome.** Claude Code is the default; the same overview runs [Codex CLI](https://developers.openai.com/codex/cli/) sessions side by side.
 
+<p align="center">
+  <a href="docs/screenshots/terminal-focus.png"><img src="docs/screenshots/terminal-focus.png" alt="Focus mode on a desktop: the live terminal pane with Claude's own colour-true output — a green Bash(bun run build) receipt, two ticked build lines, a yellow chunk-size warning — under the session's title and its ✎ use-sessions.ts · 3 agents activity, over a dock of Claude-specific keys: ⌘ palette, attach, edit-prompt, Esc, Tab, Ctrl-C, Ctrl-U and the permission-mode switch" width="760"></a>
+</p>
+
+<p align="center"><sub><em>A terminal that knows it is running Claude Code.</em></sub></p>
+
 <details>
 <summary><strong>The full feature list (overview, notifications, history, uploads, hosts, and more)</strong></summary>
 
@@ -179,12 +191,6 @@ Bot Mode runs on top of a real product. Underneath the companies is the thing su
 - **Focus mode**: tap any tile to zoom into a keyboard-captured xterm.js terminal (desktop) or a detented bottom-sheet (mobile). `⌘1..9` jumps instantly between sessions.
 - **⌘K command palette**: fuzzy search across sessions, slash commands, MCP tools, and Claude Code skills.
 - **Mixed fleets welcome**: Claude Code is the default, but the same overview runs [Codex CLI](https://developers.openai.com/codex/cli/) sessions side by side — same live status, push notifications, and prompt history.
-
-<p align="center">
-  <a href="docs/screenshots/hire-sheet-phone.png"><img src="docs/screenshots/hire-sheet-phone.png" alt="The hire-a-teammate sheet on a phone: a rerollable avatar with 'Tap the avatar to reroll' under the name field, the job written in one sentence — 'Research a topic and summarize the best sources.' — a suggestion chip below it, and an Advanced disclosure for engine, model and folder" width="300"></a>
-</p>
-
-<p align="center"><sub><em>Hiring a bot is one sentence.</em></sub></p>
 
 ### Notifications that find you
 - **Real push notifications** when Claude finishes, asks a question, or stops. Works on iOS too: install the PWA, allow notifications, walk away from your machine.
@@ -207,7 +213,7 @@ Bot Mode runs on top of a real product. Underneath the companies is the thing su
 - Mobile gets a full-page edit surface with proper safe-area handling.
 - Built on Claude Code's own `chat:externalEditor` (Ctrl+G) bridge. No scraping, no keystroke replay.
 
-<p align="center"><a href="docs/screenshots/native-input.png"><img src="docs/screenshots/native-input.png" alt="Edit prompt sheet on iPhone: native textarea with iOS selection handles, attach + voice + Done" width="260"></a></p>
+<p align="center"><a href="docs/screenshots/native-input.png"><img src="docs/screenshots/native-input.png" alt="The Edit prompt sheet on an iPhone: the prompt lifted out of Claude's ❯ prompt into a focused, browser-native textarea with the caret after the last character, Cancel / Send / Done in the sheet header, attach and dictation in the dock, and iOS's own keyboard accessory bar under it" width="260"></a></p>
 
 ### Drag-and-drop uploads
 - **Drag a file onto the terminal pane** on desktop and supermux uploads it server-side, then pastes the resolved path at Claude's cursor.
