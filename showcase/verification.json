@@ -2,8 +2,14 @@
   "schema_version": 1,
   "recording": "showcase/out/recording.webm",
   "duration_s": 53.8,
-  "viewport_desktop": { "width": 1440, "height": 900 },
-  "viewport_mobile_iframe": { "width": 390, "height": 844 },
+  "viewport_desktop": {
+    "width": 1440,
+    "height": 900
+  },
+  "viewport_mobile_iframe": {
+    "width": 390,
+    "height": 844
+  },
   "attempts": 3,
   "outputs": {
     "mp4": "docs/showcase/supermux-showcase.mp4",
@@ -110,5 +116,7 @@
     "The viewport stayed at 1440x900 for the whole recording (Chromium recordVideo size is fixed at context-create). The mobile beats render an iframe pointed at '/?_token=…' inside a phone-bezel CSS overlay so the canvas remains full-bleed; the iframe carries a 390x844 viewport so the React app inside paints the real mobile layout (bottom tabs, FAB, accessory bar — all unmodified).",
     "Sessions were seeded via the public HTTP API (POST /api/sessions then /start + /send) with shell commands chosen to trigger each status classifier: 'esc to interrupt'/'Reading N file'/'Running...' for Active (sse-stream, tile-polish, codex-board, auth-rewrite), 'Do you want to proceed' + '❯ N.' selector lines for Waiting (fix-flake), one explicit stop call for Stopped (old-experiment).",
     "Captions were injected via page.evaluate into a fixed-position '#sm-caption' overlay; the outro overlay '#sm-outro-overlay' fades in over a soft brand-gradient backdrop. A fake cursor SVG follows page.mouse so the storyboard reads as a real person clicking."
-  ]
+  ],
+  "outputs_tracked": false,
+  "outputs_note": "The rendered outputs listed under `outputs` were removed from git on 2026-08-30: 13.4 MB of media that no page, README or workflow linked to. This manifest is kept as the record of the run; re-render with `showcase/record.ts` if the artifacts are needed again."
 }

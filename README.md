@@ -12,7 +12,7 @@
        degrades to a clean static first frame. Click-through opens the HD MP4.
        Every frame is the real UI, shot from the app's own mock/dev surfaces. -->
   <a href="docs/hero.mp4"><img src="docs/hero.gif" width="900"
-     alt="supermux in use — a bot's thread on a phone with tool receipts ticking as it works; the desktop control room with every bot ranked by who needs you first; the company chat routing one question to two named bots; a lock-screen push the moment a bot needs a decision; taking the wheel in the company's shared browser; the same roster still running on a phone after the laptop closes; and the one-line install on a server"></a>
+     alt="supermux in use — a bot's thread on a phone with tool receipts ticking as it works; the desktop control room with every bot ranked by who needs you first; the company chat routing one question to two named bots; a lock-screen push the moment a bot needs a decision; taking the wheel in the company's shared browser; the thread still running on a phone after the laptop closes; and the one-line install on a server, ending on the address and the token command the installer actually prints"></a>
 </p>
 
 <p align="center"><sub>▶ <a href="docs/hero.mp4">Click for HD</a> · the loop above autoplays on GitHub</sub></p>
@@ -116,7 +116,7 @@ A **workflow** is an ordered list of prompts a bot runs on a trigger: chain the 
 One real Chrome the company shares — **log in once**, then lend individual tabs to named bots. When a bot hits a login wall you can **take the wheel**, sign in, and hand the tab back.
 
 <p align="center">
-  <a href="docs/screenshots/browser-drive.png"><img src="docs/screenshots/browser-drive.png" alt="The company's shared browser with Drive engaged instead of Watch: a rail of six company tabs, the open tab signed in and verified six minutes ago, and inside it the third-party page the bot got stuck on — 'Verify it's you — The agent hit a challenge it can't solve. Take the wheel.' over an email and a one-time-code field" width="900"></a>
+  <a href="docs/screenshots/browser-drive.png"><img src="docs/screenshots/browser-drive.png" alt="The company's shared browser with Drive engaged instead of Watch: a rail of company tabs — two pinned, then Pipeline · CRM, Analytics, a quarterly reseller report, Ads Manager and Handbook — the omnibox on mail.acme.example/inbox reading 'Signed in · verified 6 min ago', one other viewer on the tab, and the accent ring round the page that means a human has the wheel" width="900"></a>
 </p>
 
 <p align="center"><sub><em>When it's stuck, take the wheel — then hand it back.</em></sub></p>
@@ -157,13 +157,13 @@ The pitch that made Grok bots go viral — a team of agents that never sleeps �
 Bot Mode runs on top of a real product. Underneath the companies is the thing supermux has always been: **the easiest way to run a roomful of Claude Code agents from your phone** — live overview, real push, resume, files, MCP/skills, remote hosts.
 
 <p align="center">
-  <a href="docs/screenshots/overview-desktop.png"><img src="docs/screenshots/overview-desktop.png" alt="The overview after clicking a row: the HQ bar with New bot, search, sort and density; the roster's NEEDS YOU group holding a five-bot team and codex-app at 11% context; and the bot's panel open on the right with Open terminal and its Overview, Setup and Workflows tabs" width="900"></a>
+  <a href="docs/screenshots/overview-desktop.png"><img src="docs/screenshots/overview-desktop.png" alt="The overview after clicking a row: the HQ bar with New bot, search, sort and density; the roster grouped NEEDS YOU (2) — a five-bot team and codex-app at 11% context — above ACTIVE (2), build-runner and qa-astro; and codex-app's panel open on the right with Open terminal and its Overview, Setup and Workflows tabs" width="900"></a>
 </p>
 
 <p align="center"><sub><em>Every bot, ranked by who needs you.</em></sub></p>
 
 <p align="center">
-  <a href="docs/screenshots/overview-phone.png"><img src="docs/screenshots/overview-phone.png" alt="The same roster on a phone, grouped the same way: two bots that need you, two working — one listening on 127.0.0.1:8823 — each with its context ring" width="300"></a>
+  <a href="docs/screenshots/overview-phone.png"><img src="docs/screenshots/overview-phone.png" alt="The same roster on a phone, grouped the same way: two bots that need you above two that are working, one of them listening on 127.0.0.1:8823, with a context ring on the two running a model" width="300"></a>
 </p>
 
 <p align="center"><sub><em>The same control room, in your pocket.</em></sub></p>
@@ -177,7 +177,7 @@ Bot Mode runs on top of a real product. Underneath the companies is the thing su
 - **Mixed fleets welcome.** Claude Code is the default; the same overview runs [Codex CLI](https://developers.openai.com/codex/cli/) sessions side by side.
 
 <p align="center">
-  <a href="docs/screenshots/terminal-focus.png"><img src="docs/screenshots/terminal-focus.png" alt="Focus mode on a desktop: the live terminal pane with Claude's own colour-true output — a green Bash(bun run build) receipt, two ticked build lines, a yellow chunk-size warning — under the session's title and its ✎ use-sessions.ts · 3 agents activity, over a dock of Claude-specific keys: ⌘ palette, attach, edit-prompt, Esc, Tab, Ctrl-C, Ctrl-U and the permission-mode switch" width="760"></a>
+  <a href="docs/screenshots/terminal-focus.png"><img src="docs/screenshots/terminal-focus.png" alt="Focus mode on a desktop: Claude's own colour-true screen — an Update receipt with two green added lines, a Bash(bun run build) receipt, 212 tests passing, and a 'Brewed for 34s' timing line — then Claude's composer between its two rules with the next prompt already typed into it and the block cursor after the last character, all under the session's title and its ✎ use-sessions.ts · 3 agents activity, over a dock of Claude-specific keys: ⌘ palette, attach, edit-prompt, Esc, Tab, Ctrl-C, Ctrl-U and the permission-mode switch" width="900"></a>
 </p>
 
 <p align="center"><sub><em>A terminal that knows it is running Claude Code.</em></sub></p>
