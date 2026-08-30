@@ -56,9 +56,9 @@ function errorLabel(type: string, message?: string): string {
   return errorBadgeLabel(type, message) ?? 'Error'
 }
 
-/** Below this many outstanding subagents the parallelism clause stays hidden — a
- *  lone Task is not noteworthy; two or more is the "many hands" signal we surface. */
-const SUBAGENT_CLAUSE_MIN = 2
+/** Below this many running agents the parallelism clause stays hidden — a lone
+ *  Task is not noteworthy; two or more is the "many hands" signal we surface. */
+const AGENT_CLAUSE_MIN = 2
 
 /** The BMP Private Use Area — where Nerd Font packs its icon glyphs.
  *
@@ -84,16 +84,18 @@ function stripPua(s: string): string {
 export interface ActivityLineProps {
   /** The live activity label from the backend (already emoji-prefixed). */
   activity?: string
-  /** Live count of outstanding Task sub-agents for the current turn. When ≥ 2 a
-   *  calm `· N subagents` clause is appended — the display-only parallelism
-   *  signal so a 5-subagent turn reads visibly different from a single tool. */
-  subagents?: number
+  /** The subagents the server has first-hand evidence of (`SessionSummary.agents`).
+   *  When there are ≥ 2 a calm `· N agents` clause is appended — the display-only
+   *  parallelism signal, so a 5-agent turn reads visibly different from a single
+   *  tool. Counts ROWS, never the raw `subagents` number, so the clause cannot
+   *  outlive the children it is describing. */
+  agents?: readonly { id: string }[]
   /** Extra classes for the wrapping span (sizing / layout from the caller). */
   className?: string
 }
 
 /** A calm, single-line, truncating activity indicator with an optional muted
- *  `· N subagents` parallelism clause. Renders null when there is nothing to
+ *  `· N agents` parallelism clause. Renders null when there is nothing to
  *  show, so callers can drop it in without their own guard.
  *
  *  Layout is a single `truncate` line (not flex) so every call site keeps its
@@ -102,12 +104,12 @@ export interface ActivityLineProps {
  *  tight line the `truncate` ellipsis clips it before the activity label — the
  *  name always wins the squeeze. (No container query / `container-type`: that
  *  would impose size containment and collapse the header's content-sized line.) */
-export function ActivityLine({ activity, subagents, className }: ActivityLineProps) {
+export function ActivityLine({ activity, agents, className }: ActivityLineProps) {
   // Hook must run unconditionally (rules-of-hooks) — before any early return.
   const reduce = useReducedMotion()
   const label = activity?.trim() ? stripPua(activity.trim()) : undefined
-  const n = subagents ?? 0
-  const showCount = n >= SUBAGENT_CLAUSE_MIN
+  const n = agents?.length ?? 0
+  const showCount = n >= AGENT_CLAUSE_MIN
   if (!label && !showCount) return null
   return (
     <span
@@ -128,7 +130,7 @@ export function ActivityLine({ activity, subagents, className }: ActivityLinePro
           className="ml-1 inline-block align-baseline whitespace-nowrap tabular-nums text-muted-foreground"
         >
           {label ? '· ' : ''}
-          {n} subagents
+          {n} agents
         </motion.span>
       )}
     </span>

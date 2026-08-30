@@ -1068,7 +1068,7 @@ export function SessionTile({
               // signal is obvious at a glance without fighting the live preview.
               <ActivityLine
                 activity={activity}
-                subagents={session.subagents}
+                agents={session.agents}
                 className="text-xs"
               />
             ) : (

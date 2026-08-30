@@ -710,7 +710,13 @@ export function liveStates(nowMs: number): LiveState[] {
         display_name: 'Release Train',
         status: 'active',
         activity: '⚡ cargo test --lib money',
-        subagents: 3,
+        // Three children with real evidence — the expander's own fixture: two
+        // live with their current tool, one quiet inside a long command.
+        agents: [
+          { id: 'w1', type: 'general-purpose', label: '📖 ledger.rs', since_ms: 31_000, quiet_ms: 900 },
+          { id: 'w2', type: 'general-purpose', label: '⚡ cargo check', since_ms: 24_000, quiet_ms: 4_200 },
+          { id: 'w3', type: 'workflow-subagent', since_ms: 18_000, quiet_ms: 190_000 },
+        ],
       }),
       entries: release,
       turnAgo: 42,

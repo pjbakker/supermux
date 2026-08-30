@@ -22,6 +22,7 @@ import { motion, useReducedMotion } from 'framer-motion'
 
 import type { MarkPin } from '../../brand/marks'
 import { motionOff, springs } from '../../lib/springs'
+import type { AgentRow } from '@/lib/api/sessions'
 import { subagentsClause } from '@/lib/mark-status'
 
 import { stripEmojiPrefix } from './entries'
@@ -32,14 +33,15 @@ export function WorkingRow({
   name,
   pin,
   activity,
-  subagents,
+  agents,
   turnStartMs,
 }: {
   /** The working session's slug — the seed for the face in the gutter. */
   name?: string
   pin?: MarkPin
   activity?: string
-  subagents?: number
+  /** The children the server has first-hand evidence of. */
+  agents?: AgentRow[]
   /** Turn anchor in SERVER-clock ms (last_send_at when recent, else the
    *  skew-corrected flip stamp) — so the elapsed clause counts from the SEND,
    *  not from whenever this component happened to mount. */
@@ -57,7 +59,7 @@ export function WorkingRow({
   // row's `gap`/`ml-auto` geometry is unchanged on the first rung.
   const showElapsed = useElapsedShown(turnStartMs, ELAPSED_AFTER_MS)
 
-  const clause = subagentsClause(subagents)
+  const clause = subagentsClause(agents)
   // The emoji taxonomy stays terminal/tile-only, so the label is stripped here
   // exactly as the confirmed receipt it will become is (`stripEmojiPrefix`).
   const label = (activity ? stripEmojiPrefix(activity) : 'Thinking…') + clause

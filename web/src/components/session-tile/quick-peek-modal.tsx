@@ -191,11 +191,11 @@ export function QuickPeekModal({
 
           {/* Parallelism, spelled out in full where there's room (the quick-peek
               is the richest tier): a calm line when the agent is working with
-              ≥ 2 outstanding Task subagents. Mirrors the tile's `· N subagents`
-              clause, here as plain prose. */}
-          {session.status === 'active' && (session.subagents ?? 0) >= 2 && (
+              ≥ 2 running children. Counts the evidence-bearing ROWS, mirroring
+              the tile's `· N agents` clause, here as plain prose. */}
+          {session.status === 'active' && (session.agents?.length ?? 0) >= 2 && (
             <p className="px-4 pb-2 text-xs text-muted-foreground">
-              Working with {session.subagents} subagents
+              Working with {session.agents?.length} agents
             </p>
           )}
 

@@ -132,11 +132,28 @@ export function attentionFor(s: AttentionInput | null | undefined): AttentionTie
   return null
 }
 
-/** The calm ` · N subagents` parallelism clause, shared by the chat WorkingRow
- *  and the Grok roster's state word so the two never drift. Empty below 2 — one
- *  subagent is not "parallel", and the clause is a parallelism tell, not a count. */
-export function subagentsClause(subagents: number | undefined | null): string {
-  return subagents && subagents >= 2 ? ` · ${subagents} subagents` : ''
+/** How long a row may go without a hook before it reads QUIET rather than live.
+ *  Mirrors the server's `AGENT_LIVE_WINDOW` (state.rs) — deliberately 60s and
+ *  not the 10s subagent-liveness window, because an agent sitting inside one
+ *  `Bash` is legitimately silent and Claude Code's `Bash` ceiling is 600s. */
+export const AGENT_QUIET_AFTER_MS = 60_000
+
+/** The calm ` · N agents` parallelism clause, shared by the chat WorkingRow, the
+ *  tile's activity line and the Grok roster's state word so they never drift.
+ *  Empty below 2 — one agent is not "parallel", and the clause is a parallelism
+ *  tell, not a count.
+ *
+ *  It counts ROWS, not the raw `subagents` number, and that is the whole change:
+ *  a row exists only because a hook carrying that agent's own id arrived, so the
+ *  clause can no longer say `3 subagents` at a session that has none. The word
+ *  moved with the quantity — "agents" now means "children with a live tool
+ *  call", which is not what users were being shown before.
+ *
+ *  Structural parameter so any row-ish shape satisfies it (the tile, the roster
+ *  and the chat all hold slightly different session types). */
+export function subagentsClause(agents?: readonly { id: string }[] | null): string {
+  const n = agents?.length ?? 0
+  return n >= 2 ? ` · ${n} agents` : ''
 }
 
 /** Live hints a caller may know that the status field cannot spell. */

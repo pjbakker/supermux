@@ -285,10 +285,10 @@ export function LiveLayer({
     working && !target && overlay.length > 0
       ? {
           label: activity ? stripEmojiPrefix(activity) : overlay[overlay.length - 1].label,
-          // The STATIC half only — the subagent count, which changes on an SSE
+          // The STATIC half only — the agent-row count, which changes on an SSE
           // frame. The elapsed half is `turnStartMs` below: a node the running
           // line renders itself, so a second passing re-renders nothing here.
-          status: liveStatus(session?.subagents, surface),
+          status: liveStatus(session?.agents, surface),
           turnStartMs: turnStart,
         }
       : undefined
@@ -476,7 +476,7 @@ export function LiveLayer({
             name={overlay.length > 0 ? undefined : name}
             pin={pinFor?.(name)}
             activity={activity}
-            subagents={session?.subagents}
+            agents={session?.agents}
             turnStartMs={turnStart}
           />
         )
@@ -994,12 +994,18 @@ function shortDir(dir: string): string {
  * from the SEND on the server clock, and it stays off screen for the first 5s
  * because a fast turn that prints 1s, 2s, 3s feels slow).
  */
-function liveStatus(subagents?: number, surface?: 'desktop' | 'phone'): string | undefined {
+function liveStatus(
+  agents?: readonly { id: string }[],
+  surface?: 'desktop' | 'phone',
+): string | undefined {
   // The clock shares the line with the tool label now, and on the phone that
-  // line has a 266px bubble to live in. `3 subagents` costs a third of it, and
+  // line has a 266px bubble to live in. `3 agents` costs a third of it, and
   // WHAT is running matters more than how many helpers it has — so the count is
-  // a desktop clause and the clock is everywhere.
-  return surface !== 'phone' && subagents && subagents >= 2 ? `${subagents} subagents` : undefined
+  // a desktop clause and the clock is everywhere. (The phone gets the same
+  // answer from the working row's own expander, which is where a small screen
+  // should be asked for a tap rather than given a permanent clause.)
+  const n = agents?.length ?? 0
+  return surface !== 'phone' && n >= 2 ? `${n} agents` : undefined
 }
 
 /**

@@ -32,6 +32,36 @@ export type SessionStatus =
  *  and requires a clean relaunch. Matches the backend `Mode` snake_case wire. */
 export type SessionMode = 'normal' | 'accept_edits' | 'plan' | 'bypass'
 
+/**
+ * ONE running subagent, as the server has first-hand evidence of it
+ * (`SessionView.agents` / the `sessions` SSE delta's `agents` key).
+ *
+ * The point of the shape: a row is not a count. The server builds it from the
+ * `agent_id` Claude puts on every hook that fires from inside a child, so a row
+ * can only exist because that exact agent did something — where the raw
+ * `subagents` number can be pinned by a lost `SubagentStop` and says nothing
+ * about which children exist or what they are doing.
+ *
+ * Both durations are milliseconds resolved on the SERVER clock at serialization
+ * time, which is what lets the client render elapsed without a clock of its own.
+ */
+export interface AgentRow {
+  /** Claude's `agent_id`. The React key — two rows can never merge. */
+  id: string
+  /** The child's kind (`general-purpose`, `Explore`, `workflow-subagent`, …).
+   *  Shown only when there is no `label`: a workflow child has no human name
+   *  anywhere on the wire, and inventing one would be its own small lie. */
+  type: string
+  /** This agent's CURRENT tool call, in the app's own voice (`⚡ run the tests`).
+   *  Absent until its first tool hook. */
+  label?: string
+  /** Milliseconds since this agent was first seen. */
+  since_ms: number
+  /** Milliseconds since its newest hook. Past `AGENT_QUIET_AFTER_MS` the row is
+   *  QUIET: it stays, dims, and says the fact — never "stopped", never "done". */
+  quiet_ms: number
+}
+
 /** Per-tile summary. SSE `sessions` events use this same shape (deltas). */
 export interface SessionSummary {
   name: string
@@ -315,11 +345,18 @@ export interface ApiSession {
    *  emoji. Present iff `activity` is. */
   activity_kind?: string
   /** Live count of outstanding Task sub-agents for the current turn (fed by the
-   *  `SubagentStart`/`SubagentStop` hooks). DISPLAY-ONLY parallelism signal: the
-   *  overview shows a calm `· N subagents` clause on the activity line while the
-   *  agent is working and this is ≥ 2. Never a status signal. Omitted (absent)
-   *  when 0, which the SSE delta sends as `0` to clear the clause. */
+   *  `SubagentStart`/`SubagentStop` hooks). Still on the wire because the server
+   *  reads it for status + the finish notification — but NOT rendered anywhere
+   *  any more: a lost `SubagentStop` pins it, and it says nothing about WHICH
+   *  children exist. `agents` is what the UI shows instead. */
   subagents?: number
+  /** **Which subagents are actually running, and what each is doing** — one row
+   *  per child supermux has first-hand evidence of, keyed by Claude's own
+   *  `agent_id`. A row exists only because a hook carrying that exact id
+   *  arrived, so unlike `subagents` it cannot be a ghost. Absent (not `[]`) on a
+   *  session with no children; the SSE delta always sends the array so an empty
+   *  one clears the client's list. */
+  agents?: AgentRow[]
   /** TRUE when a BACKGROUND workflow is provably running RIGHT NOW — a
    *  `subagents/agent-*.jsonl` append (the tailer ground truth) OR an open
    *  subagent hook within ~10s. Unlike `subagents` (the raw count, historically

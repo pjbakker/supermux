@@ -109,7 +109,13 @@ export const MOCK_TILES: TileSession[] = [
     tokens: 48200,
     branch: 'feat/sse-merge',
     activity: '✎ use-sessions.ts',
-    subagents: 3,
+    // Rows, not a count — the mock has to be able to say WHICH children and
+    // what each is doing, because that is what the tile now renders.
+    agents: [
+      { id: 'm1', type: 'general-purpose', label: '📖 use-sessions.ts', since_ms: 41_000, quiet_ms: 1_200 },
+      { id: 'm2', type: 'general-purpose', label: '🔍 mergeDelta', since_ms: 38_000, quiet_ms: 9_400 },
+      { id: 'm3', type: 'Explore', label: '⚡ run the unit tests', since_ms: 12_000, quiet_ms: 800 },
+    ],
     preview_lines: claudeBoot('Implementing the delta-merge updater'),
     preview_ansi: claudeBootAnsi('Implementing the delta-merge updater'),
     // FASE A5 — a chat-eligible session WITH a tail. With the experiment on
@@ -153,7 +159,14 @@ export const MOCK_TILES: TileSession[] = [
     tokens: 6400,
     branch: 'main',
     activity: '🤖 dispatching review agents',
-    subagents: 5,
+    agents: [
+      { id: 'r1', type: 'general-purpose', label: '📖 tile.tsx', since_ms: 96_000, quiet_ms: 2_100 },
+      { id: 'r2', type: 'general-purpose', label: '📖 activity-status.tsx', since_ms: 94_000, quiet_ms: 400 },
+      { id: 'r3', type: 'general-purpose', label: '✎ notes.md', since_ms: 90_000, quiet_ms: 5_600 },
+      // Quiet: inside one long command, so the row dims and states the fact.
+      { id: 'r4', type: 'workflow-subagent', since_ms: 88_000, quiet_ms: 187_000 },
+      { id: 'r5', type: 'workflow-subagent', label: '⚡ bun run build', since_ms: 61_000, quiet_ms: 3_300 },
+    ],
     preview_lines: claudeBoot('Writing acceptance notes for the tile component'),
     preview_ansi: claudeBootAnsi('Writing acceptance notes for the tile component'),
     updated_at: new Date().toISOString(),
