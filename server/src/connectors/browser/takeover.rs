@@ -3559,9 +3559,9 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}{path}"))
             .await
             .expect("ws connect");
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(format!(
-            r#"{{"type":"auth","token":"{WS_TOKEN}"}}"#
-        )))
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            format!(r#"{{"type":"auth","token":"{WS_TOKEN}"}}"#).into(),
+        ))
         .await
         .expect("send auth");
         ws
@@ -3577,7 +3577,8 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
         use tokio_tungstenite::tungstenite::Message as M;
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(20), ws.next()).await {
-                Ok(Some(Ok(M::Text(t)))) => return Some(Ok(t)),
+                // tungstenite >=0.26 hands back Utf8Bytes; the assertions want a String.
+                Ok(Some(Ok(M::Text(t)))) => return Some(Ok(t.to_string())),
                 Ok(Some(Ok(M::Close(Some(cf))))) => return Some(Err(u16::from(cf.code))),
                 Ok(Some(Ok(_))) => continue,
                 _ => return None,
@@ -3873,7 +3874,7 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
 
         // ── 2. a navigate control frame moves the page ───────────────────────
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({ "type": "navigate", "url": two }).to_string(),
+            json!({ "type": "navigate", "url": two }).to_string().into(),
         ))
         .await
         .unwrap();
@@ -3887,7 +3888,7 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
 
         // ── 3. back really steps the history, forward becomes honest ─────────
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({ "type": "back" }).to_string(),
+            json!({ "type": "back" }).to_string().into(),
         ))
         .await
         .unwrap();
@@ -3899,7 +3900,7 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
 
         // ── 4. a non-http scheme is refused at the socket, like at REST ──────
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({ "type": "navigate", "url": "file:///etc/passwd" }).to_string(),
+            json!({ "type": "navigate", "url": "file:///etc/passwd" }).to_string().into(),
         ))
         .await
         .unwrap();
@@ -3916,7 +3917,7 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
         // ── 5. an alert() blocks the renderer; the feed says so and the ──────
         //      dialog frame is the only way back out.
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({ "type": "navigate", "url": alerting }).to_string(),
+            json!({ "type": "navigate", "url": alerting }).to_string().into(),
         ))
         .await
         .unwrap();
@@ -3924,7 +3925,7 @@ input{position:fixed;left:0;top:0;width:400px;height:60px;font-size:24px}</style
         assert_eq!(blocked["dialog"]["kind"], json!("alert"), "{blocked}");
         assert_eq!(blocked["dialog"]["message"], json!("stop right there"), "{blocked}");
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({ "type": "dialog", "accept": true }).to_string(),
+            json!({ "type": "dialog", "accept": true }).to_string().into(),
         ))
         .await
         .unwrap();
