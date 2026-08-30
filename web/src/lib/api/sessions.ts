@@ -32,6 +32,44 @@ export type SessionStatus =
  *  and requires a clean relaunch. Matches the backend `Mode` snake_case wire. */
 export type SessionMode = 'normal' | 'accept_edits' | 'plan' | 'bypass'
 
+/**
+ * ONE running subagent, as the server has first-hand evidence of it
+ * (`SessionView.agents` / the `sessions` SSE delta's `agents` key).
+ *
+ * The point of the shape: a row is not a count. The server builds it from the
+ * `agent_id` Claude puts on every hook that fires from inside a child, so a row
+ * can only exist because that exact agent did something — where the raw
+ * `subagents` number can be pinned by a lost `SubagentStop` and says nothing
+ * about which children exist or what they are doing.
+ *
+ * Both durations are milliseconds resolved on the SERVER clock at serialization
+ * time, which is what lets the client render elapsed without a clock of its own.
+ */
+export interface AgentRow {
+  /** Claude's `agent_id`. The React key — two rows can never merge. */
+  id: string
+  /** The child's kind (`general-purpose`, `Explore`, `workflow-subagent`, …).
+   *  Shown only when there is no `label`: a workflow child has no human name
+   *  anywhere on the wire, and inventing one would be its own small lie. */
+  type: string
+  /** This agent's CURRENT tool call, in the app's own voice (`⚡ run the tests`).
+   *  Absent until its first tool hook. */
+  label?: string
+  /** When this agent was first seen, in SERVER-clock ms (`chat/latency.ts`'s
+   *  `serverNowMs()` domain — the same one `activity_at` establishes). A STAMP
+   *  and not a duration on purpose: a duration is only true at the instant it
+   *  was serialized, so a client had to re-anchor it against its own clock on
+   *  every render, which reset the elapsed leaf back to the last delta's value. */
+  started_ms: number
+  /** When its newest hook arrived, same clock. Past `AGENT_QUIET_AFTER_MS`
+   *  (`components/chat/agent-rows.ts`) the row is QUIET: it stays, dims, and says
+   *  the fact — never "stopped", never "done", never a verdict. Being a stamp is
+   *  what lets that transition happen at all: in the case the ladder exists for
+   *  (every child silent inside a long `Bash`) no delta arrives to carry a
+   *  fresher duration, so the client has to be able to age the row itself. */
+  last_evidence_ms: number
+}
+
 /** Per-tile summary. SSE `sessions` events use this same shape (deltas). */
 export interface SessionSummary {
   name: string
@@ -315,11 +353,19 @@ export interface ApiSession {
    *  emoji. Present iff `activity` is. */
   activity_kind?: string
   /** Live count of outstanding Task sub-agents for the current turn (fed by the
-   *  `SubagentStart`/`SubagentStop` hooks). DISPLAY-ONLY parallelism signal: the
-   *  overview shows a calm `· N subagents` clause on the activity line while the
-   *  agent is working and this is ≥ 2. Never a status signal. Omitted (absent)
-   *  when 0, which the SSE delta sends as `0` to clear the clause. */
+   *  `SubagentStart`/`SubagentStop` hooks). Still on the wire because the server
+   *  reads it for status + the finish notification — but NOT rendered anywhere
+   *  any more: a lost `SubagentStop` pins it, and it says nothing about WHICH
+   *  children exist. `agents_live` is what the UI shows instead. */
   subagents?: number
+  /** **How many subagents are actually running** — the count of children
+   *  supermux has first-hand evidence of (`AgentRow`), each counted only because
+   *  a hook carrying that child's own `agent_id` arrived, so unlike `subagents`
+   *  it cannot be a ghost. What every clause site renders. Absent (not `0`) on a
+   *  session with no children; the SSE delta always sends the key so a drop back
+   *  to 0 clears the clause. The ROWS ride the same payload under `agents`,
+   *  declared on `TileSession` for the chat working row that lists them. */
+  agents_live?: number
   /** TRUE when a BACKGROUND workflow is provably running RIGHT NOW — a
    *  `subagents/agent-*.jsonl` append (the tailer ground truth) OR an open
    *  subagent hook within ~10s. Unlike `subagents` (the raw count, historically
@@ -600,6 +646,47 @@ export interface SessionConfigPatch {
  *  `BRAND.md` §6g carries the tier × policy table. */
 export type NotifPolicy = 'inherit' | 'all' | 'attention' | 'off'
 
+/** One own-slug connector grant the move REVOKED because it pointed at the OLD
+ *  company's credentials — a credential-leak guard, surfaced explicitly (spec §4)
+ *  so a dropped grant is never silent. `connector_name` is the human label for
+ *  the post-move receipt; `connector_id` its stable slug. */
+export interface MoveDroppedGrant {
+  connector_id: string
+  connector_name: string
+}
+
+/** One own-slug shared-browser tab grant the move removed because its tab
+ *  belonged to the OLD company (a dead grant once the bot has left). Listed in
+ *  the receipt (spec §4) — never dropped silently. */
+export interface MoveDeadTabGrant {
+  tab_id: string
+  title: string
+}
+
+/** Result of `POST /api/sessions/{name}/company` — the bot-move receipt (spec
+ *  §2.5). The move is FS-first with a single atomic DB tx; this is the honest
+ *  account of what followed the bot and what broke, rendered in the confirm
+ *  result and a post-move toast.
+ *
+ *  `restart_required` is ALWAYS true for a real move: confinement + the live pty
+ *  cwd are read at spawn, so a running pane keeps the old inode until restart.
+ *  `moved_files` is the FS outcome — the string `"moved"` (single rename),
+ *  `"skipped"` (a no-op / already-homed dir), or `{ copied: <n> }` on the
+ *  cross-filesystem copy-tree fallback. `warnings[]` carries the human,
+ *  ordered breakage lines (server-authored, shown verbatim). */
+export interface MoveCompanyResult {
+  ok: boolean
+  restart_required: boolean
+  /** `"moved"` | `"skipped"` | `{ copied: number }` — the FS move outcome. */
+  moved_files: 'moved' | 'skipped' | { copied: number }
+  /** Own-slug connector grants revoked as a credential-leak guard. */
+  dropped_grants: MoveDroppedGrant[]
+  /** Own-slug tab grants removed on old-company tabs. */
+  dead_tab_grants: MoveDeadTabGrant[]
+  /** Honest, ordered breakage lines — server-authored, shown verbatim. */
+  warnings: string[]
+}
+
 /** Result of `POST /api/sessions/{name}/mode` (mode-shift). `mode` is the mode
  *  ACTUALLY in effect after the op (the UI reflects truth, never an optimistic
  *  guess). `converged` is false when the Shift+Tab cycle couldn't reach the
@@ -663,7 +750,9 @@ async function sessReq<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   const token = apiToken()
   if (token) headers.set('Authorization', `Bearer ${token}`)
-  if (init?.body && !(init.body instanceof FormData)) {
+  // Default to JSON, but let a caller that already set a Content-Type (e.g. a
+  // raw image PUT) keep it — FormData sets its own multipart boundary.
+  if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
   let res: Response
@@ -823,6 +912,21 @@ export const sessionsApi = {
     sessReq(`/api/sessions/${encodeURIComponent(name)}/duplicate`, {
       method: 'POST',
       body: JSON.stringify({ new_name }),
+    }),
+
+  /** `POST /api/sessions/{name}/company { company_id }` — move a bot between
+   *  companies (`null` = HQ / main). Owner/admin only (403 for a scoped member).
+   *  FS-first with a single atomic DB tx server-side: the session's files, its
+   *  connector/tab grants and its group-chat membership all follow the bot, and
+   *  own-slug grants that would leak the OLD company's credentials are revoked.
+   *  Resolves to the honest [`MoveCompanyResult`] receipt; 409 (`archived` /
+   *  `dest_exists`) is refused BEFORE any write, so a collision never merges or
+   *  overwrites. The move never force-kills a busy pane — `restart_required` is
+   *  always true. */
+  moveCompany: (name: string, companyId: number | null): Promise<MoveCompanyResult> =>
+    sessReq(`/api/sessions/${encodeURIComponent(name)}/company`, {
+      method: 'POST',
+      body: JSON.stringify({ company_id: companyId }),
     }),
 
   /** `POST /api/sessions/{name}/external-edit/submit` — resolve an in-flight
@@ -1040,6 +1144,20 @@ export interface NewCompany {
   slug: string
   display_name: string
   root_dir: string
+  /**
+   * Provision the company's GROUP CHAT at create time (spec §6).
+   *
+   * On the server this auto-creates the Main Assistant (`<slug>-assistant`, a
+   * normal Claude session on the subscription default model), the sidecar log,
+   * the `group-chat` connector grant for the `@company:<id>` tier, and a
+   * welcome row. There is no post-hoc enable route today — `PATCH /api/companies`
+   * only touches `display_name`/`archived` — so this is a CREATE-TIME decision,
+   * which is why the sheet defaults it on rather than hiding it in settings.
+   *
+   * Optional on the wire: the field is `#[serde(default)]` server-side, so an
+   * older server ignores it and an older client still creates companies.
+   */
+  enable_group_chat?: boolean
 }
 
 export const companiesApi = {
@@ -1074,6 +1192,68 @@ export const companiesApi = {
       method: 'PATCH',
       body: JSON.stringify({ display_name }),
     }),
+
+  /** `PATCH /api/companies/{id}` — update any settings field(s): `display_name`,
+   *  `brief`, `default_connectors`, `archived`. Returns the refreshed row. */
+  patch: (
+    id: number,
+    fields: Partial<Pick<Company, 'display_name' | 'brief' | 'default_connectors'>> & {
+      archived?: boolean
+    },
+  ): Promise<Company> =>
+    sessReq(`/api/companies/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(fields),
+    }),
+
+  /** `PUT /api/companies/{id}/logo` — upload raw image bytes (the File's own
+   *  Content-Type rides along; the server caps type + size). Returns the row
+   *  (now `has_logo: true`). */
+  uploadLogo: (id: number, file: Blob): Promise<Company> =>
+    sessReq(`/api/companies/${id}/logo`, {
+      method: 'PUT',
+      body: file,
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    }),
+
+  /** `POST /api/companies/{id}/logo/from-url` — grab the site favicon via
+   *  Google's favicon service and store it. `url` may be a full URL or a bare
+   *  domain. */
+  logoFromUrl: (id: number, url: string): Promise<Company> =>
+    sessReq(`/api/companies/${id}/logo/from-url`, {
+      method: 'POST',
+      body: JSON.stringify({ url }),
+    }),
+
+  /** `DELETE /api/companies/{id}/logo` — back to the generated mark. */
+  deleteLogo: (id: number): Promise<Company> =>
+    sessReq(`/api/companies/${id}/logo`, { method: 'DELETE' }),
+
+  /** `DELETE /api/companies/{id}` — DESTRUCTIVE, irreversible cascade. Owner/
+   *  admin-only (a scoped member gets a hide-existence 404). The server tears
+   *  down EVERYTHING the company owns, best-effort in FK-safe order: every bot
+   *  (reusing the single-bot delete path — a running pane is KILLED, not
+   *  refused, then the row/spool/audit go), its `@company` + own-slug connector
+   *  grants and company-scoped accounts, its browser tabs, the group-chat
+   *  sidecar log, its files root on disk, then the companies row LAST. The row
+   *  is deleted regardless, so any item the cascade could not fully remove is
+   *  named in `warnings` rather than failing silently. Resolves to
+   *  {@link DeleteCompanyResult}. */
+  delete: (id: number): Promise<DeleteCompanyResult> =>
+    sessReq(`/api/companies/${id}`, { method: 'DELETE' }),
+}
+
+/** Result of `DELETE /api/companies/{id}` (the unwrapped `data` payload). */
+export interface DeleteCompanyResult {
+  /** Always `true` — the companies row was removed. */
+  deleted: boolean
+  /** Every session torn down as part of the cascade, the Main Assistant
+   *  (`<slug>-assistant`) included. Names, not ids. */
+  deleted_bots: string[]
+  /** Non-fatal problems the cascade rode through — a bot that would not fully
+   *  delete, a dir that would not remove. Empty on a clean sweep. Shown to the
+   *  owner honestly so an orphan is named, never silent. */
+  warnings: string[]
 }
 
 // ── Project repos endpoint ───────────────────────────────────────────────────

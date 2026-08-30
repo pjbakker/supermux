@@ -25,6 +25,7 @@ use crate::files::transport::{FileTransport, LocalFileTransport, SshFileTranspor
 use crate::state::{AppState, SseEvent};
 
 use super::runtime::SessionRuntime;
+use super::pty_state;
 use super::status::{self, Mode};
 use super::tmux::Tmux;
 use super::transport::HostId;
@@ -799,49 +800,271 @@ fn agent_busy(capture: &str) -> bool {
     capture.to_lowercase().contains("esc to interrupt")
 }
 
-/// May [`send_harness_text`] type `text`+Enter into the pty showing this CURRENT
-/// capture? The SEND-path twin of [`classify_ready_tick`]'s ready arm.
+/// LIVE Claude/Codex bottom chrome, read over the WHOLE capture rather than the
+/// 10-line tail. The composer glyph and the busy footer sit at a FIXED height
+/// above the bottom of a normal agent screen — but this deployment draws a
+/// teammate/swarm roster (`● main` / `◯ <bot>` / `↓ N more`, under a
+/// `View teammates:` line) BELOW them, so on a busy agent with many teammates
+/// the composer and footer are pushed clean out of `current_screen_tail`. The
+/// tail then holds only the roster, `agent_composer_visible`/`agent_busy` both
+/// miss, and a healthy agent is refused `NoAgent` — the send-guard regression
+/// that broke chat + scheduled delivery. These markers are drawn ONLY while a
+/// Claude/Codex agent owns the pane (its mode footer, its idle hint, its busy
+/// footer); a bare shell or a foreign program draws none of them, and the
+/// picker/trust/selection screens are refused ABOVE this on the current screen,
+/// so reading agent-presence wide can only widen an ADMIT, never a refusal.
+fn agent_footer_live(capture: &str) -> bool {
+    let c = capture.to_lowercase();
+    // Deliberately NOT `? for shortcuts` / `esc to interrupt`: those also appear in
+    // the SCROLLBACK of a session that has since exited to a shell, and admitting on
+    // them would defeat `pty_ready_for_send_ignores_stale_scrollback_above_a_bare_shell`.
+    // The mode footer and the swarm roster header, by contrast, are redrawn at the
+    // BOTTOM of the live agent UI every frame — a bare shell or a foreign program
+    // never carries them, so their presence means an agent owns the pane right now,
+    // even when its composer has been pushed above the tail by the roster beneath it.
+    c.contains("bypass permissions") // the ⏵⏵ mode footer (persistent, live)
+        || c.contains("auto mode on")
+        || c.contains("view teammates:") // the swarm roster header, drawn live at the bottom
+}
+
+/// WHY [`send_harness_text`] may NOT type `text`+Enter into the pty showing this
+/// CURRENT capture — or `None` when it may. The SEND-path twin of
+/// [`classify_ready_tick`]'s ready arm.
 ///
 /// [`wake_for_send`] already refuses a FIRST send whose wake lands on a boot
-/// modal (`start().ready == false`), but an ALREADY-AWAKE retry (`woke == false`)
-/// skips the wake entirely — so without this a retry types straight into a
-/// resume picker / trust dialog left open on the pty, records `last_send`, and
-/// reports a message the modal swallowed as delivered (codex #1, wave-7). The
-/// gate is on the CURRENT screen, not on whether we just woke.
+/// modal (`start().ready == false`), but an ALREADY-AWAKE retry (`woke ==
+/// false`) skips the wake entirely — so without this a retry types straight into
+/// a resume picker / trust dialog left open on the pty, records `last_send`, and
+/// reports a message the modal swallowed as delivered (codex #1, wave-7).
 ///
-/// Two screens legitimately receive a send:
-///   * the agent is at the wheel — its own prompt with no boot modal over it
-///     ([`agent_at_the_wheel`], which itself excludes the picker + trust dialog,
-///     and still ADMITS a permission menu so answering one is unchanged); or
-///   * the agent is mid-turn/busy ([`agent_busy`]), where a send is a queue.
-/// Everything else — the resume picker, the trust dialog, a bare shell the agent
-/// exited to — must NOT be typed into.
+/// THE RULE, and it is the whole of it: a send is admitted ONLY on POSITIVE
+/// evidence that the agent is at its TEXT COMPOSER. Not "the screen is not one
+/// of the two modals we know"; not "some interactive footer is visible". A
+/// screen this function cannot positively recognise as a composer REFUSES.
 ///
-/// CURRENT-SCREEN scoping (wave-8, codex pass 3). The readiness/busy glyphs
-/// (`❯`, `esc to interrupt`) must be read off the CURRENT screen, NOT the whole
-/// `capture_plain(30)` blob — that blob is scrollback + viewport, so a screen
-/// that ENDS at a bare shell but still has an OLDER `❯` / `esc to interrupt`
-/// line scrolled up in it would otherwise satisfy the guard and the retry would
-/// be typed into the bare shell. So:
-///   * the two full-screen BOOT MODALS are rejected over the whole capture —
-///     their `❯` is a selection cursor and their identifying TITLE sits at the
-///     TOP of the screen, so a bottom-only look would miss the title and wrongly
-///     admit the cursor; while
-///   * the live-composer / busy-footer glyphs are searched ONLY in the
-///     bottom-anchored [`current_screen_tail`] — an agent glyph higher than that
-///     is stale scrollback, not the screen we are about to type into.
-fn pty_ready_for_send(capture: &str) -> bool {
-    if at_resume_picker(capture) || at_trust_dialog(capture) {
-        return false;
+/// WHY THAT ASYMMETRY IS THE DESIGN. `send_harness_text` ends in `send_text` +
+/// `Enter`, and what that means depends entirely on what is listening:
+///   * at a COMPOSER it is a message — the thing every caller intends;
+///   * at ANY selection screen it is neither. The paste is dropped and the Enter
+///     picks whatever row is highlighted (a0 §3, the same fact
+///     `web/src/components/chat/use-composer.ts` states). The sender's words
+///     vanish and an answer nobody chose is submitted — while the caller is told
+///     it worked. That is worse than a 409 in every direction, and it is not
+///     hypothetical for a foreign program: `[y/N]` under a finger that means
+///     "yes" is a destructive confirmation.
+/// Only the BROWSER has a lens in front of this (`sendGate` refuses on a sighted
+/// dialog). `POST /api/agents/delegate`, `scheduler::runner`, the board
+/// dispatcher and the steering loop all funnel through here with no lens at all,
+/// so this guard is the only thing standing in front of those keystrokes.
+///
+/// So, in order:
+///   1. the `--resume` session picker (Claude or Codex) — refused over the WHOLE
+///      capture, because its identifying TITLE sits at the top of the screen;
+///   2. a startup GATE — `trust` / `apikey` / `onboarding` / `hooks-review`, read
+///      by [`pty_state::startup_wedge`], the same reader the status detector
+///      already trusts to say a session is waiting on a human. Same whole-capture
+///      reason;
+///   3. ANY SELECTION SCREEN on the current screen ([`selection_screen`]) — the
+///      agent's own question / plan / paused modal / permission menu, a picker
+///      whose title has scrolled out of the capture, or an interactive prompt
+///      from some program the user ran by hand in the same pty. One refusal,
+///      because a keystroke means the same wrong thing in all of them;
+///   4. otherwise: a COMPOSER anchor ([`agent_composer_visible`]), a live Codex
+///      composer ([`codex_ready`]), or a busy turn ([`agent_busy`], where a send
+///      is the queue CC itself offers) — and nothing else admits.
+///
+/// CURRENT-SCREEN scoping (wave-8, codex pass 3) is kept for every check that
+/// can be: the capture is scrollback + viewport, so a screen that ENDS at a bare
+/// shell but still carries an OLDER `❯` / `esc to interrupt` up in its history
+/// must not satisfy the guard. Steps 1-2 are the deliberate exception (a title
+/// above the fold), and both of them only ever REFUSE — widening a refusal's
+/// window can never open a door.
+fn send_block(capture: &str) -> Option<SendBlock> {
+    if at_resume_picker(capture) {
+        return Some(SendBlock::ResumePicker);
+    }
+    if at_trust_dialog(capture) {
+        return Some(SendBlock::Gate("trust"));
+    }
+    if let Some(wedge) = pty_state::startup_wedge(capture) {
+        return Some(SendBlock::Gate(wedge));
     }
     let screen = current_screen_tail(capture);
-    agent_ui_visible(&screen) || agent_busy(&screen) || codex_ready(&screen)
+    // A SELECTION SCREEN REFUSES BEFORE ANYTHING ADMITS, whoever drew it. It is
+    // checked first on purpose: a dialog's own caret is a `❯` too, so a rule
+    // that admitted first would admit every one of them.
+    if selection_screen(&screen) {
+        return Some(SendBlock::Selection);
+    }
+    // Agent presence is read over the WHOLE capture (`agent_busy` / `agent_footer_live`),
+    // not just the current tail: a teammate/swarm roster drawn below the composer can push
+    // the composer glyph and the footer out of `current_screen_tail`, and the danger screens
+    // (picker / trust / selection) have already been refused above, so widening the ADMIT
+    // path cannot reach them.
+    if agent_composer_visible(&screen)
+        || agent_busy(&screen)
+        || codex_ready(&screen)
+        || agent_footer_live(capture)
+    {
+        return None;
+    }
+    Some(SendBlock::NoAgent)
+}
+
+/// Why a send was refused — one variant per screen, because the sentence the
+/// caller reads has to name the thing that is actually in the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendBlock {
+    /// The `--resume` session picker (Claude or Codex), by its title.
+    ResumePicker,
+    /// A named startup gate (`pty_state`'s wedge token).
+    Gate(&'static str),
+    /// A screen that is answered with a KEYPRESS, not with text: the agent's own
+    /// question / plan / paused modal / permission menu, a picker recognised by
+    /// its legend rather than its title, or a foreign interactive prompt.
+    Selection,
+    /// Nothing on the CURRENT screen says an agent is at its composer — a bare
+    /// shell the agent exited to, or a screen this server cannot read as one.
+    NoAgent,
+}
+
+impl SendBlock {
+    /// The refusal, in one sentence: what is on screen, that nothing was
+    /// delivered, and the one thing that ends the situation.
+    fn sentence(self, name: &str) -> String {
+        match self {
+            SendBlock::ResumePicker => format!(
+                "session '{name}' is sitting on its resume picker — the message was NOT delivered. \
+                 Open the terminal and pick a conversation (or Reset the session), then resend.",
+            ),
+            SendBlock::Gate(wedge) => format!(
+                "session '{name}' is sitting on {} — a startup gate the agent has not passed yet, \
+                 so the message was NOT delivered. Open the terminal and answer it (or Reset the \
+                 session), then resend.",
+                gate_clause(wedge),
+            ),
+            SendBlock::Selection => format!(
+                "session '{name}' is on a prompt that is answered with a keypress, not with text \
+                 — typed words are dropped there and the Enter after them would pick whatever row \
+                 is highlighted, so the message was NOT delivered. Answer it (the card in chat, or \
+                 the terminal), then resend.",
+            ),
+            SendBlock::NoAgent => format!(
+                "session '{name}' shows no agent composer on its current screen — it has probably \
+                 exited to a shell, so the message was NOT delivered. Open the terminal to see \
+                 what it is showing (or Reset the session), then resend.",
+            ),
+        }
+    }
+}
+
+/// A wedge token as the reader meets it on screen. An unknown token names itself
+/// rather than being smoothed into "a startup gate" twice over — a sentence that
+/// says a word the user can search for beats one that says nothing.
+fn gate_clause(wedge: &str) -> String {
+    match wedge {
+        "trust" => "its folder-trust dialog".to_string(),
+        "apikey" => "its API-key gate".to_string(),
+        "onboarding" => "Claude Code's first-run setup".to_string(),
+        "hooks-review" => "Codex's hooks-review gate".to_string(),
+        other => format!("its `{other}` startup gate"),
+    }
+}
+
+/// Is the current screen answered with a KEYPRESS rather than with text?
+///
+/// Deliberately NOT "is this a Claude dialog". The pty is a terminal a human
+/// also drives by hand, and `npm init`, `gh`, `k9s`, a psql `\d` pager and a
+/// dozen other programs draw selection lists and `[y/N]` confirmations into the
+/// same pane. This function's answer only ever REFUSES a send, so it is written
+/// to be generous: every marker below costs an undeliverable 409 the caller can
+/// act on, and the alternative it prevents is a keystroke landing on a row
+/// nobody chose.
+///
+/// Two shapes, both bottom-anchored by construction:
+///   * a CARET ON A NUMBERED ROW (`❯ 1. Yes`) — the selection cursor, which is
+///     the one thing ordinary prose lists never carry (the same tell
+///     `peek-lens.ts`'s `looksModal` uses);
+///   * a KEY LEGEND — the line a TUI prints under its options saying which key
+///     commits. Claude Code and Codex draw `Enter to select` / `Enter to
+///     confirm` / `Esc to cancel` / `Tab to amend`; inquirer-style CLIs draw
+///     `(Use arrow keys)`; a shell confirmation draws `[y/N]`.
+///
+/// THE LEGEND IS ALSO THE BELT ON THE PICKER (step 1's blind spot): a resume
+/// picker whose title has scrolled out of the 30-line capture keeps its footer,
+/// so it is still refused here — one row lower in the ladder, with a sentence
+/// that is true of both.
+///
+/// Read on the CURRENT SCREEN ONLY: an answered dialog's footer scrolled up into
+/// the history is not what is about to be typed into.
+fn selection_screen(screen: &str) -> bool {
+    if screen.lines().any(is_selection_row) {
+        return true;
+    }
+    let c = screen.to_lowercase();
+    [
+        "enter to select",
+        "enter to confirm",
+        "esc to cancel",
+        "tab to amend",
+        "use arrow keys",
+        "[y/n]",
+        "(y/n)",
+    ]
+    .iter()
+    .any(|marker| c.contains(marker))
+}
+
+/// `❯ 1. Yes, and don't ask again` — a selection caret sitting ON a numbered
+/// row. The caret alone is the composer's glyph and the number alone is prose,
+/// so it takes both.
+fn is_selection_row(line: &str) -> bool {
+    let rest = match strip_caret(line) {
+        Some(rest) => rest,
+        None => return false,
+    };
+    numbered_row(rest)
+}
+
+/// The line's leading caret glyph removed, or `None` when it does not open with
+/// one. Leading whitespace is the terminal's left margin, not a signal.
+fn strip_caret(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    t.strip_prefix('❯').or_else(|| t.strip_prefix('❱'))
+}
+
+/// `1. Yes` / `12. Something` — the option-row shape, after the caret.
+fn numbered_row(rest: &str) -> bool {
+    let t = rest.trim_start();
+    let digits = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    digits.len() < t.len() && digits.starts_with('.')
+}
+
+/// POSITIVE evidence that the agent is at its TEXT COMPOSER — the one screen
+/// where `send_text` + Enter means "a message".
+///
+/// Two anchors, both Claude Code's own chrome:
+///   * `? for shortcuts`, the hint line CC prints under an idle composer and
+///     under no other screen it draws;
+///   * the composer glyph (`❯` / `❱`) opening a line that is NOT a numbered
+///     option row. That exclusion is the whole difference between this and the
+///     [`agent_ui_visible`] it replaced on the send path: a dialog's selection
+///     cursor is the SAME glyph, which is how a permission menu and an
+///     AskUserQuestion both used to read as "the agent is at the wheel".
+///
+/// [`selection_screen`] has already refused before this is consulted, so a
+/// screen carrying both (a caret row above, a composer below) never reaches
+/// here — deliberately, and in the safe direction.
+fn agent_composer_visible(screen: &str) -> bool {
+    screen
+        .lines()
+        .any(|l| l.contains("? for shortcuts") || strip_caret(l).is_some_and(|r| !numbered_row(r)))
 }
 
 /// True once a READY, EMPTY Codex composer is visible. Codex draws `›` (U+203A),
 /// not Claude's `❯`, so [`agent_ui_visible`] is blind to it and the send guard
 /// wrongly 409'd every send/delegate to an awake, idle Codex (FIX 2). ORed into
-/// [`pty_ready_for_send`] AFTER the picker/trust rejections, so a real Codex
+/// [`send_block`] AFTER the picker/trust rejections, so a real Codex
 /// resume-picker or folder-trust dialog is still refused first. Keyed (via
 /// `status`) on the "Ask Codex to do anything" placeholder and/or the composer
 /// model footer — signals a picker/trust dialog never shows — and NEVER on a
@@ -900,13 +1123,55 @@ fn at_resume_picker(capture: &str) -> bool {
 /// — `--dangerously-skip-permissions` does NOT skip it — so a freshly-cloned
 /// project dir (e.g. developing supermux on the server) would otherwise hang
 /// here forever, never reaching the `❯` prompt, and the panel shows "claude
-/// won't render". We detect it and auto-accept (Enter on the default "Yes, I
-/// trust this folder"), which also records the dir as trusted so it never
-/// reappears for that path.
+/// won't render". We detect it and auto-accept by navigating to "Yes, I trust
+/// this folder" (see [`keys_to_accept_trust`] — the option order is not fixed),
+/// which also records the dir as trusted so it never reappears for that path.
 fn at_trust_dialog(capture: &str) -> bool {
     let c = capture.to_lowercase();
     (c.contains("trust the files") || c.contains("trust this folder") || c.contains("do you trust"))
         || (c.contains("safety check") && c.contains("trust"))
+}
+
+/// The key sequence that lands on "Yes, I trust this folder" and confirms it —
+/// for whatever ORDER the trust dialog draws its options in.
+///
+/// A bare Enter was correct while Claude Code defaulted the cursor to
+/// "1. Yes, I trust this folder". A later Claude Code FLIPPED the dialog: it now
+/// lists "No, exit" FIRST and selects it by default (unnumbered), so a bare Enter
+/// picks "No, exit" and the session QUITS before it starts — the reported failure
+/// where booting a new company assistant "won't get past trust workspace, then
+/// quits", and a restart just repeats it. Never trust the default: locate the
+/// affirmative option and the cursor, then step onto the affirmative and confirm.
+///
+/// The dialog is a two-option menu, so a single arrow toward the affirmative
+/// always lands on it (blank/paragraph lines between options don't count as menu
+/// stops). Returns an EMPTY sequence when the affirmative option or the cursor
+/// can't be located, so a parse miss WAITS and retries — never a blind Enter that
+/// could confirm "No, exit".
+///
+/// The affirmative is matched on the OPTION line ("Yes…" after the cursor glyph
+/// and any "1." numbering), NOT on any line mentioning trust: the dialog's own
+/// header — "Do you trust the files in this folder?" — mentions it too, and
+/// locking onto the header put the cursor permanently "below Yes", turning the
+/// already-correct old layout into an Up that wraps a two-option menu onto
+/// "No, exit". Both cursor glyphs Claude Code has drawn (`❯`, `›`) count.
+fn keys_to_accept_trust(capture: &str) -> Vec<&'static str> {
+    let lines: Vec<&str> = capture.lines().collect();
+    let yes = lines.iter().position(|l| {
+        let x = l.to_lowercase();
+        let x = x.trim_start_matches(['❯', '›', '>', ' ', '\t']);
+        let x = x.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ');
+        x.starts_with("yes")
+    });
+    let cursor = lines
+        .iter()
+        .position(|l| l.contains('❯') || l.contains('›'));
+    match (yes, cursor) {
+        (Some(y), Some(c)) if c == y => vec!["Enter"], // already on "Yes"
+        (Some(y), Some(c)) if c < y => vec!["Down", "Enter"], // "Yes" is below
+        (Some(_), Some(_)) => vec!["Up", "Enter"],     // "Yes" is above
+        _ => Vec::new(),                               // can't measure → wait, never blind-Enter
+    }
 }
 
 /// Should `wait_for_agent_ready` ESCAPE the resume picker (Escape Escape C-c +
@@ -984,9 +1249,9 @@ async fn settle_shell(rt: &dyn SessionRuntime) -> bool {
 
 /// Poll `capture-pane` for up to 10s for the agent UI; one resume-picker escape
 /// fallback (Escape Escape C-c + clear cc ids — FRESH starts only, see
-/// [`should_escape_resume_picker`]), and one trust-dialog auto-accept (Enter on
-/// the default "Yes, I trust this folder") so a first-launch in a never-seen
-/// project dir does not hang forever.
+/// [`should_escape_resume_picker`]), and one trust-dialog auto-accept (navigate to
+/// "Yes, I trust this folder" — [`keys_to_accept_trust`]) so a first-launch in a
+/// never-seen project dir does not hang forever OR quit on the "No, exit" default.
 ///
 /// `resume_intended` (from [`build_launch_command`]) is TRUE when the launch
 /// carried `--resume`. On an intended resume the picker escape is SUPPRESSED: it
@@ -1022,10 +1287,21 @@ async fn wait_for_agent_ready(
             // Ready — a heal that only reaches the picker is a FAILED heal.
             match classify_ready_tick(&cap, resume_intended, escaped, trusted) {
                 ReadyTick::AcceptTrust => {
-                    // Default option is "1. Yes, I trust this folder"; a bare Enter
-                    // accepts it (and persists the trust so it never reappears).
-                    let _ = rt.send_key("Enter").await;
-                    trusted = true;
+                    // NEVER a bare Enter: a newer Claude Code lists "No, exit" first
+                    // and selects it by default, so Enter alone quits the session.
+                    // Navigate to "Yes, I trust this folder" whatever order it is
+                    // drawn in; accepting also persists the trust so it never
+                    // reappears for this dir.
+                    let keys = keys_to_accept_trust(&cap);
+                    let confirmed = !keys.is_empty();
+                    for k in keys {
+                        let _ = rt.send_key(k).await;
+                    }
+                    // Only latch `trusted` once we actually sent the confirm — a
+                    // parse miss must retry next tick, not silently fall through.
+                    if confirmed {
+                        trusted = true;
+                    }
                 }
                 ReadyTick::EscapePicker => {
                     let _ = rt.send_key("Escape").await;
@@ -1330,6 +1606,54 @@ pub(super) async fn start_if_stopped(
     Ok(HealStart::Started(res.ready))
 }
 
+/// STALE-RESUME GUARD — drop a `--resume` link whose transcript is gone, so that
+/// pressing Start actually starts something.
+///
+/// [`build_launch_command`] turns a stored `cc_conversation_id` into
+/// `claude --resume '<id>'`. When that conversation's transcript no longer
+/// exists, claude answers "No conversation found with session ID: …" and EXITS
+/// immediately — the pane comes back as a bare shell wearing the session's name,
+/// which the detector then settles as `idle`, and EVERY later Start resumes the
+/// same dead id, so the session can never be brought back from the UI. (Found
+/// live on `iwd-nl`: the pane showed the launch line, the refusal, then `$`.)
+///
+/// A human pressing Start is asking for this session to RUN, and a link that
+/// points at nothing is not history worth keeping: clear it — in the column AND
+/// in the in-memory row the launch builder reads — and let the launch fall
+/// through to a clean `--name` start. That also keeps `resume_intended` FALSE,
+/// which is what lets [`wait_for_agent_ready`] escape a resume picker it never
+/// asked for instead of parking in it.
+///
+/// Deliberately narrow. [`super::auto_actions::dead_resume_link`] stays the ONE
+/// owner of "is this link dead?" (claude rows only; a `cc_session_name` link is
+/// resolved by claude's own name index rather than a file we can stat, and a row
+/// with no link at all is an ordinary fresh start — neither is touched). And a
+/// REMOTE session is skipped entirely: its transcripts live on the remote host,
+/// while `resumable::project_dir_for` can only stat THIS host's `~/.claude`, so
+/// "missing here" would be a lie about a link that is perfectly alive there.
+///
+/// Returns the id that was dropped (for the tests; the log line is emitted here).
+async fn clear_stale_resume_link(
+    state: &AppState,
+    name: &str,
+    s: &mut Session,
+) -> Result<Option<String>, AppError> {
+    if s.host_id.is_some() {
+        return Ok(None);
+    }
+    let Some(conv) = super::auto_actions::dead_resume_link(s).map(str::to_string) else {
+        return Ok(None);
+    };
+    db::sessions::clear_cc_conversation_id(&state.pool, name).await?;
+    s.cc_conversation_id.clear();
+    tracing::info!(
+        session = name,
+        conversation = %conv,
+        "start: the resume link's transcript is gone — cleared it and starting clean",
+    );
+    Ok(Some(conv))
+}
+
 /// The body of [`start`], assuming the per-session lock is ALREADY held. Split
 /// out so [`start_if_stopped`] can wrap it with an atomic precondition without
 /// re-entering the (non-reentrant) lock.
@@ -1356,6 +1680,13 @@ async fn start_locked(
             s.provider
         )));
     }
+
+    // START MUST ACTUALLY START. A resume link whose transcript is gone would
+    // exit claude straight back to a shell (see [`clear_stale_resume_link`]), so
+    // drop it BEFORE anything is spawned or launched. Every start path funnels
+    // through `start_locked`, so this one call covers the Start button, the
+    // restart, the recover and the scheduler alike.
+    clear_stale_resume_link(state, name, &mut s).await?;
 
     // NATIVE-BY-DEFAULT MIGRATION. The tmux-less runtime is the product default;
     // a legacy `runtime='tmux'` row upgrades AT THE FIRST FRESH START — i.e. when
@@ -2164,13 +2495,14 @@ pub async fn send_harness_text(
         }
         match rt.capture_plain(status::CAPTURE_LINES).await {
             Ok(raw) => {
-                if !pty_ready_for_send(&status::prepare_capture(&raw)) {
-                    return Err(AppError::Conflict(format!(
-                        "session '{name}' is parked at a prompt that is not the agent's — the \
-                         message was NOT delivered. Open the terminal: it is likely sitting on a \
-                         resume picker or a folder-trust dialog. Dismiss it (or Reset the session), \
-                         then resend.",
-                    )));
+                // THE REFUSAL NAMES WHAT IS ACTUALLY IN THE WAY (owner report).
+                // It used to say "parked at a prompt that is not the agent's …
+                // likely sitting on a resume picker or a folder-trust dialog"
+                // for every screen that failed the guard — including a Claude
+                // question, which is neither, and which is now admitted. See
+                // `send_block`.
+                if let Some(block) = send_block(&status::prepare_capture(&raw)) {
+                    return Err(AppError::Conflict(block.sentence(name)));
                 }
             }
             // FAIL CLOSED. A send guard that cannot read the current screen must
@@ -2622,8 +2954,8 @@ pub async fn unarchive(state: &AppState, name: &str) -> Result<(), AppError> {
 //   | rung           | preserves                          | destroys                    |
 //   |----------------|------------------------------------|-----------------------------|
 //   | Recover holder | scrollback                         | nothing else                |
-//   | Restart        | conversation, worktree, schedules  | live pty + in-memory buffer |
-//   | Reset          | worktree, schedules, config        | conversation + scrollback   |
+//   | Restart        | conversation, worktree, workflows  | live pty + in-memory buffer |
+//   | Reset          | worktree, workflows, config        | conversation + scrollback   |
 //
 // `BRAND.md` §6h carries the same three sentences the UI shows.
 
@@ -2635,7 +2967,7 @@ pub async fn unarchive(state: &AppState, name: &str) -> Result<(), AppError> {
 /// and a heal landing in that gap races the user's own restart.
 ///
 /// Preserves the conversation (Claude resumes it), the worktree and the
-/// schedules. Destroys the live pty and whatever scrollback lived only in it.
+/// workflows. Destroys the live pty and whatever scrollback lived only in it.
 pub async fn restart(state: &AppState, name: &str) -> Result<StartResult, AppError> {
     if !db::sessions::exists_active(&state.pool, name).await? {
         return Err(AppError::NotFound(format!("session '{name}'")));
@@ -2672,7 +3004,7 @@ pub async fn recover_holder(state: &AppState, name: &str) -> Result<super::auto_
 /// Rung 3 — **Reset**: a fresh runtime for a session whose state is wedged.
 ///
 /// Preserves everything the user thinks of as THEIRS — the working directory,
-/// the worktree, the branch, the schedules, the config, the session's identity
+/// the worktree, the branch, the workflows, the config, the session's identity
 /// and name. Destroys the conversation link, the scrollback and the activity
 /// state.
 ///
@@ -2952,6 +3284,13 @@ mod agent_ready_heuristics_tests {
     //! detection is unit-tested directly (no real tmux needed).
     use super::*;
 
+    /// The send guard as a yes/no — the shape the wave-7/8 tests were written
+    /// against, kept so each of them reads as one assertion. `None` from
+    /// [`send_block`] IS "ready": every refusal is one of its variants.
+    fn pty_ready_for_send(capture: &str) -> bool {
+        send_block(capture).is_none()
+    }
+
     #[test]
     fn detects_claude_trust_dialog() {
         // Verbatim shape of Claude's first-run workspace-trust prompt.
@@ -2970,6 +3309,70 @@ mod agent_ready_heuristics_tests {
             agent_ui_visible(cap),
             "the ❯ menu cursor trips agent_ui_visible — trust MUST be handled first",
         );
+    }
+
+    #[test]
+    fn accept_trust_navigates_to_yes_when_no_exit_is_the_default() {
+        // THE reported bug: a newer Claude Code lists "No, exit" FIRST and selects
+        // it by default, so the old bare Enter quit the session at boot. Verbatim
+        // shape from the report (IMG_2950): "No, exit" cursored, "Yes" beneath.
+        let cap = "/opt/projects/companies/persoonlijk/persoonlijk-assistant\n\n\
+                   Quick safety check: Is this a project you created or one you trust?\n\n\
+                   Claude Code'll be able to read, edit, and execute files here.\n\n\
+                   Security guide\n\n\
+                   ❯ No, exit\n  Yes, I trust this folder\n\n\
+                   Enter to confirm · Esc to cancel";
+        assert!(at_trust_dialog(cap));
+        assert_eq!(
+            keys_to_accept_trust(cap),
+            vec!["Down", "Enter"],
+            "must step down onto Yes, never confirm the No default",
+        );
+    }
+
+    #[test]
+    fn accept_trust_is_a_bare_enter_when_yes_is_already_the_default() {
+        // The older layout: "Yes" is option 1 and already cursored → just confirm.
+        let cap = "Is this a project you created or one you trust?\n \
+                   ❯ 1. Yes, I trust this folder\n   2. No, exit";
+        assert_eq!(keys_to_accept_trust(cap), vec!["Enter"]);
+    }
+
+    #[test]
+    fn accept_trust_ignores_the_dialog_header_that_also_says_trust() {
+        // REGRESSION: the real header IS "Do you trust the files in this folder?",
+        // so matching any line that mentions trust locked onto the header (line 0)
+        // and every layout read as "Yes is above the cursor" → an Up that wraps a
+        // two-option menu onto "No, exit". Both real layouts must still be right.
+        let old = "Do you trust the files in this folder?\n\
+                   ❯ 1. Yes, I trust this folder\n   2. No, exit";
+        assert_eq!(keys_to_accept_trust(old), vec!["Enter"]);
+        let flipped = "Do you trust the files in this folder?\n\
+                       ❯ No, exit\n  Yes, I trust this folder";
+        assert_eq!(keys_to_accept_trust(flipped), vec!["Down", "Enter"]);
+    }
+
+    #[test]
+    fn accept_trust_reads_the_alternate_cursor_glyph() {
+        // Claude Code has drawn the menu cursor as `›` as well as `❯`; a glyph we
+        // don't know is a parse miss that hangs the boot to timeout.
+        let cap = "Do you trust the files in this folder?\n› No, exit\n  Yes, I trust this folder";
+        assert_eq!(keys_to_accept_trust(cap), vec!["Down", "Enter"]);
+    }
+
+    #[test]
+    fn accept_trust_steps_up_when_yes_is_above_the_cursor() {
+        let cap = "  Yes, I trust this folder\n❯ No, exit";
+        assert_eq!(keys_to_accept_trust(cap), vec!["Up", "Enter"]);
+    }
+
+    #[test]
+    fn accept_trust_waits_rather_than_blind_enter_when_yes_is_absent() {
+        // Parse miss (no affirmative line, or no cursor) → empty: wait & retry, so
+        // a stray Enter can never confirm "No, exit". `wait_for_agent_ready` leaves
+        // `trusted` false on an empty result and re-scans next tick.
+        assert!(keys_to_accept_trust("some unrelated capture with a ❯ prompt").is_empty());
+        assert!(keys_to_accept_trust("Yes, I trust this folder\n  No, exit").is_empty()); // no cursor glyph
     }
 
     #[test]
@@ -3098,15 +3501,31 @@ mod agent_ready_heuristics_tests {
         );
 
         // ADMIT — the agent's own composer prompt with no boot modal over it.
+        // This is the ONLY shape that admits: positive evidence of a text
+        // composer, not the absence of a modal.
         assert!(
             pty_ready_for_send("❯ Try \"fix tests\"\n  ? for shortcuts"),
             "the agent's own idle prompt is the send target",
         );
-        // ADMIT — a permission menu IS the agent waiting on the user; answering it
-        // (typing a choice) must stay unchanged, so this is deliberately typeable.
+        // …and the composer glyph is not enough on its own when it is marking a
+        // ROW rather than opening the composer — the exact confusion that made a
+        // dialog read as "the agent is at the wheel".
         assert!(
-            pty_ready_for_send("Do you want to proceed?\n❯ 1. Yes\n  2. No"),
-            "a permission menu is the agent at the wheel — still typeable (unchanged)",
+            !pty_ready_for_send("Pick one\n❯ 1. Apple\n  2. Banana"),
+            "a selection cursor is the same glyph as the composer's — it must not admit",
+        );
+        // REFUSE — a permission menu. THIS ASSERTION IS REVERSED FROM WAVE-7, on
+        // purpose and after the fact it rested on was checked: this menu is
+        // "typeable" only in the sense that the keystrokes land somewhere. The
+        // paste is dropped and the Enter picks the highlighted row (a0 §3), so a
+        // message sent here is silently destroyed AND an answer nobody chose is
+        // submitted — while the caller is told it was delivered. The browser has
+        // a lens in front of this; `delegate`, the scheduler, the board and the
+        // steering loop do not, and this is the only guard they get.
+        assert_eq!(
+            send_block("Do you want to proceed?\n❯ 1. Yes\n  2. No"),
+            Some(SendBlock::Selection),
+            "a permission menu is answered with a keypress, not with text — refuse",
         );
         // ADMIT — a busy turn: the send is a legitimate QUEUE, and the composer
         // glyph may have scrolled out of a short capture, so `esc to interrupt`
@@ -3115,6 +3534,198 @@ mod agent_ready_heuristics_tests {
             pty_ready_for_send("✻ Thinking… (esc to interrupt · 12s · ↑ 2.1k tokens)"),
             "a send while the agent is mid-turn is a queue, not a swallow",
         );
+    }
+
+    /// THE OWNER'S WEDGE, and what was actually wrong with it: a live
+    /// AskUserQuestion refused every message with a 409 that named two dialogs
+    /// which were not on screen.
+    ///
+    /// The refusal was RIGHT and the sentence was WRONG, and only the sentence
+    /// is fixed. Wave-8 reached it by accident — its bottom-10 window happened
+    /// to miss the `❯` caret, which on the real 2.1.233 capture
+    /// (`tests/fixtures/pty/ask-user-question.txt`) sits at row 29 of 39, above
+    /// four option rows with description lines, the rule, the out-of-box row and
+    /// the footer. The SAME dialog with two options and no descriptions keeps
+    /// its caret in range and was admitted, which is the tell that the reading
+    /// was positional rather than semantic. Now the dialog's own key legend —
+    /// bottom-anchored by construction — refuses it on purpose, and the
+    /// two-option twin refuses with it.
+    #[test]
+    fn a_send_while_claude_asks_a_question_is_refused_as_a_selection_not_a_boot_modal() {
+        let capture = status::prepare_capture(include_str!(
+            "../../tests/fixtures/pty/ask-user-question.txt"
+        ));
+        let block = send_block(&capture).expect("a question is answered with a keypress");
+        assert_eq!(
+            block,
+            SendBlock::Selection,
+            "an open question must refuse — the paste would be dropped and the Enter would \
+             pick the highlighted row",
+        );
+        // The SENTENCE is the fix: it no longer sends the reader looking for a
+        // resume picker or a folder-trust dialog that is not on screen.
+        let sentence = block.sentence("ipc");
+        assert!(sentence.contains("NOT delivered"), "{sentence}");
+        assert!(!sentence.contains("resume picker"), "{sentence}");
+        assert!(!sentence.contains("folder-trust"), "{sentence}");
+
+        // The SHORT twin — the same dialog, two options, no descriptions — used
+        // to be admitted purely because its caret fell inside the window. It is
+        // the same screen and it refuses the same way now.
+        let short = "Which fruit do you want?\n❯ 1. Apple\n  2. Banana\n\nEnter to select · ↑/↓ to navigate · Esc to cancel";
+        assert_eq!(send_block(short), Some(SendBlock::Selection));
+
+        // The ANSWERED twin — the same session one keystroke later, back at its
+        // composer — must still deliver. This is the half of the owner's report
+        // that IS an un-wedge: an idle agent takes messages.
+        let answered = status::prepare_capture(include_str!(
+            "../../tests/fixtures/pty/ask-user-question-answered.txt"
+        ));
+        assert_eq!(
+            send_block(&answered),
+            None,
+            "once the dialog is gone the composer is back, and a message is a message",
+        );
+    }
+
+    /// ADMISSION IS POSITIVE, AND NARROW. Not "no modal was recognised" — that
+    /// is the fail-OPEN reading, and the pty is a terminal a human also drives by
+    /// hand, so an unrecognised screen is at least as likely to be `npm init` as
+    /// it is to be an agent.
+    #[test]
+    fn only_a_recognised_composer_admits_a_send() {
+        // ADMIT: Claude's composer (glyph + its own hint line), Codex's ready
+        // composer, and a busy turn (CC queues typed text during one).
+        for screen in [
+            "❯ Try \"fix tests\"\n  ? for shortcuts",
+            "❯ \n  ⏵⏵ auto mode on\n  ? for shortcuts",
+            "› Ask Codex to do anything\n  gpt-5.6-sol high · /opt/projects/Folderwijzer-codex",
+            "✻ Thinking… (esc to interrupt · 12s · ↑ 2.1k tokens)",
+        ] {
+            assert_eq!(send_block(screen), None, "must admit: {screen:?}");
+        }
+
+        // REFUSE: everything a foreign interactive program draws into the same
+        // pane. None of these is a Claude dialog and none of them may receive a
+        // paste + Enter — `[y/N]` under an Enter is a destructive confirmation,
+        // and `delegate` / the scheduler reach this with no lens in front.
+        for screen in [
+            // inquirer-style list (npm init, create-*, gh)
+            "? Which template? (Use arrow keys)\n❯ 1. minimal\n  2. full",
+            "? Overwrite dist/? (Use arrow keys)\n> Yes\n  No",
+            // a shell confirmation
+            "Delete 42 branches? [y/N] ",
+            // a numbered menu with the caret, no legend at all
+            "❯ 1. production\n  2. staging",
+        ] {
+            assert_eq!(
+                send_block(screen),
+                Some(SendBlock::Selection),
+                "must refuse: {screen:?}",
+            );
+        }
+
+        // REFUSE: an unrecognised screen. The default is closed.
+        assert_eq!(send_block("some program printing along\nno prompt we know"), Some(SendBlock::NoAgent));
+    }
+
+    /// REGRESSION: a swarm/teammate roster drawn BELOW the composer + footer
+    /// pushes them out of the 10-line tail, so a tail-only presence check refused
+    /// a healthy busy agent (`NoAgent`) — breaking chat and scheduled delivery.
+    /// Agent presence read over the whole capture must ADMIT.
+    #[test]
+    fn a_teammate_roster_below_the_composer_still_admits() {
+        let screen = "  the real capture confirms the root cause here.\n\
+                      \n\
+                      ● Bash(curl … /api/sessions/supermux/peek)\n\
+                      \x20 ⎿ Running…\n\
+                      \n\
+                      ✽ Waddling… (8m 6s · ↓ 26.0k tokens)\n\
+                      \n\
+                      ─ View teammates: `tmux -L claude-swarm-3193337 a` ─\n\
+                      ❯ \n\
+                      ────────────────────────────────────────────────────\n\
+                      \x20 ⏵⏵ bypass permissions on · 1 shell · esc to int…\n\
+                      \x20           ✔ Update installed · Restart to update\n\
+                      \n\
+                      \x20 ● main\n\
+                      \x20 ◯ build-lightbox         You are a s… 9h 25m 43s\n\
+                      \x20 ◯ build-settings         You are a s… 9h 25m 18s\n\
+                      \x20 ◯ build-delaysend        You are a s… 9h 24m 54s\n\
+                      \x20 ◯ spec-workflows         You are a s…  9h 24m 6s\n\
+                      \x20 ↓ 27 more";
+        assert_eq!(
+            send_block(&status::prepare_capture(screen)),
+            None,
+            "a live agent whose composer/footer sit above a teammate roster must admit",
+        );
+    }
+
+    /// A PICKER WHOSE TITLE HAS SCROLLED OUT still refuses.
+    ///
+    /// `at_resume_picker` reads the whole capture, but the capture is 30 lines:
+    /// a picker with a long conversation list pushes `Resume a conversation` off
+    /// the top, and then the title-based check sees nothing. The legend the
+    /// picker keeps drawing at the bottom is what catches it — one rung lower in
+    /// the ladder, with a sentence that is true of both.
+    #[test]
+    fn a_resume_picker_whose_title_scrolled_out_is_still_refused() {
+        let mut screen = String::new();
+        for i in 0..26 {
+            screen.push_str(&format!("  {}. Fix the parser — {i}h ago\n", i + 3));
+        }
+        screen.push_str("\nEnter to select · Esc to cancel\n");
+        assert!(
+            !screen.contains("Resume a conversation"),
+            "the fixture must NOT carry the title — that is the whole point",
+        );
+        assert_eq!(
+            send_block(&status::prepare_capture(&screen)),
+            Some(SendBlock::Selection),
+            "a picker recognised by its legend rather than its title still refuses",
+        );
+    }
+
+    /// Every refusal says its own name. Before this, ANY screen that failed the
+    /// positive check was reported as "parked at a prompt that is not the
+    /// agent's … likely sitting on a resume picker or a folder-trust dialog" —
+    /// false for a question, false for a bare shell, and un-actionable in both.
+    #[test]
+    fn a_refused_send_names_the_screen_that_is_actually_in_the_way() {
+        let picker = "Resume a conversation\n❯ 1. Fix the parser  2h ago\n  2. Older chat";
+        assert_eq!(send_block(picker), Some(SendBlock::ResumePicker));
+        assert!(
+            send_block(picker).unwrap().sentence("ipc").contains("resume picker"),
+            "the sentence names the picker, and nothing else",
+        );
+
+        let trust = "Quick safety check: do you trust the files in this folder?\n❯ 1. Yes";
+        assert_eq!(send_block(trust), Some(SendBlock::Gate("trust")));
+        assert!(send_block(trust).unwrap().sentence("ipc").contains("folder-trust"));
+
+        // Codex's hooks-review gate: refused before this change too, but only as
+        // the residue of finding no agent glyph. Now it is refused BY NAME.
+        let hooks = status::prepare_capture(include_str!(
+            "../../tests/fixtures/pty/codex-hooks-review.txt"
+        ));
+        assert_eq!(send_block(&hooks), Some(SendBlock::Gate("hooks-review")));
+        assert!(send_block(&hooks).unwrap().sentence("ipc").contains("hooks-review"));
+
+        // A selection screen says what it is and what would have happened — a
+        // reader who is told "a keypress, not text" knows why retrying the same
+        // message will not help.
+        let selection = send_block("Pick one\n❯ 1. Apple\n  2. Banana").unwrap();
+        assert_eq!(selection, SendBlock::Selection);
+        assert!(selection.sentence("ipc").contains("keypress"));
+        assert!(!selection.sentence("ipc").contains("resume picker"));
+
+        // The bare shell keeps its own sentence — it is not a modal, and telling
+        // the user to dismiss one would send them looking for a screen that is
+        // not there.
+        let bare = send_block("user@host project % \n").unwrap();
+        assert_eq!(bare, SendBlock::NoAgent);
+        assert!(bare.sentence("ipc").contains("no agent composer"));
+        assert!(!bare.sentence("ipc").contains("resume picker"));
     }
 
     /// CURRENT-SCREEN scoping (wave-8, codex pass 3). A capture whose VIEWPORT is
@@ -4106,6 +4717,140 @@ mod link_liveness_tests {
             "unlinked session must not re-publish the board"
         );
 
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod stale_resume_tests {
+    //! THE START BUTTON MUST START. `claude --resume <id>` against a transcript
+    //! that no longer exists prints "No conversation found with session ID: …"
+    //! and exits, so the pane comes back as a bare shell wearing the session's
+    //! name and the row settles `idle` — the exact shape `iwd-nl` was stuck in.
+    //! [`clear_stale_resume_link`] is the guard; these exercise it against a real
+    //! DB row and a real (temp) claude project dir, without driving a pty.
+
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    async fn test_state() -> (AppState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("supermux-stale-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            extra_binds: vec![],
+            tls: Default::default(),
+            auth_token: "test-token".to_string(),
+            provider_defaults: Default::default(),
+            ws: Default::default(),
+            remote_callback_url: None,
+            push_sub: None,
+            github_token: None,
+            statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
+            extra_origins: Vec::new(),
+        };
+        let pool = crate::db::init(&config).await.expect("init pool");
+        (AppState::new(pool, config), dir)
+    }
+
+    /// Point `CLAUDE_CONFIG_DIR` at a throwaway root and lay down ONE transcript
+    /// for `session_dir` — mirrors the helper the auto-heal tests use, so both
+    /// sides of the "is this link dead?" question are proved the same way.
+    fn with_transcript(session_dir: &str, conv: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("supermux-cc-lc-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("CLAUDE_CONFIG_DIR", &root);
+        let proj = crate::sessions::resumable::project_dir_for(session_dir);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(format!("{conv}.jsonl")), b"{}\n").unwrap();
+        root
+    }
+
+    fn drop_transcript(root: PathBuf) {
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A dead link is dropped (column + in-memory row) so the launch that
+    /// follows is a CLEAN `--name` start; a link whose transcript is still there
+    /// is left completely alone and still launches as `--resume '<id>'`.
+    #[tokio::test]
+    async fn a_dead_link_is_cleared_and_a_live_one_is_kept() {
+        let _serial = crate::sessions::native::test_serial().await;
+        let (state, dir) = test_state().await;
+        for name in ["gone", "kept"] {
+            db::sessions::insert_minimal(&state.pool, name, "/tmp", "claude")
+                .await
+                .unwrap();
+        }
+        db::sessions::set_cc_conversation_id(&state.pool, "gone", "conv-vanished").await.unwrap();
+        db::sessions::set_cc_conversation_id(&state.pool, "kept", "conv-here").await.unwrap();
+        let cc = with_transcript("/tmp", "conv-here");
+
+        // ── the dead one ────────────────────────────────────────────────────
+        let mut gone = db::sessions::get(&state.pool, "gone").await.unwrap().unwrap();
+        assert_eq!(
+            clear_stale_resume_link(&state, "gone", &mut gone).await.unwrap().as_deref(),
+            Some("conv-vanished"),
+            "a link whose transcript is gone must be dropped, and NAMED for the log",
+        );
+        assert!(gone.cc_conversation_id.is_empty(), "the in-memory row the launch builder reads is cleared");
+        let persisted = db::sessions::get(&state.pool, "gone").await.unwrap().unwrap();
+        assert!(persisted.cc_conversation_id.is_empty(), "…and so is the column, so the NEXT Start is clean too");
+        let (cmd, resume_intended) = build_launch_command(&state.config, &gone, &[]);
+        assert!(!cmd.contains("--resume"), "the launch must not resume a conversation that is gone: {cmd}");
+        assert!(cmd.contains("--name gone"), "it starts a fresh named conversation instead: {cmd}");
+        assert!(!resume_intended, "a clean start is NOT resume-intended — the picker escape stays available");
+
+        // ── the live one ────────────────────────────────────────────────────
+        let mut kept = db::sessions::get(&state.pool, "kept").await.unwrap().unwrap();
+        assert_eq!(
+            clear_stale_resume_link(&state, "kept", &mut kept).await.unwrap(),
+            None,
+            "a link with its transcript still on disk is untouched",
+        );
+        assert_eq!(kept.cc_conversation_id, "conv-here");
+        let (cmd, resume_intended) = build_launch_command(&state.config, &kept, &[]);
+        assert!(cmd.contains("--resume 'conv-here'"), "it still resumes the real conversation: {cmd}");
+        assert!(resume_intended, "…and that IS resume-intended");
+
+        drop_transcript(cc);
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A REMOTE session keeps its link even when this host cannot see the
+    /// transcript: the file lives on the remote box, so "missing here" says
+    /// nothing about the link, and clearing it would destroy a live conversation.
+    #[tokio::test]
+    async fn a_remote_session_keeps_a_link_this_host_cannot_see() {
+        let _serial = crate::sessions::native::test_serial().await;
+        let (state, dir) = test_state().await;
+        db::sessions::insert_minimal(&state.pool, "remote", "/tmp", "claude")
+            .await
+            .unwrap();
+        db::sessions::set_cc_conversation_id(&state.pool, "remote", "conv-on-the-other-box")
+            .await
+            .unwrap();
+        // An empty root: NOTHING is on disk here for that conversation.
+        let cc = with_transcript("/tmp", "some-other-conv");
+
+        let mut s = db::sessions::get(&state.pool, "remote").await.unwrap().unwrap();
+        s.host_id = Some(1);
+        assert_eq!(
+            clear_stale_resume_link(&state, "remote", &mut s).await.unwrap(),
+            None,
+            "a remote row is skipped — its transcripts are not on this filesystem",
+        );
+        assert_eq!(s.cc_conversation_id, "conv-on-the-other-box");
+        let persisted = db::sessions::get(&state.pool, "remote").await.unwrap().unwrap();
+        assert_eq!(persisted.cc_conversation_id, "conv-on-the-other-box", "the column survives too");
+
+        drop_transcript(cc);
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);
     }

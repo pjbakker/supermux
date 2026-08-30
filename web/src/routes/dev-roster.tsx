@@ -64,7 +64,8 @@ import {
   AutoHealToggle,
   RecoveryLadder,
 } from '@/components/recovery/recovery-ladder'
-import { BotPanel } from '@/components/roster/bot-panel'
+import { BotPanel, type TabKey as BotPanelTabKey } from '@/components/roster/bot-panel'
+import type { WorkflowRunSummary, WorkflowWithSteps } from '@/lib/api/workflows'
 import { RestartToApply } from '@/components/roster/granted-connectors'
 import { GrokRow, TeamRow } from '@/components/roster/grok-roster'
 import { MOCK_TEAMS } from './dev-teams.fixture'
@@ -78,11 +79,15 @@ import type { SessionConnector, ConnectorCard } from '@/lib/api/connectors'
 /* ── the bot panel bench (ASK 3) ─────────────────────────────────────────────
    The per-bot settings page needs a live session row, so the bench SEEDS the
    sessions query with one mock bot (rich enough to fill every tab: role/desc,
-   tags, model, notes, tokens, a chat tail) and renders `<BotPanel variant="pane">`
-   at each of its four tabs, in both themes, wrapped in the `[data-grok]
-   .grok-roster` skin context the pane's CSS keys off. Query-backed sub-sections
-   (Issues / Schedules / Git) degrade to their empty/offline states here, which is
-   the honest still frame for a design review. */
+   tags, model, notes, a live activity line, a last prompt) and renders
+   `<BotPanel variant="pane">` at each of its four tabs, in both themes, wrapped
+   in the `[data-grok] .grok-roster` skin context the pane's CSS keys off.
+   Query-backed sub-sections (Issues / Schedules / Git) degrade to their
+   empty/offline states here, which is the honest still frame for a design review.
+
+   The seed carries what the SHIPPED panel reads. It used to seed `tokens` and
+   `task_summary` — two fields no server writes — so the bench framed a stat grid
+   and a "Latest" bubble that no live install could ever fill. */
 const BOT_PANEL_BENCH_NAME = 'web-app'
 const MOCK_BOT: ApiSession = {
   name: BOT_PANEL_BENCH_NAME,
@@ -91,7 +96,6 @@ const MOCK_BOT: ApiSession = {
   provider: 'claude',
   dir: '/opt/projects/web-app',
   branch: 'feat/grok-mode',
-  tokens: 96_400,
   model: 'opus',
   desc: 'You implement features end to end. Prefer small, verifiable steps; run the tests before claiming done; keep changes scoped to the task.',
   memory: 'Design system tokens live in web/src/brand. Never edit server/migrations. The build gate is `bun run build:perf`.',
@@ -101,18 +105,32 @@ const MOCK_BOT: ApiSession = {
   worktree: true,
   runtime: 'native',
   updated_at: new Date(1_800_000_000_000).toISOString(),
-  task_summary: 'Wiring the per-bot settings panel into the roster detail pane.',
+  activity: '⚡ bun test tests/unit',
+  subagents: 3,
+  last_send_text: 'Redo the bot panel overview — the stat cards say nothing.',
+  last_send_at: 1_799_999_100,
 } as ApiSession
 
-const BOT_PANEL_TABS: {
-  tab: 'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
-  label: string
-}[] = [
+/** One bench step row — the wire shape `lib/api/workflows.ts` declares. */
+const benchStep = (workflowId: string, position: number, title: string) => ({
+  id: `${workflowId}-S${position}`,
+  workflow_id: workflowId,
+  position,
+  title,
+  command: '',
+  prompt: title,
+  files: '[]',
+  connectors: '[]',
+  timeout_secs: 1800,
+  on_complete: '',
+  created: 1_790_000_000,
+  updated: 1_790_000_000,
+})
+
+const BOT_PANEL_TABS: { tab: BotPanelTabKey; label: string }[] = [
   { tab: 'overview', label: 'Overview' },
-  { tab: 'instructions', label: 'Instructions' },
-  { tab: 'tools', label: 'Tools' },
-  { tab: 'memory', label: 'Memory' },
-  { tab: 'activity', label: 'Activity' },
+  { tab: 'instructions', label: 'Setup' },
+  { tab: 'workflows', label: 'Workflows' },
 ]
 
 // The bench runs BotPanel against an ISOLATED, PRE-SEEDED query client so it
@@ -125,10 +143,55 @@ const BENCH_QC = new QueryClient({
   },
 })
 BENCH_QC.setQueryData<ApiSession[]>(SESSIONS_KEY, [MOCK_BOT])
-// The Activity tab's schedules list assumes an array; seed an empty one so the
-// offline bench shows its real "No schedules" empty state instead of crashing on
-// a non-array offline response.
-BENCH_QC.setQueryData(['schedules'], [])
+// The Workflows tab reads two lists: the bot's own workflows and the
+// cross-workflow activity feed. Seed BOTH so the bench reviews the populated
+// tab offline — a card with its step rail, and the run history under it —
+// instead of two skeletons. Shapes mirror `lib/api/workflows.ts` exactly, so a
+// drift in the wire type breaks `tsc`, here.
+BENCH_QC.setQueryData<WorkflowWithSteps[]>(['workflows', 'list', BOT_PANEL_BENCH_NAME], [
+  {
+    id: 'WF-bench-1',
+    title: 'Morning triage',
+    session: BOT_PANEL_BENCH_NAME,
+    company_id: null,
+    enabled: 1,
+    trigger_kind: 'recurring',
+    schedule_expr: 'weekdays at 8:00',
+    next_run: new Date(1_800_040_000_000).toISOString(),
+    last_run: new Date(1_799_950_000_000).toISOString(),
+    run_count: 34,
+    on_complete: '{"kind":"notify"}',
+    created: 1_790_000_000,
+    updated: 1_799_950_000,
+    deleted: null,
+    steps: [
+      benchStep('WF-bench-1', 0, 'Read the overnight CI runs'),
+      benchStep('WF-bench-1', 1, 'Summarise what broke'),
+    ],
+  },
+])
+BENCH_QC.setQueryData<WorkflowRunSummary[]>(['workflows', 'activity'], [
+  {
+    id: 91,
+    workflow_id: 'WF-bench-1',
+    started_at: 1_799_950_000,
+    finished_at: 1_799_950_041,
+    status: 'ok',
+    note: '',
+    title: 'Morning triage',
+    company_id: null,
+  },
+  {
+    id: 90,
+    workflow_id: 'WF-bench-1',
+    started_at: 1_799_863_600,
+    finished_at: 1_799_865_400,
+    status: 'timeout',
+    note: 'step 2 ran out of time',
+    title: 'Morning triage',
+    company_id: null,
+  },
+])
 // The Memory tab's ARCHIVAL list (`learned-notes.tsx`) reads the bot-memory HTTP
 // routes; seed the empty-query (browse) result plus one opened note so the bench
 // reviews the POPULATED panel offline — tier chips, type dots, ages, an expanded
@@ -138,6 +201,11 @@ BENCH_QC.setQueryData<NotesResponse>(['learned-notes', BOT_PANEL_BENCH_NAME, '']
   bot_count: 2,
   role_count: 1,
   role: 'implementer',
+  // `eligible` = the route answered at all; `wired` = the recall hook is really
+  // in this bot's launch overlay. Both true here: the bench frames the populated
+  // list, not either "memory isn't on yet" state.
+  eligible: true,
+  wired: true,
   notes: [
     {
       slug: 'build-gate-is-build-perf',
@@ -182,6 +250,8 @@ BENCH_QC.setQueryData<NotesResponse>(['learned-notes', BOT_PANEL_BENCH_NAME, 'mi
   bot_count: 1,
   role_count: 0,
   role: 'implementer',
+  eligible: true,
+  wired: true,
   notes: [
     {
       slug: 'never-edit-server-migrations',
@@ -357,9 +427,9 @@ const GROK_ROW_BOTS: { session: ApiSession; group: 'needs' | 'active' | 'done' |
       name: 'pr-reviewer',
       display_name: 'PR reviewer',
       status: 'waiting',
-      tokens: 42_000,
       tags: ['reviews'],
-      task_summary: 'Waiting on your call about the migration rename.',
+      activity: undefined,
+      waiting_message: 'Rename the migration, or keep 0038 and add a new one?',
     } as ApiSession,
   },
   {
@@ -369,8 +439,6 @@ const GROK_ROW_BOTS: { session: ApiSession; group: 'needs' | 'active' | 'done' |
       name: 'web-app',
       display_name: 'Web app',
       status: 'active',
-      tokens: 96_400,
-      task_summary: 'Wiring the per-bot connector panel into the roster.',
     } as ApiSession,
   },
   {
@@ -380,9 +448,9 @@ const GROK_ROW_BOTS: { session: ApiSession; group: 'needs' | 'active' | 'done' |
       name: 'night-watch',
       display_name: 'Night watch',
       status: 'idle',
-      tokens: 12_800,
       tags: ['ops'],
-      task_summary: 'Idle — watching prod logs.',
+      activity: undefined,
+      subagents: 0,
     } as ApiSession,
   },
 ]
@@ -850,7 +918,7 @@ function BenchPanel({ theme }: { theme: BenchTheme }) {
         <Section
           id="bot-panel"
           title="The bot panel — per-bot settings (ASK 3)"
-          note="The roster detail pane stopped GLANCING and became an editable, tabbed bot page: Overview (context ring HERO · tokens · provider · status · editable tags · working dir) · Instructions (role presets + desc, the model picker, notes, notifications — all launch-injected) · Tools (skills / connectors placeholders + MCP) · Activity (Schedules · Issues · Git). One component, three fidelities (pane here, sheet on mobile, and the popover it grew from). Section bodies are REUSED from session-info-panel, not reimplemented. Query-backed sub-sections show their offline empty states here."
+          note="The roster detail pane stopped GLANCING and became an editable, tabbed bot page: Overview (live state · last exchange · handoffs · editable tags · working dir) · Setup (role presets + desc, the launch-model picker, core notes against the real 40-line / 6,000-char budget, connectors, learned notes, notifications, Advanced) · Workflows (Workflows · Recent runs · Issues · Git). The old glance — a 2×2 of Context / Tokens / Provider / Status — is GONE: three of those four read fields no server writes, so they rendered em-dashes and zeroes on every live install. One component, three fidelities (pane here, sheet on mobile, and the popover it grew from). Section bodies are REUSED from session-info-panel, not reimplemented. Query-backed sub-sections show their offline empty states here."
         >
           <BotPanelBench theme={theme} />
         </Section>

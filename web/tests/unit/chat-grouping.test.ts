@@ -266,6 +266,25 @@ describe('groupItems', () => {
     expect(out.map((r) => r.grouped)).toEqual([false, false])
     expect(out.map((r) => r.showGutter)).toEqual([false, false])
   })
+
+  test('a cross-session coordination event is the system voice, gutterless, run-breaking', () => {
+    const coord = (uuid: string, ts: number): ChatItem => ({
+      type: 'coordination',
+      uuid,
+      ts,
+      text: 'pagina-catalogus is available',
+      seed: 'pagina-catalogus',
+      tone: 'teammate',
+    })
+    // A coordination row sits between two agent turns: it takes the centred
+    // system voice (no gutter mark, never grouped) and breaks the run, so the
+    // second agent turn re-hangs its own mark instead of stacking across it.
+    const out = groupItems([assistant('a1', 100), coord('c1', 101), assistant('a2', 102)])
+    expect(out.map((r) => r.speaker)).toEqual(['agent', 'system', 'agent'])
+    expect(out.map((r) => r.grouped)).toEqual([false, false, false])
+    expect(out[1].showGutter).toBe(false)
+    expect(out[2].showGutter).toBe(true)
+  })
 })
 
 /* ── session-block dividers ──────────────────────────────────────────────── */

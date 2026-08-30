@@ -239,7 +239,7 @@ export function CreateYourOwnSheet({
                     )}
                   >
                     {co ? (
-                      <CompanyMark slug={co.slug} name={co.display_name} size={28} />
+                      <CompanyMark slug={co.slug} name={co.display_name} logo={co} size={28} />
                     ) : (
                       <HqMark size={28} />
                     )}

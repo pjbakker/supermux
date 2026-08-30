@@ -17,7 +17,7 @@
  */
 import { spawnSync } from 'node:child_process'
 
-const BASELINE_ERRORS = 6
+const BASELINE_ERRORS = 0
 
 const run = spawnSync('bun', ['x', 'eslint', '.', '-f', 'json'], {
   cwd: new URL('..', import.meta.url).pathname,

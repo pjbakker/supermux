@@ -109,9 +109,15 @@ interface SnapshotStore {
   redial: () => void
 }
 
-/** One session's socket, wrapped as an external store: the FIRST subscriber
- *  dials, the LAST one to leave disposes. */
-function chatStore(name: string, enabled: boolean): SnapshotStore {
+/** One socket, wrapped as an external store: the FIRST subscriber dials, the
+ *  LAST one to leave disposes.
+ *
+ *  `path` is the second channel's only difference (`/ws/companies/{id}/groupchat`,
+ *  which the server mirrors frame-for-frame off `sessions::chat::ws`). It is
+ *  threaded rather than branched on because everything else in here — the
+ *  foreground redial, the link aggregate, the dispose discipline — is behaviour
+ *  a second data plane must inherit, not copy. */
+function chatStore(name: string, enabled: boolean, path?: string): SnapshotStore {
   let snapshot: ChatSnapshot = EMPTY_SNAPSHOT
   let socket: ChatSocket | null = null
   const listeners = new Set<() => void>()
@@ -163,7 +169,9 @@ function chatStore(name: string, enabled: boolean): SnapshotStore {
     window.removeEventListener('online', onVisibility)
   }
 
-  const linkId = `chat:${name}`
+  // The aggregate key. A company channel and a session of the same name are
+  // different links, so the PATH is what identifies one when there is one.
+  const linkId = `chat:${path ?? name}`
 
   return {
     get: () => snapshot,
@@ -174,6 +182,7 @@ function chatStore(name: string, enabled: boolean): SnapshotStore {
       if (enabled && socket === null) {
         socket = new ChatSocket({
           name,
+          path,
           onSnapshot: (s) => {
             snapshot = s
             // A6 T2.4 — the chat socket joins the app-wide link aggregate, so
@@ -185,22 +194,38 @@ function chatStore(name: string, enabled: boolean): SnapshotStore {
               .getState()
               .report(
                 linkId,
-                linkStateFor(
-                  // A session that has never had a transcript is not a link
-                  // failure, and the global banner must not shout about one:
-                  // the tail says `reconnecting` for a file that was never
-                  // written, so an app-wide "Reconnecting…" toast greeted every
-                  // new chat session. `connected` is the honest reading — the
-                  // socket is up and there is simply nothing in the file yet.
-                  isFresh(s)
-                    ? 'live'
-                    : chatPresentation({ state: s.state, lastSignalAtMs: null, nowMs: 0 }),
-                  // A TERMINAL close is reported as `gone`, which the aggregate
-                  // skips entirely. Reporting it as `offline` is what made a
-                  // deleted session paint the global "Reconnecting…" spinner
-                  // for 30 s of grace on a socket that had already given up.
-                  s.gone,
-                ),
+                // The INITIAL connect handshake is NOT a reconnection. The socket
+                // opens in `connecting` before its first seed, and
+                // `chatPresentation` collapses `connecting`→`reconnecting`, so a
+                // freshly-mounted socket reported `reconnecting` → the global
+                // aggregate went degraded → and the amber→green "Connected" flash
+                // fired on the FIRST open. Harmless for a warm, long-lived socket,
+                // but the company group chat's page re-mounts (and re-dials) on
+                // every navigation, so it greeted the user with a "Connected" pill
+                // + slide EVERY time home↔chat. Report the first handshake as the
+                // calm `connecting` the banner already opens cold on; a genuine
+                // mid-session drop uses `reconnecting` with `seeded` still true,
+                // so real recoveries still flash. (`s.state === 'connecting'` only
+                // ever holds before the first seed — a reconnect is `reconnecting`.)
+                !s.seeded && s.state === 'connecting'
+                  ? 'connecting'
+                  : linkStateFor(
+                      // A session that has never had a transcript is not a link
+                      // failure, and the global banner must not shout about one:
+                      // the tail says `reconnecting` for a file that was never
+                      // written, so an app-wide "Reconnecting…" toast greeted
+                      // every new chat session. `connected` is the honest reading
+                      // — the socket is up and there is simply nothing in the file
+                      // yet.
+                      isFresh(s)
+                        ? 'live'
+                        : chatPresentation({ state: s.state, lastSignalAtMs: null, nowMs: 0 }),
+                      // A TERMINAL close is reported as `gone`, which the aggregate
+                      // skips entirely. Reporting it as `offline` is what made a
+                      // deleted session paint the global "Reconnecting…" spinner
+                      // for 30 s of grace on a socket that had already given up.
+                      s.gone,
+                    ),
               )
             for (const l of listeners) l()
           },
@@ -223,8 +248,8 @@ function chatStore(name: string, enabled: boolean): SnapshotStore {
   }
 }
 
-export function useChatWs(name: string, enabled: boolean): ChatWireView {
-  const store = React.useMemo(() => chatStore(name, enabled), [name, enabled])
+export function useChatWs(name: string, enabled: boolean, path?: string): ChatWireView {
+  const store = React.useMemo(() => chatStore(name, enabled, path), [name, enabled, path])
   const snap = React.useSyncExternalStore(store.subscribe, store.get)
 
   return {

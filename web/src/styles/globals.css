@@ -885,6 +885,36 @@
   }
 }
 
+/* ── Chat loading skeleton (the anti-flash delay) ──────────────────────────
+   `<ChatLoadingSkeleton>` fades in on a DELAY so a fast/cached message seed
+   replaces it before it is ever visible (no flash of the skeleton, no added
+   delay on the conversation itself). `both` holds opacity 0 through the delay.
+
+   HERE, not in grok-mode.css: this is the chat RENDERER's behaviour, and the
+   renderer outlives the skin — `supermux:grok-mode = '0'` kills the skin while
+   the chat renderer stays on (lib/bot-mode-flag.ts), so a `[data-grok]`-scoped
+   rule would drop the anti-flash in exactly that split. The skin reuses the
+   keyframe for its own mount fade, the way it already reuses `sm-spin`. */
+@keyframes sm-mount-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.sm-chat-skel {
+  animation: sm-mount-fade 0.22s ease-out 0.14s both;
+}
+/* Reduce Motion: keep the ANTI-FLASH delay (hold hidden ~140ms) but drop the
+   fade — a single opacity step, not a sweep. A skeleton is decoration around an
+   absence, so it owes the reader no motion, only the courtesy of not blinking. */
+@media (prefers-reduced-motion: reduce) {
+  .sm-chat-skel {
+    animation: sm-mount-fade 0.14s step-end both;
+  }
+}
+
 /* ── Edit sheet ──────────────────────────────
    The MobileComposeSheet's textarea is prose for an LLM, not code — system font
    (not mono), with the iOS systemBlue accent for the caret + selection so the
@@ -1439,6 +1469,25 @@
   -webkit-touch-callout: default;
 }
 
+/* ── Overview items are TAP TARGETS, not selectable text (iOS long-press) ─────
+   A bot tile / row is long-pressed for its actions menu. On iOS that gesture
+   ALSO fires native text selection + the Copy / Find Selection / Look Up callout
+   over whatever text sits under the finger (owner's IMG_2955/2956). Suppressing
+   selection + the callout on the item AND its children is the standard fix for
+   an interactive element — a control is not selectable prose. It is scoped to
+   the two overview slot wrappers (`group-tile-slot` / `group-row-slot`), so the
+   chat track and every other reading surface keep their own selection. The
+   descendant `*` beats the initial value a child text node would otherwise
+   inherit-then-ignore. */
+[data-vr="group-tile-slot"],
+[data-vr="group-tile-slot"] *,
+[data-vr="group-row-slot"],
+[data-vr="group-row-slot"] * {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
 /* ── The phone composer's contenteditable host ──────────────────────────────
    `plain-editable.tsx` — the field is a `contenteditable` on the phone so iOS
    stops drawing its prev/next/Done form-assistant bar above the keyboard (that
@@ -1488,4 +1537,193 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ══ SHARED BROWSER — the joy layer's keyframes (phase 4) ═════════════════════
+   The CSS half of `components/browser/*`. Everything that is a TRANSITION over
+   there is Tailwind + the app-wide reduced-motion blanket (`* { transition-
+   duration: 0.01ms }`), which needs no twin here. What lives in this block is
+   the handful of things a transition cannot express — a sweep, a one-shot
+   arrival, an expanding ring — and every one of them carries its own
+   `prefers-reduced-motion` twin, because the blanket deliberately does not
+   touch `animation`.
+
+   THE REDUCED-MOTION TWINS DO NOT SAY `animation: none`. Two of these are
+   self-removing: the ripple and the chip-close unmount themselves in an
+   `animationend` handler, and an animation that never runs never ends — the
+   element would sit there forever. So the twins collapse the DURATION to
+   0.01ms and drop the visual, which fires the event on the same tick and
+   leaves nothing on screen. A "kill it dead" twin here would be a leak. */
+
+/* The 300ms confirmation at the point a finger landed on the relayed page.
+   On a 200ms round trip this is the difference between "did that register?"
+   and confidence — see the takeover panel's touch section. */
+@keyframes sm-browser-ripple {
+  from {
+    opacity: 0.8;
+    transform: translate(-50%, -50%) scale(0.3);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1.6);
+  }
+}
+.sm-browser-ripple {
+  animation: sm-browser-ripple 0.3s cubic-bezier(0.2, 0, 0, 1) forwards;
+}
+
+/* The chrome's 2px loading hairline. Indeterminate, because a relayed page's
+   progress is not a number anybody has — a fake percentage would be the one
+   dishonest pixel in this whole surface. */
+@keyframes sm-browser-hairline {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(320%);
+  }
+}
+.sm-browser-hairline::after {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inline-size: 32%;
+  border-radius: 9999px;
+  /* `var(--primary)` DIRECTLY: this theme's tokens are whole colours (`#007aff`),
+     not HSL channel triples, so `hsl(var(--primary))` silently resolves to an
+     invalid colour and the whole gradient falls back to `none`. */
+  background: linear-gradient(90deg, transparent, var(--primary), transparent);
+  animation: sm-browser-hairline 1.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* A tab chip arriving. Vertical + scale, 260ms — the app's second speed. */
+@keyframes sm-browser-chip-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.sm-browser-chip-in {
+  animation: sm-browser-chip-in 0.26s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+/* …and leaving. The chip COLLAPSES ITS WIDTH rather than vanishing, so the
+   rail closes the gap instead of teleporting the chips to its right. Faster
+   than the entry (150ms vs 260ms): the human has already decided. */
+@keyframes sm-browser-chip-out {
+  from {
+    opacity: 1;
+    max-inline-size: var(--sm-chip-w, 168px);
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    max-inline-size: 0;
+    padding-inline: 0;
+    margin-inline-end: -0.375rem;
+    transform: scale(0.9);
+  }
+}
+.sm-browser-chip-out {
+  animation: sm-browser-chip-out 0.15s cubic-bezier(0.4, 0, 1, 1) forwards;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* The undo bar, arriving from the thumb end of the screen. */
+@keyframes sm-browser-undo-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 12px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+.sm-browser-undo-in {
+  animation: sm-browser-undo-in 0.26s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+/* A context menu, scaling out of the point it was summoned at. */
+@keyframes sm-browser-menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.sm-browser-menu-in {
+  animation: sm-browser-menu-in 0.15s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+/* The favicon ↔ spinner swap, and the canvas' page-swap: a same-cell
+   crossfade at the app's second speed, so a load does not reflow a 112px
+   chip. */
+@keyframes sm-browser-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.sm-browser-fade-in {
+  animation: sm-browser-fade-in 0.26s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Duration, not `none` — see the block header: these two unmount themselves
+     on `animationend`. */
+  .sm-browser-ripple,
+  .sm-browser-chip-out {
+    animation-duration: 0.01ms;
+  }
+  .sm-browser-ripple {
+    opacity: 0;
+  }
+  .sm-browser-chip-in,
+  .sm-browser-undo-in,
+  .sm-browser-menu-in,
+  .sm-browser-fade-in {
+    animation: none;
+  }
+  .sm-browser-hairline::after {
+    /* The hairline is FUNCTIONAL feedback — a frozen bar reads as "stuck", so
+       the sweep is replaced by a static, full-width tint that still says
+       "something is loading". */
+    animation: none;
+    inline-size: 100%;
+    opacity: 0.5;
+  }
+}
+
+/* The undo bar's countdown hairline — the window, drawn. Its DURATION is set
+   inline from `UNDO_WINDOW_MS`, so the bar and the timer that dismisses it
+   cannot drift apart. Under Reduce Motion the drain does not animate: the bar
+   still stands for its window and still says what it is, which is the whole
+   information; only the moving part goes. */
+@keyframes sm-browser-undo-drain {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+.sm-browser-undo-drain {
+  animation: sm-browser-undo-drain linear forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sm-browser-undo-drain {
+    animation: none;
+    opacity: 0.4;
+  }
 }

@@ -262,7 +262,32 @@ pub fn member_may_reach(method: &Method, path: &str) -> bool {
             if !rest.is_empty() && !rest.contains('/') {
                 return true;
             }
+            // …plus the ONE subpath that is a read of the company's own identity:
+            // `{id}/logo`, the bytes behind `<CompanyMark>`. A member is told
+            // `has_logo` by the row they can already read, so denying the image
+            // just paints an empty tile on every companies surface they have.
+            // `logo::get_handler` runs its own `Scope::sees` check, so this cannot
+            // become a cross-company read.
+            if let Some(id) = rest.strip_suffix("/logo") {
+                if !id.is_empty() && !id.contains('/') {
+                    return true;
+                }
+            }
         }
+    }
+    // Workflows (spec §5.1). The whole surface — list/create/read/patch/steps/
+    // delete/run/cancel/runs, plus `/preview`, `/commands` and the cross-workflow
+    // feed. Its predecessor `/api/schedules` was `require_admin`-gated as a
+    // sub-router, which meant a company member got a blanket 404 on their OWN
+    // bot's jobs; a bot's people have to be able to see what their bot is going
+    // to do. The REAL filtering is the scope layer INSIDE `workflows/mod.rs`:
+    // every handler resolves `Scope::of(ctx)` and answers the uniform 404 on
+    // `!scope.sees(workflow.company_id)` (and the list / activity feed drop what
+    // they cannot see), while `create` runs its target session through
+    // `authorize_session_for_human`. This entry is the OUTER fence only. `under`
+    // requires a segment boundary, so `/api/workflowsx` is NOT admitted.
+    if under(path, "/api/workflows") {
+        return true;
     }
     // Everything else — hosts, scheduler, audit, push, updates, claude_tools (the
     // MCP registry), skills, slash-commands, agents/delegations, teams/* (start,
@@ -447,6 +472,14 @@ mod tests {
         assert!(member_may_reach(&post, "/api/connectors/mail/grant"));
         assert!(member_may_reach(&get, "/api/file/raw"));
         assert!(member_may_reach(&get, "/api/fs/delete"));
+        // The three namespace verbs became member-reachable the instant they
+        // were registered (the whole `/api/fs` prefix is admitted). That is the
+        // intended design — `company_jail` confines BOTH paths of every verb —
+        // but it is pinned here rather than assumed, and paired with the live
+        // cross-jail 404 matrix in `tests/scope_p3b.rs`.
+        assert!(member_may_reach(&post, "/api/fs/mkdir"));
+        assert!(member_may_reach(&post, "/api/fs/rename"));
+        assert!(member_may_reach(&post, "/api/fs/copy"));
         assert!(member_may_reach(&get, "/api/ls"));
         assert!(member_may_reach(&get, "/api/autocomplete/dir"));
         assert!(member_may_reach(&get, "/api/uploads/x.png"));
@@ -458,6 +491,27 @@ mod tests {
         assert!(member_may_reach(&get, "/api/agents/bot/wait"));
         assert!(member_may_reach(&get, "/api/companies"));
         assert!(member_may_reach(&get, "/api/companies/1"));
+        // …and the company mark's bytes — otherwise every `<CompanyMark>` a member
+        // sees paints an empty tile. Read-only: the write verbs stay denied.
+        assert!(member_may_reach(&get, "/api/companies/1/logo"));
+        assert!(!member_may_reach(&put, "/api/companies/1/logo"));
+        assert!(!member_may_reach(&del, "/api/companies/1/logo"));
+        assert!(!member_may_reach(&post, "/api/companies/1/logo/from-url"));
+        assert!(!member_may_reach(&get, "/api/companies//logo"));
+        // Workflows — the WHOLE surface. Its predecessor was owner-only as a
+        // sub-router, so a member got a blanket 404 on their own bot's jobs; the
+        // real fence is the per-handler `Scope::sees` 404 inside `workflows`.
+        assert!(member_may_reach(&get, "/api/workflows"));
+        assert!(member_may_reach(&post, "/api/workflows"));
+        assert!(member_may_reach(&get, "/api/workflows/WF-1"));
+        assert!(member_may_reach(&put, "/api/workflows/WF-1/steps"));
+        assert!(member_may_reach(&del, "/api/workflows/WF-1"));
+        assert!(member_may_reach(&post, "/api/workflows/WF-1/run"));
+        assert!(member_may_reach(&post, "/api/workflows/WF-1/cancel"));
+        assert!(member_may_reach(&get, "/api/workflows/WF-1/runs"));
+        assert!(member_may_reach(&get, "/api/workflows/runs"));
+        assert!(member_may_reach(&post, "/api/workflows/preview"));
+        assert!(member_may_reach(&get, "/api/workflows/commands"));
 
         // ── DENIED (global / admin / not company-scoped in v1) ──
         // Companies writes (require_admin) — only GET is admitted.
@@ -490,6 +544,9 @@ mod tests {
         // Admin routers.
         assert!(!member_may_reach(&get, "/api/hosts"));
         assert!(!member_may_reach(&get, "/api/schedules"));
+        // Segment boundary: the workflows prefix must not widen by one letter.
+        assert!(!member_may_reach(&get, "/api/workflowsx"));
+        assert!(!member_may_reach(&get, "/api/workflowsx/1"));
         assert!(!member_may_reach(&get, "/api/audit"));
         assert!(!member_may_reach(&get, "/api/push/key"));
         assert!(!member_may_reach(&get, "/api/version"));

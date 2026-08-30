@@ -36,6 +36,28 @@ export function CheckIcon({ className }: IconProps) {
 }
 
 /**
+ * Agent line: ONE running subagent, in the same 13px leading slot the receipt
+ * check and spinner occupy — so the expanded list under the working row lines up
+ * with the receipts above it and nothing reflows between the two states.
+ *
+ * Filled = live (a hook within the last minute). Hollow = quiet, the same circle
+ * as the spinner's track, so a row that goes quiet dims in place instead of
+ * changing shape. There is no third glyph: "finished" is not a state this list
+ * can draw, because a finished agent's row is gone.
+ */
+export function AgentDotIcon({ quiet, className }: IconProps & { quiet?: boolean }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden className={className}>
+      {quiet ? (
+        <circle cx="7" cy="7" r="3.2" stroke="currentColor" strokeWidth="1.5" opacity="0.55" />
+      ) : (
+        <circle cx="7" cy="7" r="3.4" fill="currentColor" />
+      )}
+    </svg>
+  )
+}
+
+/**
  * Receipt line: the tool call that is still running. Occupies the check slot so
  * the line does not reflow when it lands (§4.2 P3: the spinner *morphs* into the
  * check). 2.4s per BRAND's slow-spinner convention — see `.sm-spin`.

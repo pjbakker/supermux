@@ -225,7 +225,7 @@ export function InviteWizardSheet({
       className="sm:max-w-lg"
       title={
         <span className="flex items-center gap-2.5">
-          <CompanyMark slug={company.slug} name={company.display_name} size={24} className="grok-identity" />
+          <CompanyMark slug={company.slug} name={company.display_name} logo={company} size={24} className="grok-identity" />
           <span className="truncate">Invite a teammate</span>
         </span>
       }

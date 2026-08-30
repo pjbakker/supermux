@@ -132,9 +132,13 @@ be told about.
 
 ## After you create one
 
-The response is the schedule, including its `id`. A `Created schedule ⏱ <title>`
-line appears in this session's transcript by itself — you do not need to
-announce it separately. **Tell the human what you scheduled and when it will
+The response is `201` with the envelope every supermux API uses:
+`{"ok":true,"data":{...the schedule...}}` — the schedule itself (its `id`,
+`title`, `schedule_expr`, `next_run`) is under `data`, not at the top level.
+Read it with `jq .data.id` / `jq .data.next_run`. **A 2xx means it was created,
+even if you could not parse the body — never retry the create call, or you make
+a duplicate schedule.** A `Created schedule ⏱ <title>` line appears in this
+session's transcript by itself — you do not need to announce it separately. **Tell the human what you scheduled and when it will
 first fire**, in one sentence, so they can correct you before it runs.
 
 To change or remove a schedule, the human does it from the Schedules sheet in

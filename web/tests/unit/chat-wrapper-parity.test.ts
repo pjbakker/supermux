@@ -100,6 +100,30 @@ describe('the parity fix itself', () => {
     expect(SURVIVING_KINDS.has(c.kind)).toBe(true)
   })
 
+  test('a chained step\u2019s title carries \u00b7 step 2/4 and still round-trips', () => {
+    // Workflows v1 does NOT change the tag (`supermux-schedule` stays, so every
+    // line already on disk keeps rendering) — what changed is the SHAPE of the
+    // title a chained run writes into it. The suffix is a `\u00b7`, and the
+    // slash is not markup, so nothing here needs escaping; asserting it means a
+    // future title format cannot quietly break the label the transcript shows.
+    const c = classifyPrompt(
+      '<supermux-schedule id="WF-1" title="Nightly \u00b7 step 2/4">check it</supermux-schedule>',
+    )
+    expect(c.kind).toBe('schedule')
+    expect(c.label).toBe('Nightly \u00b7 step 2/4')
+    expect(c.text).toBe('check it')
+    expect(SURVIVING_KINDS.has(c.kind)).toBe(true)
+  })
+
+  test('an escaped title with the suffix decodes to the owner\u2019s own words', () => {
+    // `escape_attr` is what the engine writes; a title with quotes AND the step
+    // suffix is the case where a half-decoded label reads as `Ship &quot;it&quot;`.
+    const c = classifyPrompt(
+      '<supermux-schedule id="WF-2" title="Ship &quot;it&quot; \u00b7 step 10/12">go</supermux-schedule>',
+    )
+    expect(c.label).toBe('Ship "it" \u00b7 step 10/12')
+  })
+
   test('an unknown future wrapper still degrades to system and is still dropped', () => {
     // The `default:` arm is the protection against a new Claude Code wrapper
     // leaking as a fake prompt. Widening the filter must not have widened that.

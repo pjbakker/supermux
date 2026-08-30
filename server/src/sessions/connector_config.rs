@@ -49,6 +49,23 @@ use crate::db::connectors::{self, Grant};
 use crate::state::AppState;
 use crate::vault::Vault;
 
+/// The overlay filename inside a session's private config dir.
+const SETTINGS_FILE: &str = "settings.json";
+
+/// `<data_dir>/session-config/<name>` — a session's private launch-config dir.
+pub fn settings_dir(data_dir: &Path, session_name: &str) -> PathBuf {
+    data_dir.join("session-config").join(session_name)
+}
+
+/// The `settings.json` overlay inside it — what `--settings` points the launch at.
+/// Exposed because a READER needs the same path the writer uses:
+/// [`crate::bot_memory::recall_hook_wired`] answers "is memory actually wired into
+/// this bot's launch?" by looking for the hook in this very file, and re-spelling
+/// the layout there is how the two would drift.
+pub fn settings_path(data_dir: &Path, session_name: &str) -> PathBuf {
+    settings_dir(data_dir, session_name).join(SETTINGS_FILE)
+}
+
 /// One granted connector, resolved to what the launch needs: its inline
 /// `mcpServers` entry (`emit`) and any decrypted secret field-map to inject.
 #[derive(Debug, Clone)]
@@ -119,9 +136,8 @@ pub struct SessionConfig {
 impl SessionConfig {
     /// A fresh, inactive config for `session_name` under `data_dir`.
     pub fn new(data_dir: &Path, session_name: &str) -> Self {
-        let settings_dir = data_dir.join("session-config").join(session_name);
         Self {
-            settings_dir,
+            settings_dir: settings_dir(data_dir, session_name),
             settings: Map::new(),
             env: HashMap::new(),
             launch_flags: Vec::new(),
@@ -267,6 +283,25 @@ impl SessionConfig {
     /// `emit` is [`crate::connectors::browser::mcp::emit`] — `${VAR}` references
     /// only (the session name, its per-session hook token, the callback URL); no
     /// credential exists for this connector at all.
+    /// Wire the built-in GROUP CHAT server into this launch.
+    ///
+    /// Same shape as [`apply_browser_connector`](Self::apply_browser_connector)
+    /// — an in-binary MCP server, a fixed server key (`group_chat`, so tools are
+    /// `mcp__group_chat__*`) and its own allow rule. The one difference is that
+    /// its emit env is PER-SESSION: the company id is baked in by `assemble`,
+    /// which is the only layer that knows it.
+    pub fn apply_groupchat_connector(&mut self, emit: Value) {
+        self.active = true;
+        self.mcp_servers.insert(
+            crate::connectors::groupchat::SERVER_KEY.to_string(),
+            emit,
+        );
+        let rule = Value::String(crate::connectors::groupchat::ALLOW_RULE.to_string());
+        if !self.allow_rules.contains(&rule) {
+            self.allow_rules.push(rule);
+        }
+    }
+
     pub fn apply_browser_connector(&mut self, emit: Value) {
         self.active = true;
         self.mcp_servers.insert(
@@ -317,9 +352,19 @@ impl SessionConfig {
         // permissions.allow: MERGE the write-CLI grant into the shared allow list
         // (the connector globs + the connect tool live there too); `finish` writes
         // the array once, so no tier clobbers another's rules.
-        let entry = Value::String("Bash(supermux-memory *)".to_string());
-        if !self.allow_rules.contains(&entry) {
-            self.allow_rules.push(entry);
+        //
+        // BOTH prefix forms, on purpose. This shipped the space form; Claude
+        // Code's documented prefix form is `Bash(cmd:*)`, and which one a given
+        // build matches is not something the server can know. A grant that does
+        // not match costs a permission PROMPT on every `supermux-memory save` —
+        // and in an unattended pane that prompt is never answered, so the note
+        // silently never lands and the whole tier reads as broken. A duplicate
+        // allow entry is inert, so emit both rather than bet on one.
+        for rule in ["Bash(supermux-memory *)", "Bash(supermux-memory:*)"] {
+            let entry = Value::String(rule.to_string());
+            if !self.allow_rules.contains(&entry) {
+                self.allow_rules.push(entry);
+            }
         }
 
         // env: the hook + CLI read these to resolve the store + identity.
@@ -401,7 +446,7 @@ impl SessionConfig {
 
         // Every active launch gets the kill switch, decoupled from grants.
         self.apply_account_connector_killswitch();
-        let settings_path = self.settings_dir.join("settings.json");
+        let settings_path = self.settings_dir.join(SETTINGS_FILE);
         write_json_atomic(&settings_path, &Value::Object(self.settings)).await?;
         // Layer the overlay OVER ~/.claude via --settings (Claude Code merges it),
         // instead of repointing CLAUDE_CONFIG_DIR at a near-empty dir.
@@ -447,6 +492,10 @@ pub async fn assemble(state: &AppState, session_name: &str) -> Result<Option<Fin
     // connector whose MCP server is built from the binary rather than a stored
     // emit block (see the loop below).
     let mut wants_browser = false;
+    // Set when this session holds an enabled `group-chat` grant — the SECOND
+    // in-binary connector, and the only one whose emit env is per-session (the
+    // company id is baked below, the `MAIL_TO_FILTER` precedent).
+    let mut wants_groupchat = false;
 
     // ── connector tier ─────────────────────────────────────────────────────────
     let grants = connectors::grants_for_session(&state.pool, session_name).await?;
@@ -500,6 +549,15 @@ pub async fn assemble(state: &AppState, session_name: &str) -> Result<Option<Fin
                 wants_browser = true;
                 continue;
             }
+            // THE BUILT-IN GROUP CHAT is the same shape: materialized from the
+            // binary, fixed server key, and its company id baked into the env
+            // below (it is a per-session fact, so it cannot live on the card).
+            if connector.kind == crate::connectors::manifest::KIND_BUILTIN_GROUPCHAT
+                || g.connector_id == crate::connectors::groupchat::GROUPCHAT_ID
+            {
+                wants_groupchat = true;
+                continue;
+            }
             let mut emit: Value =
                 serde_json::from_str(&connector.emit_json).unwrap_or_else(|_| json!({}));
             // Inject the agent-inbox To-filter into a MAIL connector's emit env
@@ -534,6 +592,23 @@ pub async fn assemble(state: &AppState, session_name: &str) -> Result<Option<Fin
     if wants_browser {
         if let Some(path) = crate::connectors::browser::mcp::ensure(&state.config.data_dir).await {
             cfg.apply_browser_connector(crate::connectors::browser::mcp::emit(&path));
+        }
+    }
+
+    // ── group-chat tier ────────────────────────────────────────────────────────
+    // A granted bot gets the five channel tools. The company id is resolved HERE
+    // (the launch is the only layer that knows which session this is) and baked
+    // into the emit env — exactly the `MAIL_TO_FILTER` precedent above. It is
+    // display context: the tool endpoint re-reads the company from the session
+    // row and never trusts the env value.
+    if wants_groupchat {
+        if let Some(path) = crate::connectors::groupchat::ensure(&state.config.data_dir).await {
+            let company_id = crate::db::sessions::get(&state.pool, session_name)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.company_id);
+            cfg.apply_groupchat_connector(crate::connectors::groupchat::emit(&path, company_id));
         }
     }
 
@@ -1595,7 +1670,11 @@ mod tests {
         // permissions.allow carries BOTH the connector tool + the write-CLI grant.
         let allow = v["permissions"]["allow"].as_array().unwrap();
         assert!(allow.contains(&json!("mcp__github__*")), "connector allow kept: {allow:?}");
+        // BOTH prefix forms ride along — see `apply_memory`: a form the running
+        // Claude Code build does not match turns every self-save into an
+        // unanswered permission prompt.
         assert!(allow.contains(&json!("Bash(supermux-memory *)")), "memory grant merged: {allow:?}");
+        assert!(allow.contains(&json!("Bash(supermux-memory:*)")), "prefix-form grant merged: {allow:?}");
         // Connector kill switch survives the memory merge.
         assert_eq!(v["disableClaudeAiConnectors"], json!(true));
         // Recall hooks fire on both context-injecting events.

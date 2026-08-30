@@ -100,6 +100,10 @@ function speakerOf(item: ChatItem, labels?: ReadonlyMap<string, string>): Speake
   // A blocked banner is not anybody speaking: it is a fact about the session,
   // and it gets the centred system voice + its own card.
   if (item.type === 'blocked') return 'system'
+  // A cross-session coordination event is chrome about the fleet, not anybody
+  // speaking: the centred system voice, which breaks the run around it and hangs
+  // no gutter mark — its own optional face sits inline in the row instead.
+  if (item.type === 'coordination') return 'system'
   if (item.type !== 'user') return 'agent'
   // A delegated prompt is a colleague's request wearing the same face: the
   // teammate envelope and `<supermux-delegation from>` differ in transport, not

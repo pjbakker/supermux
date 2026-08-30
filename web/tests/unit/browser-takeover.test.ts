@@ -32,6 +32,11 @@ import {
   type TakeoverSnapshot,
 } from '../../src/lib/browser/takeover-socket'
 import type { TakeoverFrame } from '../../src/lib/browser/frame-map'
+import {
+  NO_CAPS,
+  parseCaps,
+  parseLoginScan,
+} from '../../src/lib/browser/page-tools'
 
 /* ── the frame arithmetic ────────────────────────────────────────────────── */
 
@@ -198,6 +203,9 @@ function harness(session = 'ada') {
   const snaps: TakeoverSnapshot[] = []
   const frames: TakeoverFrame[] = []
   const timers: Array<() => void> = []
+  const copied: string[] = []
+  const focused: Array<{ selector: string; ok: boolean }> = []
+  const filled: Array<{ selector: string; ok: boolean }> = []
   const sock = new TakeoverSocket(
     session,
     (s) => snaps.push(s),
@@ -211,6 +219,9 @@ function harness(session = 'ada') {
         return timers.length
       },
       cancel: () => undefined,
+      onCopied: (t) => copied.push(t),
+      onFocused: (selector, ok) => focused.push({ selector, ok }),
+      onFilled: (selector, ok) => filled.push({ selector, ok }),
     },
   )
   return {
@@ -218,6 +229,9 @@ function harness(session = 'ada') {
     snaps,
     frames,
     timers,
+    copied,
+    focused,
+    filled,
     last: () => FakeSocket.open[FakeSocket.open.length - 1],
     latest: () => snaps[snaps.length - 1] ?? EMPTY_SNAPSHOT,
   }
@@ -379,5 +393,233 @@ describe('the takeover socket', () => {
     expect(sent[4].text).toBeUndefined()
     expect(sent[7]).toMatchObject({ type: 'touch', kind: 'end' })
     h.sock.stop()
+  })
+})
+
+/* ── smart sign-in (phase 3 socket wiring) ───────────────────────────────────
+ *
+ * The three verbs gate on `caps.signIn`, the answers land where §3's state
+ * machine will read them, and the secret in `fill_field` never touches the
+ * snapshot. Wire names are pinned to `takeover.rs` (snake_case: `sign_in`,
+ * `multi_step`, `frame_hint`).
+ */
+
+/** Turn on the sign-in capability the way the server does. */
+function withSignIn(h: ReturnType<typeof harness>) {
+  h.sock.start()
+  h.last().accept()
+  h.last().deliver({ type: 'caps', find: false, copy: false, sign_in: true })
+}
+
+describe('smart sign-in — the socket wiring', () => {
+  test('scan_login / focus_field / fill_field produce the exact JSON frames', () => {
+    const h = harness()
+    withSignIn(h)
+    const ws = h.last()
+    expect(h.sock.scanLogin()).toBe(true)
+    expect(h.sock.focusField('#pw')).toBe(true)
+    expect(h.sock.fillField('#pw', 's3cret', 'password')).toBe(true)
+
+    const sent = ws.parsed().filter((m) => m.type !== 'auth')
+    expect(sent).toEqual([
+      { type: 'scan_login' },
+      { type: 'focus_field', selector: '#pw' },
+      { type: 'fill_field', selector: '#pw', value: 's3cret', role: 'password' },
+    ])
+    h.sock.stop()
+  })
+
+  test('the three verbs are no-ops until a caps frame lights sign-in', () => {
+    const h = harness()
+    h.sock.start()
+    h.last().accept() // authed, but NO caps frame → signIn stays false
+    const ws = h.last()
+    expect(h.sock.scanLogin()).toBe(false)
+    expect(h.sock.focusField('#pw')).toBe(false)
+    expect(h.sock.fillField('#pw', 'nope', 'password')).toBe(false)
+    // Nothing hit the wire — an un-capable relay would drop it on the floor.
+    expect(ws.parsed().filter((m) => m.type !== 'auth')).toEqual([])
+    // …and the degrade default is explicit false, never "unknown".
+    expect(h.latest().caps.signIn).toBe(false)
+    h.sock.stop()
+  })
+
+  test('a caps frame sets snap.caps.signIn; absent caps ⇒ signIn:false (degrade)', () => {
+    const on = harness()
+    withSignIn(on)
+    expect(on.latest().caps.signIn).toBe(true)
+    on.sock.stop()
+
+    // An older relay that only knows find/copy leaves signIn false without
+    // clobbering the other flags.
+    const mixed = harness()
+    mixed.sock.start()
+    mixed.last().accept()
+    mixed.last().deliver({ type: 'caps', find: true, copy: true })
+    expect(mixed.latest().caps).toEqual({ find: true, copy: true, signIn: false })
+    mixed.sock.stop()
+
+    // No caps frame at all → the EMPTY_SNAPSHOT default holds.
+    const none = harness()
+    none.sock.start()
+    none.last().accept()
+    expect(none.latest().caps).toEqual(NO_CAPS)
+    none.sock.stop()
+  })
+
+  test('a login_fields frame populates snap.loginScan (camelCased from the wire)', () => {
+    const h = harness()
+    withSignIn(h)
+    expect(h.latest().loginScan).toBeNull()
+    h.last().deliver({
+      type: 'login_fields',
+      form: true,
+      reason: null,
+      fields: [
+        { selector: '#email', role: 'username', label: 'Email', visible: true, source: 'autocomplete', rect: { x: 1, y: 2, w: 3, h: 4 } },
+        { selector: '#pw', role: 'password', label: 'Password', visible: true, source: 'type', rect: { x: 1, y: 9, w: 3, h: 4 } },
+      ],
+      otp: null,
+      multi_step: 'combined', // snake_case ON THE WIRE
+      frame_hint: null,
+    })
+    const scan = h.latest().loginScan
+    expect(scan).not.toBeNull()
+    expect(scan!.form).toBe(true)
+    expect(scan!.multiStep).toBe('combined') // camelCase in the snapshot
+    expect(scan!.frameHint).toBeNull()
+    expect(scan!.fields.map((f) => [f.selector, f.role])).toEqual([
+      ['#email', 'username'],
+      ['#pw', 'password'],
+    ])
+    expect(scan!.fields[0].rect).toEqual({ x: 1, y: 2, w: 3, h: 4 })
+    h.sock.stop()
+  })
+
+  test('a form:false scan disables the offer with its reason, no fields', () => {
+    const h = harness()
+    withSignIn(h)
+    h.last().deliver({
+      type: 'login_fields',
+      form: false,
+      reason: 'no-password-field',
+      fields: [],
+      otp: null,
+      multi_step: 'combined',
+      frame_hint: 'cross-origin-iframe',
+    })
+    const scan = h.latest().loginScan!
+    expect(scan.form).toBe(false)
+    expect(scan.reason).toBe('no-password-field')
+    expect(scan.frameHint).toBe('cross-origin-iframe')
+    expect(scan.fields).toEqual([])
+    h.sock.stop()
+  })
+
+  test('focused / filled answers reach the callbacks, not the snapshot', () => {
+    const h = harness()
+    withSignIn(h)
+    const before = h.snaps.length
+    h.last().deliver({ type: 'focused', selector: '#pw', ok: true })
+    h.last().deliver({ type: 'filled', selector: '#pw', ok: false })
+    expect(h.focused).toEqual([{ selector: '#pw', ok: true }])
+    expect(h.filled).toEqual([{ selector: '#pw', ok: false }])
+    // One-shot results must not churn the snapshot channel.
+    expect(h.snaps.length).toBe(before)
+    h.sock.stop()
+  })
+
+  test('a refused scan surfaces the banner — it does NOT spin', () => {
+    const h = harness()
+    withSignIn(h)
+    expect(h.sock.scanLogin()).toBe(true)
+    // The server answers an agent-driving scan with `refused`, not login_fields.
+    h.last().deliver({ type: 'refused', reason: 'agent is driving' })
+    expect(h.latest().refused).toBe('agent is driving')
+    expect(h.latest().loginScan).toBeNull() // no phantom offer
+    h.sock.stop()
+  })
+
+  test('the fill secret is never retained on the snapshot', () => {
+    const h = harness()
+    withSignIn(h)
+    h.sock.fillField('#pw', 'hunter2', 'password')
+    h.last().deliver({ type: 'filled', selector: '#pw', ok: true })
+    // The secret exists only inside the one frame on the wire.
+    for (const snap of h.snaps) {
+      expect(JSON.stringify(snap)).not.toContain('hunter2')
+    }
+    // …and it is not stashed on the instance's live snapshot either.
+    expect(JSON.stringify(h.sock.snapshot())).not.toContain('hunter2')
+    h.sock.stop()
+  })
+})
+
+/* ── the pure parsers ────────────────────────────────────────────────────── */
+
+describe('parseCaps', () => {
+  test('reads the wire sign_in and degrades a garbled frame to false', () => {
+    expect(parseCaps({ find: true, copy: false, sign_in: true })).toEqual({
+      find: true,
+      copy: false,
+      signIn: true,
+    })
+    // Absent / wrong-typed flags are "cannot", never "probably".
+    expect(parseCaps({})).toEqual(NO_CAPS)
+    expect(parseCaps({ sign_in: 'yes' })).toEqual(NO_CAPS)
+    // Only snake_case counts — a camelCase `signIn` is NOT the server's wire.
+    expect(parseCaps({ signIn: true }).signIn).toBe(false)
+  })
+})
+
+describe('parseLoginScan', () => {
+  test('clamps the small vocabularies and camelCases the wire names', () => {
+    const scan = parseLoginScan({
+      form: true,
+      reason: 'no-password-field', // ignored when form=true
+      fields: [{ selector: '#u', role: 'username', label: 'User', visible: true, source: 'keyword', rect: { x: 0, y: 0, w: 0, h: 0 } }],
+      otp: { selector: '#otp', label: 'Code' },
+      multi_step: 'username-only',
+      frame_hint: 'cross-origin-iframe',
+    })
+    expect(scan.form).toBe(true)
+    expect(scan.reason).toBeNull()
+    expect(scan.multiStep).toBe('username-only')
+    expect(scan.frameHint).toBe('cross-origin-iframe')
+    expect(scan.otp).toEqual({ selector: '#otp', label: 'Code' })
+    expect(scan.fields).toHaveLength(1)
+  })
+
+  test('fail-closed: a hostile frame becomes a disabled offer, not a wrong one', () => {
+    const scan = parseLoginScan({
+      form: false,
+      reason: 'not-a-real-reason', // unknown → null
+      fields: [{ selector: '#x' }], // dropped: form is false
+      otp: { selector: '#o' },
+      multi_step: 'bogus', // unknown → 'combined'
+      frame_hint: 'evil', // unknown → null
+    })
+    expect(scan.form).toBe(false)
+    expect(scan.reason).toBeNull()
+    expect(scan.fields).toEqual([])
+    expect(scan.otp).toBeNull()
+    expect(scan.multiStep).toBe('combined')
+    expect(scan.frameHint).toBeNull()
+  })
+
+  test('a field missing a selector is dropped; roles/sources clamp to known', () => {
+    const scan = parseLoginScan({
+      form: true,
+      reason: null,
+      fields: [
+        { role: 'password' }, // no selector → dropped
+        { selector: '#p', role: 'wizard', source: 'magic' }, // clamp both
+      ],
+      otp: null,
+      multi_step: 'combined',
+      frame_hint: null,
+    })
+    expect(scan.fields).toHaveLength(1)
+    expect(scan.fields[0]).toMatchObject({ selector: '#p', role: 'username', source: 'keyword' })
   })
 })

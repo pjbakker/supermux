@@ -132,11 +132,19 @@ export function attentionFor(s: AttentionInput | null | undefined): AttentionTie
   return null
 }
 
-/** The calm ` · N subagents` parallelism clause, shared by the chat WorkingRow
- *  and the Grok roster's state word so the two never drift. Empty below 2 — one
- *  subagent is not "parallel", and the clause is a parallelism tell, not a count. */
-export function subagentsClause(subagents: number | undefined | null): string {
-  return subagents && subagents >= 2 ? ` · ${subagents} subagents` : ''
+/** The calm ` · N agents` parallelism clause, shared by the chat WorkingRow, the
+ *  tile's activity line and the Grok roster's state word so they never drift.
+ *  Empty below 2 — one agent is not "parallel", and the clause is a parallelism
+ *  tell, not a count.
+ *
+ *  The argument is `agents_live`, not the raw `subagents`, and that is the whole
+ *  change: `agents_live` counts the ROWS the server has first-hand evidence of
+ *  (each exists only because a hook carrying that agent's own id arrived), so
+ *  the clause can no longer say `3 subagents` at a session that has none. The
+ *  word moved with the quantity — "agents" now means "children with a live tool
+ *  call", which is not what users were being shown before. */
+export function subagentsClause(agentsLive?: number | null): string {
+  return agentsLive && agentsLive >= 2 ? ` · ${agentsLive} agents` : ''
 }
 
 /** Live hints a caller may know that the status field cannot spell. */

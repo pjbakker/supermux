@@ -630,6 +630,69 @@
    shell root. The tab bar is safe to blur because it has no fixed descendants
    (its children are flow + one `position:absolute` chip), so the blur is a leaf
    effect exactly like the substrate `::before`. */
+
+/* ═══ SCOPE CIRCLE + SCOPE TITLE (Companies moved out of the page headers) ═════
+   The company scope used to lead every page header as a labelled chip. It now
+   lives ONCE, in the nav — a ringed circle showing the active scope's mark
+   (`<CompanySwitcher variant="circle">`), the WHOOP "profile in the corner"
+   slot. So every header is clean, and the scope is switchable from anywhere.
+   Two docks: the mobile bottom-bar (positioned in the ≤md block below) and the
+   desktop rail bottom (`[data-scope-dock='rail']`). Base styling is shared. */
+[data-grok] .gr-scope-circle {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border-radius: 50%;
+  border: 0.5px solid var(--sm-sidebar-separator);
+  background: var(--sm-raised-fill);
+  -webkit-backdrop-filter: var(--sm-glass-raised);
+  backdrop-filter: var(--sm-glass-raised);
+  /* Lift (a peer of the capsule) + a glass top-bevel + a soft accent RING so it
+     reads as the tappable identity, not a nav glyph. The ring is the only frame
+     — subtle, one accent hairline, never the rainbow. */
+  box-shadow:
+    var(--sm-nav-shadow),
+    inset 0 1px 0 color-mix(in srgb, #fff 22%, transparent),
+    0 0 0 1.5px color-mix(in srgb, var(--sm-accent) 42%, transparent);
+  cursor: pointer;
+  transition: transform 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.15);
+}
+[data-grok] .gr-scope-circle:active {
+  transform: scale(0.92);
+}
+/* The mark inside keeps its own rounded-square shape, centred in the circle. */
+[data-grok] .gr-scope-circle > * {
+  pointer-events: none;
+}
+/* Desktop rail dock: the circle sits in the 64px column flow (before the theme
+   toggle). Slightly smaller so it breathes inside the rail. */
+[data-grok] [data-scope-dock='rail'] .gr-scope-circle {
+  width: 44px;
+  height: 44px;
+}
+
+/* SCOPE TITLE — the read-only scope identity the overview header now leads with
+   (`<ScopeTitle>`): the same mark + name the chip showed, but as a TITLE, not a
+   control (switching is the nav circle's job). Reads as the page's owner line. */
+[data-grok] .gr-scope-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+[data-grok] .gr-scope-title-lbl {
+  font-weight: 660;
+  font-size: 19px;
+  letter-spacing: -0.015em;
+  color: var(--sm-sidebar-text, inherit);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 @media (max-width: 767px) {
   /* A. Float it off the floor. `pb-safe` stops being a floor-filler: the
      safe-area becomes the capsule's OUTER bottom margin, so the bar clears the
@@ -638,7 +701,11 @@
   [data-grok] [data-shell-tabs] {
     position: fixed;
     z-index: 30;
-    right: 12px;
+    /* Room on the RIGHT for the detached scope circle (48px + a 12px gap): the
+       capsule ends at 72px from the edge, the circle floats in the gap — the
+       WHOOP "pill + profile" split. Off this surface (base app) the rule never
+       applies, so the full-bleed bar is untouched. */
+    right: 72px;
     bottom: calc(env(safe-area-inset-bottom) + 10px);
     left: 12px;
     /* Horizontal padding is 8px, NOT 4px (owner: the active tint-chip on the
@@ -682,6 +749,20 @@
     content: none;
   }
 
+  /* THE DETACHED SCOPE CIRCLE (mobile) — floats in the gap the capsule's right
+     inset opened, vertically centred against it. A member of the capsule's glass
+     family (same raised fill, blur and lift) so the two read as one system. It
+     is NOT a nav cell — a fixed sibling of <nav>, so `--nav-n` / the sliding-pill
+     math never see it. The desktop rail carries its own copy; this is ≤md only. */
+  [data-grok] [data-scope-dock='bar'] {
+    position: fixed;
+    z-index: 31;
+    right: 12px;
+    /* Centre the 48px circle on the ~68px capsule (bottom safe+10, ~68 tall →
+       centre at safe+44; circle centre wants the same → bottom = safe+20). */
+    bottom: calc(env(safe-area-inset-bottom) + 20px);
+  }
+
   /* Cells + Search paint ABOVE the sliding pill (the pill is z-0, an earlier
      absolute sibling; glyphs/labels must stay crisp over it). */
   [data-grok] [data-shell-tabs] > a,
@@ -716,15 +797,18 @@
     width: calc((100% - 16px) / var(--nav-n));
     transform: translateX(calc(var(--nav-i) * 100%));
     box-sizing: border-box;
-    /* Transparent 4px border = a 4px visual inset WITHOUT changing the 100% travel
-       unit (the wash fills only inside it via padding-box clip). */
-    border: 4px solid transparent;
-    background: color-mix(in srgb, var(--sm-accent) 12%, transparent);
+    /* Transparent 5px border = a 5px visual inset (the wash fills only inside it
+       via padding-box clip) WITHOUT changing the 100% travel unit — the padding
+       that gives the glyph + label room to breathe inside the chip. */
+    border: 5px solid transparent;
+    /* A soft, READABLE tint chip — the selection reads through FILL and SPACE, not
+       a ring. ~22% accent fill on the dark glass is unmistakable but never opaque;
+       NO border (a ring is a crutch, not design). One faint inner top-highlight is
+       the only edge — the glass tell, not a frame. */
+    background: color-mix(in srgb, var(--sm-accent) 22%, transparent);
     background-clip: padding-box;
-    /* GRAFT (#3): a 0.5px accent ring so the pill keeps a crisp edge while gliding
-       over glass — the tint never reads as a mushy plate. */
-    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--sm-accent) 22%, transparent);
-    border-radius: var(--sm-r-pill);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 12%, transparent);
+    border-radius: 16px;
     /* THE GLIDE: `transform` on an overshoot curve + a DIFFERENT (standard) curve
        on `width` → the pill stretches then settles as it lands, the iOS-26
        stretch-and-settle "liquid" signature in two CSS properties, no morph
@@ -755,9 +839,12 @@
       color 0.18s ease;
   }
   [data-grok] [data-shell-tabs] a[aria-current='page'] svg[data-active] {
+    /* The active glyph is a Phosphor `fill` icon (the outline→solid tell is the
+       weight now, set in layout.tsx) — so this only TINTS it accent via
+       currentColor and lifts it. It must NOT set `fill`/`stroke-width`: those were
+       for the old outline glyph and would repaint the solid icon as a faint
+       accent ghost. */
     color: var(--sm-accent);
-    stroke-width: 2.25;
-    fill: color-mix(in srgb, var(--sm-accent) 14%, transparent);
     transform: translateY(-2px) scale(1.1);
   }
 
@@ -769,9 +856,20 @@
      so a static label would paint underneath it. */
   [data-grok] [data-shell-tabs] [data-nav-label] {
     position: relative;
+    /* 5 equal cells + the scope circle leave each cell ~one word wide (a cell is
+       ~61px at 390px; the pill it sits in is ~58px). The long labels are now
+       SHORT (Home / Tools / Flows / Browser / Files — the longest, "Browser", is
+       ~45px at 11px), so they sit inside the pill with air. `nowrap` + clip +
+       `max-width` is the guarantee — a label can never spill the pill again; if
+       one is ever too long it clips rather than overflowing (a nav word must
+       never show an ellipsis). */
     font-size: 11px;
     font-weight: 500;
     letter-spacing: -0.01em;
+    max-width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: clip;
     max-height: 14px;
     opacity: 1;
     transition:
@@ -925,14 +1023,10 @@
     transform: none;
   }
 }
-@keyframes sm-mount-fade {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
+/* `sm-mount-fade` is REUSED from globals.css (like the 2.4s `sm-spin` below):
+   the chat loading skeleton fades with it too, and the skeleton is renderer
+   behaviour that must survive the skin's kill-switch — so the keyframe lives
+   with the app, not with the skin. */
 @keyframes sm-typing-dot {
   0%,
   55%,
@@ -1526,15 +1620,15 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  height: 34px;
-  min-width: 34px;
-  padding: 0 13px;
-  border-radius: 10px;
+  gap: 5px;
+  height: 30px;
+  min-width: 30px;
+  padding: 0 11px;
+  border-radius: 9px;
   border: 0;
   cursor: pointer;
   font: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--gr-onaccent);
@@ -1551,7 +1645,7 @@
 /* the label folds away on a narrow header; the 44×44 phone rule keeps the tap */
 @media (max-width: 520px) {
   [data-grok] .grok-roster .gr-newbot {
-    padding: 0 9px;
+    padding: 0 7px;
   }
   [data-grok] .grok-roster .gr-newbot-lbl {
     display: none;
@@ -1569,7 +1663,7 @@
 /* The trigger — an always-visible scope chip in `.gr-head`, matching the
    `.gr-search` / `.gr-seg` hairline family (34px, `--sm-r-md`, surf2, 0.5px
    line). It reads as one of the header's quiet controls, not a loud button. */
-[data-grok] .grok-roster .gr-company {
+[data-grok] .gr-company {
   flex: none;
   display: inline-flex;
   align-items: center;
@@ -1585,15 +1679,15 @@
   color: var(--sm-text-primary);
   transition: background-color 0.12s, border-color 0.12s;
 }
-[data-grok] .grok-roster .gr-company:hover {
+[data-grok] .gr-company:hover {
   background: var(--gr-surf);
 }
-[data-grok] .grok-roster .gr-company:focus-visible {
+[data-grok] .gr-company:focus-visible {
   outline: none;
   border-color: transparent;
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--sm-accent) 45%, transparent);
 }
-[data-grok] .grok-roster .gr-company .gr-company-lbl {
+[data-grok] .gr-company .gr-company-lbl {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: -0.01em;
@@ -1602,7 +1696,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-[data-grok] .grok-roster .gr-company .gr-company-cv {
+[data-grok] .gr-company .gr-company-cv {
   color: var(--sm-text-tertiary);
   flex: none;
 }
@@ -1652,6 +1746,22 @@
     to bottom,
     color-mix(in oklab, var(--sm-agent-tint) 6%, transparent) 0,
     transparent var(--sm-list-fade)
+  );
+  background-repeat: no-repeat;
+}
+/* …but when the company-chat dock sits ABOVE the list, that wash began BELOW the
+   doorway as a disconnected lighter band (owner IMG_2891 — "onprofi"). The dock
+   IS the head of the company scope, so carry the ≤6% pigment wash there instead
+   (it has `--sm-agent-tint` via the rail hue) and leave the list neutral, so the
+   tint reads as one calm thing starting at the doorway, not a floating stripe. */
+[data-grok] .grok-roster:has(.gc-dock) .gr-rail[data-company] .gr-list {
+  background-image: none;
+}
+[data-grok] .grok-roster .gc-dock {
+  background-image: linear-gradient(
+    to bottom,
+    color-mix(in oklab, var(--sm-agent-tint) 7%, transparent) 0,
+    transparent 100%
   );
   background-repeat: no-repeat;
 }
@@ -2234,6 +2344,19 @@
   position: relative;
   background: var(--gr-bg);
 }
+/* PRIORITY 2 — safe-area top, the DETAIL-PANE header. Same reasoning as the
+   `.gr-head` fix above: the shell's MobileTopBar renders nothing, and the phone
+   teammate route (`/team/:teamName/:agentId`, MemberPane) is full-bleed, so in an
+   installed iOS PWA (viewport-fit=cover, status bar overlays the webview) the
+   pane header's back button + name ran UNDER the battery/signal row. Reserve the
+   inset on the header. NOT roster-scoped — that route renders the pane OUTSIDE
+   `.grok-roster` — so it keys off the `[data-shell-pane]` every pane carries (the
+   desktop roster pane has it too). Gated on `[data-standalone]` (the PWA gate the
+   shell root sets) so browser-tab mobile is untouched; `max()` keeps it a no-op
+   wherever the inset is 0 (desktop, where the 18px base padding already applies). */
+[data-grok][data-standalone] [data-shell-pane] .gr-pane-hd {
+  padding-top: max(18px, env(safe-area-inset-top));
+}
 [data-grok] .grok-roster .gr-pane-hd::after {
   content: '';
   position: absolute;
@@ -2596,6 +2719,21 @@
   }
   [data-grok] .grok-roster[data-head-hidden] .gr-head {
     transform: translateY(-100%);
+  }
+  /* GROUP-CHAT DOORWAY clearance. The mobile roster header is `position:absolute`
+     (out of flow), so the in-flow chat-entry dock would paint UNDER it. When the
+     dock is present, move the header clearance ONTO the dock and zero it on
+     `.gr-list` (now below the dock), and collapse it in sync with the header's
+     scroll-away so no dead band is left when the header hides. */
+  [data-grok] .grok-roster:has(.gc-dock) .gr-list {
+    padding-top: 0;
+  }
+  [data-grok] .grok-roster .gc-dock {
+    margin-top: calc(var(--gr-head-h, 132px) + 0.25rem);
+    transition: margin-top 0.26s ease-out;
+  }
+  [data-grok] .grok-roster[data-head-hidden] .gc-dock {
+    margin-top: 0;
   }
 }
 

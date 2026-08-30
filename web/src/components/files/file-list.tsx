@@ -1,10 +1,16 @@
 import * as React from 'react'
 import { motion } from 'framer-motion'
 import {
+  Check,
   ChevronRight,
+  Copy,
+  CopyPlus,
   Download,
   EllipsisVertical,
   Folder,
+  FolderInput,
+  PencilLine,
+  Send,
   Share2,
   Trash2,
 } from 'lucide-react'
@@ -20,6 +26,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { useToast } from '@/components/ui/use-toast'
 import { filesApi, type FsEntry } from '@/lib/api'
+import { downloadEntry } from './download'
 import { formatBytes, formatMtime, iconForEntry } from './file-types'
 
 /** Join a directory with a child name, collapsing the root-slash case. */
@@ -34,6 +41,25 @@ export interface FileListProps {
   onOpenDir: (path: string) => void
   onOpenFile: (entry: FsEntry, path: string) => void
   onDelete: (path: string, isDir: boolean) => void
+  // ── files v1 · row menu (§4.3) ──────────────────────────────────────────
+  // All four are offered for FILES AND DIRECTORIES alike (except Copy on a
+  // dir, which the server refuses until recursive copy lands in v2):
+  // `WRITABLE_EXTS` deliberately does not gate them. Renaming a `.pdf` or a
+  // `.sqlite` is a NAMESPACE op, not a write, and blocking it would make the
+  // feature useless on exactly the files people most want to tidy.
+  onRename?: (entry: FsEntry, path: string) => void
+  onMove?: (entry: FsEntry, path: string) => void
+  onCopy?: (entry: FsEntry, path: string) => void
+  onDuplicate?: (entry: FsEntry, path: string) => void
+  onSendToBot?: (entry: FsEntry, path: string) => void
+  // ── files v1 · multi-select (§4.5) ──────────────────────────────────────
+  /** Select mode reveals a checkbox per row and re-points the row's PRIMARY
+   *  tap at "toggle". A toolbar toggle, never a long-press: long-press
+   *  collides with iOS text selection, and this codebase has a documented
+   *  history of selection bugs. */
+  selectMode?: boolean
+  selectedPaths?: ReadonlySet<string>
+  onToggleSelect?: (path: string) => void
 }
 
 /** Detected once per mount: does this browser support sharing files via the Web
@@ -60,24 +86,23 @@ export function FileList({
   onOpenDir,
   onOpenFile,
   onDelete,
+  onRename,
+  onMove,
+  onCopy,
+  onDuplicate,
+  onSendToBot,
+  selectMode,
+  selectedPaths,
+  onToggleSelect,
 }: FileListProps) {
   const { toast } = useToast()
   const [canShareFiles] = React.useState(detectCanShareFiles)
 
   const handleDownload = async (path: string, name: string) => {
     try {
-      const res = await fetch(filesApi.rawUrl(path))
-      if (!res.ok) throw new Error(`download failed (${res.status})`)
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = name
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      // Defer revoke so the browser has time to start the download stream.
-      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      // Shared with the bulk bar (`download.ts`) so a row download and a
+      // selection download are the same code path.
+      await downloadEntry(path, name)
     } catch (e) {
       toast({
         message: `Download failed — ${(e as Error).message}`,
@@ -121,10 +146,11 @@ export function FileList({
         const path = childPath(dirPath, entry.name)
         const isDir = entry.type === 'dir'
         const selected = !isDir && path === selectedPath
+        const checked = !!selectedPaths?.has(path)
         const Icon = isDir ? Folder : iconForEntry(entry)
         return (
           <li key={entry.name} className="relative flex items-stretch">
-            {selected && (
+            {selected && !selectMode && (
               <motion.span
                 layoutId="file-selection"
                 transition={springs.snappy}
@@ -135,16 +161,38 @@ export function FileList({
               type="button"
               whileTap={{ scale: 0.985 }}
               transition={springs.buttonPress}
+              // In select mode the row's PRIMARY tap toggles instead of
+              // opening — one target per row, so a phone never has to hit a
+              // checkbox that is smaller than a fingertip.
               onClick={() =>
-                isDir ? onOpenDir(path) : onOpenFile(entry, path)
+                selectMode
+                  ? onToggleSelect?.(path)
+                  : isDir
+                    ? onOpenDir(path)
+                    : onOpenFile(entry, path)
               }
+              aria-pressed={selectMode ? checked : undefined}
               className={cn(
                 'relative flex min-h-12 min-w-0 flex-1 items-center gap-3 rounded-lg px-2.5 text-left transition-colors',
-                selected
+                selected && !selectMode
                   ? 'text-foreground'
                   : 'hover:bg-accent active:bg-accent',
+                selectMode && checked && 'bg-accent',
               )}
             >
+              {selectMode && (
+                <span
+                  aria-hidden
+                  className={cn(
+                    'flex size-5 shrink-0 items-center justify-center rounded-md border transition-colors',
+                    checked
+                      ? 'border-primary bg-primary text-primary-foreground'
+                      : 'border-border',
+                  )}
+                >
+                  {checked && <Check className="size-3.5" />}
+                </span>
+              )}
               <Icon
                 className={cn(
                   'size-5 shrink-0',
@@ -160,11 +208,15 @@ export function FileList({
                   </span>
                 )}
               </span>
-              {isDir && (
+              {isDir && !selectMode && (
                 <ChevronRight className="size-4 shrink-0 text-muted-foreground/60" />
               )}
             </motion.button>
 
+            {/* The row menu is hidden in select mode: the bottom bar owns the
+                verbs there, and two competing action surfaces on one row is
+                how a phone user hits the wrong one. */}
+            {!selectMode && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
@@ -176,8 +228,47 @@ export function FileList({
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
+                {onRename && (
+                  <DropdownMenuItem onClick={() => onRename(entry, path)}>
+                    <PencilLine className="size-4" />
+                    Rename…
+                  </DropdownMenuItem>
+                )}
+                {onMove && (
+                  <DropdownMenuItem onClick={() => onMove(entry, path)}>
+                    <FolderInput className="size-4" />
+                    Move…
+                  </DropdownMenuItem>
+                )}
+                {onCopy && (
+                  <DropdownMenuItem
+                    disabled={isDir}
+                    // The honest reason, not a hidden item: the verb exists,
+                    // it just refuses a directory until recursive copy lands.
+                    title={
+                      isDir ? 'Copying a folder isn’t supported yet.' : undefined
+                    }
+                    onClick={() => !isDir && onCopy(entry, path)}
+                  >
+                    <Copy className="size-4" />
+                    Copy…
+                  </DropdownMenuItem>
+                )}
+                {onDuplicate && !isDir && (
+                  <DropdownMenuItem onClick={() => onDuplicate(entry, path)}>
+                    <CopyPlus className="size-4" />
+                    Duplicate
+                  </DropdownMenuItem>
+                )}
+                {onSendToBot && !isDir && (
+                  <DropdownMenuItem onClick={() => onSendToBot(entry, path)}>
+                    <Send className="size-4" />
+                    Send to bot…
+                  </DropdownMenuItem>
+                )}
                 {!isDir && (
                   <>
+                    <DropdownMenuSeparator />
                     <DropdownMenuItem
                       onClick={() => void handleDownload(path, entry.name)}
                     >
@@ -192,9 +283,9 @@ export function FileList({
                         Share…
                       </DropdownMenuItem>
                     )}
-                    <DropdownMenuSeparator />
                   </>
                 )}
+                <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => onDelete(path, isDir)}
                   className="text-destructive focus:text-destructive"
@@ -204,6 +295,7 @@ export function FileList({
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+            )}
           </li>
         )
       })}

@@ -79,6 +79,23 @@ pub trait FileTransport: Send + Sync {
     async fn delete(&self, path: &Path) -> Result<()>;
     async fn rename(&self, from: &Path, to: &Path) -> Result<()>;
 
+    /// Create a directory, creating parents. MUST NOT error when a parent (or
+    /// the target itself) already exists — the CALLER refuses a pre-existing
+    /// target via [`FileTransport::exists`], so the verb stays honest about a
+    /// typo instead of silently succeeding on the wrong path.
+    ///
+    /// Deliberately has NO default impl: a new transport implements it
+    /// consciously (the same discipline [`FileTransport::is_local`] documents).
+    async fn mkdir(&self, path: &Path) -> Result<()>;
+
+    /// Copy a SINGLE regular file. A directory source is REFUSED by every impl
+    /// (recursive copy is v2 and gated on a security review — an unbounded walk
+    /// needs depth/byte caps and a symlink policy). The caller `stat`s first so
+    /// the refusal surfaces as a 400 rather than a transport error.
+    ///
+    /// No default impl, same reason as [`FileTransport::mkdir`].
+    async fn copy(&self, from: &Path, to: &Path) -> Result<()>;
+
     /// DEFINITIVE existence check: `Ok(false)` ONLY when the transport proved
     /// the path is absent, `Err` when it could not tell (permission denied,
     /// a dropped ssh mux, a non-GNU remote `stat`, …).
@@ -225,6 +242,32 @@ impl FileTransport for LocalFileTransport {
         tokio::fs::rename(from, to)
             .await
             .with_context(|| format!("renaming {} -> {}", from.display(), to.display()))
+    }
+
+    async fn mkdir(&self, path: &Path) -> Result<()> {
+        tokio::fs::create_dir_all(path)
+            .await
+            .with_context(|| format!("creating dir {}", path.display()))
+    }
+
+    /// `tokio::fs::copy` is a kernel-side copy — the bytes never land in our
+    /// address space, so there is no size cap to impose here. A directory
+    /// source is refused before the copy (`symlink_metadata`, so a symlink to a
+    /// directory cannot smuggle one past).
+    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        let meta = tokio::fs::symlink_metadata(from)
+            .await
+            .with_context(|| format!("stat {}", from.display()))?;
+        if meta.is_dir() {
+            bail!(
+                "refusing to copy directory {} (single-file copies only)",
+                from.display()
+            );
+        }
+        tokio::fs::copy(from, to)
+            .await
+            .with_context(|| format!("copying {} -> {}", from.display(), to.display()))?;
+        Ok(())
     }
 }
 
@@ -518,6 +561,66 @@ trap - EXIT
         Ok(())
     }
 
+    /// The same safe-exec idiom `write` uses: the script body NEVER interpolates
+    /// the path — it arrives as `$1` through the trailing positional args (`_`
+    /// fills `$0`). `mkdir -p` so parents are created and an existing parent is
+    /// not an error; the handler has already refused a pre-existing target.
+    async fn mkdir(&self, path: &Path) -> Result<()> {
+        let transport = self.ssh_transport().await?;
+        let p = path_str(path)?;
+        const SCRIPT: &str = r#"
+set -eu
+mkdir -p -- "$1"
+"#;
+        let mut cmd = transport.spawn_command("bash", &["-c", SCRIPT, "_", p]);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .await
+            .with_context(|| format!("ssh mkdir -p {}", path.display()))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            bail!("remote mkdir of {} failed: {}", path.display(), stderr);
+        }
+        Ok(())
+    }
+
+    /// SAFETY: `stat` first and refuse a directory — the same discipline
+    /// [`SshFileTransport::delete`] applies to a recursive `rm` over the wire.
+    /// A plain `cp -- f t` (argv, never interpolation) does the rest.
+    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        let s = self.stat(from).await?;
+        if s.is_dir {
+            bail!(
+                "refusing to copy directory {} over the remote transport (single-file copies only)",
+                from.display()
+            );
+        }
+        let transport = self.ssh_transport().await?;
+        let f = path_str(from)?;
+        let t = path_str(to)?;
+        let mut cmd = transport.spawn_command("cp", &["--", f, t]);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .await
+            .with_context(|| format!("ssh cp {} -> {}", from.display(), to.display()))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            bail!(
+                "remote copy of {} -> {} failed: {}",
+                from.display(),
+                to.display(),
+                stderr
+            );
+        }
+        Ok(())
+    }
+
     /// `readlink -f -- <path>` over the warm ControlMaster — one extra hop,
     /// but it folds `~/safe-link -> ~/.ssh` symlinks BEFORE the blocklist runs
     /// (the documented remote-symlink bypass). The script body never
@@ -676,6 +779,54 @@ mod tests {
         t.rename(&a, &b).await.unwrap();
         assert!(!a.exists());
         assert!(b.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn local_mkdir_creates_nested() {
+        let dir = tmp_dir();
+        let target = dir.join("a/b/c");
+        let t = LocalFileTransport;
+        t.mkdir(&target).await.unwrap();
+        assert!(target.is_dir());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `mkdir -p` semantics: an existing parent (and an existing target) is NOT
+    /// an error at the transport layer. Refusing a pre-existing target is the
+    /// HANDLER's job (409), on the back of a definitive `exists` probe.
+    #[tokio::test]
+    async fn local_mkdir_is_idempotent_on_parents() {
+        let dir = tmp_dir();
+        let t = LocalFileTransport;
+        t.mkdir(&dir.join("a/b")).await.unwrap();
+        t.mkdir(&dir.join("a/b/c")).await.unwrap();
+        t.mkdir(&dir.join("a/b/c")).await.unwrap();
+        assert!(dir.join("a/b/c").is_dir());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn local_copy_leaves_source_intact() {
+        let dir = tmp_dir();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, b"payload").unwrap();
+        let t = LocalFileTransport;
+        t.copy(&a, &b).await.unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&b).unwrap(), b"payload");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn local_copy_refuses_a_directory() {
+        let dir = tmp_dir();
+        let src = dir.join("src");
+        std::fs::create_dir(&src).unwrap();
+        let t = LocalFileTransport;
+        assert!(t.copy(&src, &dir.join("dst")).await.is_err());
+        assert!(!dir.join("dst").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

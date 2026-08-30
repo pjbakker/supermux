@@ -31,6 +31,13 @@ import { agentsApi, commandsApi, filesApi, sessionsApi } from '@/lib/api'
 import { restSessionInput, type SessionInput } from '@/lib/session-input'
 
 import { useRosterMarks } from '@/hooks/use-roster-marks'
+import { useCancelRun, useWorkflowProgress, useWorkflows } from '@/hooks/use-workflows'
+import {
+  WORKFLOWS_ROUTE,
+  workflowHref,
+  workflowNewHref,
+} from '@/components/workflows/workflow-href'
+import type { HeaderWorkflow } from './header-pill'
 import { claimChatSurface } from '@/lib/live-region-owner'
 
 import { detailFor, topAttention } from './attention'
@@ -59,8 +66,10 @@ import { focusComposer } from './composer-draft'
 import { ChatConversation, PHONE_QUERY } from './conversation'
 import type { KbLayoutComponent } from '@/components/focus-mode/kb-modes/contract'
 import { useComposer } from './use-composer'
+import { useDelaySend } from './use-delay-send'
 import { useHarnessEvents } from './use-harness-events'
 import { useDialogAnswer } from './use-dialog-answer'
+import { useQuestionAnswer } from './use-question-answer'
 import { LoginCard, ProviderAuthCard } from './login-card'
 import { loginOwnsScreen as loginOwns } from './login-lens'
 import { useLogin } from './use-login'
@@ -75,19 +84,6 @@ import { ProvisionalTail } from './provisional-tail'
 import type { ScheduleRef } from './transcript-item'
 import { exposeLatency, latencySummary, serverNowMs } from './latency'
 
-/**
- * LAZY, and it is budget-load-bearing (fase B4 T8).
- *
- * The sheet pulls in the whole scheduler editor — the form, the recurrence
- * builder, the fire log, the session picker. Imported statically it landed 8 KB
- * gz in the HERO path, for a modal nobody has opened yet. It is only ever
- * mounted while `open`, so the chunk is fetched at the moment of the tap, which
- * is the same trade the `@`/`/` picker makes (`composer.tsx`).
- */
-const SessionSchedulesSheet = React.lazy(
-  () => import('@/components/session-schedules/session-schedules-sheet'),
-)
-
 export default function ChatPanel({
   name,
   session,
@@ -96,6 +92,7 @@ export default function ChatPanel({
   surface,
   headerLeading,
   headerTrailing,
+  onTitleClick,
   actions,
   layout,
 }: {
@@ -131,6 +128,14 @@ export default function ChatPanel({
    */
   headerLeading?: React.ReactNode
   headerTrailing?: React.ReactNode
+  /**
+   * Open this bot's details from the header NAME — the mobile route's own
+   * `<BotPanel variant="sheet">`, the same panel its terminal chrome opens from
+   * `<FocusHeader onTitleClick>`. Under chat the header card IS the route's
+   * header, so without this the sheet has no door. Omitted by the desktop seam
+   * and the benches, where the name stays inert.
+   */
+  onTitleClick?: () => void
   /**
    * The route-owned actions behind the composer's leading `+` (mobile chat only).
    * The phone's old global dock — session switcher, command palette, snippets —
@@ -227,28 +232,60 @@ export default function ChatPanel({
     },
     [name, navigate],
   )
-  // The `⏱` chip's destination (fase B4 T8.5): this session's own Schedules
-  // sheet, scrolled to the schedule when the ledger row knows its id. NOT a
-  // route — the sheet exists whether or not B1's scheduler fold landed, and
-  // that independence is §0.6's whole rule.
-  const [scheduleSheet, setScheduleSheet] = React.useState<{
-    scheduleId: string | null
-    create: boolean
-    draft?: string
-  } | null>(null)
+  // The `⏱` chip's destination. It used to be a lazily-loaded per-session
+  // Schedules SHEET, because a schedule had no page of its own; a workflow does.
+  // The ids carried over unchanged in migration 0038 (`workflows.id = schedules.id`),
+  // so a chip in a transcript written last month still resolves — and it now
+  // lands on the step rail and the run history the sheet could never show.
+  // A ledger row that names no id has nowhere specific to go, so it opens the
+  // list rather than inventing a destination.
   const openSchedule = React.useCallback(
-    (ref: ScheduleRef) => setScheduleSheet({ scheduleId: ref.id ?? null, create: false }),
-    [],
+    (ref: ScheduleRef) => navigate(ref.id ? workflowHref(ref.id) : WORKFLOWS_ROUTE),
+    [navigate],
   )
-  const closeScheduleSheet = React.useCallback(() => setScheduleSheet(null), [])
-  // The human path (fase B4 T9): the composer's clock opens the SAME sheet in
-  // create mode with the draft carried over as the prompt. §13.3 calls this
-  // "the trivial human path" and it stays trivial — no new form, no new
-  // endpoint, and the draft is COPIED so cancelling costs nothing.
+  // The human path (fase B4 T9): the composer's clock opens the COMPOSER with
+  // the draft carried over as step 1. §13.3 calls this "the trivial human path"
+  // and it stays trivial — no new form, no new endpoint, and the draft is
+  // COPIED so backing out costs nothing.
   const scheduleDraft = React.useCallback(
-    (draft: string) => setScheduleSheet({ scheduleId: null, create: true, draft: draft.trim() }),
-    [],
+    (draft: string) => navigate(workflowNewHref(name, draft)),
+    [name, navigate],
   )
+  // THE WORKFLOW TELL (T6.3). A workflow's steps arrive in THIS pane as ordinary
+  // submissions, and the human can type into the same pane mid-chain. v1 does
+  // NOT lock the composer — locking a user out of their own agent is worse than
+  // the interleaving — so the header discloses instead.
+  //
+  // The live position comes from the SSE progress map, which is keyed by
+  // WORKFLOW id and carries no session; this bot's own list is what turns that
+  // into "is one of MINE running". Both are cheap and already cached by the
+  // workflows surfaces; neither polls.
+  const myWorkflows = useWorkflows(name)
+  const workflowProgress = useWorkflowProgress()
+  // `mutate` is the stable half of the mutation object — the object itself is a
+  // fresh identity every render, and memoising on it would recompute the chip
+  // on every keystroke.
+  const cancelRun = useCancelRun().mutate
+  // Deliberately NOT hand-memoised: the loop is over this bot's handful of
+  // workflows, and a manual memo here is one the React Compiler cannot preserve
+  // (the progress lookup is a dynamic index), which is a lint error for no
+  // measurable win. The compiler memoises it.
+  let headerWorkflow: HeaderWorkflow | null = null
+  for (const w of myWorkflows.data ?? []) {
+    const p = workflowProgress[w.id]
+    if (!p?.running) continue
+    const href = workflowHref(w.id)
+    headerWorkflow = {
+      id: w.id,
+      step: p.step,
+      steps: p.steps,
+      href,
+      onOpen: () => navigate(href),
+      onStop: () => cancelRun(w.id),
+    }
+    break
+  }
+
   // The wire labels `ChatItem` deliberately does not carry: the slash name of a
   // command, the teammate id of an arrival, the subject of a system event.
   const labels = React.useMemo(() => entryLabels(entries), [entries])
@@ -622,6 +659,14 @@ export default function ChatPanel({
   const onFeedback = React.useCallback(() => focusComposer(name), [name])
   const dialog = useDialogAnswer({ peek, input: plane, onFeedback })
 
+  // ── Answering the structured AskUserQuestion ───────────────────────────────
+  // The one card that is answered WITHOUT a pty sighting: the server parses the
+  // tool call into `session.question_request`, so the payload is the authority
+  // (`use-question-answer` presses `Down`×index + `Enter` down the same `/keys`
+  // lane the dialog uses, with no re-verification to do). This is the last wire
+  // of that feature — the card has always drawn the options; this makes them act.
+  const question = useQuestionAnswer({ ask: session?.question_request, input: plane })
+
   // ── Signing in (AREA 3) ────────────────────────────────────────────────────
   // `/login` is the one needs-input state chat could not answer: it is pty-only
   // (the transcript records the slash command and nothing else), so the READ has
@@ -733,6 +778,15 @@ export default function ChatPanel({
     // firing an Escape into a pty with nothing to interrupt (a silent no-op).
     onInterrupt: endTurn,
   })
+
+  // SEND LATER — the composer's delay plane. It owns nothing this panel owns:
+  // the draft store is the same one `useComposer` writes to, and the delivery
+  // is a ONE-SHOT SCHEDULE against the existing `/api/schedules` (kind `tmux`,
+  // `in 10 minutes`), so a queued message survives a reload, a phone lock and a
+  // server restart — the thing that remembers is the schedules table, not this
+  // browser. No new endpoint, and no query subscription for a session nobody
+  // has queued anything in.
+  const delaySend = useDelaySend({ name })
 
   // ── What the `@`/`/` popover offers (fase A4 T9) ───────────────────────────
   // Fetched HERE, not in the picker: the panel is the data plane (the A3/A4
@@ -926,6 +980,10 @@ export default function ChatPanel({
       // Nothing is broken, so nothing moves over the transcript.
       headerStatus={connectionNote}
       headerTrailing={headerTrailing}
+      // The workflow tell — null (and therefore invisible) unless a run of this
+      // bot's own is in flight right now.
+      workflow={headerWorkflow}
+      onTitleClick={onTitleClick}
       pinFor={pinFor}
       // The header's honesty half: an `offline` plane greys the presence dot so
       // it stops reading as a live green "ready" beside the "Offline" chip. Only
@@ -952,6 +1010,11 @@ export default function ChatPanel({
       dialog={loginOwnsScreen ? null : dialog.card}
       dialogBusy={dialog.busy}
       onChooseDialog={dialog.choose}
+      // The structured AskUserQuestion card answers itself (its own `/keys` lane),
+      // independent of the pty-scrape `dialog` above. `questionChosen` lights the
+      // picked pill until the server clears the ask on PostToolUse.
+      onAnswerQuestion={question.onAnswer}
+      questionChosen={question.chosen}
       dialogResolved={loginOwnsScreen ? null : dialog.resolved}
       // The sign-in card is what is asking on this frame, so it is what the
       // screen reader is told about (`ASK_SAY`).
@@ -1045,6 +1108,9 @@ export default function ChatPanel({
           // same rule as `mentions`/`names`.
           pickerData={pickerData}
           onSchedule={scheduleDraft}
+          // The delay plane (send later): the trailing clock, its chooser, and
+          // the queued-send receipts above the pill.
+          delay={delaySend}
           actions={actions}
           attachments={staged}
           // The dogfood number — DEV BUILDS ONLY (daily-driver QA #9).
@@ -1075,24 +1141,6 @@ export default function ChatPanel({
         />
       }
     />
-    {/* Mounted only while it is open: the sheet subscribes to the scheduler
-        stream and the schedules query, and neither should be running for every
-        session anybody happens to be looking at. */}
-    {scheduleSheet && (
-      // No fallback: the sheet's own shell IS the loading state once it lands,
-      // and a spinner for a chunk that arrives in one frame from cache would be
-      // the only thing most people ever see of it.
-      <React.Suspense fallback={null}>
-      <SessionSchedulesSheet
-        session={name}
-        open
-        onClose={closeScheduleSheet}
-        scheduleId={scheduleSheet.scheduleId}
-        createOnOpen={scheduleSheet.create}
-        draftPrompt={scheduleSheet.draft}
-      />
-      </React.Suspense>
-    )}
     </TruncationProvider>
   )
 }

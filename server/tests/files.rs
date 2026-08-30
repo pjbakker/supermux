@@ -20,6 +20,9 @@ const TOKEN: &str = "files-test-token";
 
 struct TestEnv {
     app: axum::Router,
+    /// Kept so a test can read the audit ledger / seed a company row through
+    /// the same pool the handlers write to.
+    state: AppState,
     data_dir: std::path::PathBuf,
     work_dir: std::path::PathBuf,
 }
@@ -48,7 +51,26 @@ async fn setup() -> TestEnv {
     };
     let pool = db::init(&config).await.expect("db init");
     let state = AppState::new(pool, config);
-    TestEnv { app: http::router(state), data_dir, work_dir }
+    TestEnv { app: http::router(state.clone()), state, data_dir, work_dir }
+}
+
+/// True iff the audit ledger holds a row with this action + target.
+async fn audited(env: &TestEnv, action: &str, target: &str) -> bool {
+    db::audit::list(&env.state.pool, 200)
+        .await
+        .expect("audit list")
+        .iter()
+        .any(|e| e.action == action && e.target == target)
+}
+
+/// One audit row's `detail` JSON for an action + target.
+async fn audit_detail(env: &TestEnv, action: &str, target: &str) -> Value {
+    let rows = db::audit::list(&env.state.pool, 200).await.expect("audit list");
+    let row = rows
+        .iter()
+        .find(|e| e.action == action && e.target == target)
+        .unwrap_or_else(|| panic!("no audit row for {action} on {target}"));
+    serde_json::from_str(&row.detail).unwrap_or(Value::Null)
 }
 
 impl Drop for TestEnv {
@@ -529,4 +551,766 @@ async fn projects_repos_unset_returns_empty() {
     let body = json_body(resp).await;
     assert_eq!(body["root"].as_str().unwrap(), "");
     assert_eq!(body["entries"].as_array().unwrap().len(), 0);
+}
+
+// ──────────────── namespace verbs: mkdir / rename(move) / copy ────────────────
+
+#[tokio::test]
+async fn mkdir_creates_nested_dir_and_audits() {
+    let env = setup().await;
+    let target = env.work_dir.join("reports/2026/q3");
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/mkdir",
+            &json!({ "path": target.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "mkdir creates parents");
+    let body = json_body(resp).await;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["path"], target.to_string_lossy().into_owned());
+    assert!(target.is_dir(), "the directory really exists on disk");
+    assert!(
+        audited(&env, "dir.create", &target.to_string_lossy()).await,
+        "mkdir writes a dir.create audit row"
+    );
+}
+
+#[tokio::test]
+async fn mkdir_on_existing_path_is_409() {
+    // Idempotent-mkdir would silently swallow a typo on a shared drive.
+    let env = setup().await;
+    let target = env.work_dir.join("already");
+    std::fs::create_dir(&target).unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/mkdir",
+            &json!({ "path": target.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "existing target → 409");
+
+    // A pre-existing FILE at the target is equally a conflict.
+    let file = env.work_dir.join("taken.txt");
+    std::fs::write(&file, b"x").unwrap();
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/mkdir",
+            &json!({ "path": file.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "existing file at target → 409");
+}
+
+#[tokio::test]
+async fn rename_moves_file_across_dirs_and_audits() {
+    let env = setup().await;
+    let from = env.work_dir.join("draft.md");
+    std::fs::write(&from, b"# draft\n").unwrap();
+    std::fs::create_dir(env.work_dir.join("archive")).unwrap();
+    let to = env.work_dir.join("archive/final.md");
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["from"], from.to_string_lossy().into_owned());
+    assert_eq!(body["to"], to.to_string_lossy().into_owned());
+    assert!(!from.exists(), "source is gone");
+    assert_eq!(std::fs::read(&to).unwrap(), b"# draft\n", "destination has the bytes");
+    assert!(audited(&env, "file.rename", &from.to_string_lossy()).await);
+    assert_eq!(
+        audit_detail(&env, "file.rename", &from.to_string_lossy()).await["to"],
+        to.to_string_lossy().into_owned()
+    );
+}
+
+#[tokio::test]
+async fn rename_to_existing_dest_is_409_unless_overwrite() {
+    let env = setup().await;
+    let from = env.work_dir.join("a.txt");
+    let to = env.work_dir.join("b.txt");
+    std::fs::write(&from, b"aaa").unwrap();
+    std::fs::write(&to, b"bbb").unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "silent clobber is refused");
+    assert_eq!(std::fs::read(&to).unwrap(), b"bbb", "destination untouched");
+    assert!(from.exists(), "source untouched");
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({
+                "from": from.to_string_lossy(),
+                "to": to.to_string_lossy(),
+                "overwrite": true,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "explicit overwrite is allowed");
+    assert_eq!(std::fs::read(&to).unwrap(), b"aaa");
+    assert!(!from.exists());
+}
+
+#[tokio::test]
+async fn rename_dir_into_itself_is_400_but_a_sibling_prefix_is_fine() {
+    let env = setup().await;
+    let acme = env.work_dir.join("acme");
+    std::fs::create_dir(&acme).unwrap();
+
+    // `to` inside `from` — the classic move-a-dir-into-itself.
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({
+                "from": acme.to_string_lossy(),
+                "to": acme.join("inner").to_string_lossy(),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "dir into itself → 400");
+    assert!(acme.is_dir(), "nothing moved");
+
+    // `from` == `to` is the same refusal.
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": acme.to_string_lossy(), "to": acme.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "from == to → 400");
+
+    // …but `/acme-corp` is NOT inside `/acme`: the prefix compare is
+    // `/`-delimited, so this must succeed.
+    let sibling = env.work_dir.join("acme-corp");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": acme.to_string_lossy(), "to": sibling.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a sibling-prefix name is not 'inside'");
+    assert!(sibling.is_dir());
+    assert!(!acme.exists());
+}
+
+#[tokio::test]
+async fn rename_of_a_company_root_is_403() {
+    // Renaming a company root desynchronizes `companies.root_dir` from disk and
+    // silently re-points a member's jail.
+    let env = setup().await;
+    let root = env.work_dir.join("acme-root");
+    std::fs::create_dir(&root).unwrap();
+    db::companies::create(&env.state.pool, "acme", "Acme", &root.to_string_lossy())
+        .await
+        .expect("company row");
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({
+                "from": root.to_string_lossy(),
+                "to": env.work_dir.join("renamed-root").to_string_lossy(),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a company root cannot be moved");
+    assert!(root.is_dir(), "the root is still where the DB says it is");
+
+    // A path INSIDE the root is of course movable.
+    let inside = root.join("note.md");
+    std::fs::write(&inside, b"hi").unwrap();
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({
+                "from": inside.to_string_lossy(),
+                "to": root.join("note2.md").to_string_lossy(),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "files inside a company root move freely");
+}
+
+/// BLOCKER regression: `safe_path_scoped` only asserts `abs.starts_with(jail)`,
+/// and a jail ROOT trivially satisfies that on ITSELF — so a scoped member could
+/// `DELETE /api/fs/delete` their own company's `root_dir` and `remove_dir_all`
+/// the entire Drive in one request. The root is not secret either: `GET
+/// /api/companies` hands `root_dir` to the member. Same 403 as rename.
+#[tokio::test]
+async fn delete_of_a_company_root_is_403() {
+    let env = setup().await;
+    let root = env.work_dir.join("acme-root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("keep.md"), b"the whole drive").unwrap();
+    db::companies::create(&env.state.pool, "acme", "Acme", &root.to_string_lossy())
+        .await
+        .expect("company row");
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::DELETE,
+            "/api/fs/delete",
+            &json!({ "path": root.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a company root cannot be deleted");
+    assert!(root.is_dir(), "the Drive is still there");
+    assert_eq!(
+        std::fs::read(root.join("keep.md")).unwrap(),
+        b"the whole drive",
+        "and so is its content"
+    );
+
+    // Everything INSIDE the root still deletes freely — this is a guard on one
+    // path, not a blanket deny.
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::DELETE,
+            "/api/fs/delete",
+            &json!({ "path": root.join("keep.md").to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "files inside a company root delete freely");
+    assert!(!root.join("keep.md").exists());
+}
+
+#[tokio::test]
+async fn copy_file_leaves_source_intact() {
+    let env = setup().await;
+    let from = env.work_dir.join("orig.txt");
+    let to = env.work_dir.join("orig (copy).txt");
+    std::fs::write(&from, b"payload").unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/copy",
+            &json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(std::fs::read(&from).unwrap(), b"payload", "source intact");
+    assert_eq!(std::fs::read(&to).unwrap(), b"payload", "copy has the bytes");
+    assert!(audited(&env, "file.copy", &from.to_string_lossy()).await);
+
+    // A second copy onto the same destination is a 409 (the Duplicate flow's
+    // "name (copy 2)" retry hangs off exactly this).
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/copy",
+            &json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn copy_of_a_directory_is_400() {
+    let env = setup().await;
+    let from = env.work_dir.join("adir");
+    std::fs::create_dir(&from).unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/copy",
+            &json!({
+                "from": from.to_string_lossy(),
+                "to": env.work_dir.join("bdir").to_string_lossy(),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "recursive copy is v2");
+    assert!(!env.work_dir.join("bdir").exists());
+}
+
+// ───────────────── PUT /api/file — the `if_modified` lost-update guard ─────────
+
+/// `GET /api/file`'s TEXT branch must carry `modified` — without it the client
+/// has nothing to hand back as `if_modified`.
+#[tokio::test]
+async fn get_file_text_envelope_carries_modified() {
+    let env = setup().await;
+    let target = env.work_dir.join("notes.md");
+    std::fs::write(&target, b"# hi\n").unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed(Method::GET, &format!("/api/file?path={}", enc(&target))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(
+        body["modified"].as_i64().unwrap_or(0) > 0,
+        "text envelope carries a real mtime: {body}"
+    );
+    assert_eq!(body["size"].as_u64(), Some(5));
+}
+
+#[tokio::test]
+async fn put_with_stale_if_modified_is_409_and_leaves_bytes_untouched() {
+    let env = setup().await;
+    let target = env.work_dir.join("shared.md");
+    std::fs::write(&target, b"bot wrote this\n").unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::PUT,
+            "/api/file",
+            &json!({
+                "path": target.to_string_lossy(),
+                "content": "human clobber\n",
+                "if_modified": 1,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "stale mtime → 409");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"bot wrote this\n",
+        "the file on disk is byte-identical"
+    );
+}
+
+#[tokio::test]
+async fn put_with_matching_if_modified_writes() {
+    let env = setup().await;
+    let target = env.work_dir.join("shared.md");
+    std::fs::write(&target, b"v1\n").unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed(Method::GET, &format!("/api/file?path={}", enc(&target))))
+        .await
+        .unwrap();
+    let modified = json_body(resp).await["modified"].as_i64().unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::PUT,
+            "/api/file",
+            &json!({
+                "path": target.to_string_lossy(),
+                "content": "v2\n",
+                "if_modified": modified,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "matching mtime writes");
+    assert_eq!(std::fs::read(&target).unwrap(), b"v2\n");
+    assert_eq!(
+        audit_detail(&env, "file.put", &target.to_string_lossy()).await["if_modified"],
+        json!(modified),
+        "the audit row records the check that ran"
+    );
+}
+
+#[tokio::test]
+async fn put_with_if_modified_zero_on_existing_file_is_409() {
+    let env = setup().await;
+    let target = env.work_dir.join("exists.md");
+    std::fs::write(&target, b"already here\n").unwrap();
+
+    // `0` is the "I am creating a NEW file" assertion.
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::PUT,
+            "/api/file",
+            &json!({
+                "path": target.to_string_lossy(),
+                "content": "overwrite\n",
+                "if_modified": 0,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(std::fs::read(&target).unwrap(), b"already here\n");
+
+    // …and on a genuinely absent path it writes.
+    let fresh = env.work_dir.join("fresh.md");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::PUT,
+            "/api/file",
+            &json!({
+                "path": fresh.to_string_lossy(),
+                "content": "new\n",
+                "if_modified": 0,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "if_modified=0 creates a new file");
+    assert_eq!(std::fs::read(&fresh).unwrap(), b"new\n");
+}
+
+#[tokio::test]
+async fn put_with_if_modified_on_a_vanished_file_is_409() {
+    let env = setup().await;
+    let gone = env.work_dir.join("gone.md");
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::PUT,
+            "/api/file",
+            &json!({
+                "path": gone.to_string_lossy(),
+                "content": "resurrect\n",
+                "if_modified": 1_700_000_000i64,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "file no longer exists → 409");
+    assert!(!gone.exists());
+}
+
+#[tokio::test]
+async fn put_without_if_modified_is_still_a_blind_write() {
+    // Every existing caller keeps working, byte-for-byte.
+    let env = setup().await;
+    let target = env.work_dir.join("legacy.md");
+    std::fs::write(&target, b"old\n").unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::PUT,
+            "/api/file",
+            &json!({ "path": target.to_string_lossy(), "content": "new\n" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(std::fs::read(&target).unwrap(), b"new\n");
+}
+
+#[tokio::test]
+async fn text_limit_is_one_megabyte() {
+    let env = setup().await;
+    let target = env.work_dir.join("big.log");
+    let body_text = "x".repeat(900 * 1024);
+    std::fs::write(&target, &body_text).unwrap();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed(Method::GET, &format!("/api/file?path={}", enc(&target))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["truncated"], false, "900 KB is inside the 1 MB text limit");
+    assert_eq!(body["content"].as_str().unwrap().len(), 900 * 1024);
+}
+
+// ───────────────────── the company-stamped `files` SSE frame ──────────────────
+
+/// R6 — the `files` frame is this app's FIRST company-routed producer, so this
+/// is the first end-to-end proof that `SseEvent::for_company` routing works
+/// against a real subscriber. A frame for a path under company A's root must be
+/// stamped A: unstamped would be a missing update (safe), but a frame stamped
+/// with the WRONG company leaks another company's filenames to a member and
+/// nothing downstream would catch it.
+#[tokio::test]
+async fn files_frame_is_company_stamped_by_path() {
+    use supermux_server::scope::Scope;
+
+    let env = setup().await;
+    let root_a = env.work_dir.join("acme");
+    let root_b = env.work_dir.join("beta");
+    std::fs::create_dir(&root_a).unwrap();
+    std::fs::create_dir(&root_b).unwrap();
+    let a = db::companies::create(&env.state.pool, "acme", "Acme", &root_a.to_string_lossy())
+        .await
+        .expect("company A");
+    let b = db::companies::create(&env.state.pool, "beta", "Beta", &root_b.to_string_lossy())
+        .await
+        .expect("company B");
+
+    let mut rx = env.state.sse_tx.subscribe();
+
+    let target = root_a.join("reports/q3");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/mkdir",
+            &json!({ "path": target.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let frame = rx.try_recv().expect("a files frame was published");
+    assert_eq!(frame.event, "files");
+    assert_eq!(frame.payload["op"], "mkdir");
+    assert_eq!(frame.payload["path"], target.to_string_lossy().into_owned());
+    assert_eq!(
+        frame.payload["dir"],
+        root_a.join("reports").to_string_lossy().into_owned(),
+        "`dir` is computed server-side — the FE never dirname()s"
+    );
+    assert_eq!(frame.company_id, Some(a.id), "stamped with the OWNING company");
+    assert!(Scope::Company(a.id).sees(frame.company_id), "company A sees it");
+    assert!(
+        !Scope::Company(b.id).sees(frame.company_id),
+        "company B must NEVER see company A's filenames"
+    );
+    assert!(Scope::All.sees(frame.company_id), "the owner sees everything");
+}
+
+/// A path under NO company root (HQ) stays unstamped → owner/admin only, because
+/// `Scope::sees(None)` is fail-closed for a scoped human. A missing update is the
+/// safe failure mode.
+#[tokio::test]
+async fn files_frame_outside_any_company_root_is_unstamped() {
+    use supermux_server::scope::Scope;
+
+    let env = setup().await;
+    let root_a = env.work_dir.join("acme");
+    std::fs::create_dir(&root_a).unwrap();
+    let a = db::companies::create(&env.state.pool, "acme", "Acme", &root_a.to_string_lossy())
+        .await
+        .expect("company A");
+
+    let mut rx = env.state.sse_tx.subscribe();
+
+    // `…/acme-corp` is a SIBLING of the company root, not inside it — the
+    // prefix match is `/`-delimited.
+    let target = env.work_dir.join("acme-corp/notes");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/mkdir",
+            &json!({ "path": target.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let frame = rx.try_recv().expect("a files frame was published");
+    assert_eq!(frame.company_id, None, "an HQ path is unstamped");
+    assert!(!Scope::Company(a.id).sees(frame.company_id), "fail-closed for a member");
+    assert!(Scope::All.sees(frame.company_id), "the owner still sees it");
+}
+
+/// Every mutating file handler emits, not just the new verbs.
+#[tokio::test]
+async fn put_delete_and_rename_all_emit_files_frames() {
+    let env = setup().await;
+    let target = env.work_dir.join("live.md");
+
+    let mut rx = env.state.sse_tx.subscribe();
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::PUT,
+            "/api/file",
+            &json!({ "path": target.to_string_lossy(), "content": "hi\n" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let f = rx.try_recv().expect("put emits");
+    assert_eq!((f.event.as_str(), &f.payload["op"]), ("files", &json!("put")));
+
+    let moved = env.work_dir.join("live2.md");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": target.to_string_lossy(), "to": moved.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let f = rx.try_recv().expect("rename emits");
+    assert_eq!(f.payload["op"], "rename");
+    assert_eq!(f.payload["path"], moved.to_string_lossy().into_owned());
+    assert_eq!(
+        f.payload["from"],
+        target.to_string_lossy().into_owned(),
+        "rename carries the old path"
+    );
+
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::DELETE,
+            "/api/fs/delete",
+            &json!({ "path": moved.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let f = rx.try_recv().expect("delete emits");
+    assert_eq!(f.payload["op"], "delete");
+}
+
+/// An OWNER can rename ACROSS company roots (jail `None`). The destination
+/// company's members legitimately learn the new filename — but the frame also
+/// carried `from` verbatim, so company A's naming leaked into company B's
+/// stream. A cross-company `from` is dropped.
+#[tokio::test]
+async fn cross_company_rename_frame_drops_the_foreign_from_path() {
+    let env = setup().await;
+    let root_a = env.work_dir.join("acme");
+    let root_b = env.work_dir.join("beta");
+    std::fs::create_dir(&root_a).unwrap();
+    std::fs::create_dir(&root_b).unwrap();
+    let _a = db::companies::create(&env.state.pool, "acme", "Acme", &root_a.to_string_lossy())
+        .await
+        .expect("company A");
+    let b = db::companies::create(&env.state.pool, "beta", "Beta", &root_b.to_string_lossy())
+        .await
+        .expect("company B");
+
+    let from = root_a.join("acme-secret-codename.md");
+    std::fs::write(&from, b"x").unwrap();
+    let to = root_b.join("moved.md");
+
+    let mut rx = env.state.sse_tx.subscribe();
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the owner may move across roots");
+
+    let frame = rx.try_recv().expect("a files frame was published");
+    assert_eq!(frame.company_id, Some(b.id), "stamped with the DESTINATION's company");
+    assert_eq!(frame.payload["path"], to.to_string_lossy().into_owned());
+    assert_eq!(
+        frame.payload["from"],
+        Value::Null,
+        "company A's path must not ride into company B's stream"
+    );
+
+    // Within ONE company the `from` is kept — it is what lets the client drop
+    // the old row instead of refetching.
+    let inside_from = root_b.join("moved.md");
+    let inside_to = root_b.join("moved2.md");
+    let resp = env
+        .app
+        .clone()
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/fs/rename",
+            &json!({ "from": inside_from.to_string_lossy(), "to": inside_to.to_string_lossy() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let frame = rx.try_recv().expect("a files frame was published");
+    assert_eq!(frame.company_id, Some(b.id));
+    assert_eq!(
+        frame.payload["from"],
+        inside_from.to_string_lossy().into_owned(),
+        "a same-company from is preserved"
+    );
 }

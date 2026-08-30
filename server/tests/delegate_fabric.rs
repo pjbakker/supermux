@@ -458,27 +458,28 @@ async fn every_surfaced_action_writes_a_row_whose_detail_holds_no_prompt_body() 
     make_session(&h, "b4-receiver").await;
     const SECRET: &str = "SECRET-PROMPT-BODY-DO-NOT-LOG";
 
-    // schedule.create — through the real production writer, both actors.
-    let sched = supermux_server::scheduler::create(
+    // workflow.create — through the real production writer, both actors. (This
+    // was `scheduler::create` until Phase 4A; the writer moved, the contract
+    // being defended — the prompt body never reaches the ledger — did not.)
+    let wf = supermux_server::workflows::create(
         &h.state,
-        supermux_server::scheduler::CreateScheduleInput {
+        supermux_server::workflows::CreateWorkflowInput {
             title: "Nightly release watch".into(),
-            prompt: SECRET.into(),
-            session: Some("b4-receiver".into()),
-            kind: Some("tmux".into()),
+            session: "b4-receiver".into(),
             schedule_expr: Some("daily at 09:00".into()),
+            steps: vec![supermux_server::workflows::StepBody {
+                title: "watch".into(),
+                prompt: SECRET.into(),
+                ..Default::default()
+            }],
             ..Default::default()
         },
     )
     .await
-    .expect("create schedule");
-    supermux_server::scheduler::audit_schedule_create(&h.state, &sched, "user").await;
-    supermux_server::scheduler::audit_schedule_create(
-        &h.state,
-        &sched,
-        "agent:b4-receiver",
-    )
-    .await;
+    .expect("create workflow");
+    let sched = wf.workflow;
+    supermux_server::workflows::audit_workflow_create(&h.state, &sched, "user").await;
+    supermux_server::workflows::audit_workflow_create(&h.state, &sched, "agent:b4-receiver").await;
 
     // session.delegate — the detail seam the handler uses.
     db::audit::log(
@@ -500,29 +501,32 @@ async fn every_surfaced_action_writes_a_row_whose_detail_holds_no_prompt_body() 
     .await
     .unwrap();
 
-    // schedule.run, including the failure branch — a failed fire is management
-    // log too, and it must not become the one row that leaks the prompt.
-    for status in ["ok", "error"] {
-        db::audit::log(
-            &h.state.pool,
-            "scheduler",
-            "schedule.run",
-            &sched.id,
-            json!({
-                "kind": "tmux",
-                "status": status,
-                "manual": false,
-                "session": "b4-receiver",
-                "title": sched.title,
-            }),
-        )
-        .await
-        .unwrap();
+    // The run rows, including the failure branch — a failed fire is management
+    // log too, and it must not become the one row that leaks the prompt. Both
+    // spellings are exercised: `workflow.run` is what the engine writes now,
+    // `schedule.run` is what sits in every deployed ledger and stays surfaced.
+    for action in ["schedule.run", "workflow.run"] {
+        for status in ["ok", "error"] {
+            db::audit::log(
+                &h.state.pool,
+                "workflows",
+                action,
+                &sched.id,
+                json!({
+                    "status": status,
+                    "manual": false,
+                    "session": "b4-receiver",
+                    "title": sched.title,
+                }),
+            )
+            .await
+            .unwrap();
+        }
     }
 
     let rows = all_audit(&h).await;
     let actions: Vec<&str> = rows.iter().map(|r| r.action.as_str()).collect();
-    for expected in ["schedule.create", "session.delegate", "schedule.run"] {
+    for expected in ["workflow.create", "session.delegate", "schedule.run", "workflow.run"] {
         assert!(actions.contains(&expected), "{expected} was never audited: {actions:?}");
     }
     // Both delegate actor branches are distinguishable in the ledger.
@@ -621,10 +625,15 @@ async fn an_ordinary_send_or_paste_may_not_forge_a_wrapper() {
 
 /// The exception, stated as a test so it cannot widen by accident: exactly ONE
 /// delivery seam may write a wrapper, and it is the one the harness itself uses
-/// (`agents::delegate` + `scheduler::runner` build the tag, having already
+/// (`agents::delegate` + the workflows engine build the tag, having already
 /// refused forgeable markup in every untrusted field).
+///
+/// Phase 4A split the old `scheduler::runner` caller in two: `workflows::engine`
+/// delivers the STEPS, and `workflows::complete` is the one unit allowed to
+/// originate a send that is not a step (the typed `notify`/`message` endings).
+/// Two callers became three; the list stays closed.
 #[test]
-fn the_wrapper_writing_seam_has_exactly_two_callers() {
+fn the_wrapper_writing_seam_has_exactly_three_callers() {
     let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut callers: Vec<String> = Vec::new();
     for entry in walk(&src) {
@@ -646,8 +655,12 @@ fn the_wrapper_writing_seam_has_exactly_two_callers() {
     callers.sort();
     assert_eq!(
         callers,
-        vec!["agents/delegate.rs".to_string(), "scheduler/runner.rs".to_string()],
-        "a third caller of the unguarded delivery seam is a review question, \
+        vec![
+            "agents/delegate.rs".to_string(),
+            "workflows/complete.rs".to_string(),
+            "workflows/engine.rs".to_string(),
+        ],
+        "a fourth caller of the unguarded delivery seam is a review question, \
          not a refactor — see lifecycle::send_text",
     );
 }

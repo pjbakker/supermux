@@ -66,7 +66,10 @@ export const SSE_NAMED_EVENTS = [
   // The boards list (switcher options) — re-published when a board is
   // created / renamed / deleted / registered for a team.
   'boards',
-  'schedules',
+  // Workflows v1 — list/step deltas (`{change, workflow, session, title, run_id?,
+  // step?, steps?}`). COMPANY-STAMPED server-side, so a bot's own people see it
+  // and not only the owner. An INVALIDATION TICK: `use-workflows.ts` refetches.
+  'workflows',
   'alerts',
   'status',
   'prefs',
@@ -80,6 +83,27 @@ export const SSE_NAMED_EVENTS = [
   // ledger, so they survive a reload. `use-harness-events.ts` subscribes.
   'harness',
   'external-edit',
+  // A file-namespace mutation — payload
+  // `{ op, path, dir, from, session }`, COMPANY-STAMPED by the path's owner
+  // (files v1 spec §3.2), so a member only ever receives frames their jail
+  // already permits. `use-files.ts::useFilesLive` subscribes: it invalidates
+  // the open directory's listing and feeds the Spaces landing's activity line.
+  // This is the app's FIRST company-routed producer — it is emitted through
+  // `SseEvent::for_company`, not the `SseEvent { event: "…" }` struct literal,
+  // which is why `sse-events.test.ts` scrapes both forms.
+  'files',
+  // A company group-chat row landed — payload `{company, seq, ts,
+  // author_session, author_kind}`, emitted through `SseEvent::for_company`
+  // (`companies/groupchat/mod.rs::append`), so a scoped member gets their own
+  // company's tick and nobody else's.
+  //
+  // A BADGE TICK, not the feed: the row's text is NOT in it, deliberately, so a
+  // surface that only needs "something happened in #acme" pays for a `seq`
+  // rather than for a socket. The hero holds the WS and reads its rows for
+  // content; it takes only `seq` from here, and the unread count is
+  // `max(seq seen) − lastRead`, which is idempotent whichever half arrives
+  // first. `components/chat/group-chat/use-group-chat.ts` subscribes.
+  'groupchat',
   // A 10s keep-alive — it only resets the staleness clock.
   'ping',
 ] as const

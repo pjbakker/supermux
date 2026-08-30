@@ -27,7 +27,6 @@ use crate::hosts;
 use crate::prefs;
 use crate::public;
 use crate::push;
-use crate::scheduler;
 use crate::sessions;
 use crate::sse;
 use crate::state::AppState;
@@ -55,6 +54,10 @@ pub fn router(state: AppState) -> Router {
         // never hold the dashboard bearer), plus the grant check and the drive
         // lock inside the handler.
         .merge(crate::connectors::browser::tools::router_for(state.clone()))
+        // The group-chat tool endpoint. Same no-bearer, per-session-hook-token
+        // family as the browser's: the caller is an MCP server running inside a
+        // pane, which must never hold the dashboard bearer.
+        .merge(crate::connectors::groupchat::tools::router_for(state.clone()))
         // Claude hook ingestion — NO bearer layer; auth is the per-session
         // `X-Supermux-Hook-Token` validated in the handler.
         .merge(hooks::router_for(state.clone()))
@@ -67,11 +70,13 @@ pub fn router(state: AppState) -> Router {
         // `X-Supermux-Hook-Token` auth as the status hook, plus the scope rule
         // (an agent may only mutate its own session's issue).
         .merge(board::hook_router_for(state.clone()))
-        // Agent→scheduler hook (`/api/hook/schedule/done`) — NO bearer layer; SAME
-        // per-session `X-Supermux-Hook-Token` auth + scope (an agent may only
-        // confirm a schedule that targets its own session). The agent-confirmed
-        // finish tier for "notify me when done" schedules.
-        .merge(scheduler::hook_router_for(state.clone()))
+        // Agent→workflows hook (`/api/hook/workflow/{step-done,create}`, plus the
+        // PERMANENT `/api/hook/schedule/{done,create}` aliases a live pane's
+        // footer still names) — NO bearer layer; SAME per-session
+        // `X-Supermux-Hook-Token` auth + scope (an agent may only confirm a run
+        // in its own pane). The agent-confirmed finish tier, which in a chain
+        // decides whether step k+1 ever happens.
+        .merge(crate::workflows::hook::router_for(state.clone()))
         // Bot→app capability hooks (`/api/hook/notify`, `/api/hook/delegate`) —
         // NO bearer layer; SAME per-session `X-Supermux-Hook-Token` auth, each
         // scope-locked to the calling session's own pane / same-company peers.
@@ -156,7 +161,7 @@ pub fn router(state: AppState) -> Router {
 /// .merge(sessions::router_for(state.clone()))
 /// .merge(board::router_for(state.clone()))
 /// .merge(files::router_for().with_state(state.clone()))
-/// .merge(scheduler::router_for(state.clone()))
+/// .merge(workflows::router_for(state.clone()))
 /// .merge(agents::router_for(state.clone()))
 /// ```
 fn protected_router(state: AppState) -> Router {
@@ -172,9 +177,20 @@ fn protected_router(state: AppState) -> Router {
         // provided); `.with_state` resolves it to `Router<()>` so it merges
         // alongside the already-stateful sessions router.
         .merge(files::router_for().with_state(state.clone()))
-        // Scheduler CRUD — P3d owner/admin-only (the agent→scheduler HOOK router,
-        // merged outside the bearer layer in `router`, is unaffected).
-        .merge(scheduler::router_for(state.clone()).route_layer(from_fn(require_admin_mw)))
+        // `/api/schedules` — the legacy READ-SHIM: three GETs projected from the
+        // workflows tables in the old JSON shape, `410 Gone` on every write. It
+        // exists so a PWA wedged on a stale bundle renders a correct-if-
+        // simplified list instead of crashing, and is told to reload rather
+        // than redirected (a 307 on POST re-plays a mutating body against a
+        // different contract). Still P3d owner/admin-only, exactly as the
+        // scheduler router was — `member_may_reach` does not name it. DELETE in
+        // the release after v1 (spec §5.2).
+        .merge(crate::workflows::shim::router_for(state.clone()).route_layer(from_fn(require_admin_mw)))
+        // Workflows CRUD — deliberately NOT `require_admin`-gated: a company
+        // member must be able to see and drive their own bot's workflows, so the
+        // fence is the per-handler `Scope::sees` 404 plus the `member_may_reach`
+        // allowlist entry (spec §5.1) rather than a blanket owner-only layer.
+        .merge(crate::workflows::router_for(state.clone()))
         .merge(sse::router_for(state.clone())) // GET /api/events SSE stream
         .merge(teams::router_for(state.clone())) // GET /api/teams + settings
         .merge(agents::router_for(state.clone()))
@@ -194,6 +210,16 @@ fn protected_router(state: AppState) -> Router {
         // (a member may grant `@company:<their id>` / an own-company session, but
         // not `*` / another company / a global connector definition).
         .merge(crate::connectors::router_for(state.clone()))
+        // Shared-browser WORKSPACE (`/api/browser/tabs…`) — the HUMAN's door:
+        // tab CRUD + per-tab grants, bearer-gated, owner/admin-only. The agent's
+        // door is the hook-token `/api/hook/browser/tool` router merged above;
+        // keeping them apart is what stops a bot granting itself a tab. The
+        // prefix is deliberately absent from `scope::member_may_reach`, so a
+        // member also hits the deny-by-default 404.
+        .merge(
+            crate::connectors::browser::api::router_for(state.clone())
+                .route_layer(from_fn(require_admin_mw)),
+        )
         // P2a connector-OAuth: guided per-company OAuth-app REGISTRATION
         // (`/api/oauth/apps`, owner/admin-only via `require_admin` INSIDE each
         // handler — a NEW prefix, deliberately absent from `member_may_reach`, so

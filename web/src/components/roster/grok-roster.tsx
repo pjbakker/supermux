@@ -57,7 +57,7 @@ import { NewSessionSheet } from '@/components/session-tile/new-session-sheet'
 import { SessionFace } from '@/components/roster/session-face'
 import { TeamCrewChip } from '@/components/team/team-crew-chip'
 import { SessionMark } from '@/brand/marks'
-import { attentionFor, markStateForSession, subagentsClause } from '@/lib/mark-status'
+import { attentionFor, markStateForSession } from '@/lib/mark-status'
 import { smartSort, nameSort } from '@/lib/overview-layout'
 import { useArmedConfirm } from '@/hooks/use-armed-confirm'
 import { useToast } from '@/components/ui/use-toast'
@@ -73,8 +73,8 @@ import {
 import {
   groupSessions,
   groupTeamsByTier,
-  rosteredTeams,
-  totalBotCount,
+  stateWordFor,
+  type GroupKey,
   type LeadSignal,
 } from '@/lib/team-attention'
 import { useUI } from '@/stores/ui-store'
@@ -83,9 +83,9 @@ import {
   resolveActiveCompany,
   inCompanyScope,
   companyFirstOrder,
-  companiesNeedingAttention,
 } from '@/lib/companies'
-import { CompanySwitcher } from '@/components/roster/company-switcher'
+import { GroupChatEntry, routerName } from '@/components/chat/group-chat'
+import { ScopeTitle } from '@/components/roster/company-switcher'
 import { NavBadgeDot } from '@/components/layout'
 import { useUpdateBadge } from '@/hooks/use-update-badge'
 import { agentHueVars } from '@/lib/grok-agent-hue'
@@ -95,6 +95,8 @@ import { useTheme } from '@/components/theme-provider'
 // The per-bot settings page. Lazy — it only mounts once a bot is selected (a
 // detail pane on desktop), so its section bodies (issues, schedules, git,
 // session-actions) never weigh on the roster's first paint.
+import type { TabKey as BotPanelTabKey } from '@/components/roster/bot-panel'
+
 const BotPanel = React.lazy(() =>
   import('@/components/roster/bot-panel').then((m) => ({ default: m.BotPanel })),
 )
@@ -140,7 +142,7 @@ type Sel =
 
 /** The bot-panel's tab keys — mirrors `BotPanelProps['initialTab']` so a deep-link
  *  from the roster can seat a specific tab. */
-type BotTab = 'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
+type BotTab = BotPanelTabKey
 
 /** The pane's SUBJECT as a stable string — what the "reset the pane to the
  *  thread" guard compares across renders (objects never compare equal).
@@ -221,31 +223,6 @@ function ctxPct(tokens?: number): number | null {
 }
 function rcClass(pct: number): string {
   return pct < 50 ? 'rc-ok' : pct < 80 ? 'rc-mid' : 'rc-hot'
-}
-
-type GroupKey = 'needs' | 'active' | 'done' | 'idle'
-
-interface StateWord {
-  word: string
-  cls: string
-}
-
-/** The coloured state WORD — the firewall's status half, never the agent hue
- *  (overview.md §3 law 3: state is a coloured word + the mark's face). */
-function stateWordFor(s: ApiSession, group: GroupKey): StateWord {
-  if (group === 'needs') {
-    if (s.status === 'error' || s.blocked) return { word: 'blocked', cls: 'st-block' }
-    return { word: 'needs you', cls: 'st-need' }
-  }
-  if (s.status === 'active' || s.status === 'starting') return { word: 'working' + subagentsClause(s.subagents), cls: 'st-work' }
-  if (s.status === 'error') return { word: 'blocked', cls: 'st-block' }
-  if (s.status === 'stopped') return { word: 'stopped', cls: 'st-idle' }
-  // A background workflow still running after the main turn settled: the row is
-  // bucketed active by `groupSessions`, so say WORKING (with the parallelism
-  // clause when it is available) rather than done/idle.
-  if (s.subagents_live) return { word: 'working' + subagentsClause(s.subagents), cls: 'st-work' }
-  if (group === 'done') return { word: 'done', cls: 'st-done' }
-  return { word: 'idle', cls: 'st-idle' }
 }
 
 function matches(s: ApiSession, needle: string): boolean {
@@ -337,7 +314,7 @@ export const GrokRow = React.memo(function GrokRow({ session, group, active, onO
           }
         }}
         aria-keyshortcuts="Shift+F10"
-        aria-label={`Open ${name} — ${sw.word}`}
+        aria-label={`Open ${name} — ${sw.word}${sw.agents}`}
       />
       {/* The anchored actions menu (restored). Its hover kebab is the desktop
           affordance; on touch it is opened by the long-press above and by
@@ -372,7 +349,7 @@ export const GrokRow = React.memo(function GrokRow({ session, group, active, onO
           </span>
           <span className="l2">
             <span className="pv">
-              <span className={`st ${sw.cls}`}>{sw.word}</span>
+              <span className={`st ${sw.cls}`}>{sw.word}{sw.agents}</span>
               {preview ? <> · {preview}</> : null}
             </span>
             {tokens && <span className="cost">{tokens}</span>}
@@ -697,6 +674,17 @@ export default function GrokRoster() {
     [activeCompanyRow, resolvedTheme],
   )
 
+  // The group chat's MEMBERS — every bot that belongs to the active company,
+  // read off the same live sessions list the rows below use (so a face in the
+  // pile and the same face in the list can never disagree about status). Not the
+  // search-filtered list: typing in the roster's search must not empty the
+  // channel's facepile.
+  const companySessions = React.useMemo(
+    () =>
+      activeCompany === null ? [] : allSessions.filter((s) => s.company_id === activeCompany),
+    [allSessions, activeCompany],
+  )
+
   const [rawQuery, setRawQuery] = React.useState('')
   const [sort, setSort] = React.useState<'smart' | 'alpha'>('smart')
   const [density, setDensity] = React.useState<Density>(readDensity)
@@ -789,16 +777,34 @@ export default function GrokRoster() {
   )
   const groups = React.useMemo(() => groupSessions(sorted, needNames), [sorted, needNames])
 
-  // Per-company attention for the switcher's need-you dots — the cross-company
-  // awareness the scoped census (above) intentionally drops. Computed from the
-  // FULL, UNFILTERED roster (`allSessions`, so scope/search never hide a signal)
-  // and REUSING the roster's own needs-you predicate (`needNames` — the same
-  // app-wide rollup the NEEDS YOU section and header count read), so there is
-  // exactly ONE definition of "needs you". `null` in the set = HQ needs you.
-  const companyAttention = React.useMemo(
-    () => companiesNeedingAttention(allSessions, (name) => needNames.has(name)),
-    [allSessions, needNames],
-  )
+  // SWITCHING COMPANY RE-HOMES THE PANE. The rail's scope (`activeCompany`) only
+  // ever filtered the LIST; the open agent was left untouched, so after a switch
+  // you kept staring at a bot from the company you just left — it stayed resolved
+  // because `selectedSession` looks it up in the full roster, not the scoped one.
+  // Reconcile here, in render (previous-value-in-state, the same "adjust state
+  // while rendering" pattern the pane-reset below uses — never an effect, so the
+  // stale bot is never painted for even one frame): when the open selection no
+  // longer belongs to the new scope, open the company's TOP agent — the first row
+  // the rail shows, in its own attention order (needs → active → done → idle) —
+  // or clear the pane when the company has no bots. A global search lifts scoping
+  // (`hasQuery`), so it never re-homes; and a selection that IS in scope (you
+  // switched INTO the company that owns it) is kept as-is.
+  const [scopeAt, setScopeAt] = React.useState(activeCompany)
+  if (activeCompany !== scopeAt) {
+    setScopeAt(activeCompany)
+    if (!hasQuery && selected) {
+      const stillInScope =
+        selected.kind === 'bot'
+          ? filtered.some((s) => s.name === selected.name)
+          : filteredTeams.some((t) => t.team_name === selected.team)
+      if (!stillInScope) {
+        const top =
+          groups.needs[0] ?? groups.active[0] ?? groups.done[0] ?? groups.idle[0] ?? null
+        setSelected(top ? { kind: 'bot', name: top.name } : null)
+      }
+    }
+  }
+
 
   // OD-2 = FOLD: a team is no longer a leading divider — it sorts into the SAME
   // four sections as a bot, by its own derived attention (`team-attention.ts`).
@@ -823,7 +829,6 @@ export default function GrokRoster() {
   // section PLUS teams in the needs section — so the header can never disagree
   // with what the sections show (the property the old two-ordering split
   // violated: R7/R8).
-  const needCount = groups.needs.length + teamGroups.needs.length
   // The VISIBLE list is empty when neither a (rostered) team nor any session
   // survives the current filter — the honest trigger for the empty state (jury
   // d). `totalBots` counts the UNFILTERED roster, so it cannot answer "did this
@@ -1039,10 +1044,6 @@ export default function GrokRoster() {
   // search-aware), so the two stay in lockstep while searching too. All-HQ (no
   // companies) ⇒ `filtered` is every session and `filteredTeams` every team, so
   // this is byte-identical to the old unfiltered census — behaviour-neutral.
-  const totalBots = totalBotCount(filtered.length, filteredTeams)
-  // The crew census the folded roster no longer says with a divider (OD-2) —
-  // scoped to the crews whose lead is in the active company.
-  const crewCount = rosteredTeams(filteredTeams).length
   const hasDetail = !!selectedSession || !!selectedTeam
 
   const SECTIONS: { key: GroupKey; label: string }[] = [
@@ -1063,24 +1064,11 @@ export default function GrokRoster() {
       style={headH ? ({ '--gr-head-h': `${headH}px` } as React.CSSProperties) : undefined}
     >
       <header className="gr-head" ref={headRef}>
-        {/* The HQ/company scope chip is the overview TITLE — the leftmost
-            identity. The old `.gr-brand` wordmark (a rainbow spark tile + the
-            literal "supermux") was dropped: the switcher already renders the
-            active scope's name (`active.display_name` or "HQ") next to its mark,
-            so the active TEAM name leads instead of a static wordmark. HQ now
-            shows the real blue-S brand `<Logo>` (via `<HqMark>`), not the
-            invented spark. */}
-        <CompanySwitcher attention={companyAttention} />
-        <span className="gr-count">
-          {totalBots} {totalBots === 1 ? 'bot' : 'bots'}
-          {crewCount > 0 && ` · ${crewCount} ${crewCount === 1 ? 'crew' : 'crews'}`}
-          {needCount > 0 && (
-            <>
-              {' · '}
-              <b>{needCount} need you</b>
-            </>
-          )}
-        </span>
+        {/* The overview TITLE — the active scope's mark + name, READ-ONLY. The
+            switch itself moved to the nav scope circle (the WHOOP corner slot),
+            so the scope is out of every header — this just reflects it. HQ shows
+            the real blue-S brand `<HqMark>`; a company shows its `<CompanyMark>`. */}
+        <ScopeTitle />
 
         {/* The create verb — a LABELLED accent-filled primary pill, left-anchored
             next to the count so the next action reads as an action, not a lone
@@ -1195,6 +1183,28 @@ export default function GrokRoster() {
         </span>
       </header>
 
+      {/* ── THE COMPANY GROUP CHAT DOORWAY (spec §7.3, rev) ──────────────────
+          One COMPACT row between the header and the two-pane body — NOT the
+          embedded hero it used to be. The channel is a destination now: this row
+          shows `#slug`, the member count and the latest line with an unread
+          badge, and tapping it opens the full-bleed `/company/:id/chat` page
+          where the chat has the whole screen. That ends the "worst of both
+          worlds": the overview keeps its room, and the chat gets its own.
+
+          Gated on the Router's existence (the same enablement read the entry
+          makes) so HQ and a company that never opted in add ZERO DOM — no empty
+          padded strip above the roster. */}
+      {activeCompanyRow &&
+        companySessions.some((s) => s.name === routerName(activeCompanyRow.slug)) && (
+          <div className="gc-dock flex-none px-3 pb-2" style={railHueStyle}>
+            <GroupChatEntry
+              company={activeCompanyRow}
+              sessions={companySessions}
+              onOpen={() => navigate(`/company/${activeCompanyRow.id}/chat`)}
+            />
+          </div>
+        )}
+
       <div className="gr-two">
         <div
           className="gr-rail"
@@ -1209,31 +1219,11 @@ export default function GrokRoster() {
             data-fade-top={fade.top ? '' : undefined}
             data-fade-bottom={fade.bottom ? '' : undefined}
           >
-            {/* Persistent HIRE affordance — a ghost row pinned above the first
-                section. Dashed hairline + placeholder mark, always inviting the
-                next hire (not just the zero-bots hint). Hidden while searching
-                (it is a create verb, not a result) and, via CSS, in the compact
-                feed density. ALSO hidden when the list is EMPTY: the zero-bots
-                empty state below already carries its own primary "New bot" CTA,
-                and showing both left TWO create CTAs competing on one screen
-                (sweep 4a). One primary — the centred empty-state verb when there
-                are no bots, this persistent ghost once bots exist. */}
-            {!needle && !listEmpty && (
-              <button
-                type="button"
-                className="gr-ghost grok-row-enter"
-                aria-label="Hire a new bot"
-                onClick={() => setSheetOpen(true)}
-              >
-                <span className="gr-ghost-mark" aria-hidden>
-                  <Plus size={18} aria-hidden />
-                </span>
-                <span className="gr-ghost-col">
-                  <span className="gr-ghost-t">Hire a new bot</span>
-                  <span className="gr-ghost-s">Give it a name and a job.</span>
-                </span>
-              </button>
-            )}
+            {/* The persistent "Hire a new bot" ghost row was removed (owner): with
+                bots present the header's own New-bot button is the single create
+                affordance, and the zero-bots empty state below still carries its
+                centred hire CTA — so a hire prompt shows ONLY when there are no
+                bots, never as a standing dashed card competing with the list. */}
 
             {/* No "Hire a crew" create verb: Claude starts a team itself when a
                 job needs one — teams are not created from the interface. An
@@ -1416,7 +1406,9 @@ export default function GrokRoster() {
             <div className="gr-pane-empty">
               <div>
                 <Sparkles size={22} style={{ opacity: 0.5, marginBottom: 10 }} aria-hidden />
-                <div>Select a colleague to see cost, context and their latest.</div>
+                {/* Names what the panel now shows. It used to advertise "cost,
+                  context" — the two fields the rebuild deleted as unproducible. */}
+              <div>Select a colleague to see what they’re doing and set them up.</div>
               </div>
             </div>
           </div>

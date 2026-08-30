@@ -27,6 +27,7 @@ pub mod host_pool;
 pub mod lifecycle;
 pub mod login;
 pub mod memory;
+pub mod move_company;
 pub mod pty;
 pub mod pty_state;
 pub mod recall;
@@ -119,6 +120,11 @@ pub fn router_for(state: AppState) -> Router {
         .route("/api/sessions/{name}/purge", axum::routing::delete(purge_handler))
         .route("/api/sessions/{name}/duplicate", post(duplicate_handler))
         .route("/api/sessions/{name}/config", patch(config_handler))
+        // Move a bot between companies (HQ ↔ company ↔ company). Owner/admin only
+        // — the guard is INSIDE the handler (403 for a scoped member), on top of
+        // the P3b funnel below. Sits next to `config` because it, too, returns
+        // `restart_required`.
+        .route("/api/sessions/{name}/company", post(move_company::handler))
         // ── tmux lifecycle ──
         .route("/api/sessions/{name}/start", post(start_handler))
         .route("/api/sessions/{name}/stop", post(stop_handler))
@@ -368,6 +374,25 @@ pub struct SessionView {
     /// common case) so a resting session's wire shape is unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub subagents_live: bool,
+    /// **Which subagents are actually running, and what each is doing** — the
+    /// per-agent rows ([`crate::state::AgentRun`]), keyed by Claude's own
+    /// `agent_id`. Unlike `subagents` (a number that a lost `SubagentStop` can
+    /// pin, and that says nothing about WHICH children exist) a row exists only
+    /// because a hook carrying that exact id arrived, so it cannot be a ghost.
+    /// This is what every surface renders; the count stays on the wire for the
+    /// status/notification paths that already read it.
+    ///
+    /// DISPLAY-ONLY: derived here at serialization time and consumed only by
+    /// presentational components. Omitted when empty (the common case) so a
+    /// resting session's wire shape is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub agents: Vec<crate::state::AgentRow>,
+    /// `agents.len()`, pre-derived: every surface that only draws the calm
+    /// `· N agents` clause (tile, roster, focus header, quick-peek) reads this
+    /// integer, and only the chat's working row — which LISTS the children —
+    /// takes the rows. Same display-only posture, omitted when 0.
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub agents_live: u32,
     /// The LIVE permission dialog, from the `PermissionRequest` hook: Claude is
     /// displaying a permission prompt for this tool call and is blocked on a
     /// human. In-memory only; cleared as soon as anything proves the dialog
@@ -581,6 +606,11 @@ fn view(
     // truth — the tailer's `subagent_active_at` map — lives on the state the
     // caller holds, not on `act`).
     subagents_live: bool,
+    // The per-agent rows as of the caller's `now`
+    // ([`crate::state::AppState::agent_rows`]). Threaded in for the same reason
+    // as `subagents_live`: its ground truth is a map on the state, and `view`
+    // stays a pure function of its arguments.
+    agents: Vec<crate::state::AgentRow>,
     // The statusline snapshot, when the opt-in tap is installed AND has fired
     // for this session. Threaded in rather than fetched here so `view` stays a
     // pure function of its arguments (every caller already holds the state).
@@ -653,6 +683,8 @@ fn view(
         activity_kind: act.as_ref().and_then(|a| a.activity_kind.clone()),
         subagents: act.as_ref().map(|a| a.subagents).unwrap_or(0),
         subagents_live,
+        agents_live: agents.len() as u32,
+        agents,
         permission_request: act.as_ref().and_then(|a| {
             a.permission.as_ref().map(|ask| PermissionRequestInfo {
                 tool: ask.tool.clone(),
@@ -974,6 +1006,7 @@ pub async fn list(state: &AppState) -> Result<Vec<SessionView>, AppError> {
                 rt_map.get(&s.name),
                 state.session_activity(&s.name),
                 state.subagents_live(&s.name),
+                state.agent_rows_now(&s.name),
                 state.statusline(&s.name),
             )
         })
@@ -990,6 +1023,7 @@ pub async fn get(state: &AppState, name: &str) -> Result<SessionView, AppError> 
         rt.as_ref(),
         state.session_activity(name),
         state.subagents_live(name),
+        state.agent_rows_now(name),
         state.statusline(name),
     ))
 }
@@ -1013,6 +1047,7 @@ pub async fn list_archived(state: &AppState) -> Result<Vec<SessionView>, AppErro
                 rt_map.get(&s.name),
                 state.session_activity(&s.name),
                 state.subagents_live(&s.name),
+                state.agent_rows_now(&s.name),
                 state.statusline(&s.name),
             )
         })
@@ -1461,17 +1496,17 @@ pub async fn duplicate(
             }
         }
     }
-    // T6.2 — the schedules come too, DISABLED. Before B5 no child row was
-    // cloned at all, so "duplicate this agent" silently dropped its jobs. They
-    // arrive disabled because a copy that immediately starts firing cron jobs
-    // is a surprise, and the framing is "a bot is its own template", not "its
-    // own daemon" — the UI says so at the call site.
-    match db::schedules::copy_for_session(&state.pool, src, new_name).await {
+    // T6.2 — the workflows come too, WITH THEIR STEPS, DISABLED. Before B5 no
+    // child row was cloned at all, so "duplicate this agent" silently dropped
+    // its jobs. They arrive disabled because a copy that immediately starts
+    // firing is a surprise, and the framing is "a bot is its own template", not
+    // "its own daemon" — the UI says so at the call site.
+    match db::workflows::copy_for_session(&state.pool, src, new_name).await {
         Ok(0) => {}
-        Ok(n) => tracing::info!(src = %src, new = %new_name, schedules = n, "duplicate: copied schedules (disabled)"),
-        // Best-effort: a session without its schedules is still a usable copy,
+        Ok(n) => tracing::info!(src = %src, new = %new_name, workflows = n, "duplicate: copied workflows (disabled)"),
+        // Best-effort: a session without its workflows is still a usable copy,
         // and failing the whole duplicate over them would be worse.
-        Err(e) => tracing::warn!(src = %src, error = %e, "duplicate: could not copy schedules"),
+        Err(e) => tracing::warn!(src = %src, error = %e, "duplicate: could not copy workflows"),
     }
     let hook_token = gen_hook_token();
     db::sessions::ensure_runtime(&state.pool, new_name, &hook_token).await?;
@@ -2288,7 +2323,7 @@ async fn seen_handler(
 
 /// `POST /api/sessions/{name}/restart` — atomic stop→start (rung 2).
 ///
-/// Preserves the conversation, worktree and schedules; destroys the live pty.
+/// Preserves the conversation, worktree and workflows; destroys the live pty.
 /// Exists because two clients composed this differently, and because a composed
 /// stop+start leaves a window in which the auto-healer can race the user.
 async fn restart_handler(
@@ -2319,7 +2354,7 @@ async fn recover_handler(
 
 /// `POST /api/sessions/{name}/reset` — a fresh runtime (rung 3).
 ///
-/// Preserves the worktree, schedules and config; destroys the conversation and
+/// Preserves the worktree, workflows and config; destroys the conversation and
 /// scrollback. Refuses a RUNNING session with a 409 rather than resetting under
 /// a live pty — see `lifecycle::reset` for why that split-brain is worse than
 /// the refusal.

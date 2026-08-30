@@ -97,6 +97,13 @@ pub fn router_for(state: AppState) -> Router {
             "/ws/sessions/{name}/chat",
             get(crate::sessions::chat::ws::handle_chat_ws),
         )
+        // The per-COMPANY group-chat channel — same in-band first-frame auth,
+        // same seed→live boundary, fed by the company's sidecar log instead of
+        // a session transcript (there is no tailer: the server is the writer).
+        .route(
+            "/ws/companies/{id}/groupchat",
+            get(crate::companies::groupchat::handle_groupchat_ws),
+        )
         // Resolve `%id` from `~/.claude/teams/{team}/config.json` members[] and
         // validate it against the lead's window before streaming. The
         // frontend opens this; an optional `?pane_id=%id` query lets a caller that
@@ -298,8 +305,9 @@ async fn handle_team_socket(
     //     legitimately accept are Resize anyway.
     //     See `.claude/peek-diff-audit.md` Deferred #2 and
     //     `.claude/team-lead-mobile-width-audit.md` for the full rationale.
-    if let Err(()) =
-        peek_initial_resize(&mut socket, &state, &resolved.lead_session, &rt, Some(&tmux)).await
+    if peek_initial_resize(&mut socket, &state, &resolved.lead_session, &rt, Some(&tmux))
+        .await
+        .is_err()
     {
         return;
     }
@@ -622,7 +630,7 @@ async fn handle_socket(
     //    task exists (strict in-order delivery — never dropped). The companion
     //    client change batches `[auth, resize]` together so this peek almost
     //    always finds the resize within an RTT.
-    let held_first_frame = match peek_initial_resize(
+    let peeked = match peek_initial_resize(
         &mut socket,
         &state,
         &name,
@@ -631,9 +639,13 @@ async fn handle_socket(
     )
     .await
     {
-        Ok(h) => h,
+        Ok(p) => p,
         Err(_) => return,
     };
+    let held_first_frame = peeked.held;
+    // The geometry the pty is at as far as THIS socket is concerned. See the
+    // `Resize` arm below: a client that repeats it is not resizing anything.
+    let mut socket_geom = peeked.applied;
 
     // Cross-session-leak catcher (instrumentation). Resolve the seed's tmux
     // target to the session tmux ACTUALLY maps it to; if that isn't this
@@ -770,11 +782,39 @@ async fn handle_socket(
                                         // self-heals. A drag keeps pushing the
                                         // deadline out → one resync at the final
                                         // geometry, not one per intermediate step.
-                                        ClientMsg::Resize { .. } => {
-                                            resync_deadline =
-                                                Some(Instant::now() + RESYNC_SETTLE);
-                                            if input_tx.send(cmd).is_err() {
-                                                break;
+                                        // A SAME-SIZE RESIZE IS NOT A RESIZE
+                                        // (owner report: a doubled, spliced
+                                        // footer hint on an interactive
+                                        // question). Every attach used to carry
+                                        // the SAME cols×rows two or three times
+                                        // — batched with `auth`, pushed again on
+                                        // `auth_ok`, pushed a third time by the
+                                        // observer's first fit — and each one
+                                        // re-forked `tmux resize-window`, whose
+                                        // `refresh-client` makes tmux schedule a
+                                        // redraw, which makes an inline TUI
+                                        // re-emit its whole screen. Arming the
+                                        // debounced re-seed on top of that lands
+                                        // a full snapshot in the MIDDLE of the
+                                        // repaint it caused, and a
+                                        // cursor-relative repaint applied over a
+                                        // re-seeded screen rewrites lines at the
+                                        // wrong column with no erase.
+                                        //
+                                        // The client now sends one resize per
+                                        // attach; this is the belt, because this
+                                        // server serves older bundles and other
+                                        // clients too. A geometry that genuinely
+                                        // changed still resizes AND still arms
+                                        // the auto-heal, unchanged.
+                                        ClientMsg::Resize { cols, rows } => {
+                                            if socket_geom != Some((cols, rows)) {
+                                                socket_geom = Some((cols, rows));
+                                                resync_deadline =
+                                                    Some(Instant::now() + RESYNC_SETTLE);
+                                                if input_tx.send(cmd).is_err() {
+                                                    break;
+                                                }
                                             }
                                         }
                                         // Copy-mode-over-web: a windowed, READ-ONLY
@@ -897,6 +937,15 @@ enum Apply {
 /// `web/src/hooks/use-live-term.ts`); together they make the happy path
 /// "resize-then-seed" instead of "seed-with-stale-geometry-then-resize".
 ///
+/// What the pre-seed peek found on the wire.
+#[derive(Default)]
+struct PeekedFirstFrame {
+    /// A non-resize first frame, to be re-queued once the input task exists.
+    held: Option<ClientMsg>,
+    /// The geometry the peek APPLIED to the pty, if it applied one.
+    applied: Option<(u16, u16)>,
+}
+
 /// `pane` mirrors the same fork that [`apply_one`] makes: when the WS is
 /// pinned to a tmux pane (Agent Teams lead OR teammate), the resize must hit
 /// `resize-pane -t %id` so ONLY the subscribed pane is sized to the client's
@@ -908,11 +957,14 @@ enum Apply {
 /// `resize_pane` is deliberately absent from [`SessionRuntime`]: split-window
 /// panes are a tmux-only concept, so the pane arm keeps a concrete [`Tmux`].
 ///
-/// Returns `Ok(held)`:
-/// - `Ok(None)` — peek timed out OR the peeked frame was a `Resize` we already
+/// Returns `Ok(PeekedFirstFrame)`:
+/// - `held: None` — peek timed out OR the peeked frame was a `Resize` we already
 ///   applied. Caller proceeds to seed at the (possibly resized) geometry.
-/// - `Ok(Some(msg))` — a non-resize frame arrived; hold it so the caller can
+/// - `held: Some(msg)` — a non-resize frame arrived; hold it so the caller can
 ///   enqueue it on the input task once that task's channel exists.
+/// - `applied` — the geometry this peek put on the pty, so the caller can tell a
+///   client REPEATING it (every attach used to send the same cols×rows two or
+///   three times) from one that genuinely changed it.
 /// - `Err(())` — the socket errored / closed mid-peek; caller should return
 ///   (the connection is already done).
 ///
@@ -925,11 +977,11 @@ async fn peek_initial_resize(
     name: &str,
     rt: &dyn SessionRuntime,
     pane: Option<&Tmux<'_>>,
-) -> Result<Option<ClientMsg>, ()> {
+) -> Result<PeekedFirstFrame, ()> {
     let inbound = match tokio::time::timeout(PRESEED_RESIZE_PEEK, socket.recv()).await {
         // Peek window expired. Common when the client never sends a resize
         // (legacy/test client) or hasn't finished its first paint yet.
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(PeekedFirstFrame::default()),
         // Socket closed cleanly or errored: tear down.
         Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return Err(()),
         Ok(Some(Ok(msg))) => msg,
@@ -939,13 +991,13 @@ async fn peek_initial_resize(
         // Ping is auto-ponged by the transport; Binary/Pong on the client→server
         // direction aren't part of the wire protocol. Treat as "no resize seen"
         // — don't hold (nothing to apply), don't drop a real input.
-        _ => return Ok(None),
+        _ => return Ok(PeekedFirstFrame::default()),
     };
     let cmd = match serde_json::from_str::<ClientMsg>(text.as_str()) {
         Ok(c) => c,
         // Malformed JSON: same as "no resize". Don't hold; the client will
         // either keep talking or we'll close on inbound-silence.
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(PeekedFirstFrame::default()),
     };
     match cmd {
         ClientMsg::Resize { cols, rows } => {
@@ -964,14 +1016,20 @@ async fn peek_initial_resize(
             if let Err(e) = res {
                 tracing::debug!(session = %name, error = %e, "pre-seed resize failed");
             }
-            Ok(None)
+            Ok(PeekedFirstFrame {
+                held: None,
+                applied: Some((cols, rows)),
+            })
         }
         // Any other first-frame-after-auth (Input typed before WS open, a
         // client Ping, etc.) is held; the caller queues it onto the input
         // task's mpsc the moment that channel exists. Strict in-order
         // delivery: nothing was applied between auth and this frame, and the
         // queue is drained in arrival order under the per-session lock.
-        other => Ok(Some(other)),
+        other => Ok(PeekedFirstFrame {
+            held: Some(other),
+            applied: None,
+        }),
     }
 }
 
@@ -1918,6 +1976,76 @@ mod reattach_reseed_tests {
                     .contains("send_seed_then_done"),
             "the resync tick must re-push the authoritative seed",
         );
+    }
+}
+
+#[cfg(test)]
+mod same_size_resize_tests {
+    //! A SAME-SIZE RESIZE MUST NOT ARM A RE-SEED (owner report: an interactive
+    //! question's footer hint rendered doubled and spliced —
+    //! `… Esc totcancelselect · … · Esc to cancel`).
+    //!
+    //! Every attach used to carry the SAME cols×rows two or three times (the
+    //! client batched one with `auth`, pushed another on `auth_ok`, and its
+    //! ResizeObserver's first fit pushed a third). Each one re-forked
+    //! `tmux resize-window`, whose `refresh-client` makes tmux schedule a redraw
+    //! even at an unchanged size; an inline TUI answers a redraw by re-emitting
+    //! its whole screen; and this loop armed a full mid-stream re-seed 300ms
+    //! after any resize, which then landed in the MIDDLE of that repaint. A
+    //! cursor-relative repaint applied over a re-seeded screen rewrites lines at
+    //! the wrong column with no erase — a duplicated tail with a mangled join.
+    //!
+    //! The client fix is one resize per attach; this is the belt, because the
+    //! server serves older bundles and other clients too. Structural for the
+    //! same reason the re-attach scan is: a live test needs a browser, a pty and
+    //! a tmux, and the failure mode is this guard being dropped in a later edit
+    //! of the `select!`.
+
+    const SRC: &str = include_str!("mod.rs");
+
+    fn handle_socket_body() -> &'static str {
+        let start = SRC.find("async fn handle_socket(").expect("handle_socket exists");
+        let end = SRC[start..]
+            .find("\nasync fn input_drain_loop")
+            .map(|e| start + e)
+            .unwrap_or(SRC.len());
+        &SRC[start..end]
+    }
+
+    #[test]
+    fn the_resize_arm_ignores_a_geometry_it_has_already_applied() {
+        let body = handle_socket_body();
+        assert!(
+            body.contains("let mut socket_geom = peeked.applied;"),
+            "the loop must start from the geometry the pre-seed peek applied — \
+             otherwise the client's second frame reads as a change",
+        );
+        let arm = body
+            .find("ClientMsg::Resize { cols, rows } =>")
+            .expect("the select! must have a resize arm that reads the geometry");
+        let mut end = (arm + 700).min(body.len());
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        let tail = &body[arm..end];
+        assert!(
+            tail.contains("if socket_geom != Some((cols, rows))"),
+            "a resize to the SAME geometry must be dropped, not forwarded:\n{tail}",
+        );
+        // …and a genuine change must still do BOTH things it always did.
+        assert!(
+            tail.contains("resync_deadline") && tail.contains("input_tx.send(cmd)"),
+            "a real geometry change still resizes the pty AND arms the auto-heal:\n{tail}",
+        );
+    }
+
+    #[test]
+    fn the_pre_seed_peek_reports_the_geometry_it_applied() {
+        // Without this the belt above has no baseline: the peek consumes the
+        // client's FIRST resize before the loop starts, so a loop that began at
+        // `None` would treat the duplicate as new.
+        assert!(SRC.contains("struct PeekedFirstFrame"));
+        assert!(SRC.contains("applied: Some((cols, rows)),"));
     }
 }
 

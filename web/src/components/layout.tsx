@@ -1,14 +1,19 @@
 import * as React from 'react'
 import { Outlet, useLocation } from 'react-router-dom'
+// Primary-nav glyphs — Solar (inlined; see components/nav-glyphs.tsx). Each takes
+// `active` and renders a rich bold-duotone glyph when active (premium in the
+// accent) or a clean linear outline when idle, plus the `className` the rail
+// passes. A more designed set than the Feather-derived default.
 import {
-  FolderClosed,
-  LayoutGrid,
-  Plug,
-  Search,
-  Settings as SettingsIcon,
-  Terminal,
-  type LucideIcon,
-} from 'lucide-react'
+  BrowserGlyph,
+  ConnectorsGlyph,
+  FilesGlyph,
+  FocusGlyph,
+  OverviewGlyph,
+  SettingsGlyph,
+  WorkflowsGlyph,
+  type NavGlyph,
+} from '@/components/nav-glyphs'
 
 import { cn } from '@/lib/utils'
 import { isShellSubstrateEnabled } from '@/lib/shell-substrate-flag'
@@ -30,7 +35,6 @@ import { useTheme } from '@/components/theme-provider'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ReconnectBanner } from '@/components/status-banner/reconnect-banner'
 import { CommandPalette } from '@/components/command-palette/command-palette'
-import { triggerCommandPalette } from '@/components/command-palette/trigger'
 import { ArchivedSheet } from '@/components/archived/archived-sheet'
 import { useArchivedSheet } from '@/stores/archived-sheet-store'
 import { useStandaloneMode } from '@/hooks/use-standalone-mode'
@@ -44,10 +48,28 @@ import {
 import { AttentionProvider, useAttentionProvider } from '@/hooks/use-attention'
 import { useViewportShellVars } from '@/hooks/use-keyboard-viewport'
 
+// The scope circle is LAZY: the switcher + its picker (companies data, the
+// create/invite sheets) must not ride the hero-path entry bundle — they load as
+// their own chunk when the shell mounts. Until it resolves, an empty ringed
+// circle holds the slot (no flash of layout). grok-only, so the base app never
+// even requests it.
+const LazyCompanySwitcher = React.lazy(() =>
+  import('@/components/roster/company-switcher').then((m) => ({
+    default: m.CompanySwitcher,
+  })),
+)
+function NavScopeCircle({ shortcuts }: { shortcuts?: boolean }) {
+  return (
+    <React.Suspense fallback={<span className="gr-scope-circle" aria-hidden />}>
+      <LazyCompanySwitcher variant="circle" shortcuts={shortcuts} />
+    </React.Suspense>
+  )
+}
+
 interface NavItem {
   to: string
   label: string
-  icon: LucideIcon
+  icon: NavGlyph
   /** Only the Overview route matches exactly; others match by prefix. */
   end?: boolean
   /** Onboarding-tour anchor id (sets `data-tour` on the nav link). */
@@ -80,19 +102,31 @@ interface NavItem {
 }
 
 const NAV: NavItem[] = [
-  { to: '/', label: 'Overview', icon: LayoutGrid, end: true },
+  { to: '/', label: 'Home', icon: OverviewGlyph, end: true },
   // Focus — desktop-only entry that redirects to /focus/<last-active-session>
   // (see [[FocusEntry]] in routes/focus.tsx). `end: false` (default) so the
   // item stays highlighted while you're on any /focus/* sub-route. The
   // Terminal glyph (>_) matches the abstract-geometric rest of the rail and
   // names what focus mode IS — sitting inside a terminal session.
-  { to: '/focus', label: 'Focus', icon: Terminal, desktopOnly: true, grokHidden: true },
+  { to: '/focus', label: 'Focus', icon: FocusGlyph, desktopOnly: true, grokHidden: true },
   // Connectors — the Connector-store entry (#22). The store is a fully built
   // route (/store) that had NO nav surface at all; this `grokOnly` item makes it
   // a first-class Grok destination on the rail and the phone nav (Plug glyph,
   // the same mark the command palette already uses for it). Base app unchanged.
-  { to: '/store', label: 'Connectors', icon: Plug, grokOnly: true },
-  { to: '/files', label: 'Files', icon: FolderClosed },
+  { to: '/store', label: 'Tools', icon: ConnectorsGlyph, grokOnly: true },
+  // Workflows — a bot, an ordered list of prompts, and one trigger (#—). Sits
+  // immediately AFTER Connectors because that is the order the two are learned
+  // in: you give a bot its tools, then you give it a job. `grokOnly` like the
+  // store, so the BASE rail stays four items and no `--nav-n` / tab-count /
+  // Liquid-Pill geometry is respec'd; under grok the phone bar goes 4 → 5.
+  { to: '/workflows', label: 'Flows', icon: WorkflowsGlyph, grokOnly: true },
+  // Shared browser — the human's persistent, logged-in browser workspace
+  // (shared-browser v1 §6.1). `grokOnly` for the same reason /store is: it is a
+  // Grok-native doorway, and the base app must stay byte-identical (both nav
+  // surfaces filter it out when grok is off, and `--nav-n` / the sliding pill
+  // geometry follow the filtered count automatically).
+  { to: '/browser', label: 'Browser', icon: BrowserGlyph, grokOnly: true },
+  { to: '/files', label: 'Files', icon: FilesGlyph },
   // Hosts registry AND the scheduler both moved into Settings (rare-use config
   // doesn't need a primary-nav slot). `/hosts` → /settings#hosts and
   // `/scheduler` → /settings#schedules (App.tsx) so old bookmarks land in the
@@ -106,7 +140,7 @@ const NAV: NavItem[] = [
   {
     to: '/settings',
     label: 'Settings',
-    icon: SettingsIcon,
+    icon: SettingsGlyph,
     tour: 'settings',
     badgeKind: 'updates',
     // Under grok the roster's top-right `.gr-me` avatar IS the Settings doorway
@@ -197,7 +231,7 @@ function SideNav({ grok }: { grok: boolean }) {
                           className="absolute inset-0 rounded-xl bg-primary"
                         />
                       )}
-                      <item.icon className="relative size-5" />
+                      <item.icon active={isActive} className="relative size-5" />
                       {/* Desktop: place the dot at the icon's top-right corner.
                        *  inset-y centred on the icon: top ~10px, right ~10px so
                        *  it sits just outside the 20px icon glyph. */}
@@ -213,6 +247,16 @@ function SideNav({ grok }: { grok: boolean }) {
           )
         })}
       </div>
+      {/* Scope circle — the WHOLE-app company switcher, docked at the rail's
+          bottom (WHOOP "profile in the corner"). grok-only (companies is a grok
+          surface); it OWNS the ⌘⇧O / ⌘1-9 shortcuts (the mobile dock passes
+          shortcuts=false so the two instances never double-fire). Its menu opens
+          up-and-right from here (variant='circle'). */}
+      {grok && (
+        <div data-scope-dock="rail" className="mb-1">
+          <NavScopeCircle />
+        </div>
+      )}
       <ThemeToggle />
     </nav>
   )
@@ -238,6 +282,52 @@ function MobileTopBar(_props: { overview: boolean }) {
   return null
 }
 
+/** The grok bottom-bar cells for a given grok state — `NAV` minus the mobile
+ *  drops (`desktopOnly` always; `grokHidden` under grok, `grokOnly` off grok).
+ *  Exported so the pill-truth test can assert the path→cell mapping against the
+ *  SAME array the render + `--nav-n` use (see `bottom-nav-pill.test.ts`). */
+export function bottomNavItems(grok: boolean): NavItem[] {
+  return NAV.filter(
+    (item) => !item.desktopOnly && (grok ? !item.grokHidden : !item.grokOnly),
+  )
+}
+
+/** The index of the cell that owns the current route — the SAME `end`/prefix
+ *  rule react-router's `NavLink` uses for `aria-current="page"`, so the pill
+ *  always parks under exactly the cell the screen reader announces. `-1` when
+ *  the active route is a chromeful sub-route not in the bar (the pill hides).
+ *  This is the ONE source of pill truth: the render, the `--nav-i` style prop
+ *  AND the reconcile effect all read it, so they can never disagree. */
+export function activeNavIndex(
+  items: ReadonlyArray<Pick<NavItem, 'to' | 'end'>>,
+  pathname: string,
+): number {
+  return items.findIndex((item) =>
+    item.end
+      ? pathname === item.to
+      : pathname === item.to || pathname.startsWith(`${item.to}/`),
+  )
+}
+
+/** Re-assert the pill's cell (`--nav-i`) on the live `<nav>` to the active-route
+ *  truth. This is what makes the pill robust: `onNavTap` writes `--nav-i`
+ *  IMPERATIVELY for the pre-commit glide, and React's `style`-prop reconciler
+ *  compares each render against its OWN recorded value — NOT the live DOM — so
+ *  it silently skips the write whenever the new `activeIndex` equals the value
+ *  it last rendered, leaving a tapped-but-never-active cell (often the middle
+ *  one) STRANDED under the pill while `aria-current` sits elsewhere. Calling
+ *  this from a layout effect keyed on the route makes the committed truth the
+ *  final word after every navigation, before paint (no flash). No-op off grok
+ *  and with no node, so the base/desktop bars are never touched. */
+export function reconcileNavPill(
+  el: { style: Pick<CSSStyleDeclaration, 'setProperty'> } | null,
+  grok: boolean,
+  activeIndex: number,
+): void {
+  if (!grok || !el) return
+  el.style.setProperty('--nav-i', String(activeIndex))
+}
+
 /** Mobile: bottom tab bar, safe-area inset (≤md). Filters out `desktopOnly`
  *  items so the mobile chrome stays at its 5-tab footprint — on mobile the
  *  natural way into a focused session is tapping a tile in Overview. */
@@ -246,11 +336,10 @@ function BottomNav({ grok }: { grok: boolean }) {
   // Always drop `desktopOnly` (base Focus). Under grok, keep the `grokOnly`
   // doorway (Connectors) and drop `grokHidden`; under base, drop the `grokOnly`
   // doorways so the default tab bar is byte-identical (Overview / Files /
-  // Settings + the Search control). The `data-tab-count` (route cells + the
-  // Search button) + `--nav-n` let grok-mode.css place the sliding pill.
-  const items = NAV.filter(
-    (item) => !item.desktopOnly && (grok ? !item.grokHidden : !item.grokOnly),
-  )
+  // Settings). The `data-tab-count` (the route cells) + `--nav-n` let
+  // grok-mode.css place the sliding pill. (The bottom-nav Search button was
+  // removed — Overview carries the roster search and ⌘K the command palette.)
+  const items = bottomNavItems(grok)
   // ── The sliding-pill driver (grok phone nav, "Liquid Rail") ────────────────
   //  The active-indicator is ONE persistent pill (`data-nav-pill`, painted below
   //  the cells) translated by whole cells via a single `--nav-i` custom prop and
@@ -260,18 +349,11 @@ function BottomNav({ grok }: { grok: boolean }) {
   //  is hidden then. Same `end`/prefix rule react-router's NavLink uses, so the
   //  pill parks under exactly the cell that shows `aria-current="page"`.
   const { pathname } = useLocation()
-  const activeIndex = grok
-    ? items.findIndex((item) =>
-        item.end
-          ? pathname === item.to
-          : pathname === item.to || pathname.startsWith(`${item.to}/`),
-      )
-    : -1
+  const activeIndex = grok ? activeNavIndex(items, pathname) : -1
   // Tap-drive: on tap, set `--nav-i` on the live <nav> BEFORE react-router
   // commits the route, so the pill starts gliding <100ms while the route
-  // transition runs underneath. The `style` prop below re-asserts the same value
-  // from `activeIndex` once the route commits (idempotent). Cheap haptic tick on
-  // supporting devices; silently absent on iOS Safari.
+  // transition runs underneath. Cheap haptic tick on supporting devices;
+  // silently absent on iOS Safari.
   const navRef = React.useRef<HTMLElement | null>(null)
   const onNavTap = React.useCallback(
     (index: number) => {
@@ -281,7 +363,24 @@ function BottomNav({ grok }: { grok: boolean }) {
     },
     [grok],
   )
+  // ── Reconcile the pill to the ACTIVE cell after every route commit ─────────
+  //  The optimistic `onNavTap` write above is the glide's start, but it is a
+  //  SPECULATIVE mutation of the live DOM that React does not know about: on the
+  //  next render React diffs the `--nav-i` style prop against its OWN recorded
+  //  value, not the DOM, so whenever the committed `activeIndex` equals the value
+  //  React last rendered it SKIPS the write and the tapped cell (frequently the
+  //  middle one) stays stranded under the pill while `aria-current` is elsewhere.
+  //  A layout effect keyed on the route re-asserts the committed truth on the
+  //  live node after every navigation — before paint, so no flash, and it fires
+  //  even when `activeIndex` is unchanged across the pathname change (the exact
+  //  case the style-prop diff skips). Off grok it is a no-op, so the base/desktop
+  //  bars are untouched. This is belt-and-suspenders with the `style` prop below:
+  //  the style prop covers the fast path, this guarantees eventual truth.
+  React.useLayoutEffect(() => {
+    reconcileNavPill(navRef.current, grok, activeIndex)
+  }, [grok, pathname, activeIndex])
   return (
+    <>
     <nav
       ref={navRef}
       aria-label="Primary"
@@ -291,12 +390,12 @@ function BottomNav({ grok }: { grok: boolean }) {
       // (active cell index) + `--nav-n` (cell count) drive the sliding pill in
       // grok-mode.css. All omitted off grok (`undefined` drops the attribute /
       // no style) so the base tab bar's DOM + render are byte-identical.
-      data-tab-count={grok ? items.length + 1 : undefined}
+      data-tab-count={grok ? items.length : undefined}
       style={
         grok
           ? ({
               '--nav-i': activeIndex,
-              '--nav-n': items.length + 1,
+              '--nav-n': items.length,
             } as React.CSSProperties)
           : undefined
       }
@@ -345,6 +444,7 @@ function BottomNav({ grok }: { grok: boolean }) {
                       outline→filled tell + lift on the active glyph; base CSS
                       ignores it and it is absent off grok (byte-identical). */}
                   <item.icon
+                    active={isActive}
                     className="size-5"
                     data-active={grok && isActive ? '' : undefined}
                   />
@@ -365,31 +465,19 @@ function BottomNav({ grok }: { grok: boolean }) {
           </MorphNavLink>
         )
       })}
-      {/* SEARCH — a control, not a route, and the reason it is here: ⌘K was
-          unreachable on a phone. Every trigger the palette had lived in the
-          DESKTOP dock, so enumerating every visible control at 390×844
-          returned nothing matching /palette|search|command|jump/ and the app's
-          discovery spine could only be opened by a physical keyboard. Styled
-          as a tab so the row stays one grammar; it carries no `aria-current`
-          because it goes nowhere — the pill never parks on it. */}
-      <button
-        type="button"
-        aria-label="Search"
-        data-vr="bottom-nav-search"
-        onClick={triggerCommandPalette}
-        className="relative flex min-h-14 flex-1 flex-col items-center justify-center gap-1 py-2 text-muted-foreground transition-colors active:text-foreground"
-      >
-        <span className="relative">
-          <Search className="size-5" />
-        </span>
-        <span
-          data-nav-label={grok ? '' : undefined}
-          className="text-[10px] font-medium leading-none"
-        >
-          Search
-        </span>
-      </button>
     </nav>
+      {/* The scope circle — docked to the RIGHT of the floating capsule (grok
+          CSS fixes it there and shrinks the capsule to make room), the WHOOP
+          detached-profile slot. It is OUTSIDE the <nav>, so it is never a pill
+          cell — `--nav-n` and the sliding-pill math are untouched. `md:hidden`
+          via the dock CSS (the desktop rail carries its own). shortcuts=false:
+          the desktop rail instance owns the keyboard. */}
+      {grok && (
+        <div data-scope-dock="bar" className="md:hidden">
+          <NavScopeCircle shortcuts={false} />
+        </div>
+      )}
+    </>
   )
 }
 
@@ -438,7 +526,22 @@ export function Layout() {
   // never routes here (the route redirects when bot mode is off), so every
   // existing path keeps `chromeless === isFocus` exactly.
   const isTeamDetail = pathname.startsWith('/team/')
-  const chromeless = isFocus || isTeamDetail
+  // The workflow COMPOSER (/workflows/new, /workflows/:id/edit) is a full-screen
+  // editor like focus/team-detail: it renders its OWN sticky header (back + Save)
+  // and a pinned footer, and it was authored chromeless (its comments assume no
+  // BottomNav below the footer). Without this it mounted plainly under <Layout>,
+  // so the shell's MobileTopBar double-stacked its header AND the BottomNav sat
+  // under its `pb-safe` footer (collision + double-counted inset). Gating it here
+  // drops both and flips `<main>` to `overflow-hidden`, so the composer's own
+  // `h-full` flex chain fills and scrolls internally. The read-only DETAIL route
+  // (/workflows/:id) is a normal scroll page and deliberately NOT matched.
+  const isWorkflowCompose =
+    pathname === '/workflows/new' || /^\/workflows\/[^/]+\/edit$/.test(pathname)
+  // The company group chat (`/company/:id/chat`) is a full-bleed channel like
+  // focus/team-detail — it paints the whole window and scrolls internally, so it
+  // takes no top bar and no bottom nav.
+  const isCompanyChat = /^\/company\/[^/]+\/chat$/.test(pathname)
+  const chromeless = isFocus || isTeamDetail || isWorkflowCompose || isCompanyChat
   // Archived sheet open-state lives in a shared store so the ⌘K command and the
   // overview overflow item open the same shell-mounted instance (no permanent
   // estate — the sheet is only in the DOM as an overlay when opened).

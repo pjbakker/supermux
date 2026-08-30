@@ -36,8 +36,19 @@ import {
   isFirstLaunch,
 } from '@/lib/onboarding'
 import { useOverlayOpen } from '@/stores/overlay-gate-store'
+import { useUI } from '@/stores/ui-store'
+import { shouldShowBotModeIntro } from '@/lib/botmode-onboarding'
 import { WelcomeBanner } from './welcome-banner'
 import { TourOverlay } from './tour-overlay'
+// Lazy: five full-screen story screens with their own glimpse mock-ups, shown
+// ONCE per install to a user who has not turned Bot Mode on. Eagerly imported it
+// put ~3 KB gz of first-run-only art on every cold load forever — the same
+// argument that made Files, the store and the attention picker lazy. The decision
+// to show it is a synchronous localStorage read, so the chunk is requested only
+// on the load that actually renders it.
+const BotModeIntro = React.lazy(() =>
+  import('./botmode-intro').then((m) => ({ default: m.BotModeIntro })),
+)
 
 // Where the user is in the migrated-v2 unboxing. `null` = the user has taken
 // over (started the tour, or dismissed) — see `step`.
@@ -54,6 +65,16 @@ export function OnboardingHost() {
   // banner is gated. Called unconditionally (before the early returns below) so
   // hook order is stable.
   const overlayOpen = useOverlayOpen()
+
+  // The Bot Mode intro takes precedence over the v2-migration unboxing: it is
+  // the one recommendation we make to a user who has not turned Bot Mode on, on
+  // their first run or the first load that brought the feature. Decided ONCE at
+  // mount (non-reactive `getState()` — turning Bot Mode on inside the flow
+  // reloads the app, so this never needs to re-run live). Shown on the overview
+  // only, like the rest of the unboxing.
+  const [showBotIntro, setShowBotIntro] = React.useState(() =>
+    shouldShowBotModeIntro(useUI.getState().botMode),
+  )
 
   // Decide first-launch eligibility ONCE, at mount — a later write of the flag
   // (from this very component) must not retroactively flip the branch.
@@ -110,6 +131,20 @@ export function OnboardingHost() {
   const finish = () => {
     completeFirstLaunch()
     setStep('done')
+  }
+
+  // The Bot Mode intro is a full-screen modal on the overview — show it first
+  // and let it own the screen (it suppresses the v2 banner while up).
+  if (showBotIntro && onOverview) {
+    return (
+      // `fallback={null}`: the intro is the first thing this user sees, and a
+      // spinner-then-story reads worse than the story arriving a frame later.
+      <React.Suspense fallback={null}>
+        <AnimatePresence>
+          <BotModeIntro key="botmode-intro" onClose={() => setShowBotIntro(false)} />
+        </AnimatePresence>
+      </React.Suspense>
+    )
   }
 
   // The visible phase: the user's choice (`step`) wins; otherwise the derived

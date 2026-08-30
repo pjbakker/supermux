@@ -3114,6 +3114,36 @@ mod recovery_tests {
         pid
     }
 
+    /// [`spawn_real_orphan_running`] plus a HANDSHAKE, for the tests that act on
+    /// the orphan the instant it exists.
+    ///
+    /// The orphan runs `setup`, TOUCHES `ready`, then idles — and this returns
+    /// only once that file is on disk. Reparenting to `init` is not the same
+    /// fact: it says the fork happened, not that the shell has reached the line
+    /// the test depends on. The escalation test forks a `trap "" TERM` shell and
+    /// asserts the orphan survives a `SIGTERM`, so under load it was signalling a
+    /// bash that had not installed its trap yet — a real process race with a
+    /// green run and a red one for the same code. A marker the child writes
+    /// ITSELF is the only thing that can prove the trap is in place, because it
+    /// is written by the same sequential shell one line later.
+    ///
+    /// Neither `setup` nor `ready` may contain a single quote (both ride the
+    /// single-quoted `-c` of [`spawn_real_orphan_running`]).
+    fn spawn_ready_orphan(ready: &std::path::Path, setup: &str) -> u32 {
+        let path = ready.display().to_string();
+        assert!(!path.contains('\''), "the ready path rides a single-quoted -c");
+        let pid = spawn_real_orphan_running(&format!("{setup}; : > {path}; while :; do sleep 1; done"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !ready.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "the orphan never signalled readiness — it died or never ran `{setup}`",
+        );
+        pid
+    }
+
     /// THE GAP, end to end. A crashed holder + a surviving child; `Spool::create`
     /// refuses to run over it (asserted, so this test fails loudly if that
     /// refusal is ever weakened rather than silently testing nothing); `start`
@@ -3307,8 +3337,12 @@ mod recovery_tests {
     async fn the_sigkill_escalation_re_proves_the_pid_first() {
         let (_state, dir) = test_state().await;
         // An orphan that IGNORES SIGTERM, so the reap has to reach the
-        // escalation branch to have any effect at all.
-        let orphan = spawn_real_orphan_running("trap \"\" TERM; while :; do sleep 1; done");
+        // escalation branch to have any effect at all — and that has PROVED it
+        // installed the trap before anything signals it (see
+        // [`spawn_ready_orphan`]; without the handshake this test signalled a
+        // shell that was still starting up and lost the orphan under load).
+        let ready = dir.join("toctou.trapped");
+        let orphan = spawn_ready_orphan(&ready, "trap \"\" TERM");
         assert_eq!(ppid(orphan), Some(1), "precondition: reparented to init");
         write_orphan_meta(&dir, "toctou", orphan);
 

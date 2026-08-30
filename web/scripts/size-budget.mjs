@@ -1086,7 +1086,146 @@ const BUDGET_ENTRY_JS = 161 * KB
 // `connector-task` helper: the ENTRY/hero gate is UNCHANGED at 154.25 / 161 KB (the
 // feature's hero-path cost is ZERO). A genuine additive store surface, not a
 // regression to trim; ceil(measured)=345, the same rule every fase since B3 used.
-const BUDGET_APP_JS = 345 * KB
+//
+// 345 → 355 at FILES v1, THE BOT COMPANY DRIVE (feat/files): `/files` stops being a
+// `$HOME` browser with a session dropdown and becomes the shared drive — a Spaces
+// landing (HQ + one card per company, with a live activity line), a space crumb
+// replacing `SessionPicker`, a row menu (Rename/Move/Copy/Duplicate/Send-to-bot),
+// `+ New`, a dir-only destination sheet, multi-select with a safe-area bulk bar and
+// a concurrency-4 client fan-out, `?select=` deep links, and SSE liveness.
+// Measured 354.36 against 345.00 — +9.79 KB against the parent's own 344.57, which
+// is the honest price of six new surfaces plus the gzip loss of splitting them out.
+//
+// THE HERO PATH GOT CHEAPER, not more expensive. `/files` was EAGERLY imported into
+// `App.tsx` — the only non-hero route that still was — so every byte of this feature
+// would have landed on first paint for users who never open Files. It is now
+// `React.lazy` alongside Settings / Store / TeamDetail, and the ENTRY gate MOVED
+// DOWN: 148.60 / 161 KB, from the parent's 154.24. That is −5.64 KB gz off cold load
+// for every visitor, while the feature's own ~9.8 KB is paid only by someone who
+// actually opens the drive.
+//
+// Where the app-total delta went (all in the new lazy `files` chunk + its shared
+// leaves): the Spaces grid + its pure card builder, four `ResponsiveSheet` surfaces
+// (rename / new / destination picker / send-to-bot), the select bar, the space
+// crumb, the HQ projects list, and the data layer (`mapWithLimit`, the bulk summary,
+// `companyForPath`, `useFilesLive`). ceil(measured)=355, the same rule every fase
+// since B3 used.
+//
+// 355 → 384 at the BOT-MODE SUITE INTEGRATION: the six-feature branch (image
+// lightbox, bot-panel polish, composer delay-send, Workflows, Files, the shared-
+// browser workspace) lands together. Measured app-JS total 383.20 → ceil 384. The
+// whole delta is in LAZY chunks — the Workflow composer (step tree + cadence
+// grammar), the Files drive, the shared-browser workspace (takeover canvas +
+// socket), and their data layers — each paid for only by a visitor who opens that
+// surface. THE HERO PATH DID NOT MOVE: entry JS is 153.12 / 161 KB (95%), so none
+// of these six features lands on cold load. ceil(measured)=384, same rule as B3.
+//
+// RATCHETED 384 → 412 by the shared-browser mobile wave: the smart field-aware
+// sign-in (detection algorithm + state machine + sheet), the browser toolbar +
+// keyboard/viewport fixes, and the mobile-UA path. All of it lands in the LAZY
+// /browser + roster chunks (takeover-panel-*.js is its own 15.68 KB chunk), not
+// on cold load — the ENTRY gate held at 153.46 / 161 KB (95%). ceil(measured 405.25)
+// + a little headroom = 412, same argue-in-the-PR rule as every bump above.
+//
+// RATCHETED 412 → 416 by company-scoping the full-page surfaces: the shared
+// `<ScopedPageHeader>` mounts the `<CompanySwitcher>` (a ~3 KB shared chunk) on
+// /workflows, /store and /browser as well as the roster, so the switcher moved
+// from one lazy chunk into the shared app graph (+2.4 KB). The HERO PATH still did
+// not move (entry JS 158 / 161 KB); this is pages a bot-mode user navigates to,
+// not cold load. ceil(measured 414.43) + headroom = 416.
+//
+// RATCHETED 416 → 418 by the COMPANY GROUP CHAT hero (`components/chat/group-chat/`):
+// the Slack-style `<ChatChannel>` — channel header + member facepile, the three
+// differentiated message kinds, the router's routing row, `@mention` chips and the
+// composer — mounted at the top of the company overview. Measured app-JS total
+// 414.39 → 417.41 (+3.02 KB gz), and +2.02 KB of that is inside the LAZY
+// `grok-roster` chunk (7.39 → 9.41 KB), i.e. paid only by a bot-mode user who
+// lands on the overview. THE HERO PATH BARELY MOVED: entry JS 158.22 → 158.71 /
+// 161 KB (98.6%) — the +0.49 is shared leaves (`ui/composer`, `human-mark`,
+// `mark-status`) hoisting into the shared graph, not new cold-load code. The
+// feature reuses B0's shipped primitives (`MessageRow`, `SessionMark`,
+// `MentionChip`, `Facepile`, `Composer`) rather than shipping a second chat
+// surface, which is what keeps the delta at 3 KB instead of 15.
+// ceil(measured 417.41) + headroom = 418, same rule as every bump above.
+//
+// RATCHETED 418 → 423 by WIRING that hero to the live channel: the shared
+// `ChatSocket` pointed at `/ws/companies/{id}/groupchat` (a `path` seam, not a
+// second socket), the history-paging hook, the `for_company` badge tick, and a
+// real composer — the `@`-member popover (`<EntityPickerView>`, the same listbox
+// chat / ⌘K / the workflow prompt field use) plus the waking send into the Main
+// Assistant. MEASURED IN ISOLATION by unmounting the hero and rebuilding:
+// 415.12 without it, 421.33 with it — 6.21 KB gz for the whole feature, of which
+// 4.65 lands in the LAZY `grok-roster` chunk (7.39 → 12.04) and the remainder is
+// the picker + `use-sse` hoisting into the shared graph. THE HERO PATH DID NOT
+// MOVE: entry JS 158.23 → 158.73 / 161 KB (99%), so none of it is on cold load.
+// The number is small because the socket, the picker, the composer pill and the
+// input plane are all REUSED — a second data plane here would have cost 20 KB.
+// ceil(measured 421.33) + headroom = 423, same rule as every bump above.
+// RATCHETED 423 → 427 by the group-chat DELIGHT pass (jump-to-latest pill, day
+// dividers, unread separator, URL/PR-ref linkifier, animation wiring — reuses the
+// existing [data-grok] motion bank, no new deps): ceil(measured 425.10) + headroom.
+//
+// RATCHETED 427 → 440 by the rest of the BOT-MODE SUITE (the company identity +
+// onboarding tail of PR #123). Measured 438.33 against 425.14 for the tree that
+// set the 427 ceiling (f32296f2, the delight pass) — a +13.19 KB wave, measured
+// by rebuilding that exact tree rather than trusting the last number written
+// down. Where every KB of it went, by CHUNK (the diff of the two reports, so
+// this is attribution, not a story):
+//   +6.87 KB  `use-company-channel` — the group chat's data plane, now its OWN
+//             chunk because the full-screen `/company/:id/chat` route shares it
+//             with the overview hero. It did not appear from nowhere: the same
+//             pass took `grok-roster` DOWN 13.12 → 8.12, so the extraction is
+//             about +1.9 KB net and the rest is code that already existed moving
+//             to where both surfaces reach it without a second copy.
+//   +3.35 KB  `botmode-intro` — the five-screen "Run a company of bots" intro.
+//             It landed on the ENTRY chunk when it was written; this PR makes it
+//             `React.lazy` (`onboarding-host.tsx`), which is what took the hero
+//             path from 163.02 back to 160.35. A first-run-only story does not
+//             belong on every cold load, and now nobody but a first-runner
+//             fetches it.
+//   +2.41 KB  `company-settings-sheet` (lazy) — the logo upload / favicon fetch
+//             / accent picker sheet, plus `dominant-color.ts` sampling the
+//             uploaded logo. Reached only from a company's ⋯ menu.
+//   +1.83 KB  `delete-company-sheet` (lazy) — the type-to-confirm cascade
+//             teardown. Same door, same reader.
+//   +1.48 KB  `ui-store` — the zustand store hoisted into its own shared chunk
+//             now that the sheets above and the intro all read it. Shared code
+//             leaving the chunks it was inlined in, not new code.
+//   +1.11 KB  `company-chat` — the phone-sized full-screen channel route.
+//   +0.56 KB  the ENTRY chunk (159.79 → 160.35), and the sign is what matters:
+//             the intro's ~3 KB came OFF it in this PR, so the residue is the
+//             company logo/accent reads (`companyLogoUrl` + `apiToken` in
+//             `company-mark`) plus the nav/roster leaves the scope ring pulls in.
+//             The gate that actually guards first paint stays GREEN at
+//             160.35 / 161 KB, and it did NOT move up to make room for anything.
+//   ~+0.9 KB  the remainder, spread over `browser` (+0.45 — the grant verb
+//             replacing the toolbar camera, reusing `SessionPicker`),
+//             `human-mark`, `company-switcher`, `company-mark`, `companies`.
+// ceil(measured 438.33) + headroom = 440, the same rule every bump above used.
+//
+// RATCHETED 440 → 441 by the round-3 honesty fixes on the bot panel (same PR).
+// The 440 above was ceil(438.33), but the branch has since drifted to 439.84 —
+// 0.16 KB of headroom, i.e. the same tripwire state the ENTRY ledger above
+// documents ("parked at EXACTLY 160.00/160.00 ... it had silently become a
+// tripwire the next web change of ANY kind would trip"). Measured 440.32, and
+// the +0.48 KB is attributable to ONE chunking move, not new surface:
+//   +0.60 KB  a new shared `team-attention` chunk. The bot panel now renders the
+//             ROSTER's state word (`stateWordFor`) instead of `session.status`
+//             capitalised — `mena` read `done` in the roster and `Idle` in the
+//             panel beside it — so the roster's lazy chunk and the panel's lazy
+//             chunk share the module, and rolldown split it out.
+//   -0.37 KB  `grok-roster`, the same module leaving it. Net for the extraction
+//             is ~+0.23 KB of chunk boilerplate; the rest is real code.
+//   +0.18 KB  `bot-panel` — the recall-page turn bound (`lastExchange` no longer
+//             files an older turn's receipts under the prompt above them) and
+//             the memory panel's empty-state decision.
+//   +0.05 KB  the ENTRY chunk, all of it hash churn in the import map. The gate
+//             that guards first paint stays GREEN at 160.69 / 161 KB and did NOT
+//             move; the alternative placement (folding the word into
+//             `lib/mark-status`, which IS on the hero path) measured 161.02 and
+//             was rejected for exactly that reason.
+// ceil(measured 440.32) + headroom = 441, the same rule every bump above used.
+const BUDGET_APP_JS = 441 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating
@@ -1130,7 +1269,11 @@ const BUDGET_APP_JS = 345 * KB
 // without a ratchet; ceil(measured)=34, the same rule the ratchets above use.
 // Phone-scoped + grok-scoped: the ENTRY gate is unmoved and green (157.10/161),
 // desktop keeps its static header, and the base app off grok matches none of it.
-const BUDGET_CSS = 34 * KB
+//
+// RATCHETED 34 → 36 by the shared-browser mobile wave (the takeover chrome,
+// safe-area rules on the remaining full-screen panels, and the sign-in sheet).
+// Measured 34.83; ceil + headroom = 36, same rule as above. ENTRY gate unmoved.
+const BUDGET_CSS = 36 * KB
 
 function gzipSize(path) {
   return gzipSync(readFileSync(path), { level: 9 }).length

@@ -30,6 +30,23 @@
 import { authToken, wsUrl } from '@/env'
 
 import type { FrameMetadata, TakeoverFrame } from './frame-map'
+import { EMPTY_NAV, parseNavState, type NavState } from './nav-state'
+import {
+  NO_CAPS,
+  NO_FIND,
+  copyPayload,
+  fillFieldPayload,
+  findClosePayload,
+  findPayload,
+  focusFieldPayload,
+  parseCaps,
+  parseFindResult,
+  parseLoginScan,
+  scanLoginPayload,
+  type FindResult,
+  type LoginScan,
+  type PageCaps,
+} from './page-tools'
 
 /** The slice of `WebSocket` this module uses — so a test can be a socket. */
 export interface SocketLike {
@@ -74,18 +91,57 @@ export interface TakeoverSnapshot {
   state: TakeoverState
   /** `null` until the server has told us; never guessed. */
   mode: DriveMode | null
-  /** The page's URL at attach time. */
+  /** The page's URL. Seeded by the fire-once `target` frame and then kept
+   *  honest by every `nav_state` — see [[TakeoverSnapshot.nav]]. */
   url: string
+  /**
+   * **The live address bar** — title, favicon, spinner, the honest
+   * back/forward affordances, the padlock and the modal blocking the page.
+   *
+   * Never `null`: an attached socket that has not been told anything yet
+   * renders [[EMPTY_NAV]], whose every flag is false, so the chrome greys its
+   * controls rather than inventing them. Nav state changes a few times per
+   * navigation, which is why it rides the SNAPSHOT channel and not the frame
+   * one — the whole point of the two-channel split.
+   */
+  nav: NavState
   /** The last input the server dropped, and why — cleared on the next accepted
    *  gesture so a stale banner cannot outlive its cause. */
   refused: string | null
+  /**
+   * **What this relay can do beyond pixels** (phase 4). Find-in-page and
+   * copy-out need the page's DOM, which the server does not expose yet — so
+   * every flag is FALSE until a `caps` frame says otherwise, and the UI shells
+   * for both disable themselves with the reason written on them rather than
+   * putting a frame on the wire that would be silently dropped. See
+   * `page-tools.ts` for the exact server work each one needs.
+   */
+  caps: PageCaps
+  /** The live find, as the server counts it. [[NO_FIND]] until one answers. */
+  find: FindResult
+  /**
+   * **The last login scan** (smart sign-in, spec §3) — `null` until a
+   * `scanLogin()` answers, and the shape `login-detect.ts` owns: `form` is the
+   * whole gate (`false` ⇒ the sheet disables itself with `reason`), `fields`
+   * carry the detected selectors/roles/rects Phase 4 anchors its offer to.
+   *
+   * A SNAPSHOT field, not a callback, because unlike a copy or a fill result
+   * this is durable page STATE the UI reads while the sheet is open — but note
+   * it is only the DETECTED structure, never a secret: the value typed into a
+   * field rides the transient `fillField()` call and is never parked here.
+   */
+  loginScan: LoginScan | null
 }
 
 export const EMPTY_SNAPSHOT: TakeoverSnapshot = {
   state: 'connecting',
   mode: null,
   url: '',
+  nav: EMPTY_NAV,
   refused: null,
+  caps: NO_CAPS,
+  find: NO_FIND,
+  loginScan: null,
 }
 
 export interface TakeoverOptions {
@@ -97,6 +153,56 @@ export interface TakeoverOptions {
   /** Injected for tests; defaults to `env.ts`. */
   token?: () => string
   baseUrl?: () => string
+  /** The page's selection, when a capable server answers a `copy`. A callback
+   *  rather than a snapshot field: clipboard text is a one-shot event, and
+   *  parking it in state would leave a signed-in page's content sitting in a
+   *  React tree long after the copy. */
+  onCopied?: (text: string) => void
+  /**
+   * A field the server focused (`focusField()`) or filled (`fillField()`) — the
+   * per-field answers to smart sign-in's two acting verbs. Callbacks, not
+   * snapshot fields, for the same reason as [[onCopied]]: each is a one-shot
+   * result the §3.1 state machine reacts to (advance to the next field, mark
+   * "filled", or surface an `ok:false`), and a fill result must not linger in a
+   * React tree next to the secret that produced it.
+   */
+  onFocused?: (selector: string, ok: boolean) => void
+  onFilled?: (selector: string, ok: boolean) => void
+}
+
+/**
+ * WHAT this socket is attached to. The relay is one piece of code with two
+ * subjects (`takeover.rs::router_for`):
+ *
+ *   · a SCRATCH session — `/ws/browser/{session}/takeover`, the in-chat
+ *     interruption, which grabs the wheel on attach because an ask means the
+ *     human is coming to drive;
+ *   · a WORKSPACE tab — `/ws/browser/tab/{id}`, watch-first: frames flow, input
+ *     is refused until the human presses Drive, so merely LOOKING at a tab does
+ *     not silently block every agent granted on it.
+ *
+ * A bare string stays a session subject, so every existing caller (the in-chat
+ * `TakeoverCard`, the takeover bench) is unchanged.
+ */
+export type TakeoverSubject =
+  | { kind: 'session'; name: string }
+  | { kind: 'tab'; id: string }
+
+/** A bare string is the legacy session subject. */
+export function asSubject(s: string | TakeoverSubject): TakeoverSubject {
+  return typeof s === 'string' ? { kind: 'session', name: s } : s
+}
+
+/** The route this subject attaches to — the ONLY thing that differs per kind. */
+export function subjectPath(s: TakeoverSubject): string {
+  return s.kind === 'tab'
+    ? `/ws/browser/tab/${encodeURIComponent(s.id)}`
+    : `/ws/browser/${encodeURIComponent(s.name)}/takeover`
+}
+
+/** The subject's human-readable name (aria labels, `data-` hooks). */
+export function subjectName(s: TakeoverSubject): string {
+  return s.kind === 'tab' ? s.id : s.name
 }
 
 /** Exponential backoff with ±20% jitter, capped — the terminal socket's curve. */
@@ -139,6 +245,140 @@ export function keyText(e: {
   return [...e.key].length === 1 ? e.key : undefined
 }
 
+/**
+ * The ordered relay a password-manager sign-in becomes — pure, so the sequence
+ * is a unit test rather than a socket dance the panel maps `text()`/`pressKey()`
+ * onto.
+ *
+ * Type the username, Tab to the next field, type the password, and — only if
+ * asked — press Enter. A blank field is SKIPPED, which is what makes the two
+ * "fill just this field" buttons fall out of the same function: a lone username
+ * types into whatever the human focused and presses no Tab, a lone password the
+ * same. The Tab is emitted ONLY between two filled fields, or a single-field
+ * fill would tab straight back out of the box it just typed into. Enter is
+ * opt-in because a submit into the wrong field is worse than one the human
+ * presses themselves once they can see the values landed.
+ */
+export type FillOp =
+  | { kind: 'text'; text: string }
+  | { kind: 'key'; key: 'Tab' | 'Enter' }
+
+export function signInOps(creds: {
+  username?: string
+  password?: string
+  submit?: boolean
+}): FillOp[] {
+  const user = creds.username ?? ''
+  const pass = creds.password ?? ''
+  const ops: FillOp[] = []
+  if (user) ops.push({ kind: 'text', text: user })
+  if (user && pass) ops.push({ kind: 'key', key: 'Tab' })
+  if (pass) ops.push({ kind: 'text', text: pass })
+  if (creds.submit && (user || pass)) ops.push({ kind: 'key', key: 'Enter' })
+  return ops
+}
+
+/**
+ * **The viewer's box** — the one fact only the client can know, and the whole
+ * of legibility.
+ *
+ * Without it the server lays the page out at its own default and caps the
+ * stream at 512², so a phone reads a 1366px desktop render downscaled to a
+ * third and a laptop reads a blur. With it (`ClientMsg::Viewport` →
+ * `Emulation.setDeviceMetricsOverride` + a matching screencast cap) the page is
+ * laid out at the box the human is actually looking at: a phone gets the site's
+ * MOBILE layout at 390pt, and a desktop gets type at 1:1.
+ *
+ * `mobile` is the coarse-pointer answer, not a width guess — a 390px window on
+ * a laptop is a narrow desktop, and telling a site it is a phone there would be
+ * a lie with touch-sized buttons attached.
+ */
+export interface ViewportBox {
+  /** The canvas' CSS width/height — the box frames are painted into. */
+  width: number
+  height: number
+  /** `devicePixelRatio`. Clamped: see [[MAX_VIEWPORT_DPR]]. */
+  dpr: number
+  /** A touch viewport that should get the site's phone layout. */
+  mobile: boolean
+}
+
+/** The server clamps to this too (`context::MAX_DEVICE_SCALE`); we clamp first
+ *  so a 3× phone never ASKS for a frame three times the size of the one it can
+ *  show. */
+export const MAX_VIEWPORT_DPR = 2
+
+/** The wire shape of `ClientMsg::Viewport`, or `null` for a box that is not
+ *  laid out yet.
+ *
+ *  `null` is the common case on mount — a `ResizeObserver` fires once with a
+ *  zero box before layout — and the server would reject it anyway
+ *  (`ViewportRequest::sanitized`). Not sending it keeps the profile we have
+ *  instead of asking chrome to lay a page out at nothing. */
+export function viewportPayload(box: ViewportBox): Record<string, unknown> | null {
+  const width = Math.round(box.width)
+  const height = Math.round(box.height)
+  if (!(width > 0) || !(height > 0)) return null
+  const dpr =
+    Number.isFinite(box.dpr) && box.dpr > 0 ? Math.min(box.dpr, MAX_VIEWPORT_DPR) : 1
+  return { type: 'viewport', width, height, dpr, mobile: !!box.mobile }
+}
+
+/**
+ * The device scale to ASK for, which is how a client picks its streaming
+ * profile without a second message.
+ *
+ * Driving is reading: the human is about to click a link they have to be able
+ * to read, so ask for their real pixels (capped at 2×, past which a JPEG buys
+ * nothing an eye resolves). Watching is watching: 1× is a quarter of the bytes
+ * of a retina stream and loses nothing at a glance — the audit's "drop back to
+ * a cheap profile on hand-back", expressed in the field the server already
+ * parses rather than a new one.
+ */
+export function driveDpr(driving: boolean, devicePixelRatio: number): number {
+  if (!driving) return 1
+  return Number.isFinite(devicePixelRatio) && devicePixelRatio > 0
+    ? Math.min(devicePixelRatio, MAX_VIEWPORT_DPR)
+    : 1
+}
+
+/** The subset of an element the box measurement reads. `clientWidth`/`Height`
+ *  are the CONTENT box in integer CSS px — the exact space the canvas fills and
+ *  the space `fitFrame`/`toPagePoint` map against, so the page is laid out at
+ *  the box the human is actually looking at and every tap lands true. */
+export interface MeasurableBox {
+  clientWidth: number
+  clientHeight: number
+}
+
+/**
+ * The viewport to negotiate for a measured canvas box — the ONE place the box's
+ * pixels become a `ClientMsg::Viewport`.
+ *
+ * Pulled out of the panel's effect so it is pure and pinned: the box the client
+ * MEASURES has to be the box the server LAYS OUT and the box the client MAPS
+ * clicks against, or a page renders for one height and taps resolve against
+ * another. Re-run it on every settle (rotation, split-pane, and — the iOS PWA
+ * case — the `100dvh` cold-launch height settling from short to full): the box
+ * is re-read HERE, so a height that was transiently collapsed at attach is
+ * corrected the instant the layout viewport settles, and the socket's own
+ * de-dup drops it when nothing actually moved.
+ */
+export function measuredViewport(
+  box: MeasurableBox,
+  opts: { driving: boolean; devicePixelRatio: number; coarsePointer: boolean },
+): ViewportBox {
+  return {
+    width: box.clientWidth,
+    height: box.clientHeight,
+    dpr: driveDpr(opts.driving, opts.devicePixelRatio),
+    // A COARSE POINTER, not a narrow window: a 390px browser window on a laptop
+    // is a narrow desktop, and telling a site it is a phone there would hand a
+    // mouse touch-sized buttons.
+    mobile: opts.coarsePointer,
+  }
+}
+
 export class TakeoverSocket {
   private ws: SocketLike | null = null
   private authed = false
@@ -146,22 +386,29 @@ export class TakeoverSocket {
   private attempt = 0
   private retry: unknown = null
   private snap: TakeoverSnapshot = { ...EMPTY_SNAPSHOT }
+  /** The last box we were ASKED to negotiate, and the last one actually put on
+   *  the wire. Two fields, not one: the ask outlives a reconnect (the new
+   *  socket has to be told again, or a rehydrated page lays itself out at
+   *  chrome's default), while the sent value is what de-duplicates a
+   *  `ResizeObserver` that fires four times per rotation. */
+  private wantBox: Record<string, unknown> | null = null
+  private sentBox: string | null = null
 
   // Plain fields, not constructor parameter properties: the app's tsconfig
   // sets `erasableSyntaxOnly`, so every construct that emits runtime code from
   // a type-position keyword is out.
-  private readonly session: string
+  private readonly subject: TakeoverSubject
   private readonly onSnapshot: (s: TakeoverSnapshot) => void
   private readonly onFrame: (f: TakeoverFrame) => void
   private readonly opts: TakeoverOptions
 
   constructor(
-    session: string,
+    subject: string | TakeoverSubject,
     onSnapshot: (s: TakeoverSnapshot) => void,
     onFrame: (f: TakeoverFrame) => void,
     opts: TakeoverOptions = {},
   ) {
-    this.session = session
+    this.subject = asSubject(subject)
     this.onSnapshot = onSnapshot
     this.onFrame = onFrame
     this.opts = opts
@@ -175,7 +422,7 @@ export class TakeoverSocket {
   start(): void {
     if (this.stopped || this.ws) return
     const base = (this.opts.baseUrl ?? wsUrl)()
-    const url = `${base}/ws/browser/${encodeURIComponent(this.session)}/takeover`
+    const url = `${base}${subjectPath(this.subject)}`
     const make = this.opts.factory ?? ((u: string) => new WebSocket(u) as unknown as SocketLike)
     const ws = make(url)
     this.ws = ws
@@ -266,8 +513,43 @@ export class TakeoverSocket {
     this.send({ type: 'text', text })
   }
 
+  /**
+   * Press-and-release a named navigation key. Tab moves between form fields,
+   * Enter submits — the two the sign-in fill needs and the address bar's own
+   * keystrokes do not cover. Down AND up: a field commits its value on keyDown,
+   * but focus handlers and a form's submit-on-Enter expect the matching keyUp,
+   * so a lone down leaves some pages half-notified.
+   */
+  pressKey(key: 'Tab' | 'Enter'): void {
+    const keyCode = key === 'Tab' ? 9 : 13
+    this.key('down', { key, code: key, keyCode })
+    this.key('up', { key, code: key, keyCode })
+  }
+
   touch(kind: 'start' | 'move' | 'end' | 'cancel', point?: { x: number; y: number }): void {
     this.send({ type: 'touch', kind, x: point?.x ?? 0, y: point?.y ?? 0 })
+  }
+
+  /**
+   * Tell the server what box we are painting into. Idempotent: the same box
+   * twice is one message, because a rotation fires the observer several times
+   * and each one costs a `setDeviceMetricsOverride`, a screencast renegotiation
+   * and a full still frame on the server.
+   */
+  viewport(box: ViewportBox): void {
+    const msg = viewportPayload(box)
+    if (!msg) return
+    this.wantBox = msg
+    this.flushViewport()
+  }
+
+  private flushViewport(): void {
+    const msg = this.wantBox
+    if (!msg || !this.authed) return
+    const key = JSON.stringify(msg)
+    if (key === this.sentBox) return
+    this.sentBox = key
+    this.send(msg)
   }
 
   /** Give the wheel back but keep watching. */
@@ -280,9 +562,157 @@ export class TakeoverSocket {
     this.send({ type: 'take_over' })
   }
 
+  /**
+   * Dial again after a TERMINAL state — busy, offline, or a `no-context` we
+   * have since fixed by waking the tab.
+   *
+   * `stop()` is one-way on purpose (a React cleanup must not be undoable), so
+   * this is the ONE door back, and it is only ever opened by a human pressing
+   * Retry or Wake. Nothing here retries on its own.
+   */
+  restart(): void {
+    if (this.ws) return
+    this.stopped = false
+    this.attempt = 0
+    this.authed = false
+    this.sentBox = null
+    this.patch({ state: 'connecting', refused: null })
+    this.start()
+  }
+
   /** Ask for a fresh still — a static page emits no frames of its own. */
   resync(): void {
     this.send({ type: 'resync' })
+  }
+
+  // ── the navigation controls (P1-4) ────────────────────────────────────────
+  //
+  // These ride the SOCKET rather than the REST door whenever one is attached,
+  // and the difference is not micro-optimisation: the REST route re-loads the
+  // row, wakes the tab, runs the verb and re-reads the row, and every one of
+  // those hops is latency between a thumb and a page. On an attached socket the
+  // frame lands in the relay that is already holding the page.
+  //
+  // The server handles all of them ABOVE the drive gate (`takeover.rs`), on
+  // purpose: the wheel governs the INPUT relay, not the address bar. A human
+  // watching an agent may still press Back — refusing that while the identical
+  // REST route accepts it would be incoherent, not safer.
+
+  /** The address bar's Enter, over the live socket. */
+  navigate(url: string): void {
+    if (!url) return
+    this.send({ type: 'navigate', url })
+  }
+
+  /** One step back through the page's own history. */
+  back(): void {
+    this.send({ type: 'back' })
+  }
+
+  /** …and one forward. */
+  forward(): void {
+    this.send({ type: 'forward' })
+  }
+
+  /** Reload. `ignoreCache` is the hard reload (the reload button's long-press). */
+  reload(ignoreCache = false): void {
+    this.send({ type: 'reload', ignore_cache: !!ignoreCache })
+  }
+
+  /** Stop the in-flight load — the button Reload turns into while `loading`. */
+  stopLoading(): void {
+    this.send({ type: 'stop' })
+  }
+
+  /**
+   * Answer the modal the page has opened.
+   *
+   * DISMISS is the default on the server too (`#[serde(default)] accept`), and
+   * that direction is the safe one: a garbled or half-built frame must never
+   * be read as "yes" to a `confirm()` the human never saw.
+   */
+  dialog(accept: boolean, promptText?: string): void {
+    this.send({
+      type: 'dialog',
+      accept: !!accept,
+      prompt_text: promptText ?? undefined,
+    })
+  }
+
+  // ── the DOM verbs (phase 4) — gated, because the server cannot do them yet ──
+  //
+  // FAIL CLOSED, AND LOUDLY IN THE UI RATHER THAN SILENTLY ON THE WIRE. An
+  // un-capable relay drops an unknown frame on the floor, so a find bar that
+  // sent one anyway would spin against a server that will never answer. The
+  // capability comes from a `caps` frame the server does not send yet, which
+  // means today these three are always no-ops and every surface that offers
+  // them says so. The moment `takeover.rs` grows the arms in `page-tools.ts`'s
+  // header, this client needs no edit at all.
+
+  /** Can this relay search the page's DOM and read its selection? */
+  caps(): PageCaps {
+    return this.snap.caps
+  }
+
+  /** Search the page. No-op (and `false`) when the server cannot. */
+  find(query: string, opts: { forward?: boolean; caseSensitive?: boolean } = {}): boolean {
+    if (!this.snap.caps.find || !query) return false
+    this.send(findPayload(query, opts))
+    return true
+  }
+
+  /** Drop the server's search state — closing the bar must not leak a search
+   *  per keystroke into the relay. */
+  findClose(): void {
+    if (!this.snap.caps.find) return
+    this.patch({ find: NO_FIND })
+    this.send(findClosePayload())
+  }
+
+  /** Ask for the page's current selection as text. */
+  copySelection(): boolean {
+    if (!this.snap.caps.copy) return false
+    this.send(copyPayload())
+    return true
+  }
+
+  // ── smart sign-in (phase 3) — gated on `caps.signIn`, same as find/copy ─────
+  //
+  // FAIL CLOSED. An older relay sends no `caps` frame, `caps.signIn` stays
+  // false, and all three verbs are no-ops that return false — Phase 4's sheet
+  // reads the same flag and degrades to today's blind text/Tab path rather than
+  // spinning against a server that will never answer. The secret in `fillField`
+  // lives for exactly one `send`: it is spelled into the frame and never parked
+  // on the snapshot (spec §5).
+
+  /**
+   * Scan the page for a login form. No-op (and `false`) when the server cannot.
+   * The answer arrives as a `login_fields` frame → [[TakeoverSnapshot.loginScan]]
+   * — or, if an agent holds the wheel, as a `refused` frame the banner surfaces.
+   */
+  scanLogin(): boolean {
+    if (!this.snap.caps.signIn) return false
+    this.send(scanLoginPayload())
+    return true
+  }
+
+  /** Scroll a detected field into view and focus it. Answered by `focused`. */
+  focusField(selector: string): boolean {
+    if (!this.snap.caps.signIn || !selector) return false
+    this.send(focusFieldPayload(selector))
+    return true
+  }
+
+  /**
+   * Type a secret into a detected field on the trusted keystroke path. Answered
+   * by `filled`. The value is NEVER retained: it is handed straight to
+   * [[fillFieldPayload]] and put on the wire, and nothing on this object or the
+   * snapshot holds it afterwards.
+   */
+  fillField(selector: string, value: string, role: string): boolean {
+    if (!this.snap.caps.signIn || !selector) return false
+    this.send(fillFieldPayload(selector, value, role))
+    return true
   }
 
   // ── inbound ───────────────────────────────────────────────────────────────
@@ -299,11 +729,57 @@ export class TakeoverSocket {
       case 'auth_ok':
         this.authed = true
         this.attempt = 0
+        // A fresh socket knows nothing about our box, and on a TAB route it may
+        // have just rehydrated the page at chrome's default size. Re-negotiate
+        // before the first frame lands, so the seed still is already the right
+        // shape rather than a full-desktop render the human watches snap.
+        this.sentBox = null
+        this.flushViewport()
         this.patch({ state: 'live' })
         return
       case 'target':
+        // The seed, and only the seed: it carries the canvas size the panel
+        // needs on attach. Its url is superseded the moment a nav_state lands.
         this.patch({ url: String(msg.url ?? '') })
         return
+      case 'nav_state': {
+        const nav = parseNavState(msg)
+        // `url` is patched from the SAME frame rather than left to the target
+        // seed, so every consumer of `snapshot.url` — the omnibox, the strip,
+        // the security chip — follows a page that navigates itself.
+        this.patch({ nav, url: nav.url || this.snap.url })
+        return
+      }
+      case 'caps':
+        // Sent once after `auth_ok` by a server that has the DOM verbs. Absent
+        // = [[NO_CAPS]], which is why the default is false rather than unknown.
+        this.patch({ caps: parseCaps(msg) })
+        return
+      case 'find_result':
+        this.patch({ find: parseFindResult(msg) })
+        return
+      case 'copied': {
+        const text = typeof msg.text === 'string' ? msg.text : ''
+        this.opts.onCopied?.(text)
+        return
+      }
+      case 'login_fields':
+        // The answer to `scanLogin()`. Parsed fail-closed (a garbled frame is a
+        // disabled offer, never a wrong one) and parked on the snapshot for the
+        // sheet to read.
+        this.patch({ loginScan: parseLoginScan(msg) })
+        return
+      case 'focused': {
+        // One-shot per-field result → callback, not state (see `onFocused`).
+        const selector = typeof msg.selector === 'string' ? msg.selector : ''
+        this.opts.onFocused?.(selector, msg.ok === true)
+        return
+      }
+      case 'filled': {
+        const selector = typeof msg.selector === 'string' ? msg.selector : ''
+        this.opts.onFilled?.(selector, msg.ok === true)
+        return
+      }
       case 'mode':
         this.patch({ mode: msg.mode as DriveMode, refused: null })
         return

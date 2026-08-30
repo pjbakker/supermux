@@ -23,23 +23,55 @@ import { ConnectionOverlay } from '@/components/connection/connection-overlay'
 import { MorphCommitProbe } from '@/components/view-transitions/morph'
 import { Overview } from '@/routes/overview'
 import { Focus, FocusEntry } from '@/routes/focus'
-import { Files } from '@/routes/files'
+// Files is entry-lazy for the same reason Settings is, and for a reason of its
+// own: the cold hero path is the OVERVIEW, and the entry chunk should not carry
+// a file browser to render a roster. Files v1 (the Bot Company Drive) roughly
+// doubled the route's weight — Spaces grid, four `ResponsiveSheet` surfaces, a
+// dir picker, the bulk bar — and eagerly imported that put ~7.6 KB gz of it on
+// first paint for every user who never opened Files at all. Lazy is where it
+// belongs, alongside Settings, Store and TeamDetail.
+const Files = lazy(() =>
+  import('@/routes/files').then((m) => ({ default: m.Files })),
+)
 // Settings is entry-lazy: it is a cold administrative surface, and its eager
 // import tipped the hero-path bundle over the 200 KB gz budget (#67 red).
 // (B1 folded the Scheduler route into Settings, so no Scheduler import here.)
 const Settings = lazy(() =>
   import('@/routes/settings').then((m) => ({ default: m.Settings })),
 )
+// The shared-browser WORKSPACE (/browser) — lazy for the same reason the store
+// is, plus one of its own: it pulls in the takeover canvas + socket, which no
+// other route needs.
+const BrowserWorkspaceRoute = lazy(() =>
+  import('@/routes/browser').then((m) => ({ default: m.BrowserRoute })),
+)
 // The connector store — lazy like Settings: a headline surface, but not on the
 // cold hero path, and its catalog/card tree should not weigh the entry bundle.
 const Store = lazy(() =>
   import('@/routes/store').then((m) => ({ default: m.Store })),
+)
+// Workflows — the list, the composer and the run history. Lazy like the store:
+// a headline surface, but not on the cold hero path, and the composer's step
+// tree / cadence grammar should not weigh the entry bundle.
+const Workflows = lazy(() =>
+  import('@/routes/workflows').then((m) => ({ default: m.Workflows })),
+)
+// The composer is its OWN chunk: the step tree, the cadence grammar and the
+// upload engine are only paid for by somebody who is actually composing.
+const WorkflowEdit = lazy(() =>
+  import('@/routes/workflow-edit').then((m) => ({ default: m.WorkflowEdit })),
+)
+const WorkflowDetail = lazy(() =>
+  import('@/routes/workflow-detail').then((m) => ({ default: m.WorkflowDetail })),
 )
 // The phone team-detail surface (Phase 6a). Lazy so the 160 KB entry gate never
 // carries ChatPanel/TeamPanel/MemberPane for a route the roster only reaches on a
 // phone tap (and which redirects to /focus when bot mode is off).
 const TeamDetail = lazy(() =>
   import('@/routes/team-detail').then((m) => ({ default: m.TeamDetail })),
+)
+const CompanyChat = lazy(() =>
+  import('@/routes/company-chat').then((m) => ({ default: m.CompanyChat })),
 )
 
 // DEV-only verification pages (/dev/tiles, /dev/term/:name, …). Lazy so
@@ -85,6 +117,11 @@ const DevChatUi = import.meta.env.DEV
 const DevShell = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-shell'))
   : null
+// Company GROUP CHAT bench (spec §7): the `<ChatChannel>` hero at 390/402px with
+// an offline cast — every message kind at once, no socket behind it.
+const DevGroupChat = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-groupchat'))
+  : null
 // Chat RENDERER bench (fase A3): the real conversation component, fed the wire
 // shapes the server sends, in every state the surface can be in — the page the
 // A3 screenshots are taken from.
@@ -101,6 +138,17 @@ const DevComposerAttach = import.meta.env.DEV
 // overflow, in both themes, with no server behind it.
 const DevPickers = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-pickers'))
+  : null
+// The workflows bench (T5.10): list · composer · run timeline · connector
+// picker, in both themes, at phone and desktop widths, with no server behind
+// any of it. See the file header for the query flags.
+const DevWorkflows = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-workflows'))
+  : null
+// The Files v1 bench: the Spaces grid, the destination sheet and the
+// multi-select bottom bar, hand-fed and seeded, for the 390px review pass.
+const DevFiles = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-files'))
   : null
 // The toggle-thrash bench (fase A5 T6): the REAL RendererShell + LiveTerminal,
 // toggled 100× against a firehosing `shell` pty by
@@ -121,6 +169,17 @@ const DevSelectionProbe = import.meta.env.DEV
 // app is completely unaffected.
 const DevBrowserTakeover = import.meta.env.DEV
   ? lazy(() => import('@/routes/dev-browser-takeover'))
+  : null
+// Shared-browser WORKSPACE bench — the tab rail + the per-tab grant sheet +
+// the viewport, on fixture tabs, offline. The page the /browser shots come from.
+const DevBrowserWorkspace = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-browser-workspace'))
+  : null
+// Smart sign-in bench — every state of the FIELD-AWARE sign-in sheet (no-form /
+// detected / ambiguous-mapper / otp / generate-only / frame / blind) on a
+// hand-built LoginScan, offline. The page the sign-in shots come from.
+const DevSignIn = import.meta.env.DEV
+  ? lazy(() => import('@/routes/dev-sign-in'))
   : null
 // Connector-store bench — the grid + bot-scoped sheet + inline connect-card, in
 // both themes and the [data-grok] skin, offline. The page the store shots come
@@ -257,14 +316,58 @@ export default function App() {
                     bookmark lands somewhere honest — the same pattern /scheduler
                     and /hosts use. */}
                 <Route path="/board" element={<Navigate to="/" replace />} />
-                <Route path="/files/:name?" element={<Files />} />
-                {/* Scheduler moved into Settings → Schedules (B1 T8: a route
-                    whose 5-column table did not earn a primary-nav slot).
-                    Redirect old bookmarks / deep links to the Settings anchor
-                    so no link breaks — the exact pattern /hosts uses below. */}
                 <Route
-                  path="/scheduler"
-                  element={<Navigate to="/settings#schedules" replace />}
+                  path="/files/:name?"
+                  element={
+                    <Suspense fallback={null}>
+                      <Files />
+                    </Suspense>
+                  }
+                />
+                {/* Schedules became Workflows. Both old doorways — the
+                    standalone `/scheduler` route and the Settings anchor B1
+                    folded it into — land on the new list, so no bookmark and no
+                    deep link breaks. A redirect rather than a 404 is the same
+                    courtesy /hosts and /board already get. The Settings
+                    ANCHOR (`/settings#schedules`) is a hash, which no path
+                    route can match; the section it scrolls to is deleted with
+                    the rest of the scheduler UI in 4B, and the command palette
+                    entry that used to point there now points here. */}
+                <Route path="/scheduler" element={<Navigate to="/workflows" replace />} />
+                <Route
+                  path="/workflows"
+                  element={
+                    <Suspense fallback={null}>
+                      <Workflows />
+                    </Suspense>
+                  }
+                />
+                {/* `new` is registered BEFORE `:id` so the literal wins — the
+                    same static-before-capture ordering the server router keeps
+                    for `/api/workflows/preview`. */}
+                <Route
+                  path="/workflows/new"
+                  element={
+                    <Suspense fallback={null}>
+                      <WorkflowEdit />
+                    </Suspense>
+                  }
+                />
+                <Route
+                  path="/workflows/:id/edit"
+                  element={
+                    <Suspense fallback={null}>
+                      <WorkflowEdit />
+                    </Suspense>
+                  }
+                />
+                <Route
+                  path="/workflows/:id"
+                  element={
+                    <Suspense fallback={null}>
+                      <WorkflowDetail />
+                    </Suspense>
+                  }
                 />
                 {/* Hosts moved into Settings → Remote hosts. Redirect old
                     bookmarks / deep links to the Settings anchor so no link
@@ -286,6 +389,14 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <Store />
+                    </Suspense>
+                  }
+                />
+                <Route
+                  path="/browser"
+                  element={
+                    <Suspense fallback={null}>
+                      <BrowserWorkspaceRoute />
                     </Suspense>
                   }
                 />
@@ -311,6 +422,17 @@ export default function App() {
                     </Suspense>
                   }
                 />
+                {/* The company GROUP CHAT, full-bleed (spec §7). The overview
+                    carries only a compact doorway; this is where the channel is
+                    a page. Chromeless like /team — <Layout> gates it below. */}
+                <Route
+                  path="/company/:companyId/chat"
+                  element={
+                    <Suspense fallback={null}>
+                      <CompanyChat />
+                    </Suspense>
+                  }
+                />
               </Route>
               {/* PHASE 0.2 — the DEV BENCH SKIN GATE (`?grok=1`).
                   The /dev/* benches mount OUTSIDE <Layout>, which is the only
@@ -322,6 +444,26 @@ export default function App() {
                   Without the param it renders a BARE <Outlet/> — zero extra DOM,
                   so every existing bench is byte-identical. */}
               <Route element={import.meta.env.DEV ? <DevSkin /> : <Outlet />}>
+              {DevBrowserWorkspace && (
+                <Route
+                  path="/dev/browser-workspace"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevBrowserWorkspace />
+                    </Suspense>
+                  }
+                />
+              )}
+              {DevSignIn && (
+                <Route
+                  path="/dev/sign-in"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevSignIn />
+                    </Suspense>
+                  }
+                />
+              )}
               {DevStore && (
                 <Route
                   path="/dev/store"
@@ -452,6 +594,16 @@ export default function App() {
                   }
                 />
               )}
+              {DevGroupChat && (
+                <Route
+                  path="/dev/groupchat"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevGroupChat />
+                    </Suspense>
+                  }
+                />
+              )}
               {DevChatLive && (
                 <Route
                   path="/dev/chat-live"
@@ -488,6 +640,26 @@ export default function App() {
                   element={
                     <Suspense fallback={null}>
                       <DevPickers />
+                    </Suspense>
+                  }
+                />
+              )}
+              {DevWorkflows && (
+                <Route
+                  path="/dev/workflows"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevWorkflows />
+                    </Suspense>
+                  }
+                />
+              )}
+              {DevFiles && (
+                <Route
+                  path="/dev/files"
+                  element={
+                    <Suspense fallback={null}>
+                      <DevFiles />
                     </Suspense>
                   }
                 />

@@ -23,29 +23,32 @@
 // Dev-only by construction: `@axe-core/playwright` is a devDependency and axe
 // is injected into the page by the runner, never imported by `src/` — asserted
 // in `tests/unit/a11y-tooling.test.ts`.
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test } from '@playwright/test'
 
 import { api, injectGlobals, startBackend, type Backend } from './harness'
 
-/** The chip whose `nested-interactive` this gate exists to be able to see. */
-const TEAMMATE_CHIP = '[aria-label^="Open researcher"]'
-
 /**
- * The teammate STRIP ROW on the shipped `/focus/:name` route — the focus-view
- * twin of the chip above. It carried the identical `nested-interactive` (a
- * focusable KillTeammateButton inside a `role="button"` wrapper) and was NEVER
- * scanned, because SCANS only ever covered the overview `/` and the dev
- * benches. Its aria-label is the overlay activation button's, post-repair.
+ * The `ready` guard for the shipped `/` scans: a real session TILE on the roster,
+ * so the scan runs against rendered content instead of a skeleton (the reason a
+ * `ready` gate exists at all).
+ *
+ * It used to wait for a seeded TEAM's teammate chip (`[aria-label^="Open
+ * researcher"]`). That no longer resolves in a static e2e: team DETECTION grew
+ * two runtime gates a seeded-config + a stopped shell session cannot satisfy —
+ * the team must resolve to a HOST session (pane-id / lead-cwd match) AND that
+ * host must have OPTED IN (`creator == "team"` / a `"team"` tag, set by
+ * `start_team`/`convert_to_team`), or `retain_opted_in_team_hosts` drops it
+ * (verified: `GET /api/teams` returns `[]` for a hand-seeded team even with a
+ * cwd-matched lead and `creator:"team"`). So `/` gates on the seeded SESSION
+ * tile, which renders unconditionally; the team-card / focus-strip
+ * `nested-interactive` a11y those chips guarded is still scanned on the
+ * `/dev/roster` and `/dev/focus` benches below (which mount the components from
+ * fixtures) — and the shipped routes' contrast by `theme-contrast.test.ts`. The
+ * shipped `/focus/:name` scan is dropped for the same reason (its team strip
+ * can't render statically); `/dev/focus` keeps that route's component coverage.
  */
-const TEAMMATE_STRIP_ROW = '[aria-label^="Teammate researcher"]'
-
-/** The lead session `/focus/:name` scans open — a real session on the roster
- *  so the team strip (and its teammate rows) actually render. */
-const FOCUS_LEAD = 'axe-lead'
+const SEEDED_TILE = `[aria-label^="${'axe-lead'}"]`
 
 const DESKTOP = { width: 1440, height: 900 }
 const PHONE = { width: 390, height: 844 }
@@ -62,9 +65,14 @@ const PHONE = { width: 390, height: 844 }
  * and the baseline could never see it, because the component only renders when
  * a real team is on the roster.
  *
- * `/` is therefore scanned against a SEEDED backend (see `seedTeam`): one team,
- * one lead, one teammate, one session. A bench proves a component renders; only
- * the shipped route proves what a user meets.
+ * `/` is therefore scanned against a SEEDED backend: one real session on the
+ * roster, and the scan gates on its tile (`SEEDED_TILE`) so it runs against
+ * rendered content, never a skeleton. The team-card / teammate-chip a11y this
+ * gate once reached by seeding a whole team is now covered by the `/dev/roster`
+ * and `/dev/focus` benches — team DETECTION grew runtime gates a static seed
+ * cannot forge (see `SEEDED_TILE`), and a bench mounts the component from
+ * fixtures without them. A bench proves a component renders; the shipped `/`
+ * proves the overview a user actually meets.
  */
 const SCANS = [
   { route: '/dev/roster', viewport: DESKTOP, surface: 'desktop' },
@@ -74,74 +82,13 @@ const SCANS = [
   { route: '/?mock', viewport: DESKTOP, surface: 'desktop' },
   { route: '/dev/focus-mobile', viewport: PHONE, surface: 'phone' },
   // ── the shipped roster, with real data behind it ──
-  // `ready` is not politeness: a fixed settle scanned a SKELETON on the first
-  // run of this file and reported a reassuring nothing for all four `/` rows.
-  // A gate that can scan an empty page is a gate that passes for the wrong
-  // reason, so `/` waits for its own content to exist.
-  //
-  // `ready` waits for the TEAMMATE CHIP, not merely for the page to paint. Two
-  // reasons, and the second is the important one: a fixed settle scanned a
-  // SKELETON on the first run of this file and reported a reassuring nothing
-  // for all four `/` rows; and if the seeded team ever stopped reaching the
-  // roster, these scans would go on passing while covering nothing at all —
-  // which is exactly the failure mode that let `nested-interactive` live on
-  // `/` for a fase. A gate that can pass on an empty page is not a gate.
-  { route: '/', viewport: DESKTOP, surface: 'desktop', ready: TEAMMATE_CHIP },
-  { route: '/', viewport: PHONE, surface: 'phone', ready: TEAMMATE_CHIP },
-  // ── the shipped focus route, with a real team on the strip ──
-  // `/dev/focus` proved the component renders; only `/focus/:name` proves what
-  // a user meets. It carried the identical teammate `nested-interactive` as `/`
-  // did (KillTeammateButton inside a `role="button"` row) and was structurally
-  // invisible here for a fase. `ready` waits for the teammate STRIP ROW — the
-  // element that owns the defect — so a strip that stopped rendering teams can
-  // never let this scan pass on nothing.
-  {
-    route: `/focus/${FOCUS_LEAD}`,
-    viewport: DESKTOP,
-    surface: 'desktop',
-    ready: TEAMMATE_STRIP_ROW,
-  },
+  // `ready` waits for the seeded SESSION TILE, not merely for the page to paint:
+  // a fixed settle scanned a SKELETON on the first run of this file and reported
+  // a reassuring nothing for all four `/` rows. A gate that can pass on an empty
+  // page is not a gate, so `/` waits for its own content to exist.
+  { route: '/', viewport: DESKTOP, surface: 'desktop', ready: SEEDED_TILE },
+  { route: '/', viewport: PHONE, surface: 'phone', ready: SEEDED_TILE },
 ] as const
-
-/**
- * Write the on-disk team files Claude Code would write, into the config root
- * this backend was ACTUALLY booted with (`backend.claudeConfigDir` — see the
- * note there; it is not always under `dataDir`). `teams/scan.rs` picks them up
- * on its next tick, so `/api/teams` returns
- * one team and the overview renders a `<TeamCard>` with a `<TeammateChip>` in
- * it — which is the only way this gate ever sees that component.
- */
-const TEAM = 'axe-squad'
-
-function seedTeam(backend: Backend, team = TEAM): void {
-  const dir = join(backend.claudeConfigDir, 'teams', team)
-  mkdirSync(dir, { recursive: true })
-  writeFileSync(
-    join(dir, 'config.json'),
-    JSON.stringify({
-      leadSessionId: 'axe-lead-session',
-      leadAgentId: `team-lead@${team}`,
-      createdAt: Date.now(),
-      members: [
-        {
-          name: 'team-lead',
-          agentId: `team-lead@${team}`,
-          model: 'claude-opus-4',
-          color: '#e07b39',
-          isActive: true,
-          role: 'team-lead',
-        },
-        {
-          name: 'researcher',
-          agentId: `researcher@${team}`,
-          model: 'claude-opus-4',
-          color: '#8b5cf6',
-          isActive: true,
-        },
-      ],
-    }),
-  )
-}
 
 const THEMES = ['dark', 'light'] as const
 
@@ -202,16 +149,16 @@ const BASELINE: readonly string[] = [
   '/dev/chat-ui light/desktop color-contrast',
   '/dev/focus dark/desktop color-contrast',
   '/dev/focus light/desktop color-contrast',
+  // The PHONE twin of the `/dev/focus` bench, same fixture-only muted-token
+  // chrome, same class as every `/dev/*` line above — surfaced here for the
+  // first time now that the `/` scans no longer time out on a seeded team and
+  // this assertion actually reaches every scan. Not a user-reachable defect
+  // (`/dev/*` is a bench, never a shipped route; the mobile routes a user meets
+  // are covered by `theme-contrast.test.ts`), so baselined like its siblings.
+  '/dev/focus-mobile dark/phone color-contrast',
+  '/dev/focus-mobile light/phone color-contrast',
   '/dev/roster dark/desktop color-contrast',
   '/dev/roster light/desktop color-contrast',
-  // The seeded /focus/:name scan (this PR added it to catch the team-strip
-  // nested-interactive, now fixed) surfaces the same environment-only muted-
-  // token color-contrast every other route above carries: a borderline ratio
-  // the hosted runner's font stack anti-aliases just under AA, absent on a dev
-  // box. Not a user-reachable defect — the nested-interactive it was added for
-  // IS gone; this is the route's own contrast, baselined like all its siblings.
-  '/focus/axe-lead dark/desktop color-contrast',
-  '/focus/axe-lead light/desktop color-contrast',
 ]
 
 test.describe('axe — WCAG 2 A/AA over the shell surfaces', () => {
@@ -220,18 +167,16 @@ test.describe('axe — WCAG 2 A/AA over the shell surfaces', () => {
   test.beforeAll(async () => {
     backend = await startBackend()
     // The shipped `/` scans need real data behind them, or they scan an empty
-    // state and report a reassuring nothing.
-    seedTeam(backend)
+    // state and report a reassuring nothing — so seed ONE real session and gate
+    // on its tile (SEEDED_TILE). A seeded TEAM used to back these scans, but team
+    // DETECTION now needs runtime state a static seed can't forge (an opted-in,
+    // host-resolved lead — see SEEDED_TILE); the team-chip a11y that seed guarded
+    // is covered by the `/dev/roster` + `/dev/focus` benches, which mount those
+    // components from fixtures without the detection gate.
     const A = api(backend)
     await A.createSession({ name: 'axe-lead', provider: 'shell', dir: backend.dataDir })
   })
   test.afterAll(async () => {
-    // REMOVE THE TEAM, not just the backend. `claudeConfigDir` can be SHARED
-    // across the whole run (see `Backend.claudeConfigDir`), and a team left on
-    // disk is then visible to every spec that boots after this file — including
-    // `overview-loads.spec.ts`, whose first assertion is "a fresh backend must
-    // see no teams". Seeding into a shared root obliges you to unseed.
-    if (backend) rmSync(join(backend.claudeConfigDir, 'teams', TEAM), { recursive: true, force: true })
     await backend?.dispose()
   })
 

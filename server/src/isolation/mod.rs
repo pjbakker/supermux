@@ -45,6 +45,9 @@ use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 pub mod landlock_linux;
 
+#[cfg(target_os = "macos")]
+pub mod seatbelt_macos;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IsolationMode — the REQUESTED policy
 // ─────────────────────────────────────────────────────────────────────────────
@@ -331,19 +334,11 @@ impl IsolationProvider for Noop {
 /// add the `excludedCommands` / `dangerouslyDisableSandbox` escape hatch for the
 /// three known breakage classes (Go-CLI TLS, Apple Events `-600`, nested
 /// Playwright/Chromium).
+// The macOS Seatbelt backend now lives in [`seatbelt_macos`]: a real
+// `sandbox_init` profile (allow-default + deny-cross-company-write +
+// deny-read-secrets) that reports `Partial`, replacing the former no-op stub.
 #[cfg(target_os = "macos")]
-pub struct SeatbeltMacOS;
-
-#[cfg(target_os = "macos")]
-impl IsolationProvider for SeatbeltMacOS {
-    fn name(&self) -> &'static str {
-        "seatbelt"
-    }
-    fn confine(&self, _spec: &SandboxSpec) -> io::Result<IsolationLevel> {
-        // TODO(P3): compile + apply the sandbox-exec profile; report Partial.
-        Ok(IsolationLevel::None)
-    }
-}
+pub use seatbelt_macos::SeatbeltMacOS;
 
 /// The active backend for this host: Landlock on Linux, Seatbelt (stub) on
 /// macOS, Noop elsewhere.
@@ -484,9 +479,15 @@ fn measure_best_level(provider: &dyn IsolationProvider) -> IsolationLevel {
     {
         landlock_linux::fork_probe(provider)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        // Noop / Seatbelt-stub confine() do not restrict the caller.
+        // Seatbelt's confine() jails the CALLER, so measure it in a forked child
+        // — never the daemon.
+        seatbelt_macos::fork_probe(provider)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Noop confine() does not restrict the caller, so a direct call is safe.
         let spec = SandboxSpec::for_company(Path::new("/tmp"), &probe_home());
         provider
             .confine(&spec)
@@ -557,7 +558,12 @@ fn run_confinement_self_test() -> bool {
     {
         landlock_linux::self_test_confined_exec(&probe_home())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Fork + confine + execv a real binary under Seatbelt (never the daemon).
+        seatbelt_macos::self_test_confined_exec(&probe_home())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         true
     }

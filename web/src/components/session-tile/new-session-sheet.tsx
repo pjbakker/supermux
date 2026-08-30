@@ -544,7 +544,7 @@ function AgentForm({
               exit={reduce ? { opacity: 0 } : { opacity: 0, x: 12 }}
               transition={stepTransition}
             >
-              <ConnectStep slug={createdName ?? slug} name={name} mock={bench?.mockConnectors} />
+              <ConnectStep slug={createdName ?? slug} mock={bench?.mockConnectors} />
             </motion.div>
           )}
         </AnimatePresence>
@@ -945,13 +945,11 @@ function DescribeStep(props: {
 // ── Step 2: Connect (connector onboarding, scoped, skippable) ─────────────────
 function ConnectStep({
   slug,
-  name,
   mock,
 }: {
+  /** The machine id used for the grant target; StoreView derives its heading /
+   *  subtitle from this too. */
   slug: string
-  /** The DISPLAY name for the heading (the slug is the machine id used for the
-   *  grant target). */
-  name: string
   mock?: ConnectorCard[]
 }) {
   const live = useConnectors(mock ? { source: 'local' } : {})
@@ -959,21 +957,21 @@ function ConnectStep({
   const emptyVault = !mock && !live.isLoading && cards.length === 0
 
   return (
-    <div className="flex min-h-0 flex-col gap-3 px-6 pb-2 pt-4">
-      <div className="flex flex-col gap-1">
-        <h3 className="text-[15px] font-semibold text-foreground">Give {name} its apps</h3>
-        <p className="text-[13px] text-muted-foreground">
-          Pick what this teammate can use. You can add more later — or skip.
-        </p>
-      </div>
-
-      {/* The store is the tall part — it flows in the sheet's SINGLE scroll body
-          (no inner max-h cap) so the outer ResponsiveSheet (maxHeight:var(--vvh))
-          governs the height and the catalog scrolls within it. The Skip / Finish
-          actions stay on-screen because the footer is `sticky bottom-0`, not
-          because the catalog is boxed off. */}
-      <div data-grok>
-        {emptyVault ? (
+    // Full-bleed: no horizontal padding here. StoreView (sheet variant) owns the
+    // ONLY inset (`px-4 sm:px-6` on its sticky header + scroll body) and prints the
+    // single heading ("Connectors" / "Give {name} the tools it needs."), so the
+    // catalog uses the full sheet width instead of the old double-padded inset
+    // panel. `data-grok` stays — it scopes the store's frosted `cs-*` skin inside
+    // this body-portalled sheet; it is layout-neutral, not the pinch.
+    //
+    // The store is the tall part — it flows in the sheet's SINGLE scroll body (no
+    // inner max-h cap) so the outer ResponsiveSheet (maxHeight:var(--vvh)) governs
+    // the height and the catalog scrolls within it. The Skip / Finish actions stay
+    // on-screen because the footer is `sticky bottom-0`, not because the catalog is
+    // boxed off.
+    <div data-grok className="flex min-h-0 flex-col pb-2">
+      {emptyVault ? (
+        <div className="px-4 pt-4 sm:px-6">
           <div className="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-border bg-muted/20 px-6 py-10 text-center">
             <Plus className="size-6 text-muted-foreground" aria-hidden />
             <div className="flex flex-col gap-1">
@@ -989,23 +987,25 @@ function ConnectStep({
               Open the store
             </a>
           </div>
-        ) : (
-          <React.Suspense
-            fallback={
+        </div>
+      ) : (
+        <React.Suspense
+          fallback={
+            <div className="px-4 pt-4 sm:px-6">
               <div className="flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-[13px] text-muted-foreground">
                 <Loader2 className="size-4 animate-spin" aria-hidden />
                 Loading connectors…
               </div>
-            }
-          >
-            <StoreView
-              grantTarget={slug}
-              variant="sheet"
-              {...(mock ? { mock, mockGranted: { bot: [], all: [] } } : {})}
-            />
-          </React.Suspense>
-        )}
-      </div>
+            </div>
+          }
+        >
+          <StoreView
+            grantTarget={slug}
+            variant="sheet"
+            {...(mock ? { mock, mockGranted: { bot: [], all: [] } } : {})}
+          />
+        </React.Suspense>
+      )}
     </div>
   )
 }

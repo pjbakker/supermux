@@ -14,6 +14,7 @@ use crate::config::Config;
 pub mod audit;
 pub mod board;
 pub mod boards;
+pub mod browser_tabs;
 pub mod companies;
 pub mod connectors;
 pub mod hosts;
@@ -22,12 +23,12 @@ pub mod human_users;
 pub mod prefs;
 pub mod push;
 pub mod runtime_state;
-pub mod schedules;
 pub mod sessions;
 pub mod skills;
 pub mod steering;
 pub mod teams_dismissed;
 pub mod tracked_files;
+pub mod workflows;
 
 /// Open the pool and run migrations.
 ///
@@ -119,8 +120,8 @@ mod tests {
             .unwrap()
             .get("n");
         assert_eq!(
-            applied, 35,
-            "expected thirty-five applied migrations (0001-0005, 0007-0024, 0026-0037)"
+            applied, 38,
+            "expected thirty-eight applied migrations (0001-0005, 0007-0024, 0026-0040)"
         );
 
         // 0037 applied cleanly: the new nullable company_id column exists and a
@@ -135,6 +136,37 @@ mod tests {
         assert!(
             cols.iter().any(|c| c == "company_id"),
             "0037 adds connector_accounts.company_id"
+        );
+
+        // 0039 (shared-browser v1): the workspace tab + per-tab grant tables. The
+        // grant table is the ONE that must not be an overload of
+        // `session_connectors` — its PK is (tab_id, grantee), so one grantee can
+        // hold tab A and not tab B, which the connector grant cannot express.
+        let tables: Vec<String> =
+            sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("name"))
+                .collect();
+        for want in ["browser_tabs", "browser_tab_grants"] {
+            assert!(tables.iter().any(|t| t == want), "0039 adds {want}");
+        }
+        browser_tabs::create(&pool, "tb_migration0001", "https://x.test/", None, &[])
+            .await
+            .unwrap();
+        browser_tabs::grant(&pool, "tb_migration0001", "alice", true)
+            .await
+            .unwrap();
+        // ON DELETE CASCADE, mirroring connectors→session_connectors (0031).
+        assert!(browser_tabs::delete(&pool, "tb_migration0001").await.unwrap());
+        assert!(
+            browser_tabs::grants_for_tab(&pool, "tb_migration0001")
+                .await
+                .unwrap()
+                .is_empty(),
+            "deleting a tab must cascade its grants"
         );
         connectors::upsert(&pool, "gh", "mcp_catalog", "gh", "", "", "[]", "[]", "{}", "{}")
             .await

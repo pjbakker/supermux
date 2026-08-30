@@ -68,7 +68,7 @@ pub const HUMAN_TAG: &str = "supermux-human";
 /// The schedule wrapper's tag, named here only so [`wrapper_markup`] can refuse
 /// it too: a delegated prompt that opens a `<supermux-schedule>` would let one
 /// session forge a scheduled fire in another's transcript just as easily.
-const SCHEDULE_TAG: &str = crate::scheduler::runner::SCHEDULE_TAG;
+const SCHEDULE_TAG: &str = crate::workflows::engine::SCHEDULE_TAG;
 
 /// Whether `s` contains markup that would let it forge — or break out of — one
 /// of supermux's own transcript wrappers.
@@ -151,7 +151,7 @@ pub fn wrap_human(
         return Err("prompt may not contain supermux wrapper markup");
     }
     let company = company_id.map(|c| c.to_string()).unwrap_or_default();
-    let name = crate::scheduler::runner::escape_attr(name);
+    let name = crate::workflows::engine::escape_attr(name);
     Ok(format!(
         "<{HUMAN_TAG} user=\"{user_id}\" name=\"{name}\" company=\"{company}\">\n{prompt}\n</{HUMAN_TAG}>"
     ))
@@ -290,6 +290,46 @@ pub async fn deliver_delegation(
     // [`delegation_gate_allows`] for the decision table.
     if !delegation_gate_allows(from_row.company_id, to_row.company_id) {
         return Err(AppError::NotFound(format!("session '{to}'")));
+    }
+
+    // THE GROUP-CHAT LOOP GUARD (spec §4.3). NOTHING delivered through this
+    // core may wake a company's Router (Main Assistant). That single edge is
+    // what would let one bot's output cost every other bot a turn, because the
+    // Router's whole job is to fan a message out as `@tags`.
+    //
+    // UNCONDITIONAL, and each dropped condition was a hole:
+    //
+    //  * NOT keyed on `actor`. `actor` is a free-text body field from an
+    //    already-bearer-authed caller — the module doc above says in capitals it
+    //    is not an authentication result — so exempting `actor == "human"` made
+    //    a LABEL into the fence. It held only because a bot has no supplied
+    //    bearer; the bearer still sits on disk at `<data_dir>/auth_token`, so
+    //    the guarantee rested on `isolation_mode` (default `BestEffort`) rather
+    //    than on code. A guarantee that depends on a config default is not one.
+    //
+    //  * NOT preconditioned on the SENDER having a company. A main/PA/HQ bot
+    //    (`company_id IS NULL`) reaches every company by design
+    //    ([`delegation_gate_allows`]), so that precondition let the entire HQ
+    //    tier wake any Router, unbounded — and each poke costs the Router a full
+    //    turn even when the 2-tag cap then drops its fan-out.
+    //
+    // No agent of any tier has a legitimate reason to wake a Router: the
+    // Router's entire input is HUMAN messages, and a human message must arrive
+    // through a route carrying a SERVER-RESOLVED `AuthContext` (the discipline
+    // [`wrap_human`] already applies, and which `companies::groupchat`'s post
+    // route now applies too), never through a body field here.
+    //
+    // Bot posts keep their own path (`POST /api/companies/{id}/groupchat/post`),
+    // which appends to the sidecar log and wakes nobody, so nothing legitimate
+    // is lost. A refusal is a SILENT 404 (byte-identical to a nonexistent slug)
+    // and returns BEFORE any delivery, edge or audit row — the same discipline
+    // as the company gate above.
+    if let Some(cid) = to_row.company_id {
+        if let Some(company) = db::companies::get(&state.pool, cid).await? {
+            if crate::companies::groupchat::is_router(&company.slug, to) {
+                return Err(AppError::NotFound(format!("session '{to}'")));
+            }
+        }
     }
 
     // Deliver the prompt (auto-wakes a stopped target). Claude targets get the
@@ -449,7 +489,20 @@ mod tests {
         (AppState::new(pool, config), dir)
     }
 
-    /// Insert a session and stamp its `company_id` (NULL when `company` is None).
+    /// Insert a session, stamp its `company_id` (NULL when `company` is None),
+    /// and PIN ITS RUNTIME to the "awake, agent at the composer" fixture.
+    ///
+    /// The pin is not decoration. `deliver_delegation` ends in
+    /// `lifecycle::send_harness_text`, which talks to a real pty: it probes the
+    /// runtime for liveness, auto-wakes a stopped session through `start()`, and
+    /// reads the screen back before typing. Without a stubbed runtime these
+    /// tests shell out to `tmux`, spawn a real `supermux-<name>` session on the
+    /// host's default socket and type `claude …` into it — so they passed only
+    /// where a previous run had left such a session behind with a live agent in
+    /// it, and failed on any clean host with no `claude` on PATH (every CI
+    /// runner) with "was woken but its agent never came up". The gate under test
+    /// here is the COMPANY/ROUTER decision, not the pty; state the delivery
+    /// precondition instead of inheriting it from the machine.
     async fn seed_session(state: &AppState, name: &str, company: Option<i64>) {
         db::sessions::insert_minimal(&state.pool, name, "/tmp", "claude")
             .await
@@ -460,6 +513,7 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
+        crate::sessions::runtime::testing::agent_at_composer(state, name);
     }
 
     async fn seed_company(state: &AppState, slug: &str) -> i64 {
@@ -558,6 +612,61 @@ mod tests {
         assert!(
             matches!(err, AppError::NotFound(_)),
             "company→main refusal must be a silent 404, got {err:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// GROUP CHAT §4.3 — a company bot may not wake its company's Router. The
+    /// Router fans one message out as `@tags`, so this single edge is what
+    /// would turn one bot's post into every bot's turn. Bot posts have their
+    /// own, pty-free path (`groupchat/post`), so nothing legitimate is lost.
+    #[tokio::test]
+    async fn company_bot_to_its_company_router_is_404() {
+        let (state, dir) = test_state().await;
+        let acme = seed_company(&state, "acme").await;
+        seed_session(&state, "acme-bot", Some(acme)).await;
+        // The Main Assistant, by the ONE naming convention (§3.1).
+        seed_session(&state, &crate::companies::groupchat::router_name("acme"), Some(acme)).await;
+
+        let err = delegate(
+            axum::extract::State(state.clone()),
+            crate::scope::OptCtx(None),
+            axum::Json(deleg_input("acme-bot", "acme-assistant")),
+        )
+        .await
+        .expect_err("a bot must not be able to wake the Router");
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "the refusal must be a silent 404, got {err:?}"
+        );
+        // Same discipline as the company gate: refused BEFORE any bookkeeping.
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM delegations").await, 0);
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM audit_log").await, 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The refusal is scoped to the ROUTER, not to company traffic: an ordinary
+    /// same-company peer still goes through, edge and all. Without this the
+    /// guard could be "refuse company traffic" and every existing test would
+    /// still pass.
+    #[tokio::test]
+    async fn a_company_peer_that_is_not_the_router_still_delivers() {
+        let (state, dir) = test_state().await;
+        let acme = seed_company(&state, "acme").await;
+        seed_session(&state, "acme-bot", Some(acme)).await;
+        seed_session(&state, "acme-backend", Some(acme)).await;
+
+        delegate(
+            axum::extract::State(state.clone()),
+            crate::scope::OptCtx(None),
+            axum::Json(deleg_input("acme-bot", "acme-backend")),
+        )
+        .await
+        .expect("a normal same-company peer must not hit the Router guard");
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM delegations").await,
+            1,
+            "the edge is recorded exactly as before"
         );
         std::fs::remove_dir_all(dir).ok();
     }

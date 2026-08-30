@@ -55,6 +55,13 @@ const EMITTED: string[] = (() => {
   for (const file of rustFiles(SERVER_SRC)) {
     const src = readFileSync(file, 'utf8')
     for (const m of src.matchAll(/event:\s*"([a-z-]+)"/g)) found.add(m[1]!)
+    // …and the two CONSTRUCTORS, which name the event positionally rather than
+    // through the `event:` field. `workflows` is emitted only this way, so a
+    // scrape that read the struct literal alone would have called the newest
+    // channel an orphan — the exact rot this file exists to prevent.
+    for (const m of src.matchAll(/SseEvent::(?:for_company|global)\(\s*"([a-z-]+)"/g)) {
+      found.add(m[1]!)
+    }
     if (file.endsWith('/sse.rs')) {
       for (const m of src.matchAll(/Event::default\(\)\.event\("([a-z-]+)"\)/g)) {
         found.add(m[1]!)
@@ -69,9 +76,14 @@ describe('the SSE channel list', () => {
     // A sanity floor: if the scrape stops finding anything, the assertions
     // below would pass vacuously.
     expect(EMITTED.length).toBeGreaterThan(5)
-    for (const core of ['sessions', 'status', 'harness', 'alerts']) {
+    for (const core of ['sessions', 'status', 'harness', 'alerts', 'workflows']) {
       expect(EMITTED).toContain(core)
     }
+    // `files` is the constructor-form channel the scrape was widened for. It
+    // is pinned by NAME so the channel can never half-land the way `harness`
+    // did: if the server stops emitting it, or the emit moves to a form the
+    // scrape misses, this fails here rather than silently in production.
+    expect(EMITTED).toContain('files')
   })
 
   test('EVERY channel the server emits is subscribed by the client', () => {
@@ -83,12 +95,13 @@ describe('the SSE channel list', () => {
   test('the client subscribes to nothing that does not exist', () => {
     // The other direction is a warning rather than a bug, but a channel nobody
     // emits is either a rename that half-landed or dead weight.
-    const orphans = (SSE_NAMED_EVENTS as readonly string[]).filter(
-      // `schedules` is emitted by the scheduler through the `alerts` channel
-      // today; the name is kept because `use-scheduler.ts` still routes on it.
-      (e) => !EMITTED.includes(e) && e !== 'schedules',
-    )
+    // Phase 4B removed the ONE exemption this test carried: `schedules` was
+    // kept because `use-scheduler.ts` routed on it. The scheduler client is
+    // gone, the server emits `workflows` instead, and the allowlist shrank —
+    // which is the direction it is allowed to move.
+    const orphans = (SSE_NAMED_EVENTS as readonly string[]).filter((e) => !EMITTED.includes(e))
     expect(orphans).toEqual([])
+    expect(SSE_NAMED_EVENTS as readonly string[]).not.toContain('schedules')
   })
 
   test('the list has no duplicates — a double subscription fires twice', () => {

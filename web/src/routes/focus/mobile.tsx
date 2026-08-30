@@ -131,6 +131,8 @@ import { useEdgeGestures } from '@/components/focus-mode/use-edge-gestures'
 // pane renders. Under Grok mode the mobile focus-view title opens it as a bottom
 // sheet instead of the flat info panel, so there is ONE bot surface, not two.
 // Lazy so the default (non-grok) focus route never pulls it.
+import type { TabKey as BotPanelTabKey } from '@/components/roster/bot-panel'
+
 const BotPanel = React.lazy(() =>
   import('@/components/roster/bot-panel').then((m) => ({ default: m.BotPanel })),
 )
@@ -598,9 +600,7 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
   // Which tab the info panel opens on — mobile parity for the roster's
   // name-as-click deep-link (§2.1): a "manage tools" entry navigates here with
   // `{ openPanel, panelTab }` in history state, and the panel lands on that tab.
-  const [infoTab, setInfoTab] = React.useState<
-    'overview' | 'instructions' | 'tools' | 'memory' | 'activity'
-  >('overview')
+  const [infoTab, setInfoTab] = React.useState<BotPanelTabKey>('overview')
   const location = useLocation()
   const panelHint = (location.state ?? null) as { openPanel?: boolean; panelTab?: typeof infoTab } | null
   React.useEffect(() => {
@@ -712,7 +712,7 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
               title={sessionTitle(current)}
               status={current.status}
               activity={current.activity}
-              subagents={current.subagents}
+              agentsLive={current.agents_live}
               error={current.error}
               blocked={current.blocked ?? undefined}
               rateLimits={current.rate_limits ?? undefined}
@@ -842,6 +842,15 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
                     // way out of it.
                     input={restInput}
                     onOpenTerminal={() => setRenderer('terminal')}
+                    // The bot's details, from the header NAME — the chat card
+                    // is this route's header, so this is the ONLY door to the
+                    // panel while chat holds the pane. Mirrors the terminal
+                    // chrome's `<FocusHeader onTitleClick>` above, same tab
+                    // seating, same sheet.
+                    onTitleClick={() => {
+                      setInfoTab('overview')
+                      setInfoOpen(true)
+                    }}
                     // The single-bar fold: the composer's leading `+` owns an
                     // add-menu with these route-level actions folded in, in place
                     // of the old global dock. The composer adds its own

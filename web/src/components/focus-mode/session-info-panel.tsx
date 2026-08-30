@@ -46,16 +46,17 @@ import {
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
 import { useToast } from '@/components/ui/use-toast'
 import { useSession, useSessionGit } from '@/hooks/use-sessions'
-import { useSchedules } from '@/hooks/use-scheduler'
+import { useWorkflows } from '@/hooks/use-workflows'
 import { useSessionConfig } from '@/hooks/use-session-config'
 import { IssueList } from '@/components/issues/issue-list'
 import { IssueSurface } from '@/components/issues/issue-surface'
 import {
   describeSchedule,
   formatRunTime,
-} from '@/components/scheduler/helpers'
+} from '@/components/workflows/cadence'
+import { workflowHref, workflowNewHref } from '@/components/workflows/workflow-href'
 import { displayLabel } from '@/lib/api'
-import type { ApiSession, SessionMode, ScheduleRow } from '@/lib/api'
+import type { ApiSession, SessionMode } from '@/lib/api'
 import { useCloneSession } from './use-clone-session'
 import { useRenameSession, cleanDisplayName } from './use-rename-session'
 
@@ -287,9 +288,9 @@ function PanelBody({
         }}
       />
 
-      {/* Schedules */}
-      <PaneSection label="Schedules">
-        <SchedulesList name={name} />
+      {/* Workflows */}
+      <PaneSection label="Workflows">
+        <WorkflowsList name={name} />
       </PaneSection>
 
       {/* Git — live status of the working dir (real branch / dirty / ahead-behind),
@@ -595,47 +596,25 @@ export function GitRow({ name }: { name: string }) {
   )
 }
 
+// ── workflows ────────────────────────────────────────────────────────────────
+
 /**
- * LAZY, and it is budget-load-bearing (fase B4 T8).
+ * The per-session workflows list — the flat (non-Grok) focus panel's answer to
+ * "what does this bot do on its own".
  *
- * The sheet pulls in the whole scheduler editor — the form, the recurrence
- * builder, the fire log, the session picker. Imported statically it landed 8 KB
- * gz in the HERO path, for a modal nobody has opened yet. It is only ever
- * mounted while `open`, so the chunk is fetched at the moment of the tap, which
- * is the same trade the `@`/`/` picker makes (`composer.tsx`).
+ * This was `SchedulesList` until Phase 6. The shape is unchanged (a row per job,
+ * title over a human cadence, tap to open) and so is the reason it exists: the
+ * question is per-session, so the answer must not be a trip to a global table
+ * where the reader has to find their own rows again. What changed is the source
+ * — `/api/workflows?session=` instead of the whole schedules list filtered in
+ * the browser — and the destination: a row now opens the workflow's own page,
+ * which holds the step rail and the run history a lazy sheet never could.
  */
-const SessionSchedulesSheet = React.lazy(
-  () => import('@/components/session-schedules/session-schedules-sheet'),
-)
-
-// ── schedules ────────────────────────────────────────────────────────────────
-
-export function SchedulesList({ name }: { name: string }) {
-  const { data, isLoading } = useSchedules()
+export function WorkflowsList({ name }: { name: string }) {
+  const { data, isLoading, error } = useWorkflows(name)
   const reduce = useReducedMotion()
-  // The rows open THIS SESSION's Schedules sheet (fase B4 T8.6). They used to
-  // link to `/scheduler` — a route B1 has since turned into a redirect to a
-  // global admin table, where the reader would have had to find their own rows
-  // again. The sheet is the per-session answer to a per-session question, and
-  // it exists whether or not the fold landed (§0.6).
-  const [sheet, setSheet] = React.useState<{ id: string | null; create: boolean } | null>(null)
 
-  const mine = React.useMemo<ScheduleRow[]>(
-    () => (data ?? []).filter((s) => s.session === name && !s.deleted),
-    [data, name],
-  )
-
-  const sheetEl = sheet && (
-    <React.Suspense fallback={null}>
-    <SessionSchedulesSheet
-      session={name}
-      open
-      onClose={() => setSheet(null)}
-      scheduleId={sheet.id}
-      createOnOpen={sheet.create}
-    />
-    </React.Suspense>
-  )
+  const mine = data ?? []
 
   if (isLoading && !data) {
     return (
@@ -646,62 +625,55 @@ export function SchedulesList({ name }: { name: string }) {
     )
   }
 
+  if (error) {
+    // Honesty rule: unreachable is not empty. "No workflows" here would be a
+    // claim about the server that the browser is in no position to make.
+    return <p className="text-sm text-muted-foreground">Couldn’t reach the workflows.</p>
+  }
+
   if (mine.length === 0) {
     return (
-      <>
-        <p className="text-sm text-muted-foreground">
-          No schedules.{' '}
-          <button
-            type="button"
-            onClick={() => setSheet({ id: null, create: true })}
-            className="font-medium text-primary underline-offset-2 hover:underline"
-          >
-            Add one
-          </button>
-          .
-        </p>
-        {sheetEl}
-      </>
+      <p className="text-sm text-muted-foreground">
+        No workflows.{' '}
+        <Link
+          to={workflowNewHref(name)}
+          className="font-medium text-primary underline-offset-2 hover:underline"
+        >
+          Add one
+        </Link>
+        .
+      </p>
     )
   }
 
   return (
-    <>
-      <ul className="flex flex-col gap-1.5">
-        {mine.map((s, i) => (
-          <motion.li
-            key={s.id}
-            initial={reduce ? false : { opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={reduce ? motionOff : { ...springs.snappy, delay: i * 0.02 }}
+    <ul className="flex flex-col gap-1.5">
+      {mine.map((w, i) => (
+        <motion.li
+          key={w.id}
+          initial={reduce ? false : { opacity: 0, y: 4 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={reduce ? motionOff : { ...springs.snappy, delay: i * 0.02 }}
+        >
+          <Link
+            to={workflowHref(w.id)}
+            className={cn(
+              'flex min-h-11 w-full items-center gap-2 rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-left',
+              'transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+            )}
           >
-            <button
-              type="button"
-              onClick={() => setSheet({ id: s.id, create: false })}
-              className={cn(
-                'flex min-h-11 w-full items-center gap-2 rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-left',
-                'transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-              )}
-            >
-              <CalendarClock
-                className="size-4 shrink-0 text-muted-foreground"
-                aria-hidden
-              />
-              <span className="flex min-w-0 flex-1 flex-col">
-                <span className="truncate text-[13px] font-medium text-foreground">
-                  {s.title}
-                </span>
-                <span className="truncate text-[11px] text-muted-foreground">
-                  {describeSchedule(s.schedule_expr)}
-                  {s.next_run ? ` · next ${formatRunTime(s.next_run)}` : ''}
-                </span>
+            <CalendarClock className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="truncate text-[13px] font-medium text-foreground">{w.title}</span>
+              <span className="truncate text-[11px] text-muted-foreground">
+                {describeSchedule(w.schedule_expr)}
+                {w.next_run ? ` · next ${formatRunTime(w.next_run)}` : ''}
               </span>
-            </button>
-          </motion.li>
-        ))}
-      </ul>
-      {sheetEl}
-    </>
+            </span>
+          </Link>
+        </motion.li>
+      ))}
+    </ul>
   )
 }
 
@@ -766,46 +738,218 @@ export function CopyableMono({
 }
 
 /**
+ * Where a preset lands in an instruction that ALREADY has text: at the caret the
+ * user last left, otherwise at the end — and always as its own paragraph, so a
+ * preset can never glue itself into the middle of a sentence. An empty field is
+ * the one case where the preset simply becomes the text.
+ *
+ * Pure, and exported, because "a preset never destroys what is there" is the
+ * contract `tests/unit/bot-panel-settings.test.ts` pins.
+ */
+export function insertPreset(
+  prev: string,
+  text: string,
+  caret: number | null,
+): { next: string; caret: number } {
+  const body = prev ?? ''
+  if (!body.trim()) return { next: text, caret: text.length }
+  const at = caret === null || caret < 0 || caret > body.length ? body.length : caret
+  const head = body.slice(0, at).replace(/\s+$/, '')
+  const tail = body.slice(at).replace(/^\s+/, '')
+  const upto = head ? `${head}\n\n${text}` : text
+  return { next: tail ? `${upto}\n\n${tail}` : upto, caret: upto.length }
+}
+
+/** What a preset row can do to the field it sits above. Deliberately narrow:
+ *  the pills may ADD text and put a previous draft BACK, and nothing else — the
+ *  editor keeps owning when the value is persisted. */
+export interface DescEditorHandle {
+  /** Insert `text` without destroying what is there, and keep the caret in the
+   *  field. Returns the draft from BEFORE the insert (the caller's Undo) and the
+   *  one it produced (the caller's guard — see `restore`). */
+  insert: (text: string) => { prev: string; next: string }
+  /** Put a previous draft back (the Undo path) and WRITE IT THROUGH. `expect`
+   *  guards it: an Undo offered for one insert must never wipe what the user
+   *  typed AFTER it, so a field that has moved on refuses (returns `false`)
+   *  instead of reverting — callers must branch on the boolean rather than
+   *  assume the revert happened. */
+  restore: (value: string, expect?: string) => boolean
+}
+
+/**
+ * The handle's behaviour, as a pure factory over the field's current state.
+ *
+ * Extracted from the component on purpose: `bun test` has no DOM, so the two
+ * rules that actually matter — an insert never destroys, and an undo is REFUSED
+ * once the field has moved on (and PERSISTED when it hasn't) — would otherwise
+ * be unreachable by anything but an e2e run. See
+ * `tests/unit/bot-panel-settings.test.ts`.
+ */
+export function makeDescHandle(field: {
+  /** The draft as it stands right now. */
+  draft: string
+  /** Where an insert should land — read at CALL time (the caret moves). */
+  caret: () => number | null
+  setDraft: (value: string) => void
+  setCaret: (pos: number) => void
+  /** Write a value through to the row — the same path blur-commit uses. */
+  persist: (value: string) => void
+  /** Put the caret back in the field at `pos`. */
+  refocus: (pos: number) => void
+}): DescEditorHandle {
+  return {
+    insert(text: string) {
+      const prev = field.draft
+      const { next, caret } = insertPreset(prev, text, field.caret())
+      field.setDraft(next)
+      field.setCaret(caret)
+      // NOT persisted here. The field keeps focus, so an insert is an ordinary
+      // edit and the existing blur-commit owns when it lands — which is what
+      // makes it undoable without a round trip.
+      field.refocus(caret)
+      return { prev, next }
+    },
+    restore(value: string, expect?: string) {
+      if (expect !== undefined && expect !== field.draft) return false
+      field.setDraft(value)
+      field.setCaret(value.length)
+      // An undo IS persisted, immediately: the preset it reverts may already
+      // have been blur-committed, and a revert living only in React state would
+      // leave the server holding the preset if the app closed first.
+      field.persist(value)
+      return true
+    },
+  }
+}
+
+/**
  * The session's standing instructions (`desc`).
  *
  * A textarea that commits on blur, not on every keystroke: the config PATCH
  * invalidates the sessions query, and doing that per character would refetch the
  * whole roster while the user types.
+ *
+ * The role-preset pills above it (`<InstructionsTab>`) drive it through
+ * `DescEditorHandle` rather than writing `desc` behind its back: a pill that
+ * PATCHes while this field holds an unsaved draft is exactly how a click used to
+ * wipe an authored instruction. An insert is an EDIT — same draft, same
+ * blur-commit — so undo, re-edit and cancel all keep working.
  */
-export function DescEditor({ name, desc }: { name: string; desc: string }) {
-  const { setDesc, pending } = useSessionConfig()
-  const [draft, setDraft] = React.useState(desc)
-  // Re-seed when the row lands / changes underneath us, but never while the
-  // field is focused — that would eat what the user is typing.
-  const focused = React.useRef(false)
-  React.useEffect(() => {
-    if (!focused.current) setDraft(desc)
-  }, [desc])
+export const DescEditor = React.forwardRef<DescEditorHandle, { name: string; desc: string }>(
+  function DescEditor({ name, desc }, ref) {
+    const { setDesc, pending } = useSessionConfig()
+    const [draft, setDraft] = React.useState(desc)
+    // Re-seed when the row lands / changes underneath us, but never while the
+    // field is focused — that would eat what the user is typing.
+    const focused = React.useRef(false)
+    React.useEffect(() => {
+      if (!focused.current) setDraft(desc)
+    }, [desc])
 
-  const commit = () => {
-    focused.current = false
-    const next = draft.trim()
-    if (next === (desc ?? '').trim()) return
-    void setDesc(name, next)
-  }
+    const box = React.useRef<HTMLTextAreaElement | null>(null)
+    // The caret the user last left behind. Read live off the element while it is
+    // focused; remembered here for the pills, which can fire long after a blur.
+    const caret = React.useRef<number | null>(null)
+    const rememberCaret = () => {
+      if (box.current) caret.current = box.current.selectionStart
+    }
 
-  return (
-    <textarea
-      value={draft}
-      onChange={(e) => setDraft(e.target.value)}
-      onFocus={() => {
-        focused.current = true
-      }}
-      onBlur={commit}
-      disabled={pending}
-      rows={3}
-      placeholder="Durable rules for this agent — always run the unit suite, never touch main…"
-      aria-label="Standing instructions"
-      data-vr="session-desc"
-      className="w-full resize-y rounded-md border border-input bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-    />
-  )
-}
+    /** The one write path — blur, unmount and an undo all go through it. */
+    const persist = (value: string) => {
+      const next = value.trim()
+      if (next === (desc ?? '').trim()) return
+      void setDesc(name, next)
+    }
+
+    const commit = () => {
+      focused.current = false
+      persist(draft)
+    }
+
+    /** Put the caret back at `pos`, focusing the field if it isn't already. rAF
+     *  so the controlled value has reached the DOM before the caret is placed. */
+    const place = (pos: number) => {
+      const apply = () => {
+        const el = box.current
+        if (!el || el.disabled) return
+        el.focus()
+        try {
+          el.setSelectionRange(pos, pos)
+        } catch {
+          /* not a caret-bearing field (jsdom) — the draft is what matters */
+        }
+      }
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(apply)
+      else apply()
+    }
+
+    // Commit on UNMOUNT as well. The sheet can close (or the tab can switch) while
+    // the field still holds focus, and a blur that never fires used to drop the
+    // edit silently — the one way a preset insert could still be lost. Refs, not
+    // deps: `setDesc`'s identity changes with `pending`, and re-running this
+    // cleanup mid-edit would commit a half-typed draft.
+    const latest = React.useRef({ name, draft, desc, setDesc })
+    React.useEffect(() => {
+      latest.current = { name, draft, desc, setDesc }
+    })
+    React.useEffect(
+      () => () => {
+        const l = latest.current
+        const next = l.draft.trim()
+        if (next === (l.desc ?? '').trim()) return
+        void l.setDesc(l.name, next)
+      },
+      [],
+    )
+
+    React.useImperativeHandle(
+      ref,
+      () =>
+        makeDescHandle({
+          draft,
+          // Read live off the element while it is focused (a pill does not blur
+          // it); the remembered caret is the fallback for a field the user left.
+          caret: () =>
+            focused.current && box.current ? box.current.selectionStart : caret.current,
+          setDraft,
+          setCaret: (pos) => {
+            caret.current = pos
+          },
+          persist,
+          refocus: place,
+        }),
+      // `persist`/`place` are re-made every render and close over exactly these.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [draft, desc, name, setDesc],
+    )
+
+    return (
+      <textarea
+        ref={box}
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value)
+          caret.current = e.target.selectionStart
+        }}
+        onFocus={() => {
+          focused.current = true
+        }}
+        onSelect={rememberCaret}
+        onKeyUp={rememberCaret}
+        onBlur={(e) => {
+          caret.current = e.currentTarget.selectionStart
+          commit()
+        }}
+        disabled={pending}
+        rows={3}
+        placeholder="Durable rules for this agent — always run the unit suite, never touch main…"
+        aria-label="Standing instructions"
+        data-vr="session-desc"
+        className="w-full resize-y rounded-md border border-input bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      />
+    )
+  },
+)
 
 /**
  * Tag chips + an add field. Comma or Enter commits; the ✕ on a chip removes it.

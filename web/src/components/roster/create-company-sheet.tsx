@@ -15,6 +15,13 @@
  *
  * Copy + the slug/folder derivation are verbatim from the shipped shadcn dialog
  * (`toCompanySlug` / `deriveRootDir` / the 409 line) — a pure presentation lift.
+ *
+ * ONE OTHER DECISION LIVES HERE: group chat (spec §6). Enabling it provisions
+ * the company's Main Assistant, its sidecar log and its connector grant, and
+ * there is no post-hoc enable route — `PATCH /api/companies` only touches
+ * `display_name`/`archived`. So it is a create-time choice, defaulted ON,
+ * stated in one line rather than buried in a settings pane a founder would have
+ * to know to go looking for.
  */
 import * as React from 'react'
 
@@ -58,6 +65,7 @@ export function CreateCompanySheet({
   onCreated: (id: number) => void
 }) {
   const [name, setName] = React.useState('')
+  const [groupChat, setGroupChat] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
   const create = useCreateCompany()
 
@@ -73,6 +81,7 @@ export function CreateCompanySheet({
     setWasOpen(open)
     if (open) {
       setName('')
+      setGroupChat(true)
       setError(null)
     }
   }
@@ -86,6 +95,7 @@ export function CreateCompanySheet({
         slug,
         display_name: name.trim(),
         root_dir: rootDir,
+        enable_group_chat: groupChat,
       })
       onCreated(company.id)
     } catch (err) {
@@ -173,6 +183,33 @@ export function CreateCompanySheet({
               </p>
             )}
             {error && <p className="pt-1 text-sm text-destructive">{error}</p>}
+          </div>
+        </div>
+
+        {/* GROUP CHAT — create-time, default ON. The description says what it
+            actually DOES (a bot is started), because "enable group chat" alone
+            reads as a display setting and this one spends a session. */}
+        <div className="mt-5 flex min-h-11 items-start gap-3 rounded-lg border border-border px-3 py-2.5">
+          <input
+            id="company-group-chat"
+            type="checkbox"
+            checked={groupChat}
+            onChange={(e) => setGroupChat(e.target.checked)}
+            disabled={create.isPending}
+            className="mt-0.5 size-4 accent-[hsl(var(--primary))]"
+          />
+          <div className="flex flex-col">
+            <label
+              htmlFor="company-group-chat"
+              className="cursor-pointer text-sm font-medium text-foreground"
+            >
+              Group chat
+            </label>
+            <p className="text-xs text-muted-foreground">
+              Starts a Main Assistant that routes what you ask to the right
+              teammates, and gives the company a shared channel. Can only be
+              chosen now.
+            </p>
           </div>
         </div>
       </form>

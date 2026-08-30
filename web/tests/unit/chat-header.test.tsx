@@ -29,11 +29,17 @@
  * its placeholder), and the renderer switch keeping the hooks the e2e suite
  * clicks (`renderer-chat` / `renderer-terminal`, `role="tablist"`).
  */
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, test } from 'bun:test'
 import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import { SessionHeaderPill } from '../../src/components/chat/header-pill'
+import {
+  SessionHeaderPill,
+  WorkflowChip,
+  type HeaderWorkflow,
+} from '../../src/components/chat/header-pill'
 import { RendererSwitch } from '../../src/components/chat/renderer-switch'
 import { sessionAccentVars } from '../../src/components/chat/session-accent'
 import { PHONE } from '../../src/components/chat/ui/metrics'
@@ -394,5 +400,154 @@ describe('the phone header gives its width to the name (QA #6)', () => {
         ),
       ),
     ).toBe('Chat Terminal')
+  })
+})
+
+/**
+ * T6.3 — the honesty tell.
+ *
+ * A workflow OCCUPIES the bot's thread: its steps arrive in this pane as real
+ * submissions, and the human can type into the same pane mid-chain. v1 does not
+ * lock the pane — locking a user out of their own agent is worse than the
+ * interleaving — so it DISCLOSES instead. The chip is the disclosure: it says a
+ * run is in flight, how far along it is, where to read it, and how to stop it.
+ *
+ * The chip is pure (props, no queries) for the same reason everything else in
+ * `header-pill.tsx` is: this module is rendered by `bun test`, whose resolver
+ * reads the root tsconfig and its empty `paths`. The wiring — which workflow,
+ * and the cancel mutation behind Stop — lives in the data plane and is asserted
+ * against that source.
+ */
+describe('the chat-header workflow chip', () => {
+  const chip = (over: Partial<HeaderWorkflow> = {}) =>
+    renderToStaticMarkup(
+      <WorkflowChip
+        workflow={{
+          id: 'WF-7',
+          step: 2,
+          steps: 4,
+          href: '/workflows/WF-7',
+          onOpen: () => undefined,
+          onStop: () => undefined,
+          ...over,
+        }}
+      />,
+    )
+
+  test('shows a "Workflow · step 2/4" chip while a run is in flight', () => {
+    expect(text(chip())).toContain('Workflow · step 2/4')
+  })
+
+  test('the chip opens the run timeline', () => {
+    // The run history lives on the workflow's own page — the chip is a way in,
+    // not a second, smaller timeline.
+    expect(chip()).toContain('href="/workflows/WF-7"')
+  })
+
+  test('offers Stop', () => {
+    const out = chip()
+    expect(out).toContain('data-testid="chat-header-workflow-stop"')
+    expect(text(out)).toContain('Stop')
+  })
+
+  test('shows nothing when no run is in flight', () => {
+    expect(renderToStaticMarkup(<WorkflowChip workflow={null} />)).toBe('')
+    // …and the header itself carries no chip when the prop is absent, which is
+    // every session that is not mid-chain.
+    expect(text(pill(session()))).not.toContain('Workflow ·')
+  })
+
+  test('the header renders the chip when a run IS in flight', () => {
+    const out = renderToStaticMarkup(
+      <SessionHeaderPill
+        name={FOCUS}
+        session={session()}
+        workflow={{
+          id: 'WF-7',
+          step: 2,
+          steps: 4,
+          href: '/workflows/WF-7',
+          onOpen: () => undefined,
+          onStop: () => undefined,
+        }}
+      />,
+    )
+    expect(text(out)).toContain('Workflow · step 2/4')
+  })
+
+  test('Stop is wired to the cancel mutation, and the chip to the live progress', () => {
+    // A render cannot prove which endpoint Stop hits; the data plane can.
+    const src = readFileSync(
+      new URL('../../src/components/chat/chat-panel.tsx', import.meta.url).pathname,
+      'utf8',
+    )
+    expect(src).toContain('useCancelRun')
+    expect(src).toContain('useWorkflowProgress')
+    // `cancel` is POST /api/workflows/{id}/cancel — asserted where it is spelled.
+    const api = readFileSync(
+      new URL('../../src/lib/api/workflows.ts', import.meta.url).pathname,
+      'utf8',
+    )
+    expect(api).toContain('/cancel')
+  })
+})
+
+/**
+ * The header NAME is the door to the bot's details.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The terminal chrome has had a title-click into the panel since
+ * feat-session-info (`<FocusHeader onTitleClick>`); under CHAT the same header
+ * slot was an inert `<span>`, so on the phone — where the chat card IS the
+ * route's header — there was no way to reach the bot's settings at all. The pill
+ * now takes the same optional handler, and the desktop seam (which does not pass
+ * one) must keep the span it always had.
+ */
+describe('the header name as the details door', () => {
+  test('without a handler the name stays an inert span', () => {
+    const out = pill(session())
+    expect(out).toContain(FOCUS)
+    expect(out).not.toContain('data-testid="chat-header-title"')
+    expect(out).not.toContain('aria-haspopup="dialog"')
+  })
+
+  test('with a handler the name is a real button with a 44px target', () => {
+    const out = renderToStaticMarkup(
+      <SessionHeaderPill
+        name={FOCUS}
+        session={session()}
+        surface="phone"
+        onTitleClick={() => undefined}
+      />,
+    )
+    expect(out).toContain('data-testid="chat-header-title"')
+    expect(out).toContain('<button')
+    expect(out).toContain('aria-haspopup="dialog"')
+    // The visible name leads the label (voice control keys on what is on screen).
+    expect(out).toContain(`aria-label="${FOCUS} — bot details"`)
+    // The row's own hit floor, taken back out of the layout so the card's
+    // geometry does not move (the file's one structural promise).
+    expect(out).toContain('min-h-11')
+    expect(out).toContain('-my-2.5')
+    // The name is still the elastic, truncating member it was.
+    expect(out).toContain('flex-1')
+    expect(out).toContain('truncate')
+    expect(text(out)).toContain(FOCUS)
+  })
+
+  test('the mobile chat route actually wires it to the details sheet', () => {
+    // The pill is only half the fix: the phone's `<ChatPanel>` has to pass the
+    // handler that opens the BotPanel sheet, or the button is a dead control.
+    const route = readFileSync(
+      new URL('../../src/routes/focus/mobile.tsx', import.meta.url),
+      'utf8',
+    )
+    expect(route).toContain('onTitleClick={() => {')
+    // …and it opens the SAME sheet the terminal chrome's title opens.
+    expect(route).toContain('setInfoOpen(true)')
+    const panel = readFileSync(
+      new URL('../../src/components/chat/chat-panel.tsx', import.meta.url),
+      'utf8',
+    )
+    expect(panel).toContain('onTitleClick={onTitleClick}')
   })
 })

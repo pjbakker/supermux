@@ -47,6 +47,11 @@ export interface ResponsiveSheetProps {
   descriptionTrailing?: React.ReactNode
   /** Action row rendered under the title (run-now/delete/toggle etc). */
   headerActions?: React.ReactNode
+  /** Hide the visible title bar (border + padding) entirely, keeping `title`/
+   *  `description` as sr-only for a11y. For panels that render their OWN rich
+   *  identity header in the body (e.g. the bot panel: face + editable name +
+   *  status) and must not stack a second generic bar above it. */
+  hideHeader?: boolean
   /** Sticky footer (save/delete) — pinned to the bottom in both shells. */
   footer?: React.ReactNode
   /** Scrollable body. */
@@ -78,6 +83,7 @@ function MobileBody({
   description,
   descriptionTrailing,
   headerActions,
+  hideHeader,
   footer,
   children,
   contentTheme,
@@ -104,49 +110,66 @@ function MobileBody({
           // keyboard), this Vaul sheet is body-portaled and hangs off the LAYOUT
           // viewport, which iOS does NOT shrink for the soft keyboard. So it needs
           // the SINGLE correct lift: `bottom: var(--kb)` raises the sheet by the
-          // keyboard inset, and `maxHeight: var(--vvh)` caps it to the visible
-          // (above-keyboard) height. Inline wins over the `bottom-0`/`max-h-[92vh]`
-          // classes (which stay as the keyboard-closed fallback: --kb=0, --vvh=100dvh).
-          style={{ bottom: 'var(--kb, 0px)', maxHeight: 'var(--vvh, 92vh)' }}
+          // keyboard inset, and the height cap keeps the TOP clear of the notch.
+          // The cap subtracts `--safe-top` (env(safe-area-inset-top), 0 off-device)
+          // from the visible height so the sheet top can never rise above the
+          // status-bar / Dynamic Island region: keyboard-closed the top lands at
+          // `--safe-top` below the physical top (100dvh − inset); keyboard-open the
+          // lift `--kb` + capped height still resolves to that same inset floor.
+          // Inline wins over the `bottom-0`/`max-h-…` classes (the keyboard-closed
+          // fallback: --kb=0, --vvh=100dvh — same inset subtraction so it agrees).
+          style={{
+            bottom: 'var(--kb, 0px)',
+            maxHeight: 'calc(var(--vvh, 92vh) - var(--safe-top, 0px))',
+          }}
           className={cn(
-            'glass fixed inset-x-0 bottom-0 z-[60] flex max-h-[92vh] flex-col',
+            'glass fixed inset-x-0 bottom-0 z-[60] flex max-h-[calc(92vh_-_var(--safe-top,0px))] flex-col',
             'rounded-t-[10px] border-t border-border/60 pb-[var(--kb-safe-bottom)] outline-none',
             contentTheme === 'dark' && 'dark',
           )}
         >
           {/* Drag indicator — 36×5, 2.5px radius, tertiary tint.
-              NO `pt-safe` wrapper: the sheet is capped at `max-h-[92vh]` so the
-              top of the drawer always sits ≥8% below the physical screen top —
-              more than the iOS notch / Dynamic Island inset (~47–59px) on any
-              current device, so the grab-handle is already clear of the status
-              bar. The previous defensive `pt-safe` added 40-50px of dead space
-              ABOVE the drag indicator on PWA. */}
+              NO `pt-safe` wrapper is needed on the header: the height cap already
+              subtracts `--safe-top`, so the whole drawer top sits AT the inset
+              floor — the grab-handle and title are below the notch by construction.
+              A `pt-safe` here would double-count the inset and re-introduce the
+              dead space it used to add above the handle. */}
           <div className="mx-auto mt-1.5 h-[5px] w-9 shrink-0 rounded-[2.5px] bg-muted-foreground/30" />
 
-          <div className="border-b border-border px-5 pb-3 pt-2 text-left">
-            <Drawer.Title className="truncate text-lg font-semibold text-foreground">
-              {title}
-            </Drawer.Title>
-            {/* Always present so Radix's a11y description requirement is met;
-                renders sr-only when the consumer passes none. Wrapped in a
-                flex row so a `descriptionTrailing` action sits on the SAME
-                line, right-aligned — the bulk-action pattern (no extra row,
-                no extra height). */}
-            <div className="flex items-center justify-between gap-3">
-              <Drawer.Description
-                className={cn(
-                  'min-w-0 flex-1 truncate text-sm text-muted-foreground',
-                  !description && 'sr-only',
+          {hideHeader ? (
+            // The consumer draws its OWN identity header in the body — keep the
+            // Radix a11y title/description but render NO visible bar, so nothing
+            // stacks above the body header.
+            <>
+              <Drawer.Title className="sr-only">{title}</Drawer.Title>
+              <Drawer.Description className="sr-only">{description}</Drawer.Description>
+            </>
+          ) : (
+            <div className="border-b border-border px-5 pb-3 pt-2 text-left">
+              <Drawer.Title className="truncate text-lg font-semibold text-foreground">
+                {title}
+              </Drawer.Title>
+              {/* Always present so Radix's a11y description requirement is met;
+                  renders sr-only when the consumer passes none. Wrapped in a
+                  flex row so a `descriptionTrailing` action sits on the SAME
+                  line, right-aligned — the bulk-action pattern (no extra row,
+                  no extra height). */}
+              <div className="flex items-center justify-between gap-3">
+                <Drawer.Description
+                  className={cn(
+                    'min-w-0 flex-1 truncate text-sm text-muted-foreground',
+                    !description && 'sr-only',
+                  )}
+                >
+                  {description}
+                </Drawer.Description>
+                {descriptionTrailing && (
+                  <div className="shrink-0">{descriptionTrailing}</div>
                 )}
-              >
-                {description}
-              </Drawer.Description>
-              {descriptionTrailing && (
-                <div className="shrink-0">{descriptionTrailing}</div>
-              )}
+              </div>
+              {headerActions && <div className="mt-2">{headerActions}</div>}
             </div>
-            {headerActions && <div className="mt-2">{headerActions}</div>}
-          </div>
+          )}
 
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             {children}

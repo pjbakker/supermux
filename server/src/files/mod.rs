@@ -11,6 +11,9 @@
 //! | GET    | `/api/file/raw`            | byte stream w/ Range + ETag          |
 //! | POST   | `/api/fs/upload`           | multipart upload (200 MB cap)        |
 //! | DELETE | `/api/fs/delete`           | delete a file or directory           |
+//! | POST   | `/api/fs/mkdir`            | create a directory (parents incl.)   |
+//! | POST   | `/api/fs/rename`           | rename === move a file or directory  |
+//! | POST   | `/api/fs/copy`             | copy a single file                   |
 //! | POST   | `/api/upload`              | base64 single-file upload (20 MB) — images AND arbitrary files; returns the absolute path |
 //! | GET    | `/api/uploads/{filename}`  | serve a previously uploaded file     |
 //! | GET    | `/api/autocomplete/dir`    | dir typeahead                        |
@@ -46,7 +49,7 @@ use crate::state::AppState;
 use transport::FileTransport;
 
 const CACHE_HEADER: &str = "private, max-age=3600, immutable";
-const TEXT_LIMIT: usize = 200 * 1024; // 200 KB
+const TEXT_LIMIT: usize = 1024 * 1024; // 1 MB (logs and configs are the 200 KB victims)
 const CSV_LIMIT: usize = 5 * 1024 * 1024; // 5 MB
 const IMAGE_MAX: u64 = 5 * 1024 * 1024; // 5 MB
 const PDF_MAX: u64 = 10 * 1024 * 1024; // 10 MB
@@ -84,6 +87,12 @@ pub fn router_for() -> Router<AppState> {
             post(fs_upload).layer(DefaultBodyLimit::max((FS_UPLOAD_MAX + 1024 * 1024) as usize)),
         )
         .route("/api/fs/delete", delete(fs_delete))
+        // The three namespace verbs. POST + JSON in/out; both paths of a
+        // two-path verb ride the same `transport_for_session → jail_for →
+        // safe_path_scoped` chain, with the same jail and the same transport.
+        .route("/api/fs/mkdir", post(fs_mkdir))
+        .route("/api/fs/rename", post(fs_rename))
+        .route("/api/fs/copy", post(fs_copy))
         .route(
             "/api/upload",
             post(upload).layer(DefaultBodyLimit::max(UPLOAD_MAX * 2)),
@@ -129,6 +138,36 @@ struct PutBody {
     cwd: Option<String>,
     #[serde(default)]
     session: Option<String>,
+    /// Unix epoch SECONDS the client believes the file was last modified, as
+    /// handed to it by `GET /api/file`. Absent = the legacy blind write.
+    /// `Some(0)` is the "I am creating a NEW file" assertion. See [`put_file`].
+    #[serde(default)]
+    if_modified: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MkdirBody {
+    path: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// The shared body of the two two-path verbs (`rename`, `copy`). `overwrite` is
+/// a BODY field, not a query param — these are JSON POSTs and a mixed
+/// convention is a footgun. Default `false`: silently clobbering is
+/// unacceptable when three bots and a human share a drive.
+#[derive(Debug, Deserialize)]
+struct MoveBody {
+    from: String,
+    to: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    overwrite: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,6 +445,11 @@ async fn get_file(
         "is_csv": matches!(ext.as_str(), "csv" | "tsv"),
         "is_html": matches!(ext.as_str(), "html" | "htm"),
         "truncated": truncated,
+        // The editor hands `modified` straight back as `PUT`'s `if_modified`
+        // (the lost-update guard); without it the client has nothing to send.
+        // The video/audio/binary branches already carry these.
+        "size": size,
+        "modified": modified,
     })))
 }
 
@@ -426,6 +470,38 @@ async fn put_file(
     // (non-existent) target resolves without 500ing. The jail confines a scoped
     // human's writes under their company root (a write outside → uniform 404).
     let abs = safe_path_scoped(&transport, &raw, jail.as_deref()).await?;
+
+    // D2 — the lost-update guard. With bots actively editing, a blind write is
+    // silent data loss in both directions (human clobbers bot, bot clobbers
+    // human). An ABSENT `if_modified` keeps the historical blind write, so
+    // every existing caller is byte-for-byte unaffected.
+    //
+    // TWO HONEST LIMITS, both real:
+    //   * `Stat.modified` is whole SECONDS (`local_mtime`), so two writes inside
+    //     the same second are indistinguishable. This narrows the window; it
+    //     does not close it.
+    //   * `stat` → `write` is NOT atomic. A bot writing between the two still
+    //     wins silently. Closing that needs an O_EXCL/rename dance the local hot
+    //     path does not have.
+    // Existence is probed with the DEFINITIVE `exists` (never `stat(..).is_ok()`,
+    // which conflates "absent" with "could not ask"); an indeterminate answer
+    // fails closed into an error rather than "assume absent".
+    if let Some(want) = body.if_modified {
+        let exists = transport.exists(&abs).await.map_err(map_transport)?;
+        if want == 0 {
+            // "I am creating a new file."
+            if exists {
+                return Err(AppError::Conflict("file already exists".into()));
+            }
+        } else if !exists {
+            return Err(AppError::Conflict("file no longer exists".into()));
+        } else {
+            let stat = transport.stat(&abs).await.map_err(map_transport)?;
+            if stat.modified != want {
+                return Err(AppError::Conflict("file changed on disk".into()));
+            }
+        }
+    }
 
     // For the LOCAL transport keep the old `safe_open_write` (`O_NOFOLLOW`)
     // hot path — it defends a TOCTOU symlink swap on the final component.
@@ -451,10 +527,11 @@ async fn put_file(
         "user",
         "file.put",
         &abs.to_string_lossy(),
-        json!({ "bytes": body.content.len() }),
+        json!({ "bytes": body.content.len(), "if_modified": body.if_modified }),
     )
     .await
     .ok();
+    emit_files_event(&state, "put", &abs, None, body.session.as_deref()).await;
 
     Ok(Json(json!({ "ok": true, "path": abs.to_string_lossy() })))
 }
@@ -615,6 +692,18 @@ async fn fs_upload(
         } else {
             transport.write(&target, &data).await.map_err(map_transport)?;
         }
+        // The multipart upload had NO audit row until now — it is the one
+        // mutating file handler that wrote nothing to the ledger.
+        db::audit::log(
+            &state.pool,
+            "user",
+            "file.upload",
+            &target.to_string_lossy(),
+            json!({ "bytes": data.len() }),
+        )
+        .await
+        .ok();
+        emit_files_event(&state, "upload", &target, None, session.as_deref()).await;
         saved.push(json!({
             "name": target.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             "size": data.len(),
@@ -639,6 +728,19 @@ async fn fs_delete(
     let jail = jail_for(&state, &ctx).await?;
     let abs = safe_path_scoped(&transport, &to_abs(&body.path, body.cwd.as_deref()), jail.as_deref()).await?;
 
+    // A company ROOT is never deletable — and this is the sharpest edge of the
+    // three, because `safe_path_scoped` cannot catch it: the jail check is
+    // `abs.starts_with(jail_canon)`, which the jail ROOT trivially satisfies on
+    // itself. Without this guard a scoped member could name their own
+    // `root_dir` (which `GET /api/companies` hands them) and `remove_dir_all`
+    // the entire company Drive in one request. Same helper, same 403 as
+    // `fs_rename`.
+    if is_company_root(&state, &abs).await {
+        return Err(AppError::Forbidden(
+            "a company root cannot be deleted".into(),
+        ));
+    }
+
     if is_local_transport(&transport) {
         let meta = tokio::fs::symlink_metadata(&abs).await.map_err(map_io)?;
         if meta.is_dir() {
@@ -653,8 +755,298 @@ async fn fs_delete(
     db::audit::log(&state.pool, "user", "file.delete", &abs.to_string_lossy(), json!({}))
         .await
         .ok();
+    emit_files_event(&state, "delete", &abs, None, body.session.as_deref()).await;
 
     Ok(Json(json!({ "ok": true, "deleted": abs.to_string_lossy() })))
+}
+
+/// `POST /api/fs/mkdir` — create a directory, parents included.
+///
+/// Parents ARE created (`create_dir_all` / `mkdir -p`), but the TARGET itself
+/// must not exist — 409 otherwise. Idempotent-mkdir is a silent no-op that hides
+/// a typo on a shared drive. `WRITABLE_EXTS` does not apply: a directory has no
+/// extension and this is a namespace op, not a write.
+async fn fs_mkdir(
+    State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
+    Json(body): Json<MkdirBody>,
+) -> Result<Json<Value>, AppError> {
+    let transport = transport_for_session(&state, &ctx, body.session.as_deref()).await?;
+    let jail = jail_for(&state, &ctx).await?;
+    let abs =
+        safe_path_scoped(&transport, &to_abs(&body.path, body.cwd.as_deref()), jail.as_deref())
+            .await?;
+
+    // DEFINITIVE existence probe — `exists`, never `stat(..).is_ok()`. An
+    // indeterminate answer (`Err`) fails closed through `map_transport`.
+    if transport.exists(&abs).await.map_err(map_transport)? {
+        return Err(AppError::Conflict("destination exists".into()));
+    }
+    transport.mkdir(&abs).await.map_err(map_transport)?;
+
+    db::audit::log(&state.pool, "user", "dir.create", &abs.to_string_lossy(), json!({}))
+        .await
+        .ok();
+    emit_files_event(&state, "mkdir", &abs, None, body.session.as_deref()).await;
+
+    Ok(Json(json!({ "ok": true, "path": abs.to_string_lossy() })))
+}
+
+/// `POST /api/fs/rename` — rename, which is also MOVE.
+///
+/// Every check runs BEFORE any mutation, and `from` **and** `to` both ride the
+/// full `transport_for_session → jail_for → safe_path_scoped` chain with the
+/// same jail and the same transport. A destination that skipped it would be the
+/// entire vulnerability class this verb could introduce.
+///
+/// CROSS-DEVICE CAVEAT: `rename(2)` fails with `EXDEV` across filesystems (a
+/// company root on another mount makes that reachable). The transport error is
+/// surfaced as-is; a copy+delete fallback is deliberately NOT here — it is
+/// non-atomic and needs its own conflict story.
+async fn fs_rename(
+    State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
+    Json(body): Json<MoveBody>,
+) -> Result<Json<Value>, AppError> {
+    let transport = transport_for_session(&state, &ctx, body.session.as_deref()).await?;
+    let jail = jail_for(&state, &ctx).await?;
+    let from_abs =
+        safe_path_scoped(&transport, &to_abs(&body.from, body.cwd.as_deref()), jail.as_deref())
+            .await?;
+    let to_abs =
+        safe_path_scoped(&transport, &to_abs(&body.to, body.cwd.as_deref()), jail.as_deref())
+            .await?;
+
+    // A company ROOT is never renamable: it would desynchronize
+    // `companies.root_dir` from disk and, for a member, silently re-point the
+    // jail itself. (`fs_delete` has the same hole today — pre-existing, and a
+    // one-line reuse of this helper away from being closed.)
+    if is_company_root(&state, &from_abs).await {
+        return Err(AppError::Forbidden(
+            "a company root cannot be renamed or moved".into(),
+        ));
+    }
+
+    // `to` inside `from` — `/`-delimited prefix compare on the canonicalized
+    // paths, so `…/acme-corp` is never read as inside `…/acme`.
+    if is_inside(&from_abs, &to_abs) {
+        return Err(AppError::BadRequest(
+            "cannot move a directory into itself".into(),
+        ));
+    }
+
+    if !body.overwrite && transport.exists(&to_abs).await.map_err(map_transport)? {
+        return Err(AppError::Conflict("destination exists".into()));
+    }
+
+    transport.rename(&from_abs, &to_abs).await.map_err(map_transport)?;
+
+    db::audit::log(
+        &state.pool,
+        "user",
+        "file.rename",
+        &from_abs.to_string_lossy(),
+        json!({ "to": to_abs.to_string_lossy() }),
+    )
+    .await
+    .ok();
+    emit_files_event(&state, "rename", &to_abs, Some(&from_abs), body.session.as_deref()).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "from": from_abs.to_string_lossy(),
+        "to": to_abs.to_string_lossy(),
+    })))
+}
+
+/// `POST /api/fs/copy` — copy a SINGLE file.
+///
+/// Recursive directory copy is v2 and gated on a security review (an unbounded
+/// walk needs depth + byte caps and a symlink policy), so a directory source is
+/// a 400. No size cap is imposed: the local arm is a kernel-side
+/// `tokio::fs::copy` and the remote arm is `cp` on the far side — the bytes
+/// never materialise in this process.
+///
+/// The "Duplicate" row action is this verb plus a client-proposed
+/// `name (copy).ext` that retries `name (copy 2).ext` on 409. The upload path's
+/// `dedupe_path_local` is deliberately NOT reused: silently renaming an
+/// explicitly named copy target is the clobber-adjacent surprise the 409 exists
+/// to prevent.
+async fn fs_copy(
+    State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
+    Json(body): Json<MoveBody>,
+) -> Result<Json<Value>, AppError> {
+    let transport = transport_for_session(&state, &ctx, body.session.as_deref()).await?;
+    let jail = jail_for(&state, &ctx).await?;
+    let from_abs =
+        safe_path_scoped(&transport, &to_abs(&body.from, body.cwd.as_deref()), jail.as_deref())
+            .await?;
+    let to_abs =
+        safe_path_scoped(&transport, &to_abs(&body.to, body.cwd.as_deref()), jail.as_deref())
+            .await?;
+
+    let stat = transport.stat(&from_abs).await.map_err(map_transport)?;
+    if stat.is_dir {
+        return Err(AppError::BadRequest(
+            "copying a directory is not supported yet".into(),
+        ));
+    }
+    // No company-root refusal here: copying OUT of a company root is a read the
+    // caller already has, and the root itself is a directory (refused above).
+    if is_inside(&from_abs, &to_abs) {
+        return Err(AppError::BadRequest("cannot copy a path onto itself".into()));
+    }
+    if !body.overwrite && transport.exists(&to_abs).await.map_err(map_transport)? {
+        return Err(AppError::Conflict("destination exists".into()));
+    }
+
+    transport.copy(&from_abs, &to_abs).await.map_err(map_transport)?;
+
+    db::audit::log(
+        &state.pool,
+        "user",
+        "file.copy",
+        &from_abs.to_string_lossy(),
+        json!({ "to": to_abs.to_string_lossy() }),
+    )
+    .await
+    .ok();
+    emit_files_event(&state, "copy", &to_abs, Some(&from_abs), body.session.as_deref()).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "from": from_abs.to_string_lossy(),
+        "to": to_abs.to_string_lossy(),
+    })))
+}
+
+/// Is `to` the same path as `from`, or nested INSIDE it? The compare is
+/// `/`-delimited on purpose: a plain `starts_with` on the string would read
+/// `/srv/acme-corp` as inside `/srv/acme` and refuse a legitimate rename (the
+/// same boundary discipline `confineToCompanyRoot` applies on the FE).
+///
+/// `to == from` is refused for a FILE too — it is a no-op the caller did not
+/// mean, and with `overwrite: true` it would otherwise reach `rename(2)`.
+fn is_inside(from: &Path, to: &Path) -> bool {
+    let f = from.to_string_lossy();
+    let f = f.trim_end_matches('/');
+    let t = to.to_string_lossy();
+    t == f || t.starts_with(&format!("{f}/"))
+}
+
+/// Publish one `files` SSE frame, stamped with the company that OWNS the path.
+///
+/// ```jsonc
+/// // event: files
+/// { "op": "write"|"mkdir"|"rename"|"copy"|"put"|"delete"|"upload",
+///   "path": "/abs/path",        // the DESTINATION for rename/copy
+///   "dir":  "/abs/parent",      // server-computed: the FE must never dirname()
+///   "from": "/abs/old"|null,    // rename only
+///   "session": "researcher"|null }
+/// ```
+///
+/// There is exactly ONE stamping rule and it lives here (§3.2): the company is
+/// derived from the PATH via [`company_for_path`], never from the emitting
+/// session. A path under no company root stays unstamped → `Scope::sees(None)`
+/// is fail-closed, so the frame reaches owner/admin only. That asymmetry is
+/// deliberate: a MISSING update is safe, a WRONGLY stamped one leaks another
+/// company's filenames to a member and nothing downstream would catch it.
+///
+/// `dir` is computed server-side on purpose — the FE would otherwise
+/// re-implement `dirname` for two transports and get remote paths wrong.
+pub(crate) async fn emit_files_event(
+    state: &AppState,
+    op: &str,
+    path: &Path,
+    from: Option<&Path>,
+    session: Option<&str>,
+) {
+    let company = company_for_path(state, path).await;
+    // The frame is stamped by its DESTINATION, but it also carries `from`. An
+    // OWNER can rename/copy ACROSS company roots (jail `None`), and that frame
+    // reaches the DESTINATION company's members — so a foreign `from` would ride
+    // company A's absolute path into company B's stream. Drop the source
+    // whenever it belongs to a different company than the one being notified;
+    // the destination is what the recipients are entitled to see. (A member
+    // cannot produce this shape at all: their jail fences both paths into one
+    // root.)
+    let from = match from {
+        Some(f) if company_for_path(state, f).await == company => Some(f),
+        _ => None,
+    };
+    let _ = state.sse_tx.send(crate::state::SseEvent::for_company(
+        "files",
+        json!({
+            "op": op,
+            "path": path.to_string_lossy(),
+            "dir": path.parent().map(|p| p.to_string_lossy().into_owned()),
+            "from": from.map(|p| p.to_string_lossy().into_owned()),
+            "session": session,
+        }),
+        company,
+    ));
+}
+
+/// The company that OWNS this path, by longest `/`-delimited `root_dir` prefix
+/// over ALL companies (archived included — an archived company still has
+/// members and a live root on disk). `None` = the path is under no company root
+/// (HQ), which for an SSE frame means unstamped, i.e. owner/admin only.
+///
+/// PATH-derived, never session-derived: an owner-run HQ bot can write into ANY
+/// company's folder, so the emitting session's `company_id` does not bound the
+/// path. Stamping by session would hand a member of company A a filename from
+/// company B; stamping by path cannot — the frame reaches exactly the members
+/// whose jail already permits that path.
+///
+/// Roots are canonicalized best-effort so a symlinked root (`/tmp` on some
+/// hosts) still matches the canonicalized path `safe_path` produced; a root that
+/// cannot be canonicalized falls back to its literal DB value.
+pub(crate) async fn company_for_path(state: &AppState, abs: &Path) -> Option<i64> {
+    let companies = db::companies::list(&state.pool, true).await.ok()?;
+    let p = abs.to_string_lossy();
+    let mut best: Option<(usize, i64)> = None;
+    for c in companies {
+        if c.root_dir.is_empty() {
+            continue;
+        }
+        let root = match tokio::fs::canonicalize(&c.root_dir).await {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => c.root_dir.clone(),
+        };
+        let root = root.trim_end_matches('/').to_string();
+        if root.is_empty() {
+            continue;
+        }
+        if *p == *root || p.starts_with(&format!("{root}/")) {
+            if best.map_or(true, |(len, _)| root.len() > len) {
+                best = Some((root.len(), c.id));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Is `abs` EXACTLY some company's root directory (not merely inside one)?
+async fn is_company_root(state: &AppState, abs: &Path) -> bool {
+    let Ok(companies) = db::companies::list(&state.pool, true).await else {
+        // Fail closed: if we cannot tell, we do not authorize moving a root.
+        return true;
+    };
+    let p = abs.to_string_lossy();
+    for c in companies {
+        if c.root_dir.is_empty() {
+            continue;
+        }
+        let root = match tokio::fs::canonicalize(&c.root_dir).await {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => c.root_dir.clone(),
+        };
+        if *p == *root.trim_end_matches('/') {
+            return true;
+        }
+    }
+    false
 }
 
 /// `POST /api/upload` — base64 single-file upload to `<data_dir>/uploads/`.

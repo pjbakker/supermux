@@ -38,6 +38,7 @@ import {
   resetNote,
   type AgentErrorInfo,
 } from './agent-error'
+import { coordinationEvent, parseCoordination } from './coordination'
 import type { ChatEntry } from './entries'
 import type { WireEntry } from './wire'
 
@@ -1015,6 +1016,39 @@ export function toChatEntries(wire: readonly WireEntry[]): ChatEntry[] {
     if (w.kind === 'prompt') {
       const raw = textOf(w.body)
       if (!raw.trim()) continue
+      // ── CROSS-SESSION COORDINATION (bot/grok mode) ──────────────────────────
+      // A teammate's message, delivered into this session as a user-role prompt
+      // wrapped in the "Another Claude session sent a message:" envelope with
+      // one or more `<teammate-message>{JSON}</teammate-message>` blocks. It is
+      // intercepted BEFORE `classifyPrompt` (and before the `meta` gate — a
+      // coordination event must render regardless of the isMeta flag): the whole
+      // point is that these carry a JSON PROTOCOL payload the single-block
+      // teammate arm does not read, and arrive as a MULTI-block wrapper the
+      // leading-tag classifier never matches, so they fell through to a raw
+      // prompt bubble. One display row per block; the agent-only guidance suffix
+      // is collapsed by never being read (only the blocks are extracted).
+      const blocks = parseCoordination(raw)
+      if (blocks) {
+        blocks.forEach((block, i) => {
+          // Multiple rows share one wire entry, so each needs its OWN uuid: the
+          // uuid is the render key and the memo comparator's identity, and a
+          // duplicate would collapse the rows into one. A single block keeps the
+          // wire uuid; a fan-out suffixes an index.
+          const uuid = blocks.length > 1 ? `${w.uuid}#c${i}` : w.uuid
+          const ts = toSeconds(w.ts_ms)
+          if (block.plainText !== undefined) {
+            // A plain-prose teammate message that merely arrived wrapped — keep
+            // TODAY's behaviour and render it via the existing teammate arm.
+            const text = sanitiseText(block.plainText)
+            if (!text) return
+            out.push({ uuid, ts, text, kind: 'teammate', label: block.teammateId })
+            return
+          }
+          const ev = coordinationEvent(block)
+          out.push({ uuid, ts, text: ev.text, kind: 'coordination', label: ev.seed, tone: ev.tone })
+        })
+        continue
+      }
       const c = classifyPrompt(raw)
       // `isMeta` — THE FLAG HALF, now that the wire carries it (finding 18).
       //

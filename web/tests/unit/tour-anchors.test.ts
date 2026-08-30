@@ -72,9 +72,14 @@ describe('tour anchors', () => {
     })
   }
 
-  test('step 3 points at Settings, where schedules now live (B1 T9.3)', () => {
+  test('step 3 points at Settings, which is where the way in is (B1 T9.3)', () => {
     // The scheduler route is deleted; if this ever reverts to "scheduler" the
     // anchor test above would catch the dangle, but this pins the INTENT.
+    //
+    // It stays SETTINGS rather than moving to the Workflows nav item, and the
+    // reason is the nav item itself: `/workflows` is `grokOnly`, so off grok
+    // there is no element to point at and the step would highlight nothing.
+    // Settings renders for everyone and carries the Workflows row.
     expect(selectors[2]?.name).toBe('settings')
   })
 
@@ -83,8 +88,11 @@ describe('tour anchors', () => {
     expect(allSource).not.toContain('data-tour="scheduler"')
   })
 
-  test('the copy for step 3 names its new home', () => {
+  test('the copy for step 3 names what is actually there now', () => {
     const copy = readFileSync(join(SRC, 'brand/copy.ts'), 'utf8')
-    expect(copy).toContain('Schedules live in Settings now')
+    expect(copy).toContain('Workflows are in Settings')
+    // The removed capabilities must not survive in the onboarding copy: v1
+    // cannot boot an agent or run a command on a cron expression.
+    expect(copy).not.toContain('boot agents or send commands')
   })
 })

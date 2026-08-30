@@ -62,6 +62,10 @@ export type FileMeta =
       is_csv?: boolean
       is_html?: boolean
       truncated?: boolean
+      size?: number
+      /** Unix epoch SECONDS, handed straight back as `PUT`'s `ifModified` —
+       *  the lost-update guard's whole input (files v1 spec §2.5). */
+      modified?: number
     }
 
 /** A request that failed; carries the HTTP status so callers can branch on 403
@@ -118,14 +122,62 @@ export const filesApi = {
   readFile: (path: string): Promise<FileMeta> =>
     fsRequest(`/api/file?path=${encodeURIComponent(path)}`),
 
-  /** `PUT /api/file` — write a whitelisted text file. */
+  /** `PUT /api/file` — write a whitelisted text file.
+   *
+   *  `ifModified` is the LOST-UPDATE GUARD (files v1 spec §2.5): the `modified`
+   *  epoch-seconds the client was handed by `GET /api/file`. The server 409s
+   *  when the file has moved on since — with bots editing the same drive a
+   *  blind write is silent data loss in both directions. `0` is the distinct
+   *  "I am creating a NEW file" assertion (409 if it already exists), which is
+   *  what `+ New → File` sends. OMITTING it keeps the historical blind write,
+   *  so every pre-existing caller is byte-for-byte unaffected. */
   writeFile: (
     path: string,
     content: string,
+    ifModified?: number,
   ): Promise<{ ok: boolean; path: string }> =>
     fsRequest('/api/file', {
       method: 'PUT',
-      body: JSON.stringify({ path, content }),
+      body: JSON.stringify(
+        ifModified === undefined
+          ? { path, content }
+          : { path, content, if_modified: ifModified },
+      ),
+    }),
+
+  /** `POST /api/fs/mkdir` — create a directory (parents included). The TARGET
+   *  must not exist: an idempotent mkdir is a silent no-op that hides a typo on
+   *  a shared drive, so the server 409s instead. */
+  mkdir: (path: string): Promise<{ ok: boolean; path: string }> =>
+    fsRequest('/api/fs/mkdir', {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+
+  /** `POST /api/fs/rename` — rename, which is also MOVE (the destination is
+   *  just a path in another directory). Without `overwrite` an existing
+   *  destination is a 409, never a clobber. */
+  move: (
+    from: string,
+    to: string,
+    opts?: { overwrite?: boolean },
+  ): Promise<{ ok: boolean; from: string; to: string }> =>
+    fsRequest('/api/fs/rename', {
+      method: 'POST',
+      body: JSON.stringify({ from, to, overwrite: opts?.overwrite ?? false }),
+    }),
+
+  /** `POST /api/fs/copy` — copy a SINGLE file. A directory source is a 400
+   *  ("copying a directory is not supported yet"): recursive copy is v2 and
+   *  needs its own depth/byte caps and symlink policy. */
+  copy: (
+    from: string,
+    to: string,
+    opts?: { overwrite?: boolean },
+  ): Promise<{ ok: boolean; from: string; to: string }> =>
+    fsRequest('/api/fs/copy', {
+      method: 'POST',
+      body: JSON.stringify({ from, to, overwrite: opts?.overwrite ?? false }),
     }),
 
   /** `DELETE /api/fs/delete`. */

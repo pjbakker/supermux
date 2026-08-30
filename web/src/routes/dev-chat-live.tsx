@@ -35,6 +35,7 @@ import { PAPER } from '@/brand/tokens'
 import { ChatComposer } from '@/components/chat/composer'
 import { followsFooterGrowth } from '@/components/chat/backlog'
 import { ChatConversation, PHONE_QUERY } from '@/components/chat/conversation'
+import { useQuestionAnswer } from '@/components/chat/use-question-answer'
 import type { ChatGone } from '@/components/chat/chat-socket'
 import { CHAT_GONE, CHAT_OFFLINE_BLOCKED } from '@/components/chat/connection'
 import { ConnectionNote } from '@/components/chat/connection-note'
@@ -251,6 +252,12 @@ export function Surface({
     if (el && followsFooterGrowth(el, grewBy)) el.scrollTop = el.scrollHeight
   }, [])
 
+  // The question card, driven by the SAME hook the app uses (bench↔app parity):
+  // the answers are live (clickable) and picking one lights it + goes inert, just
+  // as in the app — only the keys go nowhere here, since the bench has no pty.
+  const benchInput = React.useMemo(() => ({ sendKey: async () => {} }), [])
+  const question = useQuestionAnswer({ ask: state.session.question_request, input: benchInput })
+
   return (
     <ChatConversation
       name={state.session.name}
@@ -283,9 +290,10 @@ export function Surface({
       dialogBusy={state.dialogBusy ?? null}
       onChooseDialog={() => {}}
       // The bench has no pty behind it — the question card's answers are live
-      // (clickable), but the keys they would send go nowhere here (like
-      // `onChooseDialog`). The affordance under review is the card itself.
-      onAnswerQuestion={() => {}}
+      // (clickable) and picking one lights the pill + inerts the card via the
+      // shared hook, but the keys go nowhere here (like `onChooseDialog`).
+      onAnswerQuestion={question.onAnswer}
+      questionChosen={question.chosen}
       dialogResolved={state.dialogResolved}
       // The stall's own sentence takes the working row's label (catalog
       // `err.stream_stalled`): `session.activity` still names the last tool

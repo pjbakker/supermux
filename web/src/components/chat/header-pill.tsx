@@ -45,6 +45,10 @@ import { attentionFor } from '../../lib/mark-status'
 import { motionOff, tweens } from '../../lib/springs'
 import { cn } from '../../lib/utils'
 import { modeChipLabel } from '../focus-mode/mode-labels'
+// A local zustand store (no query layer) — safe to import into this
+// bun-test-rendered module: opening the shell's agent-tools sheet is a setState,
+// and it is where the permission-mode switcher lives (relocated in 6905fe0).
+import { useAgentToolsSheet } from '../../stores/claude-tools-store'
 import { usageTitle, worstWindow } from '../../lib/rate-limits'
 import { StatusDot } from '../session-tile/status-dot'
 import type { TileSession } from '../session-tile/types'
@@ -97,19 +101,153 @@ const BAR_MIN_H = 64
 const NAME_MIN = 56
 
 /**
+ * The one hint that the name is a door (`onTitleClick`) — a 12px chevron in the
+ * quiet ink, riding the name's own baseline. Inline SVG rather than an icon
+ * package: this module and everything it imports are rendered by `bun test`,
+ * which is why it has no `@/` imports and no icon dependency (see the file
+ * header). `shrink-0`, so it never eats the name's truncation room.
+ */
+function TitleChevron() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="12"
+      height="12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="shrink-0 text-ink-2 opacity-70"
+      aria-hidden="true"
+    >
+      <path d="m9 18 6-6-6-6" />
+    </svg>
+  )
+}
+
+/**
  * The permission mode, as a chip. Extracted so the phone can STACK it over the
  * trailing slot and the desktop can keep it in the row without two copies of the
  * class list drifting apart.
  */
-function ModeChip({ children, className }: { children: React.ReactNode; className?: string }) {
+function ModeChip({
+  children,
+  className,
+  onOpen,
+  label,
+}: {
+  children: React.ReactNode
+  className?: string
+  /** When set, the chip is a BUTTON that opens the permission-mode switcher —
+   *  the owner taps this to change or reset the mode (bypass restarts the pty; the
+   *  other three switch live). Absent → a plain, non-interactive label. */
+  onOpen?: () => void
+  /** The accessible name for the interactive chip (the visible text is often just
+   *  the mode word or a glyph). */
+  label?: string
+}) {
+  const cls = cn(
+    'flex-none rounded-full border-[0.5px] border-hairline-soft bg-fill-soft px-2 py-[3px] text-[11.5px] font-medium tracking-[0.1px] text-ink-2',
+    onOpen &&
+      'inline-flex items-center gap-1 cursor-pointer transition-colors hover:bg-fill-soft-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+    className,
+  )
+  if (onOpen) {
+    return (
+      <button type="button" onClick={onOpen} aria-label={label} title={label} className={cls}>
+        {children}
+      </button>
+    )
+  }
+  return <span className={cls}>{children}</span>
+}
+
+/** The permission-mode glyph — a small shield. Shown alone in the Normal state
+ *  (where there is no mode word to draw) so the switch is still reachable without
+ *  cluttering the common header with the word "Normal". */
+function ShieldGlyph() {
   return (
-    <span
-      className={cn(
-        'flex-none rounded-full border-[0.5px] border-hairline-soft bg-fill-soft px-2 py-[3px] text-[11.5px] font-medium tracking-[0.1px] text-ink-2',
-        className,
-      )}
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="text-ink-3"
+      aria-hidden="true"
     >
-      {children}
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    </svg>
+  )
+}
+
+/**
+ * A workflow run in flight, as the header needs to say it.
+ *
+ * Pure props, deliberately: this module is rendered by `bun test` (empty
+ * `paths`), and a chip that fetched its own workflow would drag the whole
+ * query layer in with it. The data plane fills this in — see `chat-panel.tsx`.
+ */
+export interface HeaderWorkflow {
+  /** The workflow whose run is occupying this pane. */
+  id: string
+  /** 1-based, as the SSE frame counts. */
+  step: number
+  steps: number
+  /** The workflow's own page — where the run timeline lives. */
+  href: string
+  /** SPA navigation; the `href` stays real so the chip survives a middle-click. */
+  onOpen?: () => void
+  /** `POST /api/workflows/{id}/cancel`, supplied by the data plane. */
+  onStop?: () => void
+}
+
+/**
+ * THE HONESTY TELL.
+ *
+ * A workflow's steps arrive in this pane as ordinary submissions, and the human
+ * can type into the same pane while the chain is mid-flight. v1 does NOT lock
+ * the composer — locking a user out of their own agent is worse than the
+ * interleaving — so the header discloses instead: what is running, how far it
+ * has got, where to read it, and how to stop it.
+ *
+ * Renders nothing when nothing is running, which is the common case; a chip
+ * that is always there is one more thing to look past.
+ */
+export function WorkflowChip({ workflow }: { workflow: HeaderWorkflow | null | undefined }) {
+  if (!workflow) return null
+  const { step, steps, href, onOpen, onStop } = workflow
+  return (
+    <span className="flex flex-none items-center gap-1 rounded-full border-[0.5px] border-hairline-soft bg-fill-soft py-[3px] pl-2 pr-1 text-[11.5px] font-medium tracking-[0.1px] text-ink-2">
+      <a
+        href={href}
+        data-testid="chat-header-workflow"
+        onClick={(e) => {
+          // A real href (middle-click, long-press, "open in new tab" all work),
+          // but a plain left click stays in the SPA.
+          if (!onOpen || e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+          e.preventDefault()
+          onOpen()
+        }}
+        className="rounded-full px-0.5 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Workflow · step {step}/{steps}
+      </a>
+      {onStop && (
+        <button
+          type="button"
+          onClick={onStop}
+          data-testid="chat-header-workflow-stop"
+          aria-label="Stop this workflow run"
+          className="rounded-full px-1.5 py-[1px] text-ink-2 transition-colors hover:bg-fill hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          Stop
+        </button>
+      )}
     </span>
   )
 }
@@ -156,6 +294,14 @@ export interface SessionHeaderPillProps {
   leading?: React.ReactNode
   trailing?: React.ReactNode
   /**
+   * A blocking prompt is on screen (a pty dialog, a permission request, or an
+   * AskUserQuestion). Switching mode converges by pressing Shift+Tab, and that
+   * keystroke would ANSWER the prompt (BTab accepts a permission dialog — a0 §3,
+   * live-verified), so while one is up the mode chip is an INERT label, never a
+   * control. Gated here by construction — the gate that cannot be forgotten.
+   */
+  modeLocked?: boolean
+  /**
    * The quiet status bits — the data-plane chip (`<ConnectionNote>`: "Not up to
    * date", "Offline", …). Separated from `trailing` (the renderer toggle) so the
    * phone header can GROUP the status bits together and give the toggle its own
@@ -185,11 +331,24 @@ export interface SessionHeaderPillProps {
    */
   tailError?: boolean
   /**
+   * A workflow run is occupying this pane right now. Null/absent — the common
+   * case — renders nothing. See [`WorkflowChip`].
+   */
+  workflow?: HeaderWorkflow | null
+  /**
    * A live turn is streaming right now (the chat plane's `turnStart != null`).
    * Accepted-but-inert: the header face maps from `status` alone. Retained so the
    * chat surface can keep feeding the signal without a type break.
    */
   streaming?: boolean
+  /**
+   * Open this bot's details (the `<BotPanel variant="sheet">` the mobile focus
+   * route already owns). When set, the NAME becomes the button that opens them —
+   * the same title-click contract `<FocusHeader onTitleClick>` gives the terminal
+   * chrome, which is the only way into the panel while chat holds the pane.
+   * Omitted (desktop seam, benches) → the name stays the inert span it was.
+   */
+  onTitleClick?: () => void
   className?: string
 }
 
@@ -200,9 +359,12 @@ export function SessionHeaderPill({
   surface = 'desktop',
   leading,
   trailing,
+  modeLocked,
   connection,
   offline = false,
   tailError = false,
+  workflow,
+  onTitleClick,
   className,
 }: SessionHeaderPillProps) {
   const phone = surface === 'phone'
@@ -218,6 +380,10 @@ export function SessionHeaderPill({
   // `normal` is the absence of a mode rather than a mode; a chip that always
   // reads "Normal" is one more thing to look past.
   const mode = session?.mode && session.mode !== 'normal' ? modeChipLabel(session.mode) : null
+  // Tapping the mode chip opens the permission-mode switcher (the working control
+  // in the shell's agent-tools sheet). Scoped to this session so bypass relaunches
+  // the right pty.
+  const openTools = useAgentToolsSheet((s) => s.openSheet)
 
   // The presence dot — green "ready" / the busy spinner / the grey offline disc.
   // It doubles as the ACTIVITY spinner (busy states spin it), so there is one
@@ -318,19 +484,48 @@ export function SessionHeaderPill({
                 // The name is right there; a second announcement is noise.
                 label={null}
               />
-              <span
-                className={cn(
-                  'min-w-0 truncate text-[16px] font-semibold tracking-[-0.2px] text-ink',
-                  // On the phone the name is the elastic member: the trailing
-                  // slot has to sit on the card's right edge, not next to the
-                  // name (`mobile-light.png`). It is also the member with a
-                  // FLOOR — see `NAME_MIN` (QA #6).
-                  phone && 'flex-1',
-                )}
-                style={phone ? { minWidth: `${NAME_MIN}px` } : undefined}
-              >
-                {label}
-              </span>
+              {onTitleClick ? (
+                // The name is the way into the bot's details on the phone (the
+                // terminal chrome has had it since feat-session-info; chat had
+                // an inert span and no other door). A real button: the row's
+                // 44px hit target, taken back out of the layout with a matching
+                // negative margin so the card's geometry — the one structural
+                // promise at the top of this file — does not move by a pixel.
+                <button
+                  type="button"
+                  onClick={onTitleClick}
+                  data-testid="chat-header-title"
+                  title={label}
+                  // The visible name LEADS, so voice control ("click <name>") and
+                  // a screen reader's list both key on what is on screen.
+                  aria-label={`${label} — bot details`}
+                  aria-haspopup="dialog"
+                  className={cn(
+                    '-my-2.5 flex min-h-11 min-w-0 items-center gap-1 rounded-lg py-2.5 text-left',
+                    'text-[16px] font-semibold tracking-[-0.2px] text-ink outline-none',
+                    'transition-opacity active:opacity-60 focus-visible:ring-2 focus-visible:ring-ring',
+                    phone && 'flex-1',
+                  )}
+                  style={phone ? { minWidth: `${NAME_MIN}px` } : undefined}
+                >
+                  <span className="min-w-0 truncate">{label}</span>
+                  <TitleChevron />
+                </button>
+              ) : (
+                <span
+                  className={cn(
+                    'min-w-0 truncate text-[16px] font-semibold tracking-[-0.2px] text-ink',
+                    // On the phone the name is the elastic member: the trailing
+                    // slot has to sit on the card's right edge, not next to the
+                    // name (`mobile-light.png`). It is also the member with a
+                    // FLOOR — see `NAME_MIN` (QA #6).
+                    phone && 'flex-1',
+                  )}
+                  style={phone ? { minWidth: `${NAME_MIN}px` } : undefined}
+                >
+                  {label}
+                </span>
+              )}
               {/* The app's status affordance, not a lookalike — which is how the
                   busy states keep the spinner the boot window needs. It carries
                   the `--status-*` family and never the accent (contract C7).
@@ -365,6 +560,10 @@ export function SessionHeaderPill({
                 <WarningChip text={session.limit_warning} />
               )}
               {!session?.blocked && <UsageChip session={session} />}
+              {/* THE WORKFLOW TELL — beside the conditions, for the same reason
+                  they are there: it is a fact about the SESSION, not about the
+                  turn. See [`WorkflowChip`]. */}
+              <WorkflowChip workflow={workflow} />
               {/* THE TRAILING CLUSTER — ONE ROW on the phone (single-row header).
                   It used to be a flex-COLUMN: the grouped status bits (presence,
                   mode, connection) on tier 1 and the renderer TOGGLE on tier 2.
@@ -397,7 +596,24 @@ export function SessionHeaderPill({
                 )
               ) : (
                 <>
-                  {mode && <ModeChip className="ml-auto">{mode}</ModeChip>}
+                  {/* The permission-mode switch — reachable on desktop so you can
+                      enter a mode (bypass, plan…) from Normal too, and reset out of
+                      it. Labeled when in a mode; a subtle shield in Normal (no
+                      "Normal" clutter). Tap → the mode switcher. While a prompt is
+                      up (`modeLocked`) it is an inert LABEL: the switch presses
+                      Shift+Tab, which would answer the prompt. In Normal it then
+                      has nothing to say, so it drops out entirely (as before). */}
+                  {(mode || !modeLocked) && (
+                    <ModeChip
+                      className="ml-auto"
+                      onOpen={modeLocked ? undefined : () => openTools(name)}
+                      label={
+                        mode ? `Permission mode: ${mode} — tap to change` : 'Set permission mode'
+                      }
+                    >
+                      {mode ?? <ShieldGlyph />}
+                    </ModeChip>
+                  )}
                   {connection}
                   {trailing}
                 </>

@@ -11,8 +11,9 @@
  *             JetBrainsMono 13.2px on `--sm-fill-soft`, radius 8, padding 2/7
  *   why       13.2px secondary, 5px under the question — WHERE it runs and WHAT
  *             it touches, because that is what the decision actually turns on
- *   actions   hairline pills, height 34, padding 0 15, 13.4px/500, 8px apart,
- *             13px under the why
+ *   actions   hairline pills, MIN-height 34 (a label that wraps grows the pill
+ *             instead of spilling over the row below it), padding 6/15,
+ *             13.4px/500, 8px apart, 13px under the why
  *
  * ONE BUTTON GRAMMAR: emphasis is weight plus a soft fill (`btn.primary`), never
  * the identity hue. The accent must not encode an action — it is who is
@@ -216,8 +217,30 @@ function ChoiceButton({
           : undefined
       }
       className={cn(
-        'inline-flex h-[34px] items-center gap-2 rounded-full border-[0.5px] border-hairline px-[15px]',
-        'text-[13.4px] tracking-[-0.05px] text-ink sm-t-morph',
+        // A FLOOR, NOT A HEIGHT (owner report: an unmapped question rendered as
+        // overlapping, illegible chips).
+        //
+        // This was `h-[34px]`, and a pill is `overflow: visible` with
+        // `items-center`: a label that wraps to three lines is a 56px box
+        // centred in a 34px one, so 11px of it hangs out of each end while the
+        // flex row below it sits 42px away (34 + the parent's `gap-2`). The
+        // rows then paint through each other — measured at 390px with a real
+        // permission label, and worse on a phone at large text. Every option
+        // list in the product can carry a long label: an unmapped dialog's row
+        // is the pty's own sentence, and `Yes, and don't ask again for … in
+        // <dir>` is a permission one.
+        //
+        // The board's 34px still holds for every one-line chip: a 13.4px line at
+        // 1.45 is 19.4px, plus 6px/6px and the hairline, is 32.4px — under the
+        // floor, so a one-line pill is exactly 34px as before, and the radius
+        // clamps to height/2 either way. `text-left` because a wrapped label
+        // centred in a pill reads as two fragments; `max-w-full` + `break-words`
+        // so a single long token — a path, a URL, a hash, none of which carry a
+        // break opportunity — wraps inside the pill instead of widening the card
+        // past the row. `max-w-full` alone only caps the box; without
+        // `overflow-wrap` the text still overflows it.
+        'inline-flex min-h-[34px] max-w-full items-center gap-2 rounded-[17px] border-[0.5px] border-hairline px-[15px] py-[6px]',
+        'break-words text-left text-[13.4px] leading-[1.45] tracking-[-0.05px] text-ink sm-t-morph',
         option.primary ? 'bg-fill-soft-2 font-semibold' : 'bg-transparent font-medium hover:bg-fill-soft',
         // Readable, obviously not pressable, and no hover promise.
         option.disabled && 'cursor-default opacity-45 hover:bg-transparent',

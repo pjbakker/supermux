@@ -162,6 +162,23 @@ impl FileTransport for MockFileTransport {
         files.insert(to.to_path_buf(), bytes);
         Ok(())
     }
+
+    /// The hook installer never creates directories or copies files; these
+    /// exist only because the trait requires every transport to implement them
+    /// deliberately (no default impl). Modelled on the in-memory map.
+    async fn mkdir(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        let mut files = self.files.lock().unwrap();
+        let bytes = files
+            .get(from)
+            .cloned()
+            .ok_or_else(|| anyhow!("mock copy: no such src: {}", from.display()))?;
+        files.insert(to.to_path_buf(), bytes);
+        Ok(())
+    }
 }
 
 /// The default settings path install_hooks picks when transport.is_local() is

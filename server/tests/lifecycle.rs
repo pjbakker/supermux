@@ -556,35 +556,33 @@ async fn duplicate_copies_the_template_and_nothing_that_would_surprise_you() {
     .await
     .unwrap();
 
-    let sched = supermux_server::db::schedules::Schedule {
+    let wf = supermux_server::db::workflows::Workflow {
         id: "s-src".into(),
         title: "nightly".into(),
         session: "src".into(),
-        command: String::new(),
-        prompt: "go".into(),
-        kind: "tmux".into(),
-        boot_dir: String::new(),
-        boot_provider: String::new(),
-        boot_worktree: 0,
-        sched_type: "recurring".into(),
-        recurrence: Some("every 1 minute".into()),
-        run_at: None,
+        company_id: None,
+        enabled: 1,
+        trigger_kind: "recurring".into(),
+        schedule_expr: Some("every 1 minute".into()),
         next_run: Some(chrono::Utc::now().to_rfc3339()),
         last_run: Some(chrono::Utc::now().to_rfc3339()),
-        enabled: 1,
         run_count: 17,
-        schedule_expr: Some("every 1 minute".into()),
-        watch: 0,
-        watch_timeout: 0,
-        done_pattern: None,
-        done_action: "notify".into(),
-        confirm_finish: 0,
-        bypass_permissions: 0,
+        on_complete: r#"{"kind":"notify"}"#.into(),
         created: chrono::Utc::now().timestamp(),
         updated: chrono::Utc::now().timestamp(),
         deleted: None,
     };
-    db::schedules::insert(&state.pool, &sched).await.unwrap();
+    db::workflows::insert(&state.pool, &wf).await.unwrap();
+    db::workflows::replace_steps(
+        &state.pool,
+        "s-src",
+        &[supermux_server::db::workflows::StepInput {
+            prompt: "go".into(),
+            ..Default::default()
+        }],
+    )
+    .await
+    .unwrap();
 
     let (status, _) = send(
         &app,
@@ -615,14 +613,14 @@ async fn duplicate_copies_the_template_and_nothing_that_would_surprise_you() {
     assert_eq!(copy.pinned, 0, "pinned is a placement, not a property");
     assert_eq!(copy.start_count, 0, "the copy has never run");
 
-    // Schedules: copied, but DISABLED and with no history.
-    let copied: Vec<_> = db::schedules::list(&state.pool)
+    // Workflows: copied, but DISABLED and with no history.
+    let copied: Vec<_> = db::workflows::list(&state.pool)
         .await
         .unwrap()
         .into_iter()
         .filter(|s| s.session == "dst")
         .collect();
-    assert_eq!(copied.len(), 1, "T6.2 — the schedules come with the template");
+    assert_eq!(copied.len(), 1, "T6.2 — the workflows come with the template");
     let c = &copied[0];
     assert_ne!(c.id, "s-src", "a fresh id — otherwise the fire-key table would \
                                let the original's history suppress the copy");
@@ -635,9 +633,14 @@ async fn duplicate_copies_the_template_and_nothing_that_would_surprise_you() {
     assert_eq!(c.run_count, 0, "the copy has no run history");
     assert!(c.last_run.is_none(), "…and inherits none");
     assert!(c.next_run.is_none(), "…so it is not scheduled either");
+    // And the STEPS came too — a workflow without its body is not a copy of it.
+    let steps = db::workflows::steps_for(&state.pool, &c.id).await.unwrap();
+    assert_eq!(steps.len(), 1, "T6.2 — the steps come with the workflow");
+    assert_eq!(steps[0].prompt, "go");
+    assert_ne!(steps[0].workflow_id, "s-src");
 
     // The original is untouched by having been copied.
-    let orig: Vec<_> = db::schedules::list(&state.pool)
+    let orig: Vec<_> = db::workflows::list(&state.pool)
         .await
         .unwrap()
         .into_iter()

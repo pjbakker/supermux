@@ -33,13 +33,14 @@
  * focus to the trigger (the combobox pattern).
  */
 import * as React from 'react'
-import { Check, ChevronsUpDown, Plus, UserPlus } from 'lucide-react'
+import { ChevronsUpDown, Plus, SlidersHorizontal, Trash2, UserPlus } from 'lucide-react'
 
 import { useCompanies } from '@/hooks/use-companies'
 import { useUI } from '@/stores/ui-store'
 import { companyForDigit } from '@/lib/companies'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { CompanyMark, HqMark } from '@/components/roster/company-mark'
+import { CompanyPicker } from '@/components/roster/company-picker'
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
 
 const CreateCompanySheet = React.lazy(() =>
@@ -56,6 +57,20 @@ const InviteWizardSheet = React.lazy(() =>
   })),
 )
 
+// The destructive delete flow is lazy for the same reason — its type-to-confirm
+// sheet and the `useSessions` bot-count it reads never touch the cold-load path;
+// the danger row is the only entry edge, opened at most once per delete.
+const DeleteCompanySheet = React.lazy(() =>
+  import('@/components/roster/delete-company-sheet').then((m) => ({
+    default: m.DeleteCompanySheet,
+  })),
+)
+const CompanySettingsSheet = React.lazy(() =>
+  import('@/components/roster/company-settings-sheet').then((m) => ({
+    default: m.CompanySettingsSheet,
+  })),
+)
+
 /** Whether a keyboard event is the ⌘/Ctrl modifier (mac vs the rest). */
 function isCmdOrCtrl(e: KeyboardEvent | React.KeyboardEvent): boolean {
   return e.metaKey || e.ctrlKey
@@ -63,20 +78,6 @@ function isCmdOrCtrl(e: KeyboardEvent | React.KeyboardEvent): boolean {
 
 /** A stable empty attention set so the default prop is referentially constant. */
 const EMPTY_ATTENTION: ReadonlySet<number | null> = new Set()
-
-/** A subtle ~6px attention dot in the status token (`--gr-need`), NOT an
- *  identity hue — the firewall's status half. Static (no pulse), so it is
- *  reduced-motion-safe by construction; it carries no text, so it owes no AA
- *  contrast, and the accessible signal rides an `sr-only` word on the row. */
-function NeedDot() {
-  return (
-    <span
-      aria-hidden
-      className="size-1.5 shrink-0 rounded-full"
-      style={{ background: 'var(--gr-need)' }}
-    />
-  )
-}
 
 /** The ⌘⇧O open-shortcut hint, shared verbatim between the menu footer and the
  *  sheet footer slot so the two shells read identically. */
@@ -94,8 +95,21 @@ export function CompanySwitcher({
    *  bot needing attention, from the roster's own needs-you rollup. A dot shows
    *  on each row in the set. Defaults to empty so a bench can render it bare. */
   attention = EMPTY_ATTENTION,
+  /** Trigger shape. `'chip'` (default) is the labelled `.gr-company` pill.
+   *  `'circle'` is the compact ringed scope MARK that docks in the nav (mobile
+   *  bottom-bar right, desktop rail bottom — the WHOOP "profile in the corner"
+   *  slot), so the scope leaves every page header. Both open the SAME picker. */
+  variant = 'chip',
+  /** Register the global ⌘⇧O / ⌘1-9 shortcuts. TRUE on exactly one mounted
+   *  instance — otherwise every mounted switcher toggles its own picker open on
+   *  ⌘⇧O (the mobile dock's bottom sheet is body-portaled, so a `display:none`
+   *  wrapper would NOT hide it). The desktop rail owns the keyboard; the mobile
+   *  dock passes `false`. */
+  shortcuts = true,
 }: {
   attention?: ReadonlySet<number | null>
+  variant?: 'chip' | 'circle'
+  shortcuts?: boolean
 } = {}) {
   const { companies } = useCompanies()
   const activeCompany = useUI((s) => s.activeCompany)
@@ -109,6 +123,8 @@ export function CompanySwitcher({
   const [open, setOpen] = React.useState(false)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [inviteOpen, setInviteOpen] = React.useState(false)
+  const [deleteOpen, setDeleteOpen] = React.useState(false)
+  const [settingsOpen, setSettingsOpen] = React.useState(false)
   // The roving highlight index into the flat option list (0 = HQ, then each
   // company, then the New-company action last). −1 = nothing highlighted yet.
   // Only used by the desktop menu; the touch sheet ignores it.
@@ -152,6 +168,7 @@ export function CompanySwitcher({
 
   // ── Global shortcuts: ⌘/Ctrl+⇧+O opens; ⌘/Ctrl+1..9 jumps to the Nth ─────────
   React.useEffect(() => {
+    if (!shortcuts) return
     const onKey = (e: KeyboardEvent) => {
       if (!isCmdOrCtrl(e)) return
       // Open — ⌘/Ctrl+Shift+O (KeyO is layout-stable).
@@ -161,8 +178,17 @@ export function CompanySwitcher({
         return
       }
       // Jump-to-Nth — ⌘/Ctrl+1..9, only without Shift (Shift+digit is a symbol).
+      // ⌘1 is ALWAYS HQ (so HQ has a shortcut of its own); companies start at ⌘2,
+      // so ⌘2 → the first company, ⌘3 → the second, and so on.
       if (!e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
-        const c = companyForDigit(companies, Number(e.key))
+        const digit = Number(e.key)
+        if (digit === 1) {
+          e.preventDefault()
+          setActiveCompany(null)
+          setOpen(false)
+          return
+        }
+        const c = companyForDigit(companies, digit - 1)
         if (c) {
           e.preventDefault()
           setActiveCompany(c.id)
@@ -172,7 +198,7 @@ export function CompanySwitcher({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [companies, setActiveCompany])
+  }, [companies, setActiveCompany, shortcuts])
 
   // Seat the highlight on the active row whenever the list opens (both shells).
   // Done on the open TRANSITION during render (the "adjust state when a prop
@@ -249,88 +275,23 @@ export function CompanySwitcher({
       : 'gap-2.5 px-3 py-2 text-[13px] hover:bg-accent/50'
     const hl = (on: boolean) => (!sheet && on ? 'bg-accent/50' : '')
     const markSize = sheet ? 28 : 24
-    // HQ mark matches the company-mark scale in each shell (sheet 28 / menu 24).
-    const sparkSize = sheet ? 28 : 24
 
     return (
       <>
-        {/* HQ — pinned top, its own cell (the "above all companies" home). */}
-        <button
-          type="button"
-          role="menuitemradio"
-          aria-checked={activeCompany === null}
-          data-hl={cursor === 0 || undefined}
-          className={`${rowBase} ${rowSkin} ${hl(cursor === 0)}`}
-          onMouseEnter={() => !sheet && setCursor(0)}
-          onClick={() => select(null)}
-        >
-          <HqMark size={sparkSize} />
-          <span className="flex min-w-0 flex-col">
-            <span className="font-semibold text-foreground">HQ</span>
-            <span
-              className={`text-muted-foreground ${sheet ? 'text-[12.5px]' : 'text-[11.5px]'}`}
-            >
-              PA · tech-admin · sees everything
-            </span>
-          </span>
-          {attention.has(null) && <span className="sr-only"> — needs you</span>}
-          <span className="ml-auto flex items-center gap-2 pl-2">
-            {attention.has(null) && <NeedDot />}
-            {activeCompany === null && (
-              <Check size={16} style={{ color: 'var(--sm-accent)' }} aria-hidden />
-            )}
-          </span>
-        </button>
-
-        <div className="my-1 h-px bg-border" role="separator" />
-
-        {/* companies — CompanyMark + name + a faint slug meta + active check */}
-        {companies.map((c, i) => {
-          const idx = i + 1
-          const on = activeCompany === c.id
-          const needs = attention.has(c.id)
-          return (
-            <button
-              key={c.id}
-              type="button"
-              role="menuitemradio"
-              aria-checked={on}
-              data-hl={cursor === idx || undefined}
-              className={`${rowBase} ${rowSkin} ${hl(cursor === idx)}`}
-              onMouseEnter={() => !sheet && setCursor(idx)}
-              onClick={() => select(c.id)}
-            >
-              <CompanyMark
-                slug={c.slug}
-                name={c.display_name}
-                size={markSize}
-                className="shrink-0"
-              />
-              <span className="flex min-w-0 flex-col">
-                <span className="truncate font-semibold text-foreground">
-                  {c.display_name}
-                </span>
-                <span
-                  className={`truncate text-muted-foreground ${sheet ? 'text-[12.5px]' : 'text-[12px]'}`}
-                >
-                  {c.slug}
-                </span>
-              </span>
-              {needs && <span className="sr-only"> — needs you</span>}
-              <span className="ml-auto flex items-center gap-2 pl-2">
-                {needs && <NeedDot />}
-                {!sheet && i < 9 && (
-                  <kbd className="hidden text-[11px] tabular-nums text-muted-foreground sm:inline">
-                    ⌘{i + 1}
-                  </kbd>
-                )}
-                {on && (
-                  <Check size={16} style={{ color: 'var(--sm-accent)' }} aria-hidden />
-                )}
-              </span>
-            </button>
-          )
-        })}
+        {/* HQ row + company rows + marks — the shared `<CompanyPicker>` list.
+            The switcher keeps its roving cursor, ⌘1..9 hints, attention dots and
+            the active check by feeding them in; the move sheet reuses the SAME
+            list without any of that. */}
+        <CompanyPicker
+          variant={variant}
+          companies={companies}
+          onPick={select}
+          activeId={activeCompany}
+          attention={attention}
+          cursor={cursor}
+          onCursor={setCursor}
+          showShortcutHints
+        />
 
         {companies.length > 0 && (
           <div className="my-1 h-px bg-border" role="separator" />
@@ -384,6 +345,59 @@ export function CompanySwitcher({
           </span>
           Start a company…
         </button>
+
+        {/* Delete the ACTIVE company — a LOW-emphasis danger action (destructive
+            ink on a plain row, never a filled button), separated from the safe
+            actions and pinned last. Owner/admin-only server-side; a scoped
+            member gets the hide-existence 404, so this row never fires for them.
+            Shown only when a company is in scope, since it deletes THAT company.
+            Tapping only OPENS the type-to-confirm sheet — the destroy itself is
+            gated behind typing the company name. */}
+        {active && (
+          <>
+            <div className="my-1 h-px bg-border" role="separator" />
+            {/* Company settings — logo, name, accent, and (later) the shared
+                brief. A safe action, so it sits above the delete danger zone. */}
+            <button
+              type="button"
+              role="menuitem"
+              className={`${rowBase} ${rowSkin}`}
+              onMouseEnter={() => !sheet && setCursor(-1)}
+              onClick={() => {
+                setOpen(false)
+                setSettingsOpen(true)
+              }}
+            >
+              <span
+                className="grid place-items-center"
+                aria-hidden
+                style={{ width: markSize, height: markSize, flex: 'none' }}
+              >
+                <SlidersHorizontal size={sheet ? 18 : 15} />
+              </span>
+              Company settings…
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className={`${rowBase} ${rowSkin} text-destructive hover:bg-destructive/10 active:bg-destructive/10`}
+              onMouseEnter={() => !sheet && setCursor(-1)}
+              onClick={() => {
+                setOpen(false)
+                setDeleteOpen(true)
+              }}
+            >
+              <span
+                className="grid place-items-center"
+                aria-hidden
+                style={{ width: markSize, height: markSize, flex: 'none' }}
+              >
+                <Trash2 size={sheet ? 18 : 15} />
+              </span>
+              Delete this company…
+            </button>
+          </>
+        )}
       </>
     )
   }
@@ -391,32 +405,63 @@ export function CompanySwitcher({
   return (
     <>
       <div className="relative">
-        <button
-          ref={triggerRef}
-          type="button"
-          className="gr-company"
-          role="combobox"
-          aria-haspopup="menu"
-          aria-expanded={open}
-          aria-controls={menuId}
-          aria-label="Company scope"
-          onClick={() => setOpen((v) => !v)}
-        >
-          {active ? (
-            <CompanyMark
-              slug={active.slug}
-              name={active.display_name}
-              size={22}
-              className="grok-identity"
-            />
-          ) : (
-            <HqMark size={22} />
-          )}
-          <span className="gr-company-lbl">{label}</span>
-          <ChevronsUpDown size={15} className="gr-company-cv" aria-hidden />
-        </button>
+        {variant === 'circle' ? (
+          <button
+            ref={triggerRef}
+            type="button"
+            className="gr-scope-circle"
+            role="combobox"
+            aria-haspopup="menu"
+            aria-expanded={open}
+            aria-controls={menuId}
+            aria-label={`Company scope: ${label}`}
+            title={`Scope — ${label}`}
+            onClick={() => setOpen((v) => !v)}
+          >
+            {active ? (
+              <CompanyMark
+                slug={active.slug}
+                name={active.display_name}
+                size={26}
+                className="grok-identity"
+                logo={active}
+              />
+            ) : (
+              <HqMark size={26} />
+            )}
+          </button>
+        ) : (
+          <button
+            ref={triggerRef}
+            type="button"
+            className="gr-company"
+            role="combobox"
+            aria-haspopup="menu"
+            aria-expanded={open}
+            aria-controls={menuId}
+            aria-label="Company scope"
+            onClick={() => setOpen((v) => !v)}
+          >
+            {active ? (
+              <CompanyMark
+                slug={active.slug}
+                name={active.display_name}
+                size={22}
+                className="grok-identity"
+                logo={active}
+              />
+            ) : (
+              <HqMark size={22} />
+            )}
+            <span className="gr-company-lbl">{label}</span>
+            <ChevronsUpDown size={15} className="gr-company-cv" aria-hidden />
+          </button>
+        )}
 
-        {/* DESKTOP (fine pointer): the compact anchored menu, viewport-safe. */}
+        {/* DESKTOP (fine pointer): the compact anchored menu, viewport-safe. The
+            `circle` trigger docks at the rail's BOTTOM-LEFT, so its menu opens
+            UP-and-RIGHT (bottom-aligned, to the side) instead of downward off the
+            screen edge; the chip keeps the under-the-trigger drop. */}
         {open && !isMobile && (
           <div
             ref={menuRef}
@@ -430,7 +475,11 @@ export function CompanySwitcher({
             // right viewport edge on any width — the collision-safe replacement
             // for the old fixed `w-[300px]`.
             style={{ width: 'min(300px, calc(100vw - 24px))' }}
-            className="gr-cmenu absolute left-0 top-full z-30 mt-1.5 flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none"
+            className={
+              variant === 'circle'
+                ? 'gr-cmenu absolute bottom-0 left-full z-30 ml-2 flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none'
+                : 'gr-cmenu absolute left-0 top-full z-30 mt-1.5 flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none'
+            }
           >
             {renderOptions('menu')}
 
@@ -485,6 +534,58 @@ export function CompanySwitcher({
           />
         </React.Suspense>
       )}
+
+      {deleteOpen && active && (
+        <React.Suspense fallback={null}>
+          <DeleteCompanySheet
+            open={deleteOpen}
+            onOpenChange={setDeleteOpen}
+            company={{ id: active.id, slug: active.slug, display_name: active.display_name }}
+            onDeleted={() => {
+              // The row is gone — leave its now-dead scope for HQ immediately
+              // (a lingering id would fail open to HQ on the next refetch anyway;
+              // this makes the switch instant). The sheet decides whether to
+              // then close itself or hold open on its honest warnings view.
+              setActiveCompany(null)
+            }}
+          />
+        </React.Suspense>
+      )}
+
+      {settingsOpen && active && (
+        <React.Suspense fallback={null}>
+          <CompanySettingsSheet open={settingsOpen} onOpenChange={setSettingsOpen} company={active} />
+        </React.Suspense>
+      )}
     </>
+  )
+}
+
+/**
+ * `<ScopeTitle>` — the READ-ONLY scope identity for a page header (the overview
+ * leads with it). It shows the active scope's mark + name exactly as the switcher
+ * chip did, but it is NOT a control: switching now lives in the nav scope circle
+ * (`<CompanySwitcher variant="circle">`), so the page just REFLECTS the active
+ * scope while the nav OWNS the switch. Presentational — no picker, no state.
+ */
+export function ScopeTitle() {
+  const { companies } = useCompanies()
+  const activeCompany = useUI((s) => s.activeCompany)
+  const active = companies.find((c) => c.id === activeCompany) ?? null
+  return (
+    <span className="gr-scope-title">
+      {active ? (
+        <CompanyMark
+          slug={active.slug}
+          name={active.display_name}
+          size={24}
+          className="grok-identity"
+          logo={active}
+        />
+      ) : (
+        <HqMark size={24} />
+      )}
+      <span className="gr-scope-title-lbl">{active ? active.display_name : 'HQ'}</span>
+    </span>
   )
 }

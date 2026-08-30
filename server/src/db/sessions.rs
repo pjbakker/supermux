@@ -243,15 +243,15 @@ pub async fn ensure_runtime(
 
 /// Delete a session. `session_runtime` and child rows cascade via FK.
 ///
-/// `schedules` does NOT — its `session` column is a bare `TEXT` with no foreign
-/// key (`0003_schedules.sql`) — so the disposition is enforced in code here
-/// (B5/T7.1). Without it a deleted session's schedules kept firing, failing,
-/// and pushing an error notification to the user's phone every tick. Soft, so
-/// the `schedule_runs` ledger (which DOES cascade) survives.
+/// `workflows` does NOT — its `session` column is a bare `TEXT` with no foreign
+/// key (`0038_workflows.sql`, deliberately: spec §2.4) — so the disposition is
+/// enforced in code here (B5/T7.1). Without it a deleted session's workflows
+/// kept firing, failing, and pushing an error notification to the user's phone
+/// every tick. Soft, so the `workflow_runs` ledger (which DOES cascade) survives.
 pub async fn delete(pool: &SqlitePool, name: &str) -> sqlx::Result<()> {
-    let disposed = super::schedules::soft_delete_for_session(pool, name).await?;
+    let disposed = super::workflows::soft_delete_for_session(pool, name).await?;
     if disposed > 0 {
-        tracing::info!(session = %name, schedules = disposed, "disposed of schedules with their session");
+        tracing::info!(session = %name, workflows = disposed, "disposed of workflows with their session");
     }
     sqlx::query("DELETE FROM sessions WHERE name = ?")
         .bind(name)
@@ -270,14 +270,14 @@ pub async fn purge_archived(pool: &SqlitePool, name: &str) -> sqlx::Result<u64> 
         .bind(name)
         .execute(pool)
         .await?;
-    // Schedules have no FK to cascade on (see [`delete`]), so dispose of them
+    // Workflows have no FK to cascade on (see [`delete`]), so dispose of them
     // explicitly (B5/T7.1) — but only if the guarded DELETE actually removed
     // the row. A purge that raced an unarchive removes nothing, and must
     // therefore destroy nothing either.
     if res.rows_affected() > 0 {
-        let disposed = super::schedules::soft_delete_for_session(pool, name).await?;
+        let disposed = super::workflows::soft_delete_for_session(pool, name).await?;
         if disposed > 0 {
-            tracing::info!(session = %name, schedules = disposed, "disposed of schedules with their purged session");
+            tracing::info!(session = %name, workflows = disposed, "disposed of workflows with their purged session");
         }
     }
     Ok(res.rows_affected())
@@ -474,6 +474,26 @@ pub async fn set_runtime(pool: &SqlitePool, name: &str, runtime: &str) -> sqlx::
     Ok(())
 }
 
+/// Durably set (or clear, with `None` = HQ/main) the session's `company_id`
+/// (migration 0032). Mirrors [`set_runtime`] as the narrow single-column writer
+/// the bot-MOVE service (`sessions::move_to_company`) uses. Nullable, so it
+/// follows the [`set_mark_pin`] `bind(Option<_>)` shape rather than the
+/// text-field helper. Callers must ALSO invalidate the AppState runtime /
+/// isolation caches and re-derive the session's `dir`, connector/tab grants and
+/// group-chat channel — this touches ONE column and nothing derived from it.
+pub async fn set_company_id(
+    pool: &SqlitePool,
+    name: &str,
+    company_id: Option<i64>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE sessions SET company_id = ? WHERE name = ?")
+        .bind(company_id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn runtime_kind(pool: &SqlitePool, name: &str) -> sqlx::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as("SELECT runtime FROM sessions WHERE name = ?")
         .bind(name)
@@ -537,9 +557,10 @@ pub async fn rename(pool: &SqlitePool, old: &str, new: &str) -> sqlx::Result<()>
         "UPDATE delegations SET from_session = ? WHERE from_session = ?",
         "UPDATE delegations SET to_session = ? WHERE to_session = ?",
         "UPDATE share_tokens SET session = ? WHERE session = ?",
-        // schedules.session has NO foreign key (migrations/0003), so deferred-FK
-        // does not auto-migrate it — a rename would otherwise orphan every job.
-        "UPDATE schedules SET session = ? WHERE session = ?",
+        // workflows.session has NO foreign key (migrations/0038, a deliberate
+        // choice — spec §2.4), so deferred-FK does not auto-migrate it; a
+        // rename would otherwise orphan every job the bot owns.
+        "UPDATE workflows SET session = ? WHERE session = ?",
     ] {
         sqlx::query(stmt)
             .bind(new)

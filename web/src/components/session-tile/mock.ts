@@ -109,7 +109,10 @@ export const MOCK_TILES: TileSession[] = [
     tokens: 48200,
     branch: 'feat/sse-merge',
     activity: '✎ use-sessions.ts',
-    subagents: 3,
+    // The tile draws the CLAUSE, so the mock only owes it the number the clause
+    // reads — the rows behind it belong to the chat's working row, which this
+    // fixture does not render.
+    agents_live: 3,
     preview_lines: claudeBoot('Implementing the delta-merge updater'),
     preview_ansi: claudeBootAnsi('Implementing the delta-merge updater'),
     // FASE A5 — a chat-eligible session WITH a tail. With the experiment on
@@ -153,7 +156,7 @@ export const MOCK_TILES: TileSession[] = [
     tokens: 6400,
     branch: 'main',
     activity: '🤖 dispatching review agents',
-    subagents: 5,
+    agents_live: 5,
     preview_lines: claudeBoot('Writing acceptance notes for the tile component'),
     preview_ansi: claudeBootAnsi('Writing acceptance notes for the tile component'),
     updated_at: new Date().toISOString(),

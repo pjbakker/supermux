@@ -23,6 +23,11 @@ use crate::error::AppError;
 pub const KIND_MCP_CATALOG: &str = "mcp_catalog";
 pub const KIND_AGENT_AUTHORED: &str = "agent_authored";
 pub const KIND_BUILTIN_BROWSER: &str = "builtin_browser";
+/// The per-company GROUP CHAT connector. Like the browser it is built from the
+/// binary rather than a stored emit block — and unlike every other card its emit
+/// env is per-SESSION (the company id is baked at assemble time), so
+/// `connector_config::assemble` has a branch for it.
+pub const KIND_BUILTIN_GROUPCHAT: &str = "builtin_groupchat";
 
 /// One declared tool, for the card's tool-count + list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

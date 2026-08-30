@@ -23,9 +23,13 @@
  * as "a space") but shows the actual brand mark, not the invented rainbow spark
  * it used to. `<HqMark>` is the HQ analogue of `<CompanyMark>`.
  */
+import * as React from 'react'
+
 import { characterFromSeed, bodyColor, accentInk } from '@/brand/marks'
 import { useTheme } from '@/components/theme-provider'
 import { Logo } from '@/components/logo'
+import { companyLogoUrl } from '@/lib/companies'
+import { apiToken } from '@/lib/api/client'
 
 /** 1–2 letters from the display name: initials of the first two words, or the
  *  first 1–2 characters of a single word. Uppercased; always ≥1 char for any
@@ -51,6 +55,12 @@ export interface CompanyMarkProps {
    *  omitted the live resolved theme drives it. */
   dark?: boolean
   style?: React.CSSProperties
+  /** The company's identity fields needed to resolve its uploaded logo. Pass the
+   *  whole `Company` (or any object with `{id, has_logo, updated_at}`) and the
+   *  mark resolves + auth-tokens the logo URL ITSELF — so every call site shows
+   *  the logo just by passing `logo={company}`, with no per-site wiring to forget.
+   *  Absent, or `has_logo` false → the generated monogram. */
+  logo?: { id: number; has_logo?: boolean; updated_at?: number } | null
 }
 
 /**
@@ -89,10 +99,53 @@ export function CompanyMark({
   className,
   dark,
   style,
+  logo,
 }: CompanyMarkProps) {
+  // Hooks run unconditionally, BEFORE the logo early-return (rules-of-hooks).
   const { resolvedTheme } = useTheme()
   const isDark = dark ?? resolvedTheme === 'dark'
   const hue = characterFromSeed(slug).hue
+  // The URL that FAILED to load, not a boolean: a re-upload (or a fresh token)
+  // changes the URL, which un-fails the mark by itself — no effect, no stale flag.
+  const [failedUrl, setFailedUrl] = React.useState<string | null>(null)
+  // `has_logo` gates the token read as well as the URL: a company with no logo
+  // needs neither, and a mark rendered outside the browser (bun's SSR tests)
+  // never touches `window` for a monogram it was going to draw anyway.
+  const resolved = logo?.has_logo ? companyLogoUrl(logo, apiToken()) : null
+  // `has_logo` says the bytes EXIST, not that this viewer can load them: a 404
+  // (a scoped member, a rotated token) or an offline miss must fall through to the
+  // generated monogram, never leave an empty tinted tile.
+  const logoUrl = resolved && resolved !== failedUrl ? resolved : null
+  // An uploaded logo replaces the generated monogram, keeping the rounded-square
+  // tile geometry so the company silhouette is unchanged. It sits on a SUBTLE
+  // tile tinted from the company's own hue — light enough that a dark / mono-glyph
+  // favicon (a black wordmark) stays legible on the dark UI, but never a hard
+  // white plate (owner: white looked cheap in dark mode). `contain` + a small
+  // inset frames the icon the way an app icon is framed, without cropping.
+  if (logoUrl) {
+    return (
+      <span
+        aria-hidden
+        className={className}
+        style={{
+          ...identityTileStyle(size),
+          overflow: 'hidden',
+          // ~90% white lifted toward the brand hue: a soft, considered plate, not
+          // a flat white square.
+          background: `color-mix(in srgb, ${bodyColor(hue)} 10%, white)`,
+          padding: Math.max(1, Math.round(size * 0.12)),
+          ...style,
+        }}
+      >
+        <img
+          src={logoUrl}
+          alt=""
+          onError={() => setFailedUrl(logoUrl)}
+          style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+        />
+      </span>
+    )
+  }
   const wash = `color-mix(in srgb, ${bodyColor(hue)} 14%, transparent)`
   const ink = accentInk(hue, isDark)
   const mono = companyMonogram(name)

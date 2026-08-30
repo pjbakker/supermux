@@ -50,10 +50,11 @@ import type { ChatGone } from './chat-socket'
 import { CHAT_GONE } from './connection'
 import type { DialogCardView } from './dialog-answer'
 import { ChatSurface } from './chat-surface'
+import { ChatLoadingSkeleton } from './chat-loading-skeleton'
 import { ComposerShell } from './composer-shell'
 import type { ChatItem } from './entries'
 import { buildTranscript } from './grouping'
-import { SessionHeaderPill } from './header-pill'
+import { SessionHeaderPill, type HeaderWorkflow } from './header-pill'
 import { LiveLayer } from './live-layer'
 import { deliveryLine, type PendingSend } from './pending'
 import { TranscriptItem, type ScheduleRef } from './transcript-item'
@@ -163,6 +164,12 @@ export interface ChatConversationProps {
    * `TranscriptItem`.
    */
   showActions?: boolean
+  /**
+   * A workflow run occupying this pane right now (T6.3) — the header's honesty
+   * chip. Data, not a slot: the panel owns the query and the cancel mutation,
+   * this surface only renders what it is handed.
+   */
+  workflow?: HeaderWorkflow | null
   /** Go to another session — the destination of a harness line's chip. */
   onOpenSession?: (slug: string) => void
   /** Open this session's Schedules sheet — the destination of a `⏱` chip
@@ -251,6 +258,9 @@ export interface ChatConversationProps {
   /** Answer the live AskUserQuestion (`session.question_request`) by option index
    *  — straight through to the live band's `QuestionCard` (`live-layer.tsx`). */
   onAnswerQuestion?: (optionIndex: number) => void
+  /** The option just chosen on the live question — forwarded to `QuestionCard` so
+   *  the picked pill lights up and the card goes inert. */
+  questionChosen?: number | null
   /** The line the card became once an answer landed. */
   dialogResolved?: string | null
   /** The pty's stall line, straight through to the live band's working row
@@ -287,6 +297,9 @@ export interface ChatConversationProps {
    *  `headerTrailing` (the renderer toggle) so the phone header groups the status
    *  bits and gives the toggle its own place (mobile polish #1). */
   headerStatus?: React.ReactNode
+  /** Open this bot's details from the header NAME (mobile parity with the
+   *  terminal chrome's `<FocusHeader onTitleClick>`). Omitted → inert name. */
+  onTitleClick?: () => void
   /** The chat data plane has GIVEN UP (`ChatPresentation === 'offline'`, A6):
    *  greys the header presence dot so it stops reading as a live green "ready"
    *  next to the "Offline" chip. Composer gating is the panel's job (it owns the
@@ -335,6 +348,7 @@ export function ChatConversation({
   showActions = false,
   onOpenSession,
   onOpenSchedule,
+  workflow = null,
   handoff,
   nowMs,
   turnStart,
@@ -355,6 +369,7 @@ export function ChatConversation({
   dialogBusy,
   onChooseDialog,
   onAnswerQuestion,
+  questionChosen,
   dialogResolved,
   stalled,
   compacting,
@@ -370,6 +385,7 @@ export function ChatConversation({
   headerLeading,
   headerTrailing,
   headerStatus,
+  onTitleClick,
   offline = false,
   stat,
   scrollRef,
@@ -415,6 +431,26 @@ export function ChatConversation({
     // lie the pending-echo case fixed.
     !handoff &&
     !(session?.status === 'active' && turnStart != null)
+
+  // THE ANTI-FLASH GATE. `nodes` is `buildTranscript(items, events)`, and the
+  // two feeds arrive out of order: the harness event ledger (a fast REST GET)
+  // routinely lands before the message tail's slow WS seed. With `items` still
+  // empty, `buildTranscript` emits an EVENTS-ONLY stream — the screenful of
+  // repeated "Ran schedule · …" rows that used to flash for ~500ms on open.
+  // While the seed is still in flight AND no message has arrived, we suppress
+  // that stream entirely and show a calm skeleton instead; the instant the seed
+  // lands, `isLoading` clears and the real (correctly merged) rows render.
+  const noItemsYet = isLoading && items.length === 0
+  // Show the skeleton through the whole load window — but NOT over an optimistic
+  // echo (a just-sent message) or a live/attention overlay, which are the reader's
+  // own content and belong on screen instead. Deliberately NOT gated on the
+  // active-turn branch of `isBlank`: an active session whose history is still
+  // seeding is exactly when the loader is wanted (the working row renders below).
+  const showSkeleton =
+    noItemsYet &&
+    (pending?.length ?? 0) === 0 &&
+    (overlay?.length ?? 0) === 0 &&
+    !provisional
 
   // The room the floating composer needs, MEASURED (daily-driver QA #12).
   const [footerRef, footerH] = useMeasuredHeight()
@@ -502,7 +538,12 @@ export function ChatConversation({
           leading={headerLeading}
           trailing={headerTrailing}
           connection={headerStatus}
+          // The name opens the bot's details when the shell gives us a door
+          // (mobile chat); on the desktop seam it is omitted and the name stays
+          // the span it has always been.
+          onTitleClick={onTitleClick}
           offline={offline}
+          workflow={workflow}
           // The live turn signal, straight from the chat plane: a running turn
           // (`turnStart != null` while active) is the honest "streaming now" the
           // status field only approximates. Grok wears it as the header's live
@@ -514,6 +555,14 @@ export function ChatConversation({
           // body (the jury's worst honesty break). Inert off grok — the base
           // app's dot is unchanged.
           tailError={isError}
+          // The mode switch presses Shift+Tab to converge; while ANY prompt is on
+          // screen that keystroke would answer it, so the header's mode chip stays
+          // an inert label until the dialog / permission / question is gone.
+          modeLocked={
+            dialog != null ||
+            session?.permission_request != null ||
+            session?.question_request != null
+          }
         />
       }
       footer={
@@ -621,24 +670,34 @@ export function ChatConversation({
 
           {/* Confirmed content (fase A3 T3). Vertical rhythm belongs to the rows
               themselves — `MessageRow` spends 14px between speakers and 8px
-              inside a run — so this column adds no gap of its own. */}
-          {nodes.map((node) => (
-            <TranscriptItem
-              key={node.key}
-              node={node}
-              name={name}
-              surface={phone ? 'phone' : 'desktop'}
-              labels={labels}
-              mentions={mentions}
-              names={names}
-              rawUrl={rawUrl}
-              pinFor={pinFor}
-              showActions={showActions}
-              onOpenSession={onOpenSession}
-              onOpenSchedule={onOpenSchedule}
-              onOpenTerminal={onOpenTerminal}
-            />
-          ))}
+              inside a run — so this column adds no gap of its own.
+
+              While the message seed is still landing (`noItemsYet`), the node
+              list would be the events-only flash, so we render the loading
+              skeleton in its place — but only when the track is otherwise blank
+              (an optimistic echo or a live turn already carries the UI, and the
+              layers below draw it). */}
+          {showSkeleton ? (
+            <ChatLoadingSkeleton />
+          ) : noItemsYet ? null : (
+            nodes.map((node) => (
+              <TranscriptItem
+                key={node.key}
+                node={node}
+                name={name}
+                surface={phone ? 'phone' : 'desktop'}
+                labels={labels}
+                mentions={mentions}
+                names={names}
+                rawUrl={rawUrl}
+                pinFor={pinFor}
+                showActions={showActions}
+                onOpenSession={onOpenSession}
+                onOpenSchedule={onOpenSchedule}
+                onOpenTerminal={onOpenTerminal}
+              />
+            ))
+          )}
 
           {/* P10 (fase A4 T4) — what this client has SENT but the transcript
               has not confirmed yet. It sits between the confirmed layer and the
@@ -674,6 +733,7 @@ export function ChatConversation({
             dialogBusy={dialogBusy}
             onChooseDialog={onChooseDialog}
             onAnswerQuestion={onAnswerQuestion}
+            questionChosen={questionChosen}
             dialogResolved={dialogResolved}
             stalled={stalled}
             compacting={compacting}

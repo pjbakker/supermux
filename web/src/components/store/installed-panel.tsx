@@ -275,7 +275,7 @@ function GrantLevelChip({ level }: { level: GrantLevel }) {
         <Users className="size-3" aria-hidden />
       ) : level.scope === 'company' ? (
         company ? (
-          <CompanyMark slug={company.slug} name={company.display_name} size={14} />
+          <CompanyMark slug={company.slug} name={company.display_name} logo={company} size={14} />
         ) : (
           <Building2 className="size-3" aria-hidden />
         )
@@ -621,7 +621,7 @@ function ConsumerList({
                 <Users className="size-4" aria-hidden />
               ) : c.scope === 'company' ? (
                 company ? (
-                  <CompanyMark slug={company.slug} name={company.display_name} size={20} />
+                  <CompanyMark slug={company.slug} name={company.display_name} logo={company} size={20} />
                 ) : (
                   <Building2 className="size-4" aria-hidden />
                 )

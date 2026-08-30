@@ -20,6 +20,35 @@ export interface Company {
   archived: number
   created_at?: number
   updated_at?: number
+  /** (Stage 2) shared brief injected into every company bot. */
+  brief?: string | null
+  /** (Stage 2) default-connectors JSON for new bots. */
+  default_connectors?: string | null
+  /** Server-derived: the company has an uploaded logo (fetch it from the logo
+   *  GET). The bytes never ride this row. */
+  has_logo?: boolean
+}
+
+/** The URL that serves a company's uploaded logo, or `null` when the company has
+ *  no logo (callers fall back to the generated `<CompanyMark>`).
+ *
+ *  `updated_at` rides along as a cache-buster so a re-upload shows immediately
+ *  (the GET sets a 60s private cache). A `token` MUST be passed for use in an
+ *  `<img src>`: the logo GET is bearer-protected and an `<img>` cannot send an
+ *  Authorization header, so it uses the `?_token=` query fallback the auth layer
+ *  accepts (`server/src/auth.rs`) — the same pattern as the Files raw-image
+ *  viewer. Kept pure (token passed in, not read from `window`) so it unit-tests
+ *  in bun without a DOM. */
+export function companyLogoUrl(
+  company: Pick<Company, 'id' | 'has_logo' | 'updated_at'>,
+  token?: string | null,
+): string | null {
+  if (!company.has_logo) return null
+  const params = new URLSearchParams()
+  if (company.updated_at) params.set('v', String(company.updated_at))
+  if (token) params.set('_token', token)
+  const qs = params.toString()
+  return `/api/companies/${company.id}/logo${qs ? `?${qs}` : ''}`
 }
 
 /** Resolve a persisted `activeCompany` id against the live company set: an id
@@ -146,4 +175,37 @@ export function companyFirstOrder<T extends { company_id?: number | null }>(
     else others.push(it)
   }
   return [...inSpace, ...others]
+}
+
+/** The company that OWNS an absolute path — longest `/`-delimited `root_dir`
+ *  prefix, `null` when the path is under no company root (HQ).
+ *
+ *  This is the CLIENT MIRROR of the server's one stamping rule (files v1 spec
+ *  §3.2, `server/src/files/mod.rs::company_for_path`): a `files` SSE frame is
+ *  stamped by the company that owns the path, never by the emitting session's
+ *  company, because an owner-run HQ bot can write into any company's folder.
+ *  Here it routes an incoming frame to its landing card.
+ *
+ *  Boundary discipline is `confineToCompanyRoot`'s: the compare is
+ *  `/`-delimited, so `…/acme-corp` is never read as inside `…/acme`. LONGEST
+ *  match wins, so a company nested under another company's root resolves to the
+ *  inner one — the same tie-break the server makes, and the only one that can't
+ *  hand a member the wrong space. Pure + unit-tested. */
+export function companyForPath(
+  path: string,
+  companies: readonly Company[],
+): Company | null {
+  const p = stripTrailingSlash(path)
+  let best: Company | null = null
+  let bestLen = -1
+  for (const c of companies) {
+    const root = stripTrailingSlash(c.root_dir)
+    if (!root) continue
+    if (p !== root && !p.startsWith(root + '/')) continue
+    if (root.length > bestLen) {
+      best = c
+      bestLen = root.length
+    }
+  }
+  return best
 }

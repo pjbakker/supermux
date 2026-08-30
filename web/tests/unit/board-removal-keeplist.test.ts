@@ -147,8 +147,12 @@ describe('the server-side machinery is untouched', () => {
     expect(auto).toContain('emit_board')
     expect(auto).toMatch(/NeedsReview|needs_review/)
     expect(auto).toMatch(/AwaitingInput|awaiting_input/)
-    // A scheduled run reports onto its issue with the literal skill line.
-    expect(read('server/src/scheduler/runner.rs')).toContain('/supermux-task')
+    // A scheduled run reports onto its issue with the literal skill line. The
+    // module that owns that delivery moved in Phase 4A (`scheduler::runner` →
+    // `workflows::engine`, spec §3.2) — the capability did not: a step's bare
+    // `/command` line is still sent as its own submission, which is the only
+    // reason a skill line executes as a skill.
+    expect(read('server/src/workflows/engine.rs')).toContain('/supermux-task')
     // A rename re-points the issue rows rather than orphaning them.
     expect(read('server/src/db/sessions.rs')).toMatch(/UPDATE issues SET session/)
   })
@@ -237,12 +241,14 @@ describe('and the PAGE is really gone', () => {
     expect(layout).not.toContain("to: '/board'")
     expect(layout).not.toContain('SquareKanban')
     const navBlock = layout.slice(layout.indexOf('const NAV'), layout.indexOf('/** Tiny notification dot'))
-    // The array is FIVE entries — the base four (Overview / Focus / Files /
-    // Settings) plus the `grokOnly` Connector-store doorway (`/store`, #22) that
-    // this branch added; each rendered nav still filters by mode. What this guard
-    // fixes is that NO entry is the removed board slot (asserted above); the count
-    // just pins the array size so a board slot cannot quietly return.
-    expect(navBlock.match(/to: '/g)?.length).toBe(5)
+    // The array is SEVEN entries — the base four (Overview / Focus / Files /
+    // Settings) plus THREE `grokOnly` doorways: the Connector store (`/store`,
+    // #22), Workflows (`/workflows`, the schedules successor) and the shared-
+    // browser workspace (`/browser`, shared-browser v1 §6.1). Each rendered nav
+    // still filters by mode, so the BASE rail is still four. What this guard
+    // fixes is that NO entry is the removed board slot (asserted above); the
+    // count just pins the array size so a board slot cannot quietly return.
+    expect(navBlock.match(/to: '/g)?.length).toBe(7)
   })
 
   test('the palette lost its four board verbs and its issue rows', () => {

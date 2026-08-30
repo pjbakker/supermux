@@ -43,6 +43,7 @@ import * as React from 'react'
 import { createPortal } from 'react-dom'
 import {
   Archive,
+  Building2,
   Check,
   Info,
   Mail,
@@ -71,12 +72,22 @@ import { useNavigateMorph } from '@/components/view-transitions/morph'
 import { useAttentionContext } from '@/hooks/use-attention'
 import { useSessionActions } from '@/hooks/use-session-actions'
 import { useSessionConfig } from '@/hooks/use-session-config'
+import { useCompanies } from '@/hooks/use-companies'
 import { useChatRenderer } from '@/components/chat/use-chat-renderer'
 import { useRendererState } from '@/components/chat/use-renderer-pref'
 import { prefFor, type RendererPref } from '@/components/chat/renderer-pref'
 import { onRowMenuRequest } from './row-menu-bus'
 import { sessionTitle, type ApiSession } from '@/lib/api'
 import { useUI } from '@/stores/ui-store'
+
+// Lazy so the move-bot sheet (+ its CompanyPicker) never lands on the roster's
+// cold path — it is opened from one menu item, the same lazy discipline the
+// switcher uses for its create/invite sheets.
+const MoveToCompanySheet = React.lazy(() =>
+  import('@/components/roster/move-to-company-sheet').then((m) => ({
+    default: m.MoveToCompanySheet,
+  })),
+)
 
 /** The three renderer choices, in the order the switch shows them. `Auto` is
  *  first because it is the fixpoint — it is what a session is until somebody
@@ -120,6 +131,9 @@ export interface SessionActionsMenuProps {
     | 'seen_epoch'
     | 'display_name'
     | 'task_summary'
+    // The bot's current company scope — so "Move to company…" opens the picker
+    // with the current company excluded (a bot is never moved in place).
+    | 'company_id'
   >
   /** Where the menu sits. */
   variant: 'tile' | 'row'
@@ -194,6 +208,12 @@ export function SessionActionsMenu({
   )
   const navigateMorph = useNavigateMorph()
 
+  // "Move to company…" — the bot-move entry point (§5). Gated on there being at
+  // least one company to move into/among; opens the destination-picker sheet.
+  const { companies } = useCompanies()
+  const canMoveCompany = companies.length > 0
+  const [moveCompanyOpen, setMoveCompanyOpen] = React.useState(false)
+
   // Action visibility matrix (per user spec — keep redundancies pruned):
   //   Stop:    session is mid-flight (active / waiting / idle / starting).
   //            Skipped on 'stopped' (nothing to stop) and 'error' (the session
@@ -242,7 +262,14 @@ export function SessionActionsMenu({
           />,
           document.body,
         )}
-      <DropdownMenu open={open} onOpenChange={setOpen}>
+      {/* `modal={false}` so this opens when nested inside a Vaul/Radix modal
+          drawer (the bot-panel `variant="sheet"` on a phone). A modal Vaul/Radix
+          drawer sets `pointer-events: none` on everything outside it, and a
+          modal Radix menu portalled to <body> lands there — so on touch the menu
+          appeared dead. Non-modal keeps its trigger + items interactive; on
+          desktop the only change is no scroll-lock, which a small action menu
+          does not need. (Same note as pwa/a2hs-sheet.tsx.) */}
+      <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
         <DropdownMenuTrigger asChild>
           <button
             ref={infoAnchorRef}
@@ -456,8 +483,35 @@ export function SessionActionsMenu({
               </DropdownMenuSub>
             </>
           )}
+          {/* Move to company… — the bot-move sibling of the group "Move to ▸".
+              A plain item (not a submenu): the destination list lives in the
+              `<CompanyPicker>` sheet, which also carries the confirm + honest
+              warnings a submenu could not. */}
+          {canMoveCompany && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                data-vr="tile-move-company"
+                disabled={busy}
+                onSelect={() => setMoveCompanyOpen(true)}
+              >
+                <Building2 className="size-4" aria-hidden />
+                <span>Move to company…</span>
+              </DropdownMenuItem>
+            </>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
+
+      {moveCompanyOpen && (
+        <React.Suspense fallback={null}>
+          <MoveToCompanySheet
+            open={moveCompanyOpen}
+            onOpenChange={setMoveCompanyOpen}
+            session={session}
+          />
+        </React.Suspense>
+      )}
 
       {/* Session info — same component as the focus-page title-click. Desktop
           forks to an anchored Popover (positions against the kebab trigger),

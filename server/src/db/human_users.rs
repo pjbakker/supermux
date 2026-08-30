@@ -54,6 +54,25 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<HumanUser>> 
     .await
 }
 
+/// The seeded OWNER row (0032): `role = 'owner'`, company-unscoped.
+///
+/// The owner bearer resolves to [`crate::auth_human::AuthContext::Owner`], which
+/// carries no `user_id` — it is a token, not a person. This is where that
+/// identity becomes a real `human_users` row, so a surface that must attribute
+/// an owner action to a person (the group chat's `AUTHOR_HUMAN` row and its
+/// `<supermux-human>` wrapper) uses the row the migration already seeds instead
+/// of inventing a sentinel id. `ORDER BY id LIMIT 1` because the seed is exactly
+/// one row and a hand-added second owner must not make the answer arbitrary.
+pub async fn owner(pool: &SqlitePool) -> sqlx::Result<Option<HumanUser>> {
+    sqlx::query_as::<_, HumanUser>(
+        "SELECT id, email, display_name, company_id, role, created_at \
+         FROM human_users WHERE role = 'owner' AND company_id IS NULL \
+         ORDER BY id LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// Rebind the seeded `owner@localhost` sentinel to the owner's real email, once,
 /// at startup — per the 0032 header ("the real email is bound from config at
 /// startup"). Only touches the still-sentinel owner row, so it is idempotent and

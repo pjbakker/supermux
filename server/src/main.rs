@@ -7,8 +7,8 @@
 //! `lib.rs` so the binary and integration tests share them.
 
 use supermux_server::{
-    agents, bot_memory, config, connectors, db, external_edit, http, scheduler, sessions, state,
-    teams,
+    agents, bot_memory, config, connectors, db, external_edit, http, sessions, state,
+    teams, workflows,
 };
 
 #[tokio::main]
@@ -149,8 +149,21 @@ async fn main() -> anyhow::Result<()> {
 
     sessions::auto_actions::reconcile_on_boot(&state).await;
 
-    // Background tasks. The scheduler tick runs here.
-    scheduler::spawn(state.clone());
+    // One-shot, idempotent: re-derive every workflow's company_id cache and, on
+    // the FIRST boot after 0038, tell the user once about anything the port
+    // could not carry over. Runs BEFORE the tick so a workflow never fires with
+    // a stale company stamp (which is what routes its SSE frames).
+    match workflows::port::reconcile(&state).await {
+        Ok(r) if r.alerted => tracing::info!(
+            unported = r.unported, command_notes = r.command_notes,
+            "workflows: announced the schedules port"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "workflows: port reconciliation failed"),
+    }
+
+    // Background tasks. The workflows tick (and its crash reaper) run here.
+    workflows::spawn(state.clone());
     // Resume per-session status detection on boot (cold-start init).
     sessions::auto_actions::spawn_all(&state).await;
     // Resume per-session steering delivery on boot.
@@ -181,6 +194,10 @@ async fn main() -> anyhow::Result<()> {
     // Seeding the row starts NO browser: chrome is spawned lazily, and only by a
     // granted session's first tool call.
     connectors::browser::mcp::seed(&state).await;
+    // The built-in Company Group Chat connector card (kind `builtin_groupchat`).
+    // Seeding the row grants nothing: a bot reaches the channel only through its
+    // company's `@company:<id>` grant, written when group chat is enabled.
+    connectors::groupchat::seed(&state).await;
     // Start the HostPool reaper. Sweeps every 60s,
     // tears down SSH ControlMasters that have been idle > 10min AND have no
     // live session row pointing at them. Cheap no-op while no remote hosts

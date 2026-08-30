@@ -103,6 +103,28 @@ pub struct HookPayload {
     /// nothing. Snake_case on the wire; aliased to the camel form.
     #[serde(default, alias = "notificationType")]
     pub notification_type: Option<String>,
+    /// **The subagent this hook fired from.** Claude Code's base payload schema
+    /// `and`s this into EVERY event, and its own docstring is the rule we follow:
+    /// *"Present only when the hook fires from within a subagent … Absent for the
+    /// main thread, even in --agent sessions. Use this field (not `agent_type`) to
+    /// distinguish subagent calls from main-thread calls."*
+    ///
+    /// So its PRESENCE is the whole signal: a `PreToolUse` carrying it is a
+    /// CHILD's tool call arriving on the shared parent token, and it is the only
+    /// first-hand evidence that a specific subagent exists and is working right
+    /// now. supermux already forwarded these bytes verbatim and discarded them
+    /// ([`crate::state::AppState::touch_agent`] is what now reads them).
+    /// Captured live on 2.1.251 for BOTH kinds of child — an `Agent`/`Task`
+    /// worker and a `workflow-subagent`.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// The subagent's KIND (`general-purpose` / `Explore` / `workflow-subagent` /
+    /// a user-defined agent name). Rides with [`agent_id`](Self::agent_id) on
+    /// every child hook. Display-only, and never the presence test — a
+    /// main-thread hook can be absent both, but only `agent_id` is documented as
+    /// the discriminator.
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 /// The live "Claude is asking permission to do X" state, derived from a
@@ -372,7 +394,7 @@ fn basename(path: &str) -> &str {
 /// * `Read`              → `📖 {basename(file_path)}`
 /// * `Grep`/`Glob`       → `🔍 {pattern}`
 /// * `WebFetch`/`WebSearch` → `🌐 fetching`
-/// * `Task`/`Agent`      → `🤖 subagent`
+/// * `Task`/`Agent`      → `🤖 {description || "subagent"}`
 /// * `mcp__a__b`         → `🔌 {b}`
 /// * anything else       → the tool name verbatim (kind `tool`).
 pub fn activity_label(p: &HookPayload) -> Option<(String, String)> {
@@ -434,7 +456,21 @@ pub fn activity_label(p: &HookPayload) -> Option<(String, String)> {
             (format!("🔍 {pat}"), "search")
         }
         "WebFetch" | "WebSearch" => ("🌐 fetching".to_string(), "web"),
-        "Task" | "Agent" => ("🤖 subagent".to_string(), "task"),
+        // The spawn carries Claude's own one-line `description` of what the
+        // child is for ("Map the UI surfaces") — the same human, secret-free
+        // field the `Bash` arm above prefers, and the only name a subagent ever
+        // gets on the wire. It was being thrown away, so five different Task
+        // fan-outs all read `🤖 subagent`. Falls back to the generic when the
+        // payload carries no description (a Task shape that omits it).
+        "Task" | "Agent" => {
+            let text = ti
+                .and_then(|t| t.description.as_deref())
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(truncate)
+                .unwrap_or_else(|| "subagent".to_string());
+            (format!("🤖 {text}"), "task")
+        }
         other => (truncate(other), "tool"),
     };
     Some((label, kind.to_string()))
@@ -571,6 +607,28 @@ mod tests {
         let (label, kind) = activity_label(&p).unwrap();
         assert_eq!(label, "⚡ run the test suite");
         assert_eq!(kind, "bash");
+    }
+
+    /// The spawn's own `description` is the only human name a subagent has on
+    /// the wire; a fan-out of five must not read `🤖 subagent` five times.
+    #[test]
+    fn task_prefers_description() {
+        let p = parse(
+            r#"{"tool_name":"Task","tool_input":{"description":"Map the UI surfaces","prompt":"…","subagent_type":"general-purpose"}}"#,
+        );
+        let (label, kind) = activity_label(&p).unwrap();
+        assert_eq!(label, "🤖 Map the UI surfaces");
+        assert_eq!(kind, "task");
+        // `Agent` is the same tool under its other wire name.
+        let p = parse(r#"{"tool_name":"Agent","tool_input":{"description":"probe"}}"#);
+        assert_eq!(activity_label(&p).unwrap().0, "🤖 probe");
+        // No description (or a blank one) → the generic, exactly as before.
+        for json in [
+            r#"{"tool_name":"Task"}"#,
+            r#"{"tool_name":"Task","tool_input":{"description":"   "}}"#,
+        ] {
+            assert_eq!(activity_label(&parse(json)).unwrap().0, "🤖 subagent");
+        }
     }
 
     #[test]

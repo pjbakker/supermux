@@ -701,7 +701,10 @@ async fn run_with_log(args: Args, log: Arc<HolderLog>) -> Result<()> {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            // `TIOCSCTTY` is `c_ulong` on Linux but `u32` on macOS, while
+            // `ioctl`'s request arg is `c_ulong` on both — cast so the call
+            // typechecks portably (a no-op widening on Linux).
+            if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

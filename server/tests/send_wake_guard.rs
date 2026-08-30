@@ -366,3 +366,139 @@ async fn delegate_into_an_open_picker_records_no_edge() {
     state.pool.close().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ── the SELECTION screens (owner report, review wave 2) ───────────────────────
+//
+// The picker tests above are one instance of a wider rule the guard now states
+// outright: a send is admitted ONLY on positive evidence that the agent is at
+// its TEXT COMPOSER. Everything else — the agent's own question / plan / paused
+// modal / permission menu, a picker recognised by its footer rather than its
+// title, an interactive prompt from a program the user ran by hand in the same
+// pane — is answered with a KEYPRESS, and `send_text` + Enter there drops the
+// message and picks whatever row is highlighted.
+//
+// The browser refuses in front of that (`use-composer.ts`'s `sendGate`). NOTHING
+// else does: `POST /api/agents/delegate`, `scheduler::runner`, the board
+// dispatcher and the steering loop all funnel through `send_harness_text` with
+// no lens at all. These are the tests for those callers.
+
+/// The live AskUserQuestion screen, CC 2.1.233 — the same capture the unit tests
+/// read, trimmed to the rows a 30-line `capture_plain` would return. Its `❯`
+/// caret is ABOVE the option list, so what identifies it at the bottom of the
+/// screen is the key legend.
+const ASK_QUESTION: &str = include_str!("fixtures/pty/ask-user-question.txt");
+
+/// An idle Claude composer — the one screen that admits.
+const COMPOSER: &str = "\n\n❯ Try \"fix tests\"\n  ? for shortcuts\n  ⏵⏵ auto mode on\n";
+
+/// A resume picker with a long conversation list: `Resume a conversation` has
+/// scrolled off the top of the capture, so the TITLE check cannot see it. Its
+/// footer is still on screen, and that is what must refuse.
+fn picker_without_its_title() -> String {
+    let mut s = String::new();
+    for i in 0..26 {
+        s.push_str(&format!("  {}. Fix the parser — {i}h ago\n", i + 3));
+    }
+    s.push_str("\nEnter to select · Esc to cancel\n");
+    s
+}
+
+/// (a) A picker this server can only recognise by its FOOTER — the title is out
+/// of the capture window — must still refuse, type nothing, and stamp no
+/// `last_send`.
+#[tokio::test]
+async fn a_retry_send_to_a_picker_whose_title_scrolled_out_is_undelivered() {
+    let (state, dir) = new_state().await;
+    db::sessions::insert_minimal(&state.pool, "longlist", "/tmp", "claude").await.unwrap();
+    let capture = picker_without_its_title();
+    assert!(!capture.contains("Resume a conversation"), "the fixture must not carry the title");
+    let rt = PickerStub::parked_at(&capture);
+    state.session_runtimes.insert("longlist".to_string(), rt.clone());
+
+    let err = sessions::lifecycle::send_text(&state, "longlist", "PROBE")
+        .await
+        .expect_err("a picker is a picker whether or not its title is still on screen");
+    assert!(format!("{err:?}").contains("Conflict"), "an undeliverable send is a 409; got {err:?}");
+    assert_eq!(rt.text_calls.load(Ordering::SeqCst), 0, "nothing typed into the picker");
+    assert_eq!(rt.key_calls.load(Ordering::SeqCst), 0, "and no Enter submitted into it");
+
+    let row = db::sessions::get(&state.pool, "longlist").await.unwrap().unwrap();
+    assert!(row.last_send_text.trim().is_empty(), "got {:?}", row.last_send_text);
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// (b) THE OWNER'S SCREEN, via the lens-less callers. A delegate (and by the
+/// same seam the scheduler, the board and steering) arriving while Claude is
+/// asking a question must come back UNDELIVERED — and must not submit an option
+/// on the sender's behalf.
+#[tokio::test]
+async fn delegate_while_claude_asks_a_question_is_undelivered_and_answers_nothing() {
+    let (state, dir) = new_state().await;
+    db::sessions::insert_minimal(&state.pool, "sender", "/tmp", "shell").await.unwrap();
+    db::sessions::insert_minimal(&state.pool, "asking", "/tmp", "claude").await.unwrap();
+    let rt = PickerStub::parked_at(ASK_QUESTION);
+    state.session_runtimes.insert("asking".to_string(), rt.clone());
+
+    let err = supermux_server::agents::delegate::delegate(
+        axum::extract::State(state.clone()),
+        supermux_server::scope::OptCtx(None),
+        axum::Json(DelegateInput {
+            from: "sender".into(),
+            to: "asking".into(),
+            prompt: "please also check the parser".into(),
+            actor: None,
+        }),
+    )
+    .await
+    .err()
+    .expect("delivery into an open question is not a delegation");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("Conflict"), "the sender is told it was undelivered; got {msg}");
+    // The SENTENCE names what is really there. The bug the owner hit was a 409
+    // that sent them looking for a resume picker and a folder-trust dialog while
+    // an ordinary question was on screen.
+    assert!(!msg.contains("resume picker"), "must not name a picker that is not there; got {msg}");
+    assert!(!msg.contains("folder-trust"), "must not name a trust dialog that is not there; got {msg}");
+
+    // THE SAFETY ASSERTION: not one keystroke. A paste is dropped by the dialog
+    // and the Enter after it would pick the highlighted row — answering "Apple"
+    // on behalf of a sender who never saw the question.
+    assert_eq!(rt.text_calls.load(Ordering::SeqCst), 0, "nothing typed into the question");
+    assert_eq!(rt.key_calls.load(Ordering::SeqCst), 0, "and NO option submitted");
+
+    let row = db::sessions::get(&state.pool, "asking").await.unwrap().unwrap();
+    assert!(row.last_send_text.trim().is_empty(), "got {:?}", row.last_send_text);
+    assert!(
+        db::audit::delegations_out(&state.pool, "sender").await.unwrap().is_empty(),
+        "a refused delivery must not leave an edge behind",
+    );
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// (c) THE UN-WEDGE. The same seam, the same session, one keystroke later: the
+/// dialog is gone and the agent is back at its composer, so the message is
+/// typed and submitted exactly as before. Without this the two tests above would
+/// pass on a guard that refuses everything.
+#[tokio::test]
+async fn a_send_to_an_agent_at_its_composer_is_delivered() {
+    let (state, dir) = new_state().await;
+    db::sessions::insert_minimal(&state.pool, "ready", "/tmp", "claude").await.unwrap();
+    let rt = PickerStub::parked_at(COMPOSER);
+    state.session_runtimes.insert("ready".to_string(), rt.clone());
+
+    sessions::lifecycle::send_text(&state, "ready", "PROBE")
+        .await
+        .expect("an idle composer takes messages — this is the half of the report that IS a wedge");
+    assert_eq!(rt.text_calls.load(Ordering::SeqCst), 1, "the message is typed");
+    assert_eq!(rt.key_calls.load(Ordering::SeqCst), 1, "and submitted with one Enter");
+
+    let row = db::sessions::get(&state.pool, "ready").await.unwrap().unwrap();
+    assert!(row.last_send_text.contains("PROBE"), "got {:?}", row.last_send_text);
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}

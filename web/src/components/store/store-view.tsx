@@ -23,6 +23,7 @@ import { useConnectors, useSessionConnectors } from '@/stores/connectors-store'
 import { useCompanies } from '@/hooks/use-companies'
 import { useUI } from '@/stores/ui-store'
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
+import { ScopedPageHeader } from '@/components/roster/scoped-page-header'
 
 import { CATEGORIES } from './catalog'
 import { brandMark } from './brand-marks'
@@ -107,7 +108,10 @@ export function StoreView({
   // Browse | Installed — a tab on the SAME `/store` route (DRY, one nav slot).
   // Only offered on the page variant (the library `/store`); the bot-scoped sheet
   // is already a working "installed for this bot" list and keeps its single view.
-  const [tab, setTab] = React.useState<StoreTab>('browse')
+  // Open on INSTALLED — the store lands on "what my bots already have" (owner
+  // request); Browse is one tap away. Page variant only shows tabs, so the sheet
+  // (bot-scoped connect flow) is unaffected — it never reads `tab`.
+  const [tab, setTab] = React.useState<StoreTab>('installed')
   const showTabs = variant === 'page' && !botName
 
   const live = useConnectors(mock ? { source: 'local' } : {})
@@ -164,6 +168,15 @@ export function StoreView({
   // the header subtitle ("The tools <company> can use").
   const inCompany = variant === 'page' && !botName && resolvedCompany !== null
 
+  // The hero subtitle — a bot dock names its bot, a company-scoped page names the
+  // company (whose tools these are), else the default. Shared by both header
+  // layouts below.
+  const subtitle = botName
+    ? `Give ${botName} the tools it needs.`
+    : inCompany && companyRow
+      ? `The tools ${companyRow.display_name} can use — add one to install it.`
+      : 'Give your bots the tools they need.'
+
   // Featured is a curated highlight, not the whole catalog: cap the rail so it
   // reads as an editorial shelf and never sprawls (blocker H1). In a bot scope
   // (row layout) the rail is skipped entirely — the sheet is a working list.
@@ -207,7 +220,19 @@ export function StoreView({
 
   // The Installed tab consumes the SAME grid query — local (installed) rows carry
   // their connected `accounts`. Filtering here means no second fetch.
-  const localCards = React.useMemo(() => cards.filter((c) => c.source === 'local'), [cards])
+  //
+  // Scoped to the active space, mirroring `grantedFor`'s tiers: a connector lands
+  // in Installed when it carries a grant AT the current scope's tier — the active
+  // company's company-tier grant (`companySet`), or, at HQ, an all-agents/global
+  // grant (`allSet`). The catalog itself stays global (a company is the install
+  // TARGET, never a catalog filter); only this "what's connected here" list
+  // narrows. A non-empty SEARCH lifts scope (the roster idiom), so a cross-space
+  // lookup still resolves every installed connector.
+  const installedSet = resolvedCompany !== null ? companySet : allSet
+  const localCards = React.useMemo(
+    () => cards.filter((c) => c.source === 'local' && (q.trim() !== '' || installedSet.has(c.id))),
+    [cards, q, installedSet],
+  )
   const installedCount = React.useMemo(
     () => localCards.reduce((n, c) => n + Math.max(1, c.accounts?.length ?? 0), 0),
     [localCards],
@@ -219,20 +244,40 @@ export function StoreView({
   return (
     <div className={cn('cs-root flex min-h-0 flex-1 flex-col', variant === 'page' && 'mx-auto w-full max-w-[1120px]')}>
       {/* header */}
-      <div className="cs-header sticky top-0 z-10 flex flex-col gap-3 px-4 pb-3 pt-4 sm:px-6">
-        <div className="flex flex-wrap items-end justify-between gap-3">
-          <div className="min-w-0">
-            <h1 className="text-[24px] font-semibold tracking-tight text-foreground sm:text-[28px]">Connectors</h1>
-            <p className="mt-0.5 text-[13.5px] text-muted-foreground">
-              {botName
-                ? `Give ${botName} the tools it needs.`
-                : inCompany && companyRow
-                  ? `The tools ${companyRow.display_name} can use — add one to install it.`
-                  : 'Give your bots the tools they need.'}
-            </p>
+      <div
+        className={cn(
+          'cs-header sticky top-0 z-10 flex flex-col gap-3 px-4 pb-3 sm:px-6',
+          // The shell's MobileTopBar renders nothing, so a top-level route owns
+          // its own top inset (same reason the grok roster header does). In the
+          // PAGE variant (`/store`) reserve the iOS-PWA status-bar band on the
+          // sticky header so the title/search clear the notch — `max()` no-ops
+          // wherever the inset is 0 (desktop, browser tab), keeping the original
+          // `pt-4`. The SHEET variant sits inside a bottom sheet, never under the
+          // status bar, so it keeps its plain `pt-4`.
+          variant === 'page' ? 'pt-[max(1rem,env(safe-area-inset-top))]' : 'pt-4',
+        )}
+      >
+        {/* On the `/store` PAGE the header leads with the `<CompanySwitcher/>` scope
+            chip (ScopedPageHeader, like Overview), so the active space is visible +
+            switchable; the subtitle already reflects it. The bot-scoped SHEET keeps
+            its bespoke title — it is already scoped to one bot, so no switcher. */}
+        {variant === 'page' ? (
+          <>
+            {/* Scope chip + large title (ScopedPageHeader); the full-width search
+                is a page control, so it sits BELOW the header, not on the scope
+                row. The wrapper's own gap spaces them. */}
+            <ScopedPageHeader title="Connectors" subtitle={subtitle} />
+            <SearchBox value={q} onChange={setQ} />
+          </>
+        ) : (
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div className="min-w-0">
+              <h1 className="text-[24px] font-semibold tracking-tight text-foreground sm:text-[28px]">Connectors</h1>
+              <p className="mt-0.5 text-[13.5px] text-muted-foreground">{subtitle}</p>
+            </div>
+            <SearchBox value={q} onChange={setQ} />
           </div>
-          <SearchBox value={q} onChange={setQ} />
-        </div>
+        )}
 
         {/* Browse | Installed tablist (page variant only) — the bot-panel WAI-ARIA
             tab idiom verbatim: roving tabindex, arrow-key movement, active underline. */}
@@ -261,7 +306,7 @@ export function StoreView({
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-10 pt-1 sm:px-6">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-10 pt-3 sm:px-6">
         {showTabs && tab === 'installed' ? (
           <div role="tabpanel" id="store-tabpanel-installed" aria-labelledby="store-tab-installed" className="pt-2">
             <InstalledPanel cards={localCards} q={q} />
@@ -362,6 +407,10 @@ function BrowseBody({
         {railVisible && featured.length > 0 && (
           <section className="mb-7">
             <h2 className="mb-2.5 text-[13px] font-semibold uppercase tracking-wide text-muted-foreground">Featured</h2>
+            {/* Featured stays ONE column on mobile — the hero card (brand wash +
+                large artwork, unclamped hook) needs the width; halving it wraps
+                the hook to a tall ribbon and collides with the chip. The dense
+                2-col treatment is for the calm catalog grid below. */}
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {featured.map((c) => (
                 <FeaturedCard
@@ -387,7 +436,7 @@ function BrowseBody({
             className={cn(
               isRow
                 ? 'flex flex-col gap-2'
-                : 'grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3',
+                : 'grid grid-cols-2 gap-2.5 sm:grid-cols-2 sm:gap-3 lg:grid-cols-3',
             )}
           >
             {filtered.map((c) => (

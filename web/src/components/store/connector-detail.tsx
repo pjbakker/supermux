@@ -636,7 +636,7 @@ function GrantPicker({
             onToggle={onToggleCompany}
             label={`All bots in ${company.display_name}`}
             sub="This company"
-            mark={<CompanyMark slug={company.slug} name={company.display_name} size={18} />}
+            mark={<CompanyMark slug={company.slug} name={company.display_name} logo={company} size={18} />}
           />
         )}
         {(bots.length > 0 || loading) && <span className="mx-2 my-0.5 h-px bg-border" />}
