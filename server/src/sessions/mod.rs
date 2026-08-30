@@ -38,6 +38,7 @@ pub mod status;
 /// the `PreToolUse` payload that raises the in-chat "take the wheel" card.
 pub mod takeover_ask;
 pub mod steering;
+pub mod swarm;
 pub mod teams;
 pub mod tmux;
 pub mod transport;
@@ -1388,6 +1389,10 @@ pub async fn delete(state: &AppState, name: &str) -> Result<(), AppError> {
     // never block deleting the row.
     let is_native = !state.is_tmux_runtime(name).await;
     if let Ok(rt) = state.runtime_for(name).await {
+        // capture before the kill; teardown waits for the lead to die
+        if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+            crate::sessions::swarm::spawn_teardown_for_lead(pid);
+        }
         let _ = rt.kill().await;
     }
     // A native session owns a directory under the data dir (spool, `meta.json`,
@@ -2788,6 +2793,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,

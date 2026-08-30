@@ -2134,6 +2134,11 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     // hard-kill and the definitive teardown are all backend-agnostic.
     let rt = state.runtime_for(name).await?;
 
+    // Capture the lead agent PID while the pane is still up: the agent-team
+    // tmux server is named `claude-swarm-<lead pid>` and after teardown the
+    // pid is unrecoverable. Teardown itself waits for the lead to die.
+    let swarm_lead = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await;
+
     if !rt.alive().await {
         db::sessions::set_last_status(&state.pool, name, "stopped").await?;
         broadcast_status(state, name, "stopped");
@@ -2215,6 +2220,9 @@ pub async fn stop(state: &AppState, name: &str) -> Result<(), AppError> {
     // the board card mirrors the linked session's state — re-publish so a linked
     // card reflects the now-stopped session rather than a stale running dot.
     emit_board_if_linked(state, name).await;
+    if let Some(pid) = swarm_lead {
+        crate::sessions::swarm::spawn_teardown_for_lead(pid);
+    }
     Ok(())
 }
 
@@ -2857,6 +2865,10 @@ pub async fn archive(state: &AppState, name: &str) -> Result<String, AppError> {
         // Definitive teardown through the seam (best-effort — the archive row
         // is already flipped and the job already answered 202).
         if let Ok(rt) = state.runtime_for(&name).await {
+            // capture before the kill; teardown waits for the lead to die
+            if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                crate::sessions::swarm::spawn_teardown_for_lead(pid);
+            }
             let _ = rt.kill().await;
         }
 
@@ -3891,6 +3903,7 @@ mod build_env_tests {
             auth_token: "t".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -4675,6 +4688,7 @@ mod link_liveness_tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -4762,6 +4776,7 @@ mod stale_resume_tests {
         let dir = std::env::temp_dir().join(format!("supermux-stale-resume-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = Config {
+            swarm_reaper: Default::default(),
             data_dir: dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             extra_binds: vec![],
@@ -5032,6 +5047,7 @@ mod write_runtime_tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,

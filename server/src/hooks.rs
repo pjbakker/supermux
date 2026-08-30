@@ -1084,6 +1084,17 @@ fn force_stopped(state: &AppState, session: &str) {
             company_id: None,
             payload: json!({ "delta": [{ "name": session, "status": Status::Stopped.as_str() }] }),
         });
+        // AFTER the status flip: SessionEnd means the lead agent is exiting right
+        // now, so capture its pid while it is still the pane's foreground job and
+        // let the teardown task wait out its death and reap the team's tmux
+        // server. This forks tmux, and the tile flip must not wait on that; the
+        // agent takes far longer than these few ms to actually leave the pane, and
+        // the teardown polls for its death anyway.
+        if let Ok(rt) = state.runtime_for(&session).await {
+            if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                crate::sessions::swarm::spawn_teardown_for_lead(pid);
+            }
+        }
     });
 }
 
@@ -1180,6 +1191,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,

@@ -847,6 +847,7 @@ mod tests {
     async fn browser_state() -> (crate::state::AppState, PathBuf) {
         let dir = temp_dir();
         let config = crate::config::Config {
+            swarm_reaper: Default::default(),
             data_dir: dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             extra_binds: vec![],

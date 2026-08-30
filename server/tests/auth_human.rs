@@ -49,6 +49,7 @@ fn human_auth_cfg() -> HumanAuthConfig {
 
 fn config_with(dir: &std::path::Path, human_auth: HumanAuthConfig) -> Config {
     Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.to_path_buf(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],
