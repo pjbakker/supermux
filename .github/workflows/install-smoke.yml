@@ -8,6 +8,11 @@ name: install-smoke
 # the installer end-to-end without depending on a GitHub Release roundtrip.
 
 on:
+  # 03:00 UTC daily: the WIDE matrix (every distro x every scenario). See the
+  # matrix block below and `nightly.yml` for why the PR run is narrower.
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -90,16 +95,29 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false
+      # TWELVE JOBS ON A SCHEDULE, THREE ON A PULL REQUEST.
+      #
+      # The full 3x4 grid is the honest coverage of the installer and it still
+      # runs — nightly, and on every push to main, which is the commit an actual
+      # release is cut from. What a PULL REQUEST gates is the subset that can
+      # catch a defect the other nine cannot:
+      #
+      #   * `fresh` and `upgrade` on ubuntu-24.04 are where installer logic
+      #     lives: unit files, the deploy runner, the data-dir migration. A bug
+      #     in `install.sh` shows up here first, on every distro.
+      #   * `dry-run` is seconds and proves the script parses and plans without
+      #     touching the box — the cheapest real assertion in the workflow.
+      #   * `port-conflict` and the two extra distros are VARIATION on paths the
+      #     three above already walk. They catch distro-specific regressions,
+      #     which are real but rare, and they are worth a night's latency rather
+      #     than a place in a ten-minute PR budget.
+      #
+      # Measured: this workflow is 4.2 min of wall clock (run 33318390920) and
+      # is NOT the critical path — `ci.yml` is. So this trim buys runner cost and
+      # queue pressure, not PR wall clock, and it is listed as such.
       matrix:
-        distro:
-          - ubuntu-24.04
-          - ubuntu-22.04
-          - debian-12
-        scenario:
-          - dry-run
-          - fresh
-          - upgrade
-          - port-conflict
+        distro: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-24.04"]') || fromJSON('["ubuntu-24.04","ubuntu-22.04","debian-12"]') }}
+        scenario: ${{ github.event_name == 'pull_request' && fromJSON('["dry-run","fresh","upgrade"]') || fromJSON('["dry-run","fresh","upgrade","port-conflict"]') }}
     steps:
       - uses: actions/checkout@v4
 
