@@ -458,7 +458,7 @@
 
 - **Status:** 🔴 OPEN · **Severity:** major · **PR:** #76
 - **Sources (deduped):** A6 plan T11.1–T11.8 (unchecked on main); MEMORY README hero video pipeline
-- **Evidence on origin/main:** Never executed. `docs/showcase/supermux-showcase.{gif,mp4}` on main are from the EARLIER launch-video programme, not from this one.
+- **Evidence on origin/main:** Never executed. `docs/showcase/supermux-showcase.{gif,mp4}` were from the EARLIER launch-video programme, not from this one; they were untracked on 2026-08-30 (13.4 MB no page linked to — see `showcase/verification.json`).
 - **Detail:** Eight items: the SCENARIOS.md register, the per-platform capture rig on harness.ts against :8829, the matrix with a stated reduction rule, keyboard-driven use as a first-class scenario (S24), the visual jury on the existing rubric, the fix→re-capture→re-judge loop, VERDICT.md (one row per scenario × platform × theme), and the single hand-off page the owner opens. THIS IS THE 'PERFECT FINISH' DELIVERABLE the owner is waiting on.
 
 #### `SHOW-03` — A6 T13.1–T13.5 — the A7-readiness checklist, full gate and hand-off

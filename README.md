@@ -9,9 +9,13 @@
 <p align="center">
   <!-- Bot Mode hero. Embedded as <img> so it autoplays everywhere GitHub renders
        (web logged-out, iOS Safari, the GitHub mobile app, IDE previews) and
-       degrades to a clean static first frame. Click-through opens the HD MP4. -->
-  <a href="docs/hero.mp4"><img src="docs/hero.gif" alt="supermux Bot Mode — Run a company of bots: named AI teammates (a developer, a marketer, a sales bot) organized into companies that talk to each other" width="760"></a>
+       degrades to a clean static first frame. Click-through opens the HD MP4.
+       Every frame is the real UI, shot from the app's own mock/dev surfaces. -->
+  <a href="docs/hero.mp4"><img src="docs/hero.gif" width="900"
+     alt="supermux in use — a bot's thread on a phone with tool receipts ticking as it works; the desktop control room with every bot ranked by who needs you first; the company chat routing one question to two named bots; a lock-screen push the moment a bot needs a decision; taking the wheel in the company's shared browser; the thread still running on a phone after the laptop closes; and the one-line install on a server, ending on the address and the token command the installer actually prints"></a>
 </p>
+
+<p align="center"><sub>▶ <a href="docs/hero.mp4">Click for HD</a> · the loop above autoplays on GitHub</sub></p>
 
 <p align="center"><sub>An open-source, self-hosted AI company you run yourself.</sub></p>
 
@@ -59,56 +63,63 @@ Then stand up your first company:
 
 A bot has a name, an avatar, and a role you assign — *Ada the developer*, *Iris the marketer*, *Sol in sales*. Each one gets **its own folder** on the box (its filesystem, scoped to what it's allowed to touch) and **its own connectors**. It's a full Claude Code agent with a job, not a scratch chat window.
 
+<p align="center">
+  <a href="docs/screenshots/hire-sheet-phone.png"><img src="docs/screenshots/hire-sheet-phone.png" alt="The hire-a-teammate sheet on a phone: the bot named Ada above 'Tap the avatar to reroll', and under 'What should your teammate do?' the job typed into the focused field — 'Watch the nightly build and open a PR when it breaks.' — with an Advanced disclosure for engine, model and folder, and Cancel / Continue at the foot" width="300"></a>
+</p>
+
+<p align="center"><sub><em>Hiring a bot is one sentence.</em></sub></p>
+
+<p align="center">
+  <a href="docs/screenshots/chat-phone.png"><img src="docs/screenshots/chat-phone.png" alt="A bot's thread on a phone: two finished tool calls — Read money.rs and Grep parse_locale — with cargo test --lib money still spinning under a live timer, below the reply the owner just sent" width="300"></a>
+</p>
+
+<p align="center"><sub><em>Every tool call, as it happens.</em></sub></p>
+
+<p align="center">
+  <a href="docs/screenshots/chat-desktop.png"><img src="docs/screenshots/chat-desktop.png" alt="The same company on a desktop: a rail of seven named threads with Patch mid-reply and an unread dot on Quill; in the thread, the owner's question, the bot's four tool receipts (cargo check clean, 212 tests passed, v0.6.0 tagged, one image read), the screenshot it attached, then a 'Message from Patch' divider where another bot answers inside this thread, and a live 'asking Patch…' pill above the composer" width="900"></a>
+</p>
+
+<p align="center"><sub><em>Seven bots, one rail — and they can talk to each other.</em></sub></p>
+
 ### Companies
 
 Group bots into a **company** and they share connectors, a central **company chat**, and a shared browser. Bots **message each other and hand tasks off**: the marketer asks the developer for the changelog, the developer drops it in the shared drive, the sales bot picks it up. You set the direction; they do the passing.
 
 <p align="center">
-  <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. -->
-  <a href="docs/screenshots/botmode/companies.png"><img src="docs/screenshots/botmode/companies.png" alt="Company roster: 'Northwind' with three avatar bots (Ada, Iris, Sol) and the central company chat panel, with the company switcher ring visible in the nav" width="860"></a>
+  <a href="docs/screenshots/groupchat-phone.png"><img src="docs/screenshots/groupchat-phone.png" alt="A company's group chat on a phone: the owner asks once, the Main Assistant fans the ask out to @chat-dataplane and @render-bug, and chat-dataplane is already answering below the unread divider" width="300"></a>
 </p>
 
-<p align="center"><em>Northwind's bots hand off work in the company chat — all mock data.</em></p>
-
-<p align="center">
-  <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. The Bot Mode mental model:
-       phone (owner) → a Company holding named bots, a shared Connectors rail, a Shared Browser,
-       a central Company Chat, arrows showing bots messaging each other + handing off files. -->
-  <a href="docs/screenshots/botmode/company-diagram.png"><img src="docs/screenshots/botmode/company-diagram.png" alt="Diagram of the Bot Mode mental model: an owner's phone drives a Company container holding three named bots, a shared connectors rail, a shared browser, and a central company chat, with arrows showing bots handing work to each other" width="860"></a>
-</p>
+<p align="center"><sub><em>You ask once. The router picks who does it.</em></sub></p>
 
 ### Connectors
 
 Plug bots into the tools you already use — Gmail, GitHub, your database, anything — **with or without an MCP server or API**, via the connect concierge and one-tap sign-in. Grants are per-bot: a bot only reaches the connectors you hand it.
 
 <p align="center">
-  <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. Real catalog cards, no fake URLs. -->
-  <a href="docs/screenshots/botmode/connectors.png"><img src="docs/screenshots/botmode/connectors.png" alt="Connector store card and a one-tap 'Sign in with GitHub' connect-concierge sheet on mobile" width="780"></a>
+  <a href="docs/screenshots/connector-store.png"><img src="docs/screenshots/connector-store.png" alt="The connector store with the Browse tab open and the All category chip selected: a row of category filters over two rows of cards — featured GitHub with 21 tools, Notion with 12 and Stripe, then PayPal, Plaid and Square — each with its own Connect button" width="900"></a>
 </p>
 
-<p align="center"><em>Connect a bot to your tools in a tap — all mock data.</em></p>
+<p align="center"><sub><em>A store of tools, granted per bot — not per box.</em></sub></p>
 
 ### Workflows
 
 A **workflow** is an ordered list of prompts a bot runs on a trigger: chain the steps, run them on a schedule, and fire a completion action when it's done. Ship the weekly report every Monday without lifting a finger.
 
 <p align="center">
-  <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. -->
-  <a href="docs/screenshots/botmode/workflows.png"><img src="docs/screenshots/botmode/workflows.png" alt="Workflow composer on mobile: a step rail with four steps, an 'every Mon 09:00' schedule, and a completion action 'email the summary'" width="420"></a>
+  <a href="docs/screenshots/workflow-runs.png"><img src="docs/screenshots/workflow-runs.png" alt="A workflow's run history: today's run still Running with step one done in 41 s and step two spinning, yesterday's run Failed at step three with the reason written out and per-step timings, and an earlier run marked Done" width="900"></a>
 </p>
 
-<p align="center"><em>An ordered, scheduled multi-step workflow — all mock data.</em></p>
+<p align="center"><sub><em>Give a bot a job and a time. It tells you what happened — including the failures.</em></sub></p>
 
 ### A shared company browser
 
 One real Chrome the company shares — **log in once**, then lend individual tabs to named bots. When a bot hits a login wall you can **take the wheel**, sign in, and hand the tab back.
 
 <p align="center">
-  <!-- TODO: capture from /?mock or /dev — mock data only, no client PII. -->
-  <a href="docs/screenshots/botmode/shared-browser.png"><img src="docs/screenshots/botmode/shared-browser.png" alt="The shared browser route: a tab strip, a live page, a 'Watch / Drive · 2 agents' control, and a 'take the wheel — login needed' moment" width="780"></a>
+  <a href="docs/screenshots/browser-drive.png"><img src="docs/screenshots/browser-drive.png" alt="The company's shared browser with Drive engaged instead of Watch: a rail of company tabs — two pinned, then Pipeline · CRM, Analytics, a quarterly reseller report, Ads Manager and Handbook — the omnibox on mail.acme.example/inbox reading 'Signed in · verified 6 min ago', one other viewer on the tab, and the accent ring round the page that means a human has the wheel" width="900"></a>
 </p>
 
-<p align="center"><em>One browser the whole company logs into once — all mock data.</em></p>
+<p align="center"><sub><em>When it's stuck, take the wheel — then hand it back.</em></sub></p>
 
 ---
 
@@ -146,10 +157,16 @@ The pitch that made Grok bots go viral — a team of agents that never sleeps �
 Bot Mode runs on top of a real product. Underneath the companies is the thing supermux has always been: **the easiest way to run a roomful of Claude Code agents from your phone** — live overview, real push, resume, files, MCP/skills, remote hosts.
 
 <p align="center">
-  <a href="docs/screenshots/overview-desktop.png"><img src="docs/screenshots/overview-desktop.png" alt="supermux desktop overview: a grid of live Claude Code session tiles with color-true terminal previews and 'waiting on you' status pills" width="860"></a>
+  <a href="docs/screenshots/overview-desktop.png"><img src="docs/screenshots/overview-desktop.png" alt="The overview after clicking a row: the HQ bar with New bot, search, sort and density; the roster grouped NEEDS YOU (2) — a five-bot team and codex-app at 11% context — above ACTIVE (2), build-runner and qa-astro; and codex-app's panel open on the right with Open terminal and its Overview, Setup and Workflows tabs" width="900"></a>
 </p>
 
-<p align="center"><em>Every agent, live, on one screen — who's working, who's waiting on you, who's idle.</em></p>
+<p align="center"><sub><em>Every bot, ranked by who needs you.</em></sub></p>
+
+<p align="center">
+  <a href="docs/screenshots/overview-phone.png"><img src="docs/screenshots/overview-phone.png" alt="The same roster on a phone, grouped the same way: two bots that need you above two that are working, one of them listening on 127.0.0.1:8823, with a context ring on the two running a model" width="300"></a>
+</p>
+
+<p align="center"><sub><em>The same control room, in your pocket.</em></sub></p>
 
 - **All your Claude sessions in one live view.** Color-true terminal previews, sub-second fresh. See who's typing, who's waiting on you, who's idle.
 - **Notifications when Claude needs you.** Real push (PWA, real iOS push) the second Claude asks a question, finishes a task, or stops. Per-category mute.
@@ -158,6 +175,12 @@ Bot Mode runs on top of a real product. Underneath the companies is the thing su
 - **Schedule recurring prompts.** Cron and "every Nm/Nh" jobs, an iCal feed, a live job list — routine work happens without you.
 - **A terminal made for Claude Code.** Attach a file or photo and it drops the path at Claude's prompt; Markdown and code render with real syntax highlighting; edit prompts in a native textarea; tap Claude-specific actions (cycle permission mode, rewind, approve) a plain SSH app can't know about.
 - **Mixed fleets welcome.** Claude Code is the default; the same overview runs [Codex CLI](https://developers.openai.com/codex/cli/) sessions side by side.
+
+<p align="center">
+  <a href="docs/screenshots/terminal-focus.png"><img src="docs/screenshots/terminal-focus.png" alt="Focus mode on a desktop: Claude's own colour-true screen — an Update receipt with two green added lines, a Bash(bun run build) receipt, 212 tests passing, and a 'Brewed for 34s' timing line — then Claude's composer between its two rules with the next prompt already typed into it and the block cursor after the last character, all under the session's title and its ✎ use-sessions.ts · 3 agents activity, over a dock of Claude-specific keys: ⌘ palette, attach, edit-prompt, Esc, Tab, Ctrl-C, Ctrl-U and the permission-mode switch" width="900"></a>
+</p>
+
+<p align="center"><sub><em>A terminal that knows it is running Claude Code.</em></sub></p>
 
 <details>
 <summary><strong>The full feature list (overview, notifications, history, uploads, hosts, and more)</strong></summary>
@@ -168,8 +191,6 @@ Bot Mode runs on top of a real product. Underneath the companies is the thing su
 - **Focus mode**: tap any tile to zoom into a keyboard-captured xterm.js terminal (desktop) or a detented bottom-sheet (mobile). `⌘1..9` jumps instantly between sessions.
 - **⌘K command palette**: fuzzy search across sessions, slash commands, MCP tools, and Claude Code skills.
 - **Mixed fleets welcome**: Claude Code is the default, but the same overview runs [Codex CLI](https://developers.openai.com/codex/cli/) sessions side by side — same live status, push notifications, and prompt history.
-
-<p align="center"><a href="docs/screenshots/new-session.png"><img src="docs/screenshots/new-session.png" alt="New session sheet on the overview: Quick start (Blank Claude / Code reviewer / Doc writer presets) and Advanced" width="780"></a></p>
 
 ### Notifications that find you
 - **Real push notifications** when Claude finishes, asks a question, or stops. Works on iOS too: install the PWA, allow notifications, walk away from your machine.
@@ -192,7 +213,7 @@ Bot Mode runs on top of a real product. Underneath the companies is the thing su
 - Mobile gets a full-page edit surface with proper safe-area handling.
 - Built on Claude Code's own `chat:externalEditor` (Ctrl+G) bridge. No scraping, no keystroke replay.
 
-<p align="center"><a href="docs/screenshots/native-input.png"><img src="docs/screenshots/native-input.png" alt="Edit prompt sheet on iPhone: native textarea with iOS selection handles, attach + voice + Done" width="260"></a></p>
+<p align="center"><a href="docs/screenshots/native-input.png"><img src="docs/screenshots/native-input.png" alt="The Edit prompt sheet on an iPhone: the prompt lifted out of Claude's ❯ prompt into a focused, browser-native textarea with the caret after the last character, Cancel / Send / Done in the sheet header, attach and dictation in the dock, and iOS's own keyboard accessory bar under it" width="260"></a></p>
 
 ### Drag-and-drop uploads
 - **Drag a file onto the terminal pane** on desktop and supermux uploads it server-side, then pastes the resolved path at Claude's cursor.
@@ -305,6 +326,13 @@ If `tailscaled` is running on the target host, the installer auto-detects it and
 - **Company isolation is best-effort, not a hard multi-tenant jail.** Separation is app-layer scoping plus the systemd sandbox (and best-effort Landlock where the kernel allows) — sandboxed isolation on a box you control, not fully isolated tenants. Don't host mutually-hostile companies on one instance.
 - **Letting outside humans into a company needs your own domain + OAuth.** Out of the box supermux is single-owner behind an auth token (and ideally Tailscale); external human access is your setup to add.
 - **It runs Claude Code.** Bot Mode is as capable — and as fallible — as the agent driving it. It does the things you could do at a keyboard, and it makes the mistakes an agent makes. Keep a human in the loop for anything that matters.
+- **Chat renders permission prompts; it can't answer them yet.** When Claude asks to run something, the card shows up in chat with the command and its options — and says out loud that you have to answer it in the terminal. The screenshot below is the real state, footnote and all.
+
+<p align="center">
+  <a href="docs/screenshots/chat-permission-phone.png"><img src="docs/screenshots/chat-permission-phone.png" alt="A permission prompt in a bot's chat on a phone: 'Run cargo publish --dry-run?' with Bash · in supermux/server underneath, three options keyed 1, 2 and 3 — Allow once, Allow while this session runs, Not now — and the footnote 'Answer in the terminal — chat can't answer this one yet.'" width="300"></a>
+</p>
+
+<p align="center"><sub><em>Claude asks. Chat shows you what it's asking — and where you have to answer.</em></sub></p>
 
 ---
 

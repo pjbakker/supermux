@@ -83,8 +83,8 @@ export default function DevGroupChat() {
                   ts: base + 60 * (n + 1),
                   kind: 'request',
                   authorKind: 'human',
-                  authorSeed: 'user-sander',
-                  authorName: 'Sander',
+                  authorSeed: 'user-sam',
+                  authorName: 'Sam',
                   body: text,
                 },
                 {

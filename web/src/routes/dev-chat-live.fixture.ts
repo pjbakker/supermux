@@ -1697,7 +1697,7 @@ export const BENCH_ROSTER: readonly BenchRosterRow[] = [
     seed: 'kestrel',
     label: 'Kestrel',
     timestamp: 'Yesterday',
-    preview: 'strato box is quiet since the fix.',
+    preview: 'the staging box is quiet since the fix.',
     state: 'done',
   },
 ]
