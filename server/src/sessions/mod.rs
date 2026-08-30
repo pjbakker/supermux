@@ -333,6 +333,11 @@ pub struct SessionView {
     /// unchanged — it is purely the PATCH result's advisory bit.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub restart_required: bool,
+    /// The disposable marker (migration 0025): archive this session the moment
+    /// it stops. Surfaced so the workflows editor's "archive on stop" toggle can
+    /// read the marker it writes (the workflows create/patch plumbing stamps
+    /// this very column on the target session).
+    pub archive_on_stop: bool,
     /// Last 6 lines of `last_capture`, ANSI-stripped.
     pub preview_lines: Vec<String>,
     /// Same last 6 lines, with SGR escape sequences preserved — the colour-true
@@ -677,6 +682,7 @@ fn view(
         // Only ever flipped true by `config_patch` on a launch-line change; every
         // other construction path (get/list/SSE) leaves it false → omitted.
         restart_required: false,
+        archive_on_stop: s.archive_on_stop != 0,
         preview_lines: preview_lines(last_capture),
         preview_ansi: last_n_lines(last_capture_ansi, 20),
         activity: act.as_ref().and_then(|a| a.activity.clone()),

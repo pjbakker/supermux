@@ -105,3 +105,97 @@ async fn audit_count(pool: &sqlx::SqlitePool, target: &str) -> i64 {
     .unwrap();
     n
 }
+
+// ── the workflows plumbing ───────────────────────────────────────────────────
+
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
+use http_body_util::BodyExt;
+use supermux_server::workflows::{self, CreateWorkflowInput, StepBody};
+use tower::ServiceExt;
+
+fn one_step() -> Vec<StepBody> {
+    vec![StepBody { prompt: "do the thing".into(), ..Default::default() }]
+}
+
+async fn flag_of(pool: &sqlx::SqlitePool, name: &str) -> i64 {
+    let (v,): (i64,) =
+        sqlx::query_as("SELECT archive_on_stop FROM sessions WHERE name = ?")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    v
+}
+
+#[tokio::test]
+async fn workflow_create_stamps_the_target_session_opt_in_default_off() {
+    let (state, _router, _dir) = setup().await;
+    insert_session(&state, "bot-a", false).await;
+    insert_session(&state, "bot-b", false).await;
+
+    // Flag omitted -> the session's marker is untouched (opt-in, default off).
+    workflows::create(&state, CreateWorkflowInput {
+        title: "plain".into(),
+        session: "bot-a".into(),
+        steps: one_step(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(flag_of(&state.pool, "bot-a").await, 0, "omitted flag leaves the marker alone");
+
+    // Explicit ON -> the SESSION row is stamped (there is no workflows copy).
+    workflows::create(&state, CreateWorkflowInput {
+        title: "clean-me-up".into(),
+        session: "bot-b".into(),
+        steps: one_step(),
+        archive_on_stop: Some(true),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(flag_of(&state.pool, "bot-b").await, 1, "explicit on stamps the session");
+    assert!(db::sessions::archive_pending(&state.pool, "bot-b").await.unwrap());
+}
+
+#[tokio::test]
+async fn workflow_patch_stamps_and_clears_the_target_session() {
+    let (state, app, _dir) = setup().await;
+    insert_session(&state, "bot-c", false).await;
+    let wf = workflows::create(&state, CreateWorkflowInput {
+        title: "toggle-me".into(),
+        session: "bot-c".into(),
+        steps: one_step(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let patch = |body: serde_json::Value| {
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/api/workflows/{}", wf.workflow.id))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // PATCH {archive_on_stop: true} -> stamped.
+    let resp = app.clone().oneshot(patch(serde_json::json!({ "archive_on_stop": true }))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(flag_of(&state.pool, "bot-c").await, 1);
+
+    // PATCH without the field -> untouched.
+    let resp = app.clone().oneshot(patch(serde_json::json!({ "title": "renamed" }))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(flag_of(&state.pool, "bot-c").await, 1, "omitted field leaves the marker alone");
+
+    // PATCH {archive_on_stop: false} -> cleared (the one write path that
+    // un-marks a disposable session without unarchiving anything).
+    let resp = app.clone().oneshot(patch(serde_json::json!({ "archive_on_stop": false }))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(flag_of(&state.pool, "bot-c").await, 0);
+    let _ = resp.into_body().collect().await;
+}

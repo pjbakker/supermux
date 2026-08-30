@@ -771,6 +771,22 @@ pub async fn set_archived(pool: &SqlitePool, name: &str, archived: bool) -> sqlx
     Ok(())
 }
 
+/// Set the disposable marker (0025). Returns the number of rows matched so a
+/// caller stamping a name that has no row can say so instead of silently
+/// succeeding.
+pub async fn set_archive_on_stop(
+    pool: &SqlitePool,
+    name: &str,
+    on: bool,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query("UPDATE sessions SET archive_on_stop = ? WHERE name = ?")
+        .bind(on as i64)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// True iff a LIVE (non-archived) row exists AND is flagged `archive_on_stop`.
 /// The stop hook's single gate: a missing row, an already-archived row, or an
 /// unflagged row all return false, so the caller never double-archives.
