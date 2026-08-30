@@ -49,6 +49,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::keepalive;
 use super::lock::Actor;
 use super::tab::{Tab, TabMeta};
 use super::tools::browser_err;
@@ -104,6 +105,13 @@ async fn tab_json(state: &AppState, row: &db_tabs::TabRow, live: &[String]) -> V
         "login_state": row.login_state,
         "last_probe_at": row.last_probe_at,
         "live": live.contains(&row.id),
+        // "Keep me signed in" (`keepalive::*`). Four flat fields, because
+        // everything the menu row says is derivable from them — there is no
+        // fifth "status" field and no in-memory map behind this.
+        "keepalive_enabled": row.keepalive_enabled != 0,
+        "keepalive_every": row.keepalive_every,
+        "keepalive_action": row.keepalive_action,
+        "last_keepalive_at": row.last_keepalive_at,
         "grants": grants,
         "created_at": row.created_at,
         "last_used_at": row.last_used_at,
@@ -209,6 +217,11 @@ pub struct PatchBody {
     pub origins: Option<Vec<String>>,
     /// `ok` | `needs_login` | `unknown`. Set by the human clearing a stale state.
     pub login_state: Option<String>,
+    /// **"Keep me signed in" — the only keepalive field a body may set.** The
+    /// interval and the mode are server-derived (the sweep learns them from the
+    /// cookie jar), so there is no interval picker and no way to ask this door
+    /// for a shorter one.
+    pub keepalive_enabled: Option<bool>,
 }
 
 async fn patch_handler(
@@ -228,6 +241,54 @@ async fn patch_handler(
             return Err(AppError::BadRequest(format!("unknown login_state '{ls}'")));
         }
     }
+    // Keep-signed-in is a HUMAN act with two refusals, both of which have to be
+    // said out loud rather than silently clamped.
+    //
+    // **No chrome is started here.** The old shape of this feature read the
+    // cookie jar inside the handler, which cold-starts chrome (~2-5 s on a small
+    // box) while a phone waits — and then refused to enable on the answer. This
+    // is a plain DB write: `keepalive_clear_stamp` nulls `last_keepalive_at`,
+    // which `keepalive::due_at` reads as **due now**, so the first tick lands
+    // inside 60 s and does all of the learning.
+    let mut keepalive_every = None;
+    let mut keepalive_action = None;
+    let mut clear_stamp = false;
+    if let Some(on) = body.keepalive_enabled {
+        let row = load(&state, &id).await?;
+        if on {
+            if !(row.url.starts_with("http://") || row.url.starts_with("https://")) {
+                return Err(AppError::BadRequest(
+                    "only web pages can be kept signed in".into(),
+                ));
+            }
+            // An enabled tab is held LIVE, which holds chrome up. The cap is
+            // that cost, stated rather than hidden.
+            let enabled = db_tabs::list_keepalive(&state.pool).await?;
+            if enabled.iter().filter(|r| r.id != id).count() >= keepalive::MAX_ENABLED_TABS {
+                return Err(AppError::BadRequest(format!(
+                    "supermux keeps at most {} tabs signed in — each one holds a page open in the browser",
+                    keepalive::MAX_ENABLED_TABS
+                )));
+            }
+            keepalive_every = Some(keepalive::BLIND_MINUTES);
+            keepalive_action = Some(keepalive::ACTION_SOFT.to_string());
+            clear_stamp = true;
+        }
+        // Off leaves `keepalive_every` / `keepalive_action` alone — harmless,
+        // and it keeps the last learned cadence visible if it is turned back on.
+        let _ = crate::db::audit::log(
+            &state.pool,
+            "user",
+            if on {
+                "browser.keepalive_on"
+            } else {
+                "browser.keepalive_off"
+            },
+            &format!("tab:{id}"),
+            json!({ "url": row.url }),
+        )
+        .await;
+    }
     let patch = db_tabs::TabPatch {
         title: body.title,
         url: body.url,
@@ -236,6 +297,11 @@ async fn patch_handler(
         login_state: body.login_state,
         probed_now: false,
         touch_used: false,
+        keepalive_enabled: body.keepalive_enabled,
+        keepalive_every,
+        keepalive_action,
+        keepalive_stamp_now: false,
+        keepalive_clear_stamp: clear_stamp,
     };
     db_tabs::update(&state.pool, &id, &patch).await?;
     let row = load(&state, &id).await?;
