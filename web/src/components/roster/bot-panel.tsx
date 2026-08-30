@@ -595,7 +595,10 @@ function LiveState({
           <span className="text-muted-foreground" aria-hidden>·</span>
           <ActivityLine
             activity={session.activity}
-            subagents={session.subagents}
+            // `agents_live`, never the raw `subagents`: the raw count is pinned
+            // by a lost `SubagentStop` and would keep the "· N agents" clause
+            // alive after the children are gone. Same field the tile passes.
+            agentsLive={session.agents_live}
             className="max-w-full flex-1 basis-40 text-[13px]"
           />
         </>
