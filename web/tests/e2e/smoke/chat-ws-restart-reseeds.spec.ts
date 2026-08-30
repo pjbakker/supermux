@@ -53,15 +53,22 @@ test.describe('chat WS — a server restart mid-stream (A6 T3.1)', () => {
     await backend?.dispose()
   })
 
-  // @quarantine — same rule as `chat-toggle-focus-leak`: broken, not slow. Red
-  // on main in run 32700541733 and on every run of this branch. The composer's
-  // pending chip reaches `undelivered` where this asserts `unconfirmed`, which
-  // is what a hosted runner with no real `claude` to deliver to produces — so
-  // the spec is asserting a delivery this environment cannot perform. Whether
-  // the fix is a fixture or a `@needs-claude` tag is a diagnosis nobody has
-  // finished, and 35 s per PR is not how that gets decided. Runs nightly; take
-  // the tag off in the commit that makes it pass.
-  test('@quarantine reconnects visibly, re-seeds the gap, and duplicates nothing', async ({ page }) => {
+  // QUARANTINE LIFTED (v0.6.1 pjbakker integration), per the contract the tag
+  // carried: "take the tag off in the commit that makes it pass".
+  //
+  // The diagnosis the quarantine note left unfinished: the composer's pending
+  // chip reached `undelivered` because `POST /send` answered 409, and it did so
+  // for a reason that had nothing to do with a missing real `claude`. The send
+  // guard (`lifecycle.rs::send_block`) admits only on positive evidence of an
+  // AGENT composer on the current screen, and the stand-in agent's pane drew a
+  // bare shell prompt (`t3$ `) — to the server, a shell the agent had exited to.
+  // The fixture now draws the agent's own composer glyph, so the send is
+  // admitted and the chip settles on `unconfirmed` as asserted. The guard was
+  // never made test-aware and no assertion here was weakened.
+  //
+  // Verified rather than assumed: with the old `t3$ ` prompt this test still
+  // fails on the same assertion, with `❯ ` it passes (50.9 s locally).
+  test('reconnects visibly, re-seeds the gap, and duplicates nothing', async ({ page }) => {
     test.setTimeout(300_000)
 
     const fx = await chatSession(backend, 'a6t3-restart')
