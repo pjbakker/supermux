@@ -121,3 +121,37 @@ describe('raw Vaul is confined to a shrinking allowlist', () => {
     expect(src.toLowerCase()).toContain('responsivesheet')
   })
 })
+
+/**
+ * The paint half of "a menu inside a sheet is dead on touch".
+ *
+ * `modal={false}` (session-actions-menu.tsx) fixed the pointer-events half: a
+ * modal Vaul drawer sets `pointer-events: none` on <body>, where a modal Radix
+ * menu portals. But the workflow card's ⋮ stayed dead on a phone AFTER that
+ * fix, because the menu content was `z-50` while every mobile bottom sheet is
+ * `z-[60]` — and both portal to <body>, so the sheet's glass simply painted
+ * over the open menu and swallowed the taps meant for it. Desktop hid it: the
+ * side Sheet is `z-50` too, so DOM order put the menu on top.
+ *
+ * A menu is always opened FROM a surface, so it must outrank the surfaces that
+ * can host it. That is the invariant; the numbers may move together.
+ */
+describe('the overlay ladder puts menus above the sheets that host them', () => {
+  /** Highest `z-[N]` / `z-N` on a positioned overlay in a file. Line comments
+   *  are stripped first — this file's own prose quotes both numbers, and a
+   *  comment that satisfied the test would be a test of nothing. */
+  function maxZ(rel: string): number {
+    const src = readFileSync(join(SRC, rel), 'utf8').replace(/^\s*\/\/.*$/gm, '')
+    const hits = [...src.matchAll(/(?:^|["'\s])z-\[(\d+)\]|(?:^|["'\s])z-(\d+)(?:\s|["'])/g)].map(
+      (m) => Number(m[1] ?? m[2]),
+    )
+    expect(hits.length).toBeGreaterThan(0)
+    return Math.max(...hits)
+  }
+
+  test('the dropdown menu outranks the mobile sheet it opens inside', () => {
+    expect(maxZ('components/ui/dropdown-menu.tsx')).toBeGreaterThan(
+      maxZ('components/ui/responsive-sheet.tsx'),
+    )
+  })
+})
