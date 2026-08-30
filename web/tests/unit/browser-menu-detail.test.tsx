@@ -66,7 +66,7 @@ describe('BrowserMenuItem.detail', () => {
   test('draws a second, muted line INSIDE the one menuitem button', () => {
     const html = menu([{ id: 'keepalive', ...keepAliveRow(tab(), NOW) }])
     expect(html).toContain('Stop keeping signed in')
-    expect(html).toContain('Every 45 min · checked 12 min ago.')
+    expect(html).toContain('Checked 12 min ago · next in ~33 min.')
     expect(html).toContain('data-browser-menu-detail="keepalive"')
     // One button, two lines — not two rows.
     expect(html.split('role="menuitem"').length - 1).toBe(1)

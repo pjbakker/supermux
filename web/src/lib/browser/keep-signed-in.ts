@@ -188,9 +188,14 @@ export function keepAliveRow(
       attention: true,
     }
   }
+  // The owner asked to SEE the schedule, not infer it: name the next check.
+  // `last_keepalive_at` is the scheduler's own cursor (every tick stamps it),
+  // so cursor + interval IS the next due time; "~" because the sweep runs on a
+  // minute tick with jitter, and a human holding the wheel defers it.
+  const nextIn = Math.max(0, tab.last_keepalive_at + tab.keepalive_every * 60 - now)
   return {
     label: ON_LABEL,
-    detail: `Every ${everyLabel(tab.keepalive_every)} · checked ${ago(since)}.`,
+    detail: `Checked ${ago(since)} · next in ~${everyLabel(Math.max(1, Math.round(nextIn / 60)))}.`,
   }
 }
 
