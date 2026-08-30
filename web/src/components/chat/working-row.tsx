@@ -27,7 +27,9 @@
 //   · NOTHING RE-RENDERS PER SECOND. Each row's elapsed is a `LiveElapsed` leaf
 //     mutating its own text node — the `TICKING_ROSTER` regression class was a
 //     per-second repaint pinning a session Active, and no per-agent update may
-//     reach the status classifier.
+//     reach the status classifier. The live→quiet dim is the one thing this row
+//     re-renders for on its own, and it is an EDGE (one `setTimeout` at the
+//     transition), not a tick.
 //   · IT IS DISPLAY-ONLY, all the way down. Nothing here is read by
 //     `use-chat-turn.ts`; `tests/unit/subagent-display-only.test.ts` pins that.
 //
@@ -44,7 +46,7 @@ import { subagentsClause } from '../../lib/mark-status'
 import { motionOff, springs } from '../../lib/springs'
 import { cn } from '../../lib/utils'
 
-import { AGENT_ROWS_SHOWN, agentName, isQuiet, quietLabel } from './agent-rows'
+import { AGENT_ROWS_SHOWN, agentName, isQuiet, nextQuietAtMs, quietLabel } from './agent-rows'
 import { stripEmojiPrefix } from './entries'
 import { serverNowMs } from './latency'
 import { ELAPSED_AFTER_MS, LiveElapsed, useElapsedShown } from './live-elapsed'
@@ -108,6 +110,9 @@ export function WorkingRow({
   }, [expanded])
 
   const rows = agents ?? []
+  // The ladder's own clock. One scheduled flip per transition, exactly like the
+  // 5s rung above it — never a tick (see the header rule).
+  const nowMs = useAgentQuietEdge(rows)
   const clauseText = subagentsClause(rows)
   // The emoji taxonomy stays terminal/tile-only, so the label is stripped here
   // exactly as the confirmed receipt it will become is (`stripEmojiPrefix`).
@@ -154,7 +159,7 @@ export function WorkingRow({
           <AgentList
             id={listId}
             className="mt-1"
-            rows={rows.slice(0, AGENT_ROWS_SHOWN).map(toListRow)}
+            rows={rows.slice(0, AGENT_ROWS_SHOWN).map((row) => toListRow(row, nowMs))}
             more={Math.max(0, rows.length - AGENT_ROWS_SHOWN)}
             // The one honesty line this surface owed and never said: the chat
             // does not render subagent turns (a deliberate A6 decision, not an
@@ -181,23 +186,49 @@ function scrollOwnerToBottom(el: HTMLElement | null) {
   }
 }
 
-/** One wire row → one list line. Kept out of the component so the JSX stays a
- *  layout statement and the decisions stay testable (`agent-rows.ts`). */
-function toListRow(row: AgentRow): AgentListRow {
-  const quiet = isQuiet(row)
+/**
+ * "Now" for the agent ladder, plus ONE scheduled re-render at the instant the
+ * next row goes quiet.
+ *
+ * The rows carry absolute server-clock stamps, so live→quiet is a judgement this
+ * component makes rather than a fact the server pushes — which is the only way
+ * the transition can happen at all in the case it exists for: a fan-out where
+ * every child is inside a long `Bash` produces no hooks, therefore no deltas,
+ * therefore nothing to re-render on. `nextQuietAtMs` is stable while the clock
+ * sits inside one interval, so the effect arms the timer once per transition and
+ * not once per render.
+ */
+function useAgentQuietEdge(rows: readonly AgentRow[]): number {
+  const [, bump] = React.useReducer((n: number) => n + 1, 0)
+  const nowMs = serverNowMs()
+  const quietAt = nextQuietAtMs(rows, nowMs)
+  React.useEffect(() => {
+    if (quietAt == null) return
+    // Floored so an edge that is somehow already past when the timeout lands
+    // re-arms rather than spinning — same guard as `useElapsedShown`.
+    const id = window.setTimeout(bump, Math.max(50, quietAt - serverNowMs()))
+    return () => window.clearTimeout(id)
+  }, [quietAt])
+  return nowMs
+}
+
+/** One wire row → one list line. Kept out of the component (and exported) so the
+ *  JSX stays a layout statement and the decisions stay testable
+ *  (`agent-rows.ts`), the anchor below among them. */
+export function toListRow(row: AgentRow, nowMs: number): AgentListRow {
+  const quiet = isQuiet(row, nowMs)
   return {
     id: row.id,
     label: agentName(row, stripEmojiPrefix),
     quiet,
     // A quiet row states the FACT and stops. A live one gets a clock counting
-    // from its own first sighting — `since_ms` is server-clock ms resolved at
-    // serialization, so subtracting it lands the anchor in the same clock domain
-    // `LiveElapsed` reads, and `afterMs: 0` means it shows from the first frame
-    // (unlike the turn's own clock, a child that has been up 3s is worth saying).
-    right: quiet ? (
-      quietLabel(row.quiet_ms)
-    ) : (
-      <LiveElapsed turnStartMs={serverNowMs() - row.since_ms} afterMs={0} />
-    ),
+    // from its own first sighting — `started_ms` is already in the server-clock
+    // domain `LiveElapsed` reads, so it is passed straight through. That it is a
+    // STAMP is what keeps the clock honest: the anchor is identical on every
+    // render, so the leaf's interval is never torn down and the digits never
+    // snap back to what they were at the last delta. `afterMs: 0` means it shows
+    // from the first frame — unlike the turn's own clock, a child that has been
+    // up 3s is worth saying.
+    right: quiet ? quietLabel(nowMs - row.last_evidence_ms) : <LiveElapsed turnStartMs={row.started_ms} afterMs={0} />,
   }
 }

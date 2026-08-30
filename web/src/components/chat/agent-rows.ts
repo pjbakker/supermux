@@ -34,9 +34,40 @@ export const AGENT_QUIET_AFTER_MS = 60_000
  */
 export const AGENT_ROWS_SHOWN = 6
 
-/** Has this row gone quiet — no tool call within `AGENT_QUIET_AFTER_MS`? */
-export function isQuiet(row: Pick<AgentRow, 'quiet_ms'>): boolean {
-  return row.quiet_ms >= AGENT_QUIET_AFTER_MS
+/** Has this row gone quiet as of `nowMs` — no tool call within
+ *  `AGENT_QUIET_AFTER_MS`?
+ *
+ *  Judged against the CLOCK rather than a number the server put on the wire,
+ *  and that is the whole reason the wire carries stamps: the case this ladder
+ *  exists for is every child sitting silent inside a long `Bash`, which is
+ *  precisely the case where no hook fires, so no delta arrives and no
+ *  server-computed staleness could ever be refreshed. The row would keep a
+ *  filled dot and a running clock forever. Now it dims on its own. */
+export function isQuiet(row: Pick<AgentRow, 'last_evidence_ms'>, nowMs: number): boolean {
+  return nowMs - row.last_evidence_ms >= AGENT_QUIET_AFTER_MS
+}
+
+/**
+ * The next moment one of these rows changes what it says — its live→quiet dim —
+ * as an absolute server-clock stamp, or `null` when they have all gone quiet.
+ *
+ * An EDGE, not a tick, and the distinction is load-bearing: the caller arms one
+ * `setTimeout` for this instant instead of re-rendering every second, so nothing
+ * here can put the chat panel on a cosmetic cadence (the `TICKING_ROSTER`
+ * regression class). It is also stable across renders — while `nowMs` sits
+ * inside the same interval the answer does not move — so the timer is armed
+ * once per transition rather than torn down on every render.
+ */
+export function nextQuietAtMs(
+  rows: readonly Pick<AgentRow, 'last_evidence_ms'>[],
+  nowMs: number,
+): number | null {
+  let next: number | null = null
+  for (const row of rows) {
+    const at = row.last_evidence_ms + AGENT_QUIET_AFTER_MS
+    if (at > nowMs && (next == null || at < next)) next = at
+  }
+  return next
 }
 
 /**

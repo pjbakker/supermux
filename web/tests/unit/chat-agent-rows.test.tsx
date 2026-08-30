@@ -21,10 +21,11 @@ import {
   AGENT_ROWS_SHOWN,
   agentName,
   isQuiet,
+  nextQuietAtMs,
   quietLabel,
 } from '../../src/components/chat/agent-rows'
 import { serverNowMs } from '../../src/components/chat/latency'
-import { WorkingRow } from '../../src/components/chat/working-row'
+import { WorkingRow, toListRow } from '../../src/components/chat/working-row'
 import { AgentList } from '../../src/components/chat/ui'
 import type { AgentRow } from '../../src/lib/api/sessions'
 
@@ -36,7 +37,8 @@ const text = (html: string) =>
     .trim()
 
 function agent(over: Partial<AgentRow> & { id: string }): AgentRow {
-  return { type: 'general-purpose', since_ms: 12_000, quiet_ms: 900, ...over }
+  const now = serverNowMs()
+  return { type: 'general-purpose', started_ms: now - 12_000, last_evidence_ms: now - 900, ...over }
 }
 
 const rows = (n: number, over: Partial<AgentRow> = {}) =>
@@ -49,9 +51,28 @@ const row = (over: Partial<AgentRow> = {}) =>
 
 describe('the quiet ladder', () => {
   test('a row is live inside the window and quiet outside it', () => {
-    expect(isQuiet({ quiet_ms: 0 })).toBe(false)
-    expect(isQuiet({ quiet_ms: AGENT_QUIET_AFTER_MS - 1 })).toBe(false)
-    expect(isQuiet({ quiet_ms: AGENT_QUIET_AFTER_MS })).toBe(true)
+    const now = 1_756_000_000_000
+    expect(isQuiet({ last_evidence_ms: now }, now)).toBe(false)
+    expect(isQuiet({ last_evidence_ms: now - AGENT_QUIET_AFTER_MS + 1 }, now)).toBe(false)
+    expect(isQuiet({ last_evidence_ms: now - AGENT_QUIET_AFTER_MS }, now)).toBe(true)
+  })
+
+  test('the dim is an EDGE the client can schedule, not a fact it waits for', () => {
+    // The whole reason the wire carries stamps: in the case this ladder exists
+    // for — every child silent inside a long `Bash` — no hook fires, so no delta
+    // arrives, so a server-computed staleness could never be refreshed and the
+    // row would keep a filled dot forever. The client has to know WHEN to look
+    // again, and it must be a single edge rather than a per-second tick.
+    const now = 1_756_000_000_000
+    const soon = { last_evidence_ms: now - 10_000 }
+    const later = { last_evidence_ms: now - 1_000 }
+    expect(nextQuietAtMs([later, soon], now)).toBe(soon.last_evidence_ms + AGENT_QUIET_AFTER_MS)
+    // Stable while the clock sits inside the interval — that is what keeps the
+    // timer armed once per transition instead of re-armed on every render.
+    expect(nextQuietAtMs([later, soon], now + 5_000)).toBe(soon.last_evidence_ms + AGENT_QUIET_AFTER_MS)
+    // Nothing left to schedule once every row has already gone quiet.
+    expect(nextQuietAtMs([{ last_evidence_ms: now - AGENT_QUIET_AFTER_MS }], now)).toBe(null)
+    expect(nextQuietAtMs([], now)).toBe(null)
   })
 
   test('a quiet row states the fact and never a verdict', () => {
@@ -71,6 +92,30 @@ describe('the quiet ladder', () => {
     expect(agentName(agent({ id: 'a', type: 'workflow-subagent' }), strip)).toBe('workflow-subagent')
     // A blank label is an absent one — it must not render as an empty line.
     expect(agentName(agent({ id: 'a', type: 'Explore', label: '   ' }), strip)).toBe('Explore')
+  })
+})
+
+describe('the per-agent clock', () => {
+  test('a live row is anchored on its own stamp, identically on every render', () => {
+    // The anchor used to be `serverNowMs() - since_ms`, recomputed in the render
+    // body: `since_ms` is frozen at the last delta while `serverNowMs()` keeps
+    // moving, so every render handed `LiveElapsed` a LATER anchor, which tore
+    // down its interval and rewrote the digits back to the delta's value. The
+    // clock counted up between renders and snapped backwards on each one.
+    const r = agent({ id: 'a1', started_ms: 1_756_000_000_000, last_evidence_ms: 1_756_000_009_000 })
+    const first = toListRow(r, 1_756_000_010_000)
+    const later = toListRow(r, 1_756_000_040_000)
+    for (const line of [first, later]) {
+      expect(line.quiet).toBe(false)
+      expect((line.right as { props: { turnStartMs: number } }).props.turnStartMs).toBe(r.started_ms)
+    }
+  })
+
+  test('a quiet row drops the clock and states the fact', () => {
+    const r = agent({ id: 'a1', started_ms: 1_756_000_000_000, last_evidence_ms: 1_756_000_000_000 })
+    const line = toListRow(r, 1_756_000_000_000 + 3 * 60_000)
+    expect(line.quiet).toBe(true)
+    expect(line.right).toBe('no tool call for 3m')
   })
 })
 
@@ -107,7 +152,7 @@ describe('the expanded list', () => {
         // caller's decision, and this pins the pair, not the primitive alone.
         rows={rows(n, over)
           .slice(0, AGENT_ROWS_SHOWN)
-          .map((r) => ({ id: r.id, label: r.label ?? r.type, quiet: isQuiet(r) }))}
+          .map((r) => ({ id: r.id, label: r.label ?? r.type, quiet: isQuiet(r, serverNowMs()) }))}
         more={Math.max(0, n - AGENT_ROWS_SHOWN)}
         note="their work shows in the terminal"
       />,

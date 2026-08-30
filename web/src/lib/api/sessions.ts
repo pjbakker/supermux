@@ -55,12 +55,19 @@ export interface AgentRow {
   /** This agent's CURRENT tool call, in the app's own voice (`⚡ run the tests`).
    *  Absent until its first tool hook. */
   label?: string
-  /** Milliseconds since this agent was first seen. */
-  since_ms: number
-  /** Milliseconds since its newest hook. Past `AGENT_QUIET_AFTER_MS`
+  /** When this agent was first seen, in SERVER-clock ms (`chat/latency.ts`'s
+   *  `serverNowMs()` domain — the same one `activity_at` establishes). A STAMP
+   *  and not a duration on purpose: a duration is only true at the instant it
+   *  was serialized, so a client had to re-anchor it against its own clock on
+   *  every render, which reset the elapsed leaf back to the last delta's value. */
+  started_ms: number
+  /** When its newest hook arrived, same clock. Past `AGENT_QUIET_AFTER_MS`
    *  (`components/chat/agent-rows.ts`) the row is QUIET: it stays, dims, and says
-   *  the fact — never "stopped", never "done", never a verdict. */
-  quiet_ms: number
+   *  the fact — never "stopped", never "done", never a verdict. Being a stamp is
+   *  what lets that transition happen at all: in the case the ladder exists for
+   *  (every child silent inside a long `Bash`) no delta arrives to carry a
+   *  fresher duration, so the client has to be able to age the row itself. */
+  last_evidence_ms: number
 }
 
 /** Per-tile summary. SSE `sessions` events use this same shape (deltas). */

@@ -84,9 +84,9 @@ describe('the stack, top to bottom', () => {
       status: 'active',
       activity: '⚡ cargo check',
       agents: [
-        { id: 'a1', type: 'general-purpose', label: '📖 ledger.rs', since_ms: 9_000, quiet_ms: 400 },
-        { id: 'a2', type: 'general-purpose', label: '⚡ cargo check', since_ms: 8_000, quiet_ms: 900 },
-        { id: 'a3', type: 'Explore', label: '🔍 money', since_ms: 6_000, quiet_ms: 1_400 },
+        { id: 'a1', type: 'general-purpose', label: '📖 ledger.rs', started_ms: serverNowMs() - 9_000, last_evidence_ms: serverNowMs() - 400 },
+        { id: 'a2', type: 'general-purpose', label: '⚡ cargo check', started_ms: serverNowMs() - 8_000, last_evidence_ms: serverNowMs() - 900 },
+        { id: 'a3', type: 'Explore', label: '🔍 money', started_ms: serverNowMs() - 6_000, last_evidence_ms: serverNowMs() - 1_400 },
       ],
       permission_request: { tool: 'Bash', summary: '⚡ cargo publish --dry-run', kind: 'bash' },
     }),
@@ -279,8 +279,8 @@ describe('the working row’s first rung', () => {
       Array.from({ length: n }, (_, i) => ({
         id: `a${i}`,
         type: 'general-purpose',
-        since_ms: 9_000,
-        quiet_ms: 500,
+        started_ms: serverNowMs() - 9_000,
+        last_evidence_ms: serverNowMs() - 500,
       }))
     expect(text(rowAt(1_000, { activity: '⚡ tests', agents: rows(3) }))).toContain(
       'tests · 3 agents',

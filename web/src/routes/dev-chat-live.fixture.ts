@@ -83,6 +83,11 @@ export const MENTIONS: ReadonlyMap<string, string> = new Map(
 
 /* ── sessions ────────────────────────────────────────────────────────────── */
 
+/** An agent row's stamps are ABSOLUTE server-clock ms, so a fixture states the
+ *  age it wants and lets the clock resolve it — a hard-coded stamp would age
+ *  into `no tool call for 9h` the first time this file is a day old. */
+const ago = (ms: number) => Date.now() - ms
+
 const DIR = '/opt/projects/supermux/server'
 
 function session(over: Partial<TileSession> & { name: string }): TileSession {
@@ -713,9 +718,9 @@ export function liveStates(nowMs: number): LiveState[] {
         // Three children with real evidence — the expander's own fixture: two
         // live with their current tool, one quiet inside a long command.
         agents: [
-          { id: 'w1', type: 'general-purpose', label: '📖 ledger.rs', since_ms: 31_000, quiet_ms: 900 },
-          { id: 'w2', type: 'general-purpose', label: '⚡ cargo check', since_ms: 24_000, quiet_ms: 4_200 },
-          { id: 'w3', type: 'workflow-subagent', since_ms: 18_000, quiet_ms: 190_000 },
+          { id: 'w1', type: 'general-purpose', label: '📖 ledger.rs', started_ms: ago(31_000), last_evidence_ms: ago(900) },
+          { id: 'w2', type: 'general-purpose', label: '⚡ cargo check', started_ms: ago(24_000), last_evidence_ms: ago(4_200) },
+          { id: 'w3', type: 'workflow-subagent', started_ms: ago(18_000), last_evidence_ms: ago(190_000) },
         ],
       }),
       entries: release,
@@ -737,11 +742,11 @@ export function liveStates(nowMs: number): LiveState[] {
         status: 'active',
         activity: '🤖 Review the ledger rounding',
         agents: [
-          { id: 'f1', type: 'general-purpose', label: '📖 ledger.rs', since_ms: 41_000, quiet_ms: 900 },
-          { id: 'f2', type: 'general-purpose', label: '⚡ cargo test --lib money', since_ms: 38_000, quiet_ms: 3_100 },
-          { id: 'f3', type: 'Explore', label: '🔍 round_half_even', since_ms: 22_000, quiet_ms: 12_400 },
+          { id: 'f1', type: 'general-purpose', label: '📖 ledger.rs', started_ms: ago(41_000), last_evidence_ms: ago(900) },
+          { id: 'f2', type: 'general-purpose', label: '⚡ cargo test --lib money', started_ms: ago(38_000), last_evidence_ms: ago(3_100) },
+          { id: 'f3', type: 'Explore', label: '🔍 round_half_even', started_ms: ago(22_000), last_evidence_ms: ago(12_400) },
           // Inside one long command: the row dims and states the fact.
-          { id: 'f4', type: 'workflow-subagent', since_ms: 19_000, quiet_ms: 191_000 },
+          { id: 'f4', type: 'workflow-subagent', started_ms: ago(19_000), last_evidence_ms: ago(191_000) },
         ],
       }),
       entries: release,
