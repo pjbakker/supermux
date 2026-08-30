@@ -67,11 +67,6 @@ import {
       before it), copied rather than exported so a panel module stays readable
       on its own; they are five lines each and have never drifted. ─────────── */
 
-const CTX_WINDOW = 200_000
-function ctxPct(tokens?: number): number | null {
-  if (typeof tokens !== 'number' || tokens <= 0) return null
-  return Math.min(100, Math.round((tokens / CTX_WINDOW) * 100))
-}
 // The STATE inks are the roster's own tone tokens (`--sm-tone-*`, declared on
 // `[data-grok]` itself — grok-mode.css:48/206 — so they resolve in the pane AND
 // in the portalled sheet, which stamps `data-grok` for exactly this reason), so
@@ -82,14 +77,6 @@ const INK_OK = 'var(--sm-tone-success, hsl(var(--status-active-ink)))'
 const INK_WARN = 'var(--sm-tone-warning, hsl(var(--status-waiting-ink)))'
 const INK_HOT = 'var(--sm-tone-danger, hsl(var(--status-error-ink)))'
 const INK_MUTED = 'hsl(var(--muted-foreground))'
-function ringColor(pct: number): string {
-  return pct < 50 ? INK_OK : pct < 80 ? INK_WARN : INK_HOT
-}
-function fmtTokens(n?: number): string | undefined {
-  if (typeof n !== 'number' || n <= 0) return undefined
-  if (n < 1000) return `${Math.max(0.1, n / 1000).toFixed(1)}k`
-  return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`
-}
 function modelOf(s: ApiSession | null): string {
   if (!s) return ''
   if (s.model?.trim()) return s.model.trim()
@@ -538,18 +525,18 @@ function OverviewTab({
   const needs = needsYouCount(team)
   const progress = taskProgress(team)
   const working = team.members.filter((m) => m.status === 'working').length
-  // COST/CONTEXT is the LEAD's today, stated as such. A teammate's statusline
-  // posts with the lead's inherited $SUPERMUX_SESSION, so per-member cost does
-  // not exist on the wire yet; S3 (pane-attributed statusline, Phase 5) is what
-  // turns this card into a real crew total. An honest label beats a fake sum.
-  const pct = ctxPct(leadSession?.tokens)
-  const tokens = fmtTokens(leadSession?.tokens)
   const dir = leadSession?.dir?.trim() || ''
   const model = modelOf(leadSession)
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+      {/* THREE cards, not four. The fourth was a Context ring over
+          `leadSession.tokens` — a field `ApiSession` declares and nothing in
+          `server/src` writes, so it painted `—` and "lead — no tokens yet" on
+          every install. Crew / Needs you / Tasks are real team data. (Removed
+          alongside the identical dead ring in `bot-panel.tsx`: the two panels
+          are meant to read as one family, and half a fix is a drift.) */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
         <div className="flex flex-col rounded-2xl border border-border bg-card p-4">
           <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
             Crew
@@ -583,29 +570,6 @@ function OverviewTab({
             {progress.done}/{progress.total}
           </span>
           <span className="mt-0.5 text-[11.5px] text-muted-foreground">completed</span>
-        </div>
-        <div className="flex flex-col rounded-2xl border border-border bg-card p-4">
-          <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
-            Context
-          </span>
-          {pct !== null ? (
-            <div
-              className="relative mt-2 size-11"
-              style={{
-                borderRadius: '50%',
-                background: `conic-gradient(${ringColor(pct)} ${pct}%, var(--muted, #e5e5e5) 0)`,
-              }}
-            >
-              <span className="absolute inset-[6px] grid place-items-center rounded-full bg-card font-mono text-[12px] font-bold text-foreground">
-                {pct}%
-              </span>
-            </div>
-          ) : (
-            <span className="mt-2 text-base font-semibold text-foreground">—</span>
-          )}
-          <span className="mt-1.5 text-[11.5px] text-muted-foreground">
-            {tokens ? `${tokens} tokens · lead` : 'lead — no tokens yet'}
-          </span>
         </div>
       </div>
 

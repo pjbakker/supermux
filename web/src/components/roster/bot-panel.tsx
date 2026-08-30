@@ -15,11 +15,26 @@
  *
  * Three quiet tabs — the five-tab version read as five settings screens, so it
  * was folded down to what you actually DO here: glance, configure, automate.
- *   • Overview  — the glance (context / tokens / provider / status), the latest
- *                 line, editable tags and the working directory.
- *   • Setup     — everything you CONFIGURE, grouped: the role + model + core
- *                 notes, the bot's Connectors, what it has learned, how it
- *                 notifies you, and the launch internals (skills / MCP / flags)
+ *   • Overview  — what this bot is doing, what it last did, who hands it work,
+ *                 editable tags and the working directory.
+ *
+ * WHAT THE GLANCE USED TO BE, AND WHY IT ISN'T.
+ * The Overview opened on a 2×2 card grid — Context ring / Tokens / Provider /
+ * Status — and a "Latest" bubble. Three of those five read fields with NO server
+ * producer: `tokens` is declared on `ApiSession` and written by nothing in
+ * `server/src`, `task_summary` never reaches the wire, and `chat_tail` is
+ * SSE-delta-only so it is absent on every fresh open. The ring was permanently
+ * `—`, Tokens permanently `0 · cumulative`, and the bubble permanently blank;
+ * Provider said `claude` about a fleet that is all claude. The panel was less
+ * informative than the roster tile it was opened from.
+ *
+ * A field with no producer is DELETED here, not em-dashed. What replaced them is
+ * what the row already carries and nothing rendered: the live activity line, the
+ * blocked/limit badges, `last_send_text`, and two cheap reads — the chat recall
+ * page and the delegation graph.
+ *   • Setup     — everything you CONFIGURE, grouped: the role + launch model +
+ *                 core notes, the bot's Connectors, what it has learned, how it
+ *                 notifies you, and the launch internals (MCP / flags / runtime)
  *                 tucked under one Advanced disclosure.
  *   • Workflows — the bot-scoped Workflows list · Recent runs · Issues · Git.
  *
@@ -33,6 +48,7 @@
  * sheet; the pane's outer chrome reuses the roster's existing `.gr-pane` surface.
  */
 import * as React from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   ArrowRight,
   Check,
@@ -52,6 +68,18 @@ import { modelOptions } from '@/lib/model-options'
 import { SessionFace } from '@/components/roster/session-face'
 import { GrantedConnectors, RestartToApply } from '@/components/roster/granted-connectors'
 import { LearnedNotes } from '@/components/roster/learned-notes'
+import {
+  ActivityLine,
+  BlockedBadge,
+  ErrorBadge,
+  UsageChip,
+} from '@/components/session-tile/activity-status'
+import { condenseReceiptLabel } from '@/components/chat/grouping'
+import {
+  formatRecallTime,
+  useLastSend,
+  type LastSend,
+} from '@/components/focus-mode/last-send-recall'
 import { NotifPolicyControl } from '@/components/focus-mode/notif-policy-control'
 import {
   DescEditor,
@@ -75,57 +103,98 @@ import { useSession } from '@/hooks/use-sessions'
 import { useSessionConfig } from '@/hooks/use-session-config'
 import { useCloneSession } from '@/components/focus-mode/use-clone-session'
 import { useToast } from '@/components/ui/use-toast'
-import { displayLabel, type ApiSession } from '@/lib/api'
+import { agentsApi } from '@/lib/api/agents'
+import { displayLabel, sessionsApi, type ApiSession, type RecallEntry } from '@/lib/api'
 
 /* ── tiny pure helpers (mirrors of grok-roster's; kept local so this module is
       self-contained and does not widen grok-roster's export surface) ────────── */
 
-const CTX_WINDOW = 200_000
-function ctxPct(tokens?: number): number | null {
-  if (typeof tokens !== 'number' || tokens <= 0) return null
-  return Math.min(100, Math.round((tokens / CTX_WINDOW) * 100))
-}
-/** The ring's colour, as a COLOUR. `--status-*-ink` holds a bare HSL triplet
- *  (`38 92% 33%`), so dropping it straight into `conic-gradient()` made the whole
- *  declaration invalid at computed-value time and the ring painted NOTHING — the
- *  glance's hero stat was a bare percentage on a blank card. `--color-status-*-ink`
- *  is the same token already wrapped in `hsl()` (globals.css `@theme`), which is
- *  what a gradient can actually use; the hex stays as the fallback.
- *
- *  The three steps follow the hexes the author wrote (green → amber → hot), so
- *  they map onto `ready` / `active` / `error` — the app's own green, amber and
- *  (never-alarmist) orange. `waiting` is the BLUE "needs input" channel and says
- *  nothing about how full a context window is, so it stays out of this scale. */
-function ringColor(pct: number): string {
-  return pct < 50
-    ? 'var(--color-status-ready-ink, #16a34a)'
-    : pct < 80
-      ? 'var(--color-status-active-ink, #d97706)'
-      : 'var(--color-status-error-ink, #dc2626)'
-}
-function fmtTokens(n?: number): string | undefined {
-  if (typeof n !== 'number' || n <= 0) return undefined
-  if (n < 1000) return `${Math.max(0.1, n / 1000).toFixed(1)}k`
-  return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`
-}
 function modelOf(s: ApiSession | null): string {
   if (!s) return ''
   if (s.model?.trim()) return s.model.trim()
   const m = s.flags?.match(/--model[= ]+(\S+)/)
   return m?.[1] ?? ''
 }
-function relTime(iso?: string): string {
-  if (!iso) return ''
-  const then = Date.parse(iso)
-  if (Number.isNaN(then)) return ''
-  const secs = Math.max(0, Math.round((Date.now() - then) / 1000))
-  if (secs < 45) return 'now'
-  const mins = Math.round(secs / 60)
-  if (mins < 60) return `${mins}m`
-  const hrs = Math.round(mins / 60)
-  if (hrs < 24) return `${hrs}h`
-  const days = Math.round(hrs / 24)
-  return days === 1 ? 'Yesterday' : `${days}d`
+
+/* ── the CORE-notes budget, mirrored from the server ───────────────────────── */
+
+/** The budgets `cap_core_notes` (`server/src/sessions/lifecycle.rs`) enforces —
+ *  whichever bites FIRST. The editor used to state `~N / 2000 chars`, a number
+ *  that exists nowhere on the server and that hid the line budget entirely; on
+ *  a bulleted index the line budget is the one that actually bites. */
+export const CORE_MAX_LINES = 40
+export const CORE_MAX_CHARS = 6_000
+
+export interface CoreNotesBudget {
+  lines: number
+  chars: number
+  overLines: boolean
+  overChars: boolean
+}
+
+/** What the server will keep of these notes, in the server's own two units.
+ *  Pure, so `tests/unit/bot-panel-settings.test.ts` can pin it against the Rust
+ *  without a DOM.
+ *
+ *  Two details are the whole reason this is a function and not two `.length`s:
+ *  Rust's `str::lines()` yields NOTHING for an empty string where JS's
+ *  `''.split('\n')` yields one entry, and `chars().count()` counts Unicode
+ *  SCALARS where `String.length` counts UTF-16 units — an emoji index would
+ *  otherwise read as twice its real cost. `trimEnd()` first, exactly as the
+ *  Rust does, so a trailing newline is not a line. */
+export function coreNotesBudget(notes: string): CoreNotesBudget {
+  const text = notes.trimEnd()
+  const lines = text === '' ? 0 : text.split('\n').length
+  const chars = [...text].length
+  return {
+    lines,
+    chars,
+    overLines: lines > CORE_MAX_LINES,
+    overChars: chars > CORE_MAX_CHARS,
+  }
+}
+
+/* ── the last exchange, selected out of a recall page ──────────────────────── */
+
+/** What the Overview shows of the bot's last turn: the reply, the receipts under
+ *  it, and — the fact that is ABOUT being a company of bots — who delegated the
+ *  work in. */
+export interface LastExchange {
+  /** The newest assistant prose. */
+  answer?: string
+  /** Up to [`RECEIPT_MAX`] tool receipts, newest first. */
+  receipts: { label: string; ok: boolean }[]
+  /** The session whose delegation started this exchange. */
+  from?: string
+}
+
+/** More than three receipts is a transcript, and the transcript is one tap away. */
+const RECEIPT_MAX = 3
+
+/** Pick the readable bits out of a `?chat=true` recall page (newest first).
+ *  Pure, so the selection is unit-testable without a live panel — the same shape
+ *  `normalizeTab` and `afterUndo` already take in this file.
+ *
+ *  Only the LABEL comes from the chat plane (`condenseReceiptLabel`), never the
+ *  chrome: `<ReceiptGroup>` wraps itself in the grok-scoped chat `<Bubble>`, and
+ *  this file is committed to Tailwind + shadcn tokens so one component renders
+ *  identically in the pane and in the body-portalled sheet. */
+export function lastExchange(entries: RecallEntry[]): LastExchange {
+  const out: LastExchange = { receipts: [] }
+  for (const e of entries) {
+    const text = e.text?.trim() ?? ''
+    if (e.kind === 'assistant') {
+      if (!out.answer && text) out.answer = text
+    } else if (e.kind === 'tool_use') {
+      const label = condenseReceiptLabel(text)
+      if (label && out.receipts.length < RECEIPT_MAX) {
+        out.receipts.push({ label, ok: e.ok !== false })
+      }
+    } else if (e.kind === 'delegation') {
+      if (!out.from && e.label) out.from = e.label
+    }
+  }
+  return out
 }
 
 /** Role presets that ADD a durable job to the role/desc textarea. Picking one
@@ -215,6 +284,14 @@ function RestartHint({ name }: { name: string }) {
 
 /* ── model picker ──────────────────────────────────────────────────────────── */
 
+/** The empty id is the PROVIDER's default. `lib/model-options` labels it
+ *  `Default`, which on a trigger reads as "we don't know what this bot is on" —
+ *  the exact hollowness this field was accused of. Same data, honest word; the
+ *  allowlist itself stays shared with the create sheet. */
+function optionLabel(o: { value: string; label: string }): string {
+  return o.value ? o.label : 'Provider default'
+}
+
 function ModelPicker({
   name,
   session,
@@ -227,7 +304,9 @@ function ModelPicker({
   const { setModel, pending } = useSessionConfig()
   const options = modelOptions(session?.provider)
   const current = modelOf(session)
-  const currentLabel = options.find((o) => o.value === current)?.label ?? current ?? 'Default'
+  const currentLabel = optionLabel(
+    options.find((o) => o.value === current) ?? { value: current, label: current },
+  )
 
   if (options.length === 0) {
     return (
@@ -253,7 +332,8 @@ function ModelPicker({
             'transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
           )}
         >
-          <span className="font-mono">{currentLabel || 'Default'}</span>
+          {/* Mono is for model IDS; "Provider default" is a sentence. */}
+          <span className={cn(current && 'font-mono')}>{currentLabel}</span>
           <ChevronDown className="size-3.5 text-muted-foreground" aria-hidden />
         </button>
       </DropdownMenuTrigger>
@@ -269,7 +349,7 @@ function ModelPicker({
               })
             }}
           >
-            <span className="flex-1 font-mono text-[13px]">{o.label}</span>
+            <span className={cn('flex-1 text-[13px]', o.value && 'font-mono')}>{optionLabel(o)}</span>
             {o.value === current && <Check className="size-4 shrink-0" aria-hidden />}
           </DropdownMenuItem>
         ))}
@@ -305,21 +385,42 @@ function NotesEditor({
     })
   }
 
+  // The counter reads the DRAFT, not the saved value: the limit is only useful
+  // while you are typing past it. It lives here rather than beside each caller
+  // so the bot panel and `<TeamPanel>` state the same budget from one place.
+  const budget = coreNotesBudget(draft)
+
   return (
-    <textarea
-      value={draft}
-      onChange={(e) => setDraft(e.target.value)}
-      onFocus={() => {
-        focused.current = true
-      }}
-      onBlur={commit}
-      disabled={pending}
-      rows={3}
-      placeholder="Facts this bot should always have on hand — conventions, endpoints, who owns what…"
-      aria-label="Notes this bot keeps"
-      data-vr="bot-notes"
-      className="w-full resize-y rounded-md border border-input bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-    />
+    <>
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onFocus={() => {
+          focused.current = true
+        }}
+        onBlur={commit}
+        disabled={pending}
+        rows={3}
+        placeholder="Facts this bot should always have on hand — conventions, endpoints, who owns what…"
+        aria-label="Notes this bot keeps"
+        data-vr="bot-notes"
+        className="w-full resize-y rounded-md border border-input bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      />
+      {/* BOTH budgets, because the server truncates on whichever bites first —
+          and it is the LINE budget that usually bites on a bulleted index. The
+          exceeded number goes amber (never red: the calm error tone the rest of
+          the app uses), so the reader can see WHICH one is over. */}
+      <p data-vr="bot-notes-budget" className="text-[12px] tabular-nums text-muted-foreground">
+        <span className={cn(budget.overLines && 'font-semibold text-status-error')}>
+          {budget.lines} / {CORE_MAX_LINES} lines
+        </span>
+        {' · '}
+        <span className={cn(budget.overChars && 'font-semibold text-status-error')}>
+          {budget.chars.toLocaleString('en-US')} / {CORE_MAX_CHARS.toLocaleString('en-US')} chars
+        </span>
+        {' · restart to apply'}
+      </p>
+    </>
   )
 }
 
@@ -389,119 +490,272 @@ export function normalizeTab(t?: string | null): TabKey {
   return 'overview'
 }
 
-/** The CORE-notes cap — stated plainly (the truth about when edits land). */
-const CORE_NOTES_CAP = 2000
-
-/** One card in the glance row. The four differ only in what they SAY, so they
- *  share a shell: the same label rhythm, and — because the Context ring is 44px
- *  and a word is not — a common 44px value floor that lines all four values up
- *  on one baseline instead of letting each card set its own. */
-function Stat({
-  label,
-  value,
-  meta,
+/** LIVE STATE — the row that replaced the 2×2 stat grid.
+ *
+ *  The grid said one real fact between its four cards (Status) and occupied the
+ *  entire fold at 390px doing it. This row says strictly more on one line: the
+ *  status word, the tool the agent is running RIGHT NOW, how many subagents it
+ *  has out, and the two badges that mean it cannot take a turn at all.
+ *
+ *  No status DOT here on purpose. `<SessionFace>` in the header, six lines up,
+ *  already carries it — and "one fact rendered three times" is precisely what
+ *  got the Status card deleted. State is a word here; colour stays on the face.
+ *
+ *  Every badge self-nulls when it has nothing to say (their documented
+ *  contract), so they mount unguarded and a calm bot's row is two words. */
+function LiveState({
+  session,
+  lastSend,
 }: {
-  label: string
-  value: React.ReactNode
-  meta?: string
+  session: ApiSession | null
+  lastSend: LastSend | null
 }) {
+  // `<ActivityLine>` self-nulls without a live tool label, and the idle tail
+  // fills the same slot — so both key off the same fact rather than a second
+  // copy of the component's subagent threshold.
+  const working = Boolean(session?.activity?.trim())
+  if (!session) return null
+
   return (
-    <div className="flex flex-col gap-2 rounded-2xl border border-border bg-card p-4">
-      <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">{label}</span>
-      <div className="flex min-h-11 flex-col justify-end gap-0.5">
-        {value}
-        {meta && <span className="truncate text-[11.5px] leading-tight text-muted-foreground">{meta}</span>}
-      </div>
+    // wrap, never overflow: the badges are the part that grows on a bad day.
+    <div
+      data-vr="bot-live-state"
+      className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]"
+    >
+      <span className="font-medium capitalize text-foreground">{session.status}</span>
+      {working ? (
+        <>
+          <span className="text-muted-foreground" aria-hidden>·</span>
+          <ActivityLine
+            activity={session.activity}
+            subagents={session.subagents}
+            className="max-w-full flex-1 basis-40 text-[13px]"
+          />
+        </>
+      ) : (
+        <span className="text-muted-foreground">
+          {/* "last PROMPTED", never "last active": `updated_at` is
+              max(last_send, last_started, created_at) and never arrives on the
+              SSE delta, so "last active" would be a second small lie in a row
+              that exists to stop telling them. */}
+          · {lastSend ? `last prompted ${formatRecallTime(lastSend.sentAt)}` : 'never prompted'}
+        </span>
+      )}
+      <ErrorBadge error={session.error} session={session} />
+      <BlockedBadge blocked={session.blocked ?? undefined} error={session.error} />
+      <UsageChip rateLimits={session.rate_limits ?? undefined} />
     </div>
+  )
+}
+
+/** LAST EXCHANGE — what the "Latest" bubble was trying to be.
+ *
+ *  That bubble read `chat_tail ?? task_summary`: one is SSE-delta-only (absent
+ *  on every fresh open, as `session-row.tsx` already documents) and the other
+ *  has no server producer at all, so it rendered blank every single time. Two
+ *  layers instead, so the block is never empty and never expensive:
+ *
+ *    1 · the prompt off the session row — free, present on 34/36 live rows;
+ *    2 · one `?chat=true` recall page (measured 200 / 2.2 ms / 5.9 KB at
+ *        limit=8) for the reply, its receipts, and any inbound delegation.
+ *
+ *  ONE tap target, not five 18px ones: everything in here opens the thread. */
+function LastExchangeBlock({
+  name,
+  lastSend,
+  onOpenThread,
+}: {
+  name: string
+  lastSend: LastSend | null
+  onOpenThread: () => void
+}) {
+  const recall = useQuery({
+    queryKey: ['bot-last-exchange', name],
+    queryFn: () => sessionsApi.recall(name, { chat: true, limit: 8 }),
+    staleTime: 30_000,
+    retry: false,
+  })
+  const exchange = React.useMemo(() => lastExchange(recall.data?.entries ?? []), [recall.data])
+  const replied = Boolean(exchange.answer || exchange.receipts.length > 0 || exchange.from)
+
+  // Nothing on the row AND nothing on the wire. One muted line — an empty card
+  // with a heading is the shape this redesign exists to remove. Unreachable is
+  // NOT empty, so a failed read says so rather than claiming silence.
+  if (!lastSend && !replied && !recall.isLoading) {
+    return (
+      <p className="text-[13px] text-muted-foreground">
+        {recall.isError
+          ? 'Couldn’t read this bot’s history.'
+          : 'No conversation yet — open the thread to start one.'}
+      </p>
+    )
+  }
+
+  return (
+    <Field label="Last exchange">
+      <button
+        type="button"
+        onClick={onOpenThread}
+        data-vr="bot-last-exchange"
+        className="flex min-h-11 w-full flex-col gap-2.5 rounded-2xl border border-border bg-card px-4 py-3 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        {lastSend && (
+          <div className="flex w-full flex-col gap-0.5">
+            <span className="text-[11.5px] font-medium text-muted-foreground">
+              You asked · {formatRecallTime(lastSend.sentAt)}
+            </span>
+            <span className="line-clamp-3 text-[13px] leading-relaxed text-foreground">
+              {lastSend.text}
+            </span>
+          </div>
+        )}
+
+        {recall.isLoading ? (
+          <div className="h-16 w-full animate-pulse rounded-xl border border-border bg-muted/30" />
+        ) : recall.isError ? (
+          <span className="text-[12.5px] text-muted-foreground">
+            Couldn’t read this bot’s history.
+          </span>
+        ) : (
+          replied && (
+            <div className="flex w-full flex-col gap-1.5">
+              {exchange.answer && (
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-[11.5px] font-medium text-muted-foreground">It answered</span>
+                  <span className="line-clamp-2 text-[13px] leading-relaxed text-foreground">
+                    {exchange.answer}
+                  </span>
+                </div>
+              )}
+              {exchange.receipts.map((r, i) => (
+                <span
+                  key={`${r.label}-${i}`}
+                  className={cn(
+                    'flex items-baseline gap-2 text-[12.5px]',
+                    r.ok ? 'text-muted-foreground' : 'text-status-error',
+                  )}
+                >
+                  <span aria-hidden>{r.ok ? '✓' : '✗'}</span>
+                  <span className="min-w-0 truncate">{r.label}</span>
+                </span>
+              ))}
+              {exchange.from && (
+                <span className="truncate text-[12.5px] text-muted-foreground">
+                  ↳ from {exchange.from}
+                </span>
+              )}
+            </div>
+          )
+        )}
+      </button>
+    </Field>
+  )
+}
+
+/** HANDOFFS — who hands this bot work, and who it hands work to.
+ *
+ *  The delegation graph has been typed and served since migration 0005 and is
+ *  rendered by nothing in the product. In a company-of-bots product it is the
+ *  one fact on this panel that is ABOUT being a company of bots, and it is
+ *  already populated on real sessions.
+ *
+ *  Strictly conditional: no edges ⇒ no section, no empty card, no zero count.
+ *  A failed read renders nothing too — an error banner about a graph the user
+ *  did not ask for is noise. */
+function Handoffs({
+  name,
+  onNavigate,
+}: {
+  name: string
+  onNavigate: (name: string) => void
+}) {
+  const { data } = useQuery({
+    queryKey: ['bot-handoffs', name],
+    queryFn: () => agentsApi.delegations(name),
+    staleTime: 60_000,
+    retry: false,
+  })
+  const rows = React.useMemo(() => {
+    const edges = [
+      ...(data?.incoming ?? []).map((e) => ({ e, partner: e.from_session, inbound: true })),
+      ...(data?.outgoing ?? []).map((e) => ({ e, partner: e.to_session, inbound: false })),
+    ]
+    return edges.sort((a, b) => b.e.ts - a.e.ts).slice(0, 3)
+  }, [data])
+
+  if (rows.length === 0) return null
+
+  return (
+    <Field label="Handoffs" hint="Work passed to this bot, and work it passed on.">
+      <div className="flex flex-col">
+        {rows.map(({ e, partner, inbound }) => (
+          <button
+            key={e.id}
+            type="button"
+            onClick={() => onNavigate(partner)}
+            data-vr="bot-handoff"
+            className="flex min-h-11 w-full items-center gap-2 rounded-lg px-1 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <span className="shrink-0 text-[13px] font-medium text-foreground">
+              <span aria-hidden>{inbound ? '←' : '→'}</span> {partner}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-[12.5px] text-muted-foreground">
+              {e.prompt}
+            </span>
+            <span className="shrink-0 text-[11.5px] text-muted-foreground">
+              {/* Epoch SECONDS on the wire — the same conversion `useLastSend`
+                  does for `last_send_at`. */}
+              {formatRecallTime(new Date(e.ts * 1000))}
+            </span>
+          </button>
+        ))}
+      </div>
+    </Field>
   )
 }
 
 function OverviewTab({
   name,
   session,
+  onOpenThread,
+  onNavigate,
 }: {
   name: string
   session: ApiSession | null
+  onOpenThread: () => void
+  onNavigate: (name: string) => void
 }) {
-  const pct = ctxPct(session?.tokens)
-  const tokens = fmtTokens(session?.tokens)
-  const model = modelOf(session)
-  const preview =
-    session?.chat_tail?.agent?.trim() ||
-    session?.chat_tail?.user?.trim() ||
-    session?.task_summary?.trim() ||
-    ''
   const dir = session?.dir?.trim() || ''
+  // `last_send_at` is epoch SECONDS, not an ISO string — the hook owns that
+  // conversion, and reading the field by hand is how the old code would have
+  // silently rendered nothing.
+  const lastSend = useLastSend(session ?? undefined)
+  const asking = session?.status === 'waiting' && Boolean(session.waiting_message?.trim())
 
   return (
-    // TWO REGIONS, not one column of five loose things: the GLANCE (read-only
-    // numbers, one card row) and then, under a hairline, the DETAILS you can act
-    // on. The rule is what makes the tab read as intentional — before it, the
-    // stat cards, a chat bubble, a tag field and a path row all sat at the same
-    // altitude, six units apart, with nothing saying which was which.
+    // TWO REGIONS, not one column of loose things: what this bot is DOING (live,
+    // read-only) and then, under a hairline, the details you can act on. Single
+    // column throughout — the 2×2 grid is what put a fold full of em-dashes in
+    // front of every phone user.
     <div className="flex flex-col gap-5">
-      {/* the glance — Context ring HERO + Tokens + Provider + Status */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Stat
-          label="Context"
-          value={
-            pct !== null ? (
-              <div
-                className="relative size-11"
-                style={{
-                  borderRadius: '50%',
-                  background: `conic-gradient(${ringColor(pct)} ${pct}%, var(--muted, #e5e5e5) 0)`,
-                }}
-              >
-                <span className="absolute inset-[6px] grid place-items-center rounded-full bg-card font-mono text-[12px] font-bold text-foreground">
-                  {pct}%
-                </span>
-              </div>
-            ) : (
-              <span className="text-[15px] font-semibold text-foreground">—</span>
-            )
-          }
-          meta={tokens ? `${tokens} tokens` : 'no tokens yet'}
-        />
-        <Stat
-          label="Tokens"
-          value={
-            <span className="font-mono text-[22px] font-semibold leading-none tabular-nums text-foreground">
-              {tokens ?? '0'}
-            </span>
-          }
-          meta="cumulative"
-        />
-        <Stat
-          label="Provider"
-          value={
-            <span className="truncate text-[15px] font-semibold capitalize text-foreground">
-              {session?.provider ?? '—'}
-            </span>
-          }
-          meta={model || (session?.runtime === 'native' ? 'native runtime' : 'runtime')}
-        />
-        <Stat
-          label="Status"
-          value={
-            <span className="truncate text-[15px] font-semibold capitalize text-foreground">
-              {session?.status ?? '—'}
-            </span>
-          }
-          meta={relTime(session?.updated_at) || '—'}
-        />
-      </div>
+      <LiveState session={session} lastSend={lastSend} />
+
+      {asking && (
+        <Field label="Needs you">
+          {/* The ask's OWN sentence, and nothing else: `Open thread` in the
+              header is the resolution. A second answering surface here would be
+              a second place for the same reply to go wrong. */}
+          <p className="line-clamp-2 text-[13px] leading-relaxed text-muted-foreground">
+            {session?.waiting_message}
+          </p>
+        </Field>
+      )}
+
+      <LastExchangeBlock name={name} lastSend={lastSend} onOpenThread={onOpenThread} />
+
+      <Handoffs name={name} onNavigate={onNavigate} />
 
       <div className="flex flex-col gap-6 border-t border-border pt-5">
-        {preview && (
-          <Field label="Latest">
-            <div className="max-w-[64ch] rounded-2xl rounded-bl-md border border-border bg-card px-4 py-3 text-sm leading-relaxed text-foreground">
-              {preview}
-              <div className="mt-2 text-[12px] text-muted-foreground">{relTime(session?.updated_at)}</div>
-            </div>
-          </Field>
-        )}
-
         <Field label="Tags" hint="Searchable across the roster.">
           <TagsEditor name={name} tags={session?.tags ?? []} />
         </Field>
@@ -614,10 +868,16 @@ function RoleField({ name, session }: { name: string; session: ApiSession | null
   )
 }
 
-/** The launch internals — skills, MCP, flags, worktree, runtime — behind ONE
- *  disclosure. These are the "nerdy" bits the owner wanted folded away, not
- *  deleted: shown on demand, never in the resting surface. Shared by the Setup
- *  tab and by `<TeamPanel>`'s `ToolsTab`. */
+/** The launch internals — MCP, flags, worktree, runtime — behind ONE disclosure.
+ *  These are the "nerdy" bits the owner wanted folded away, not deleted: shown
+ *  on demand, never in the resting surface. Shared by the Setup tab and by
+ *  `<TeamPanel>`'s `ToolsTab`.
+ *
+ *  The `Skills` row is gone: it printed the hardcoded string "Workspace
+ *  defaults", because `sessions.skills` is a reserved column whose own doc says
+ *  nothing consumes it yet. And MCP / Worktree render only when SET — otherwise
+ *  Advanced opened onto a column reading None / No / None, which is furniture
+ *  wearing the costume of data. Flags and Runtime are real on every row. */
 function LaunchInternals({ session }: { session: ApiSession | null }) {
   const mcp = session?.mcp?.trim() || ''
   return (
@@ -625,25 +885,17 @@ function LaunchInternals({ session }: { session: ApiSession | null }) {
       <summary className="cursor-pointer list-none text-[13px] font-medium text-foreground [&::-webkit-details-marker]:hidden">
         Advanced
       </summary>
-      <div className="mt-3 flex flex-col gap-4">
-        <div className="flex items-baseline justify-between gap-3">
-          <dt className="text-muted-foreground text-[13px]">Skills</dt>
-          <dd className="text-[13px] text-foreground">Workspace defaults</dd>
-        </div>
-        <div className="flex flex-col gap-1">
-          <dt className="text-muted-foreground text-[13px]">MCP</dt>
-          <dd className="min-w-0">
-            {mcp ? (
+      <dl className="mt-3 flex flex-col gap-2 text-[13px]">
+        {mcp && (
+          <div className="flex flex-col gap-1">
+            <dt className="text-muted-foreground">MCP</dt>
+            <dd className="min-w-0">
               <code className="block max-w-full truncate rounded-md bg-muted/60 px-2 py-1.5 font-mono text-[12px] text-foreground">
                 {mcp}
               </code>
-            ) : (
-              <span className="text-[13px] text-muted-foreground">None</span>
-            )}
-          </dd>
-        </div>
-      </div>
-      <dl className="mt-4 flex flex-col gap-2 border-t border-border pt-3 text-[13px]">
+            </dd>
+          </div>
+        )}
         <div className="flex items-baseline justify-between gap-3">
           <dt className="text-muted-foreground">Flags</dt>
           <dd className="min-w-0 text-right">
@@ -654,10 +906,12 @@ function LaunchInternals({ session }: { session: ApiSession | null }) {
             )}
           </dd>
         </div>
-        <div className="flex items-baseline justify-between gap-3">
-          <dt className="text-muted-foreground">Worktree</dt>
-          <dd>{session ? (session.worktree ? 'Yes' : 'No') : '—'}</dd>
-        </div>
+        {session?.worktree && (
+          <div className="flex items-baseline justify-between gap-3">
+            <dt className="text-muted-foreground">Worktree</dt>
+            <dd>Yes</dd>
+          </div>
+        )}
         <div className="flex items-baseline justify-between gap-3">
           <dt className="text-muted-foreground">Runtime</dt>
           <dd className="capitalize">{session?.runtime ?? '—'}</dd>
@@ -666,6 +920,20 @@ function LaunchInternals({ session }: { session: ApiSession | null }) {
     </details>
   )
 }
+
+/** The model field's hint, shared by both Setup surfaces so they cannot drift.
+ *
+ *  The field was called "Model" and read as hollow because it looks like a
+ *  READOUT and is not one: there is no live-model signal on the wire (`model` is
+ *  empty on every live row), and this control writes the launch line. Saying so
+ *  is the whole fix — the write path itself is real and the server 400s an
+ *  unknown id. */
+const LAUNCH_MODEL_HINT =
+  'Passed as --model when this bot next starts. It is not a reading of the model a running agent is on.'
+
+/** Core notes are the reachable half of the memory gate (`session_has_memory`),
+ *  so the field that turns the tier on should say that it does. */
+const MEMORY_SWITCH_HINT = 'This is also what turns this bot’s memory on.'
 
 /** The LEAD's instructions, verbatim, when `<TeamPanel>` mounts it — a crew is
  *  steered by steering its lead, so there is exactly ONE instructions surface.
@@ -683,12 +951,12 @@ export function InstructionsTab({
   return (
     <div className="flex flex-col gap-6">
       <RoleField name={name} session={session} />
-      <Field label="Model" hint="The launch model for this bot.">
+      <Field label="Launch model" hint={LAUNCH_MODEL_HINT}>
         <ModelPicker name={name} session={session} onRestartAdvised={onRestartAdvised} />
       </Field>
       <Field
         label="Notes this bot keeps"
-        hint="Injected read-only into the system prompt at launch — the bot can read these, but not rewrite them."
+        hint={`Injected read-only into the system prompt at launch — the bot can read these, but not rewrite them. ${MEMORY_SWITCH_HINT}`}
       >
         <NotesEditor name={name} memory={session?.memory ?? ''} onRestartAdvised={onRestartAdvised} />
       </Field>
@@ -748,17 +1016,14 @@ function SetupTab({
     <div className="flex flex-col gap-6">
       <Group>
         <RoleField name={name} session={session} />
-        <Field label="Model" hint="The launch model for this bot.">
+        <Field label="Launch model" hint={LAUNCH_MODEL_HINT}>
           <ModelPicker name={name} session={session} onRestartAdvised={onRestartAdvised} />
         </Field>
         <Field
           label="Notes this bot keeps"
-          hint="Kept verbatim and injected into the system prompt every run — the bot reads these, but can't rewrite them."
+          hint={`Kept verbatim and injected into the system prompt every run — the bot reads these, but can't rewrite them. ${MEMORY_SWITCH_HINT}`}
         >
           <NotesEditor name={name} memory={memory} onRestartAdvised={onRestartAdvised} />
-          <p className="mt-1 text-[12px] tabular-nums text-muted-foreground">
-            ~{memory.length} / {CORE_NOTES_CAP} chars · restart to apply
-          </p>
         </Field>
       </Group>
 
@@ -875,8 +1140,11 @@ function BotPanelBody({
   const onRestartAdvised = React.useCallback(() => setRestartAdvised(true), [])
 
   const label = displayLabel(session ?? { name })
-  const model = modelOf(session)
-  const sub = [session?.status, model || session?.provider, session?.branch].filter(Boolean).join(' · ')
+  // The sub-line is the bot's STANDING JOB, not `status · model · branch` — two
+  // of those three are empty on every live row, so it collapsed to "idle ·
+  // claude" on every bot and restated the face dot for the third time. An
+  // unconfigured bot gets the product's actual next action instead of a blank.
+  const role = session?.desc?.trim() ?? ''
 
   const doClone = async () => {
     if (clone.pending) return
@@ -930,12 +1198,24 @@ function BotPanelBody({
           )}
         </div>
         <div className="flex items-center justify-between gap-3">
-          {sub ? (
-            <span className="min-w-0 flex-1 truncate text-[13px] capitalize text-muted-foreground">
-              {sub}
+          {role ? (
+            // No `capitalize` here: `desc` is a sentence the owner wrote, not a
+            // status word, and title-casing it reads as a bug.
+            <span
+              data-vr="bot-role-line"
+              className="min-w-0 flex-1 truncate text-[13px] text-muted-foreground"
+            >
+              {role}
             </span>
           ) : (
-            <span className="flex-1" />
+            <button
+              type="button"
+              onClick={() => setTab('instructions')}
+              data-vr="bot-role-cta"
+              className="-ml-1 inline-flex min-h-9 min-w-0 flex-1 items-center justify-start truncate rounded-md px-1 text-left text-[13px] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Say what this bot does →
+            </button>
           )}
           {onOpenTerminal ? (
             <button
@@ -1031,7 +1311,12 @@ function BotPanelBody({
       >
         {restartAdvised && <div className="mb-4"><RestartHint name={name} /></div>}
         {tab === 'overview' && (
-          <OverviewTab name={name} session={session} />
+          <OverviewTab
+            name={name}
+            session={session}
+            onOpenThread={onOpenThread}
+            onNavigate={onNavigate}
+          />
         )}
         {tab === 'instructions' && (
           <SetupTab name={name} session={session} onRestartAdvised={onRestartAdvised} />

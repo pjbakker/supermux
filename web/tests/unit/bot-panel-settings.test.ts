@@ -20,11 +20,16 @@ import { readFileSync } from 'node:fs'
 
 import {
   afterUndo,
+  coreNotesBudget,
+  CORE_MAX_CHARS,
+  CORE_MAX_LINES,
+  lastExchange,
   normalizeTab,
   TABS,
   type AppliedPreset,
 } from '../../src/components/roster/bot-panel'
 import { insertPreset, makeDescHandle } from '../../src/components/focus-mode/session-info-panel'
+import type { RecallEntry } from '../../src/lib/api/sessions'
 
 const PRESET = 'You review changes for correctness and clarity.'
 const MINE = 'Never touch main. Always run the unit suite before you claim done.'
@@ -184,28 +189,172 @@ describe('the tab bar fits a 390 / 320px phone', () => {
 })
 
 /**
- * 3 — The context ring paints.
+ * 3 — The glance stopped rendering fields no server writes.
  * ─────────────────────────────────────────────────────────────────────────────
- * `--status-active-ink` is a bare HSL TRIPLET (`38 92% 33%`), not a colour, so
- * `conic-gradient(var(--status-active-ink) 48%, …)` was invalid at
- * computed-value time and the glance's hero stat rendered a percentage on a
- * blank card. The `--color-*` tokens are the same values already wrapped in
- * `hsl()` — the only form a gradient can consume.
+ * The Overview opened on a 2×2 grid — Context ring / Tokens / Provider / Status
+ * — over `session.tokens`, a key `ApiSession` declares and NOTHING in
+ * `server/src` produces. The ring was permanently `—`, Tokens permanently
+ * `0 · cumulative`, and the "Latest" bubble beside them read `chat_tail ??
+ * task_summary`: one SSE-delta-only (absent on every fresh open), the other with
+ * no producer either. Four cards and a bubble, empty on every live install.
+ *
+ * A field with no producer is DELETED, not em-dashed — and `<TeamPanel>` kept
+ * its OWN copy of the same dead ring, so it goes in the same pass or the lie
+ * survives one tap away.
  */
-describe('the context ring', () => {
-  const src = readFileSync(
-    new URL('../../src/components/roster/bot-panel.tsx', import.meta.url),
-    'utf8',
-  )
+describe('the dead glance is gone from both panels', () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8')
 
-  test('colours the ring with real colours, never raw triplets', () => {
-    expect(src).toContain('conic-gradient(')
-    expect(src).toContain('var(--color-status-ready-ink')
-    expect(src).toContain('var(--color-status-active-ink')
-    expect(src).toContain('var(--color-status-error-ink')
-    expect(src).not.toContain('var(--status-active-ink')
-    expect(src).not.toContain('var(--status-waiting-ink')
-    expect(src).not.toContain('var(--status-error-ink')
+  for (const file of ['bot-panel.tsx', 'team-panel.tsx']) {
+    test(`${file}: no context ring, no token readout`, () => {
+      const src = read(`../../src/components/roster/${file}`)
+      expect(src).not.toContain('conic-gradient(')
+      expect(src).not.toContain('ctxPct')
+      expect(src).not.toContain('fmtTokens')
+      expect(src).not.toContain('CTX_WINDOW')
+    })
+  }
+
+  test('the bot panel reads the fields that ARE populated instead', () => {
+    const src = read('../../src/components/roster/bot-panel.tsx')
+    // The live row, the prompt off the session row, and the two cheap reads.
+    expect(src).toContain('<ActivityLine')
+    expect(src).toContain('<BlockedBadge')
+    expect(src).toContain('useLastSend')
+    expect(src).toContain('sessionsApi.recall')
+    expect(src).toContain('agentsApi.delegations')
+    // …and nothing that only a mock can fill (the prose above still names the
+    // three dead fields, which is the point — they are documented, not read).
+    expect(src).not.toContain('session?.tokens')
+    expect(src).not.toContain('session?.task_summary')
+    expect(src).not.toContain('session?.chat_tail')
+  })
+
+  test('the bench seeds the shipped panel, not the deleted one', () => {
+    // A bench fed by dead fields frames a panel nobody ships — the design review
+    // would sign off on a surface that cannot exist.
+    const src = read('../../src/routes/dev-roster.tsx')
+    const seed = src.slice(src.indexOf('const MOCK_BOT'), src.indexOf('const benchStep'))
+    expect(seed).not.toContain('tokens:')
+    expect(seed).not.toContain('task_summary:')
+    expect(seed).toContain('last_send_text:')
+    expect(seed).toContain('activity:')
+  })
+})
+
+/**
+ * 3b — The core-notes counter states the budget the SERVER applies.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The editor said `~N / 2000 chars`. `cap_core_notes`
+ * (`server/src/sessions/lifecycle.rs`) truncates at 40 LINES or 6,000 CHARS,
+ * whichever bites first — so the old counter was wrong on both axes and silent
+ * about the budget that usually bites. This is the mirror; if the Rust moves,
+ * these numbers must move with it.
+ */
+describe('coreNotesBudget mirrors cap_core_notes', () => {
+  test('the server-side budgets, verbatim', () => {
+    expect(CORE_MAX_LINES).toBe(40)
+    expect(CORE_MAX_CHARS).toBe(6_000)
+  })
+
+  test('an empty field is ZERO lines, not one', () => {
+    // Rust's `str::lines()` yields nothing for ""; JS's `''.split('\n')` yields
+    // one entry. Counting the JS way would open every fresh bot on "1 / 40".
+    expect(coreNotesBudget('')).toEqual({ lines: 0, chars: 0, overLines: false, overChars: false })
+    expect(coreNotesBudget('   \n\n ')).toEqual({ lines: 0, chars: 0, overLines: false, overChars: false })
+  })
+
+  test('an ordinary index is under both budgets', () => {
+    const notes = '- the build gate is bun run build:perf\n- never edit server/migrations'
+    const b = coreNotesBudget(notes)
+    expect(b.lines).toBe(2)
+    expect(b.chars).toBe(notes.length)
+    expect(b.overLines).toBe(false)
+    expect(b.overChars).toBe(false)
+  })
+
+  test('41 lines is over the LINE budget only', () => {
+    const b = coreNotesBudget(Array.from({ length: 41 }, (_, i) => `- fact ${i}`).join('\n'))
+    expect(b.lines).toBe(41)
+    expect(b.overLines).toBe(true)
+    expect(b.overChars).toBe(false)
+  })
+
+  test('one 6,001-char line is over the CHAR budget only', () => {
+    const b = coreNotesBudget('x'.repeat(6_001))
+    expect(b.lines).toBe(1)
+    expect(b.chars).toBe(6_001)
+    expect(b.overChars).toBe(true)
+    expect(b.overLines).toBe(false)
+  })
+
+  test('characters are Unicode scalars, matching Rust chars().count()', () => {
+    // `'👍'.length` is 2 (UTF-16 units) but `chars().count()` is 1 — an
+    // emoji-heavy index would otherwise read as twice its real token cost.
+    expect(coreNotesBudget('👍👍👍').chars).toBe(3)
+  })
+
+  test('a trailing newline is not a line', () => {
+    expect(coreNotesBudget('- one\n- two\n').lines).toBe(2)
+  })
+})
+
+/**
+ * 3c — What the Overview shows of the last turn.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The "Latest" bubble read two fields that are never on a fresh panel open, so
+ * it was blank every time. Its replacement selects out of ONE `?chat=true`
+ * recall page; the selection is pure so it is pinned here rather than through a
+ * live panel.
+ */
+describe('lastExchange', () => {
+  const entry = (over: Partial<RecallEntry> & { kind: RecallEntry['kind'] }): RecallEntry => ({
+    uuid: `u-${Math.random()}`,
+    ts: 1_788_079_360,
+    sessionId: 's',
+    text: '',
+    sidechain: false,
+    ...over,
+  })
+
+  test('an empty page selects nothing at all', () => {
+    expect(lastExchange([])).toEqual({ receipts: [] })
+  })
+
+  test('the NEWEST assistant line wins (the page is newest-first)', () => {
+    const out = lastExchange([
+      entry({ kind: 'assistant', text: 'Shipped it.' }),
+      entry({ kind: 'assistant', text: 'Working on it.' }),
+    ])
+    expect(out.answer).toBe('Shipped it.')
+  })
+
+  test('receipts cap at three and carry a failure through', () => {
+    const out = lastExchange([
+      entry({ kind: 'tool_use', text: 'Bash cargo check', ok: false }),
+      entry({ kind: 'tool_use', text: 'Read /opt/projects/supermux/server/src/main.rs' }),
+      entry({ kind: 'tool_use', text: 'Edit /opt/projects/supermux/web/src/app.tsx' }),
+      entry({ kind: 'tool_use', text: 'Read /never/rendered.ts' }),
+    ])
+    expect(out.receipts).toHaveLength(3)
+    expect(out.receipts[0].ok).toBe(false)
+    // Condensed to the part that identifies the call — a basename, not a path.
+    expect(out.receipts[1].label).toContain('main.rs')
+    expect(out.receipts[1].label).not.toContain('/opt/projects')
+    expect(out.receipts[1].ok).toBe(true)
+  })
+
+  test('an inbound delegation surfaces the sender', () => {
+    const out = lastExchange([entry({ kind: 'delegation', text: 'review the diff', label: 'mena' })])
+    expect(out.from).toBe('mena')
+  })
+
+  test('kinds the panel does not render are ignored', () => {
+    const out = lastExchange([
+      entry({ kind: 'prompt', text: 'do the thing' }),
+      entry({ kind: 'system', text: 'noise' }),
+    ])
+    expect(out).toEqual({ receipts: [] })
   })
 })
 
