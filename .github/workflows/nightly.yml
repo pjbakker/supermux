@@ -11,6 +11,13 @@ name: nightly
 #      90-second staleness clock (measured 126 s and 90 s in CI — 216 s of a
 #      569 s passing suite). They are correct, they are not flaky, and no test
 #      trick shortens a timer the product owns. They run here, every night.
+#   1b. `@quarantine` e2e specs — `chat-toggle-focus-leak` (180 s) and
+#      `chat-ws-restart-reseeds` (35 s). NOT the same thing as `@extended`:
+#      these are BROKEN, never observed green, red on main in run 32700541733
+#      and on every run since. They are here rather than on the PR gate because
+#      215 s per pull request re-proves a defect that is already known, and
+#      because a permanently-red gate teaches people to ignore the gate. A red
+#      nightly on these is the correct state until the tag comes off.
 #   2. The wide `install-smoke` matrix (debian-12 + ubuntu-22.04, and the
 #      `port-conflict` scenario) — see the WHY in `install-smoke.yml`, which
 #      carries its own `schedule:` trigger for exactly that reason.
@@ -102,7 +109,10 @@ jobs:
       # `@slow` and `@needs-claude` stay excluded even here, and for a reason
       # that no schedule can fix: both need the real `claude` CLI on PATH, and a
       # hosted GitHub runner does not have one. They are developer-machine
-      # tests. `@extended` is NOT excluded — running it is why this file exists.
+      # tests. `@extended` and `@quarantine` are NOT excluded — running them is
+      # why this file exists. A red nightly is the intended state while a
+      # `@quarantine` spec is still broken: that is the alarm, and it should stay
+      # loud until someone takes the tag off.
       - name: Full smoke suite (shard ${{ matrix.shard }}/4)
         working-directory: web
         run: bun x playwright test tests/e2e/smoke --shard=${{ matrix.shard }}/4 --grep-invert "@slow|@needs-claude"
