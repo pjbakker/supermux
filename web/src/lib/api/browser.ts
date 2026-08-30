@@ -47,6 +47,18 @@ export interface BrowserTab {
   last_probe_at: number | null
   /** Transient: a live CDP target exists right now. `false` = dehydrated. */
   live: boolean
+  /** "Keep me signed in" — the human's per-tab toggle. */
+  keepalive_enabled: boolean
+  /** Minutes between checks, as the sweep last LEARNED it from the cookie jar.
+   *  Server-derived: there is no interval picker, by design. */
+  keepalive_every: number
+  /** `soft` = the tab is being refreshed; `watch` = this site expires sessions
+   *  in minutes, so supermux reads the jar and pings nothing. Any other value
+   *  (including the column's legacy `reload` default) means soft. */
+  keepalive_action: string
+  /** Unix seconds of the last COMPLETED check, or `null` for "never" — which is
+   *  also what the server reads as "due now". */
+  last_keepalive_at: number | null
   grants: TabGrant[]
   created_at: number
   last_used_at: number | null
@@ -159,6 +171,9 @@ export interface TabPatch {
   pinned?: boolean
   origins?: string[]
   login_state?: LoginState
+  /** "Keep me signed in". The ONLY keepalive field the server accepts from a
+   *  body — the interval and the mode are learned, never asked for. */
+  keepalive_enabled?: boolean
 }
 
 /** `PATCH /api/browser/tabs/{id}` — pin/unpin, rename, re-scope, clear a state. */

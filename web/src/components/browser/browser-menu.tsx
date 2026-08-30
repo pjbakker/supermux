@@ -42,6 +42,12 @@ export interface BrowserMenuItem {
   disabled?: boolean
   /** Why it is greyed, or what it will do. */
   hint?: string
+  /** A second, muted line under the label — the EVIDENCE.
+   *
+   *  NOT a tooltip: `hint` renders only as `title=`, and a phone has no hover,
+   *  so without this a menu row physically cannot show state. Rows without it
+   *  render byte-identically to before. */
+  detail?: string
   /** Draws it in the destructive tint (Close, Close others). */
   danger?: boolean
   /** A hairline above this row. */
@@ -180,7 +186,10 @@ export function BrowserMenu({ at, items, label, onSelect, onClose, fixed }: Brow
               onPointerEnter={() => !item.disabled && setActive(i)}
               onClick={() => run(item)}
               className={cn(
-                'flex min-h-11 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13.5px] transition-colors motion-reduce:transition-none',
+                'flex w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13.5px] transition-colors motion-reduce:transition-none',
+                // Taller ONLY when there is a second line, so every existing row
+                // keeps the 44px tap target it has always had.
+                item.detail ? 'min-h-14 py-1.5' : 'min-h-11',
                 item.disabled
                   ? 'cursor-default text-muted-foreground/50'
                   : item.danger
@@ -190,7 +199,19 @@ export function BrowserMenu({ at, items, label, onSelect, onClose, fixed }: Brow
               )}
             >
               {Icon && <Icon className="size-4 shrink-0 opacity-70" aria-hidden />}
-              <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              {item.detail ? (
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate">{item.label}</span>
+                  <span
+                    data-browser-menu-detail={item.id}
+                    className="line-clamp-2 text-[11.5px] leading-snug text-muted-foreground"
+                  >
+                    {item.detail}
+                  </span>
+                </span>
+              ) : (
+                <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              )}
             </button>
           </React.Fragment>
         )
