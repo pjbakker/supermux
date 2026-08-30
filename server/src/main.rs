@@ -172,6 +172,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Background tasks. The workflows tick (and its crash reaper) run here.
     workflows::spawn(state.clone());
+    // "Keep me signed in": the shared browser's keep-alive sweep. A no-op — and
+    // NO chrome start — while no tab has the toggle on, so the lazy-start
+    // invariant holds. It is also the only thing in the codebase that rehydrates
+    // a workspace tab at boot, which is what makes "overnight" true.
+    connectors::browser::keepalive::spawn(state.clone());
     // Resume per-session status detection on boot (cold-start init).
     sessions::auto_actions::spawn_all(&state).await;
     // Resume per-session steering delivery on boot.

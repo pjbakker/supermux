@@ -37,6 +37,8 @@
 //! 3. [`click_and_insert_text_mutate_the_page`]
 //! 4. [`human_takeover_refuses_agent_input_until_released`]
 //! 5. [`dropping_the_service_without_shutdown_still_kills_the_tree`] — the Drop backstop.
+//! 6. [`a_soft_ping_slides_a_cookie_expiry_without_navigating`] — the whole
+//!    mechanism behind "Keep me signed in", against a real sliding cookie.
 
 use std::path::Path;
 use std::time::Duration;
@@ -45,6 +47,7 @@ use supermux_server::connectors::browser::context::ScreencastOptions;
 use supermux_server::connectors::browser::error::BrowserError;
 use supermux_server::connectors::browser::launch::ProfileMode;
 use supermux_server::connectors::browser::lock::{Actor, DriveMode, HandOff};
+use supermux_server::connectors::browser::keepalive::PING_JS;
 use supermux_server::connectors::browser::tab::TabMeta;
 use supermux_server::connectors::browser::{dispose_on_teardown, BrowserConfig, BrowserService};
 
@@ -176,6 +179,44 @@ async fn serve_page(html: &'static str) -> (String, tokio::task::JoinHandle<()>)
                 let response = format!(
                     "HTTP/1.1 200 OK\r\n\
                      Content-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {}\r\n\
+                     Cache-Control: no-store\r\n\
+                     Connection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{}/", addr.port()), handle)
+}
+
+/// [`serve_page`], but every response also re-issues a **sliding** httpOnly
+/// session cookie — the shape "Keep me signed in" exists for. `Max-Age` is
+/// re-applied on each request, so a plain `fetch` of `/` moves the expiry
+/// forward by exactly the elapsed time, and that movement is the assertion.
+async fn serve_page_with_sliding_cookie(
+    html: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/html; charset=utf-8\r\n\
+                     Set-Cookie: sid=THE-HUMAN; Path=/; Max-Age=600; HttpOnly\r\n\
                      Content-Length: {}\r\n\
                      Cache-Control: no-store\r\n\
                      Connection: close\r\n\r\n{}",
@@ -877,4 +918,94 @@ async fn dropping_the_service_without_shutdown_still_kills_the_tree() {
         "Drop left the profile dir {} behind",
         profile.display()
     );
+}
+
+// ── 6. "Keep me signed in": the soft ping ───────────────────────────────────
+
+/// **The whole mechanism, against a real sliding cookie.**
+///
+/// `keepalive::PING_JS` is not a reload and not a navigation: it is a
+/// same-origin `fetch` issued by the page itself. Two things have to be true at
+/// once for the feature to be worth anything, and neither is provable without a
+/// real browser and a real `Set-Cookie`:
+///
+/// 1. the network stack applies the response's `Set-Cookie` to the jar, so the
+///    session's deadline **moves forward** — that is what "keeps you signed in";
+/// 2. the page does not move: `Page.getNavigationHistory` still has exactly one
+///    entry afterwards, so no CSRF nonce is burned, no form state is dropped and
+///    nothing lands on top of a bot mid-action.
+///
+/// The read is `AgentContext::cookies` (`Network.getCookies` with no `urls` and
+/// no `Network.enable`) precisely because the cookie under test is **httpOnly**
+/// and therefore invisible to `document.cookie`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the pinned chrome"]
+async fn a_soft_ping_slides_a_cookie_expiry_without_navigating() {
+    if !chrome_present() {
+        return;
+    }
+    let (url, server) = serve_page_with_sliding_cookie(PAGE).await;
+    let profile = std::env::temp_dir().join(format!("supermux-keepalive-{}", uuid::Uuid::new_v4()));
+    let svc = durable_service(&profile);
+    let tab = svc
+        .ensure_tab(
+            "tb_keepalivetest00001",
+            TabMeta {
+                url: url.clone(),
+                ..TabMeta::default()
+            },
+        )
+        .await
+        .expect("open tab");
+    tab.page().navigate(Actor::Agent, &url).await.expect("nav");
+
+    /// The httpOnly `sid`'s expiry, straight from the jar.
+    fn sid_expiry(cookies: &[serde_json::Value]) -> f64 {
+        cookies
+            .iter()
+            .find(|c| c.get("name").and_then(|v| v.as_str()) == Some("sid"))
+            .and_then(|c| c.get("expires").and_then(|v| v.as_f64()))
+            .expect("the sliding sid cookie must be in the jar")
+    }
+
+    let before = tab.page().cookies().await.expect("jar before");
+    let expiry_before = sid_expiry(&before);
+    assert!(
+        before
+            .iter()
+            .any(|c| c.get("httpOnly").and_then(|v| v.as_bool()) == Some(true)),
+        "the cookie under test must be httpOnly — that is why document.cookie is not enough"
+    );
+    let history_before = tab.page().history().await.expect("history before");
+
+    // Long enough that a slid expiry is unambiguous at second resolution.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let raw = tab.page().evaluate(PING_JS).await.expect("ping");
+    assert_eq!(
+        raw.as_str(),
+        Some("basic 200 0 /"),
+        "the ping must report the four fields `classify` parses"
+    );
+
+    let after = tab.page().cookies().await.expect("jar after");
+    let expiry_after = sid_expiry(&after);
+    assert!(
+        expiry_after > expiry_before + 1.0,
+        "the ping must SLIDE the session: {expiry_before} -> {expiry_after}"
+    );
+
+    let history_after = tab.page().history().await.expect("history after");
+    assert_eq!(
+        history_after.entries.len(),
+        history_before.entries.len(),
+        "the ping must not navigate — history grew from {:?} to {:?}",
+        history_before.entries.len(),
+        history_after.entries.len()
+    );
+    assert_eq!(history_after.current_index, history_before.current_index);
+
+    svc.shutdown().await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(&profile);
 }

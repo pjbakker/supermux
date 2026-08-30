@@ -91,6 +91,10 @@ pub mod tab;
 /// Shared-browser v1: the HUMAN's bearer-gated tab CRUD + per-tab grant API.
 /// Deliberately a different door from [`tools`], which is the agent's.
 pub mod api;
+/// "Keep me signed in": the 60-second sweep that refreshes an opted-in tab's
+/// session from what the cookie jar knows. The first writer of `login_state`
+/// and `last_probe_at` that is not a human.
+pub mod keepalive;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

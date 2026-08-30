@@ -541,6 +541,10 @@ function Bench({
             login_state: 'unknown',
             last_probe_at: null,
             live: true,
+            keepalive_enabled: false,
+            keepalive_every: 15,
+            keepalive_action: 'soft',
+            last_keepalive_at: null,
             grants: [],
             created_at: Math.floor(Date.now() / 1000),
             last_used_at: null,
@@ -553,6 +557,17 @@ function Bench({
         setActiveId((cur) => (cur === id ? null : cur))
       }}
       onPin={(id, pinned) => patch(id, (t) => ({ ...t, pinned }))}
+      // Offline bench: the toggle flips the row locally so the ⋯ detail line's
+      // "Starting — the first check is due shortly." state is shootable too.
+      onKeepAlive={(id, on) =>
+        patch(id, (t) => ({
+          ...t,
+          keepalive_enabled: on,
+          keepalive_action: on ? 'soft' : t.keepalive_action,
+          keepalive_every: on ? 15 : t.keepalive_every,
+          last_keepalive_at: on ? null : t.last_keepalive_at,
+        }))
+      }
       onGrant={async (id, grantee) => {
         patch(id, (t) => ({
           ...t,

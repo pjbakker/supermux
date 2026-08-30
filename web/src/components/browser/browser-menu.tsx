@@ -42,8 +42,22 @@ export interface BrowserMenuItem {
   disabled?: boolean
   /** Why it is greyed, or what it will do. */
   hint?: string
+  /** A second, muted line under the label — the EVIDENCE.
+   *
+   *  NOT a tooltip: `hint` renders only as `title=`, and a phone has no hover,
+   *  so without this a menu row physically cannot show state. Rows without it
+   *  render byte-identically to before. */
+  detail?: string
   /** Draws it in the destructive tint (Close, Close others). */
   danger?: boolean
+  /** The row's STATE needs the owner — it tints the ICON and the detail line in
+   *  the workspace's amber, and leaves the label alone.
+   *
+   *  NOT `danger`: that is the destructive-VERB tint, and a row whose verb is
+   *  "Stop keeping signed in" is not destructive. What is wrong is the state the
+   *  detail line describes, so that is what gets the colour — the same amber the
+   *  sign-in banner and the tab chip already use for `needs_login`. */
+  attention?: boolean
   /** A hairline above this row. */
   separated?: boolean
 }
@@ -180,7 +194,10 @@ export function BrowserMenu({ at, items, label, onSelect, onClose, fixed }: Brow
               onPointerEnter={() => !item.disabled && setActive(i)}
               onClick={() => run(item)}
               className={cn(
-                'flex min-h-11 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13.5px] transition-colors motion-reduce:transition-none',
+                'flex w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13.5px] transition-colors motion-reduce:transition-none',
+                // Taller ONLY when there is a second line, so every existing row
+                // keeps the 44px tap target it has always had.
+                item.detail ? 'min-h-14 py-1.5' : 'min-h-11',
                 item.disabled
                   ? 'cursor-default text-muted-foreground/50'
                   : item.danger
@@ -189,8 +206,35 @@ export function BrowserMenu({ at, items, label, onSelect, onClose, fixed }: Brow
                 !item.disabled && i === active && (item.danger ? 'bg-red-500/10' : 'bg-secondary'),
               )}
             >
-              {Icon && <Icon className="size-4 shrink-0 opacity-70" aria-hidden />}
-              <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              {Icon && (
+                <Icon
+                  className={cn(
+                    'size-4 shrink-0',
+                    item.attention && !item.disabled
+                      ? 'text-amber-600 dark:text-amber-500'
+                      : 'opacity-70',
+                  )}
+                  aria-hidden
+                />
+              )}
+              {item.detail ? (
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate">{item.label}</span>
+                  <span
+                    data-browser-menu-detail={item.id}
+                    className={cn(
+                      'line-clamp-2 text-[11.5px] leading-snug',
+                      item.attention && !item.disabled
+                        ? 'text-amber-600 dark:text-amber-500'
+                        : 'text-muted-foreground',
+                    )}
+                  >
+                    {item.detail}
+                  </span>
+                </span>
+              ) : (
+                <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              )}
             </button>
           </React.Fragment>
         )
