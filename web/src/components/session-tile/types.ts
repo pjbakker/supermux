@@ -1,6 +1,7 @@
 import type { SessionSummary } from '@/lib/api'
 import type { ElicitationAsk } from '@/components/chat/elicitation'
 import type {
+  AgentRow,
   BrowserTakeoverInfo,
   ChatTail,
   ConnectRequestInfo,
@@ -38,10 +39,20 @@ export interface TileSession extends SessionSummary {
   /** Machine class for `activity` (`bash`/`edit`/`read`/`search`/`web`/`task`/
    *  `mcp`/`fail`). Present iff `activity` is. */
   activity_kind?: string
-  /** Live count of outstanding Task sub-agents for the current turn. Display-only
-   *  parallelism signal: the activity line gains a calm `· N subagents` clause
-   *  when the agent is working and this is ≥ 2. Absent/0 → no clause. */
+  /** Live count of outstanding Task sub-agents for the current turn. Still on the
+   *  wire (the server reads it for status + notifications) but NOT rendered: a
+   *  lost `SubagentStop` pins it, and it names no child. `agents_live` replaced it. */
   subagents?: number
+  /** How many subagents the server has FIRST-HAND evidence of. Display-only
+   *  parallelism signal: the activity line gains a calm `· N agents` clause when
+   *  the agent is working and this is ≥ 2. Absent/0 → no clause, and unlike the
+   *  count it cannot outlive the children (`SessionSummary.agents_live`). */
+  agents_live?: number
+  /** Those same children as ROWS, keyed by Claude's own `agent_id`. Declared
+   *  here rather than on every session type because exactly ONE surface lists
+   *  them: the chat's working row, which opens them from its `· N agents`
+   *  control. Everything else reads `agents_live`. */
+  agents?: AgentRow[]
   /** The latest unrecovered agent error from a StopFailure hook (hooks-10x).
    *  Cleared when the agent resumes — drives the amber error badge. */
   error?: { type: string; message: string }

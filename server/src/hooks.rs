@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use axum::body::Bytes;
+use std::time::Instant;
 
 use crate::db;
 use crate::notify::{self, NotifEvent};
@@ -524,6 +525,34 @@ fn salvage_truncated_body(raw: &[u8]) -> Option<HookBody> {
     None
 }
 
+/// Record a CHILD's hook against its own per-agent row, when this hook actually
+/// came from one.
+///
+/// `agent_id` is present **iff** the hook fired from inside a subagent — that is
+/// Claude Code's own documented rule for the field, and it is the entire
+/// admission test here. A main-thread hook is a no-op that allocates nothing.
+///
+/// Purely ADDITIVE at every call site: the existing `set_activity` /
+/// `touch_subagent_tool_hook` / `inc_subagents` / `dec_subagents` calls are left
+/// exactly as they are, so the outstanding count, `subagents_live`, the status
+/// classifier and the finish-notification gate stay byte-identical. These rows
+/// are read only by the SSE delta and the `SessionView` serializer
+/// ([`crate::state::AgentRun`]'s display-only invariant).
+///
+/// Returns whether the row list a reader sees changed, which the arms OR into
+/// their own change flag: the rows ride the change-only broadcast, so a row that
+/// only this call can produce needs this call to admit it happened.
+fn touch_agent_row(state: &AppState, session: &str, payload: &HookPayload) -> bool {
+    let Some(id) = payload.agent_id.as_deref().filter(|i| !i.is_empty()) else {
+        return false;
+    };
+    // The same sentence the activity line would show for this call — no new
+    // parsing, and `None` for a non-tool event (a `SubagentStart` proves the
+    // child exists but says nothing about its work).
+    let label = activity::activity_label(payload).map(|(label, _kind)| label);
+    state.touch_agent(session, id, payload.agent_type.as_deref(), label)
+}
+
 /// Derive + store the in-memory activity/error/lifecycle effects of one hook
 /// event's PAYLOAD, broadcasting a `sessions` SSE delta only
 /// when the activity/error actually changed (change-only). Pure
@@ -599,7 +628,13 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             // no allocation) when no subagent is outstanding — a plain turn is
             // unaffected.
             state.touch_subagent_tool_hook(session);
-            connect || takeover || question || label
+            // …and, when this tool call came from a CHILD, give that child its
+            // own row. The line above keeps the parent's aggregate liveness
+            // fresh; this one is the only place the answer to "which agents, and
+            // what is each doing" comes from. Evaluated BEFORE the `||` chain so
+            // a short-circuit can never skip it.
+            let child = touch_agent_row(state, session, payload);
+            connect || takeover || question || label || child
         }
         // A tool FAILED → transient `✗ {tool} failed`. Claude DOES have a
         // dedicated `PostToolUseFailure` event (live-verified on 2.1.227 +
@@ -630,7 +665,10 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             };
             // Keep an outstanding subagent's liveness fresh (see the pre-tool arm).
             state.touch_subagent_tool_hook(session);
-            cleared || failed
+            // A child's tool FINISHING is evidence it is still there, so the row
+            // stays fresh across a call that spans the quiet threshold.
+            let child = touch_agent_row(state, session, payload);
+            cleared || failed || child
         }
         // Claude is DISPLAYING a permission dialog for this tool call and is
         // blocked on a human. Fires before any decision; no hook ever reports the
@@ -702,7 +740,13 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
         "elicitation_result" | "ElicitationResult" => state.clear_elicitation(session),
         // A Task sub-agent STARTED → bump the live outstanding count (the
         // display-only parallelism signal). Never touches the turn boundary.
-        "subagent_start" | "SubagentStart" => state.inc_subagents(session),
+        "subagent_start" | "SubagentStart" => {
+            // The row opens here (label-less until the child's first tool hook),
+            // so a subagent that is thinking is already visible instead of
+            // appearing only once it touches something.
+            let child = touch_agent_row(state, session, payload);
+            state.inc_subagents(session) || child
+        }
         // The MAIN turn ended → clear the live activity (the error, if any,
         // persists until the next prompt/start). The subagent count is DELIBERATELY
         // NOT force-0'd here any more: a session that dispatched a BACKGROUND
@@ -731,15 +775,39 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
         // MAIN agent is still working, so do NOT wipe the main activity label or
         // end the turn (non-decisive, mirrors turn_end = Stop-only) — but DO
         // decrement the live outstanding count (saturating).
-        "subagent_stop" | "SubagentStop" => state.dec_subagents(session),
+        "subagent_stop" | "SubagentStop" => {
+            // Tombstone THIS child's row. Id-keyed, so a duplicated stop removes
+            // it once and is a no-op afterwards — it can drive nothing negative
+            // and, unlike the count, cannot be pinned by a lost one either.
+            //
+            // The row's removal is its OWN change signal and must be, because
+            // `dec_subagents` reports none when the count is already 0 — the
+            // normal case here: no `SubagentStart` fires for a workflow child,
+            // and `UserPromptSubmit` zeroes the count under any child that
+            // outlives a prompt. Gating the broadcast on the count alone left
+            // the finished child on screen, which is the exact ghost these rows
+            // exist to abolish.
+            let gone = payload
+                .agent_id
+                .as_deref()
+                .filter(|i| !i.is_empty())
+                .is_some_and(|id| state.stop_agent(session, id));
+            state.dec_subagents(session) || gone
+        }
         // A new prompt / a fresh session → the previous error is no longer
         // current (the user is acting again) → clear it, and reset the subagent
         // count for the new turn.
         "user_prompt" | "user_prompt_submit" | "UserPromptSubmit" => {
             let err = state.clear_error(session);
             let sub = state.reset_subagents(session);
+            // Rows follow the same edge as the count, with one deliberate
+            // exception: a child that is PROVABLY still working right now
+            // survives the new prompt, exactly as the count's own
+            // no-force-0-on-Stop rule protects a background workflow. Everything
+            // else belonged to the turn that just ended.
+            let pruned = state.prune_agents_for_prompt(session, Instant::now());
             let perm = state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
-            err || sub || perm
+            err || sub || perm || pruned
         }
         // Session lifecycle ───────────────────────────────────────────────────
         // Start: clear a stale error AND any pending forced-stopped override so
@@ -752,9 +820,11 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             // effect; wake_detector (in the handler) re-ticks the status.
             state.reset_turn_state(session);
             state.clear_forced_status(session);
+            // A brand-new Claude process inherits no children.
+            let dropped = state.clear_agents(session);
             let err = state.clear_error(session);
             let perm = state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
-            err || perm
+            err || perm || dropped
         }
         // End: clear activity AND force Stopped now (the capture classifier can't
         // infer a clean exit). The forced status is applied by the detector loop;
@@ -780,6 +850,9 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             }
             let act_changed = state.clear_activity(session);
             let sub_changed = state.reset_subagents(session);
+            // The session is gone; nothing that ran under it is still ours to
+            // claim knowledge of.
+            let dropped_rows = state.clear_agents(session);
             let perm_changed =
                 state.clear_permission_request(session) | state.clear_elicitation(session) | state.clear_connect_request(session) | state.clear_browser_takeover(session) | state.clear_question_request(session) | state.clear_waiting_message(session);
             // The turn is definitively over when the session ends — drop it so a
@@ -794,7 +867,7 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             // a no-op.
             crate::connectors::browser::dispose_on_teardown(&state.browser, session);
             force_stopped(state, session);
-            act_changed || sub_changed || perm_changed
+            act_changed || sub_changed || perm_changed || dropped_rows
         }
         // A turn failed with an agent error → record `{type, message}` for the
         // error badge (also clear the now-irrelevant activity).
@@ -901,6 +974,10 @@ pub(crate) fn broadcast_activity_delta(state: &AppState, session: &str) {
     let permission = act.permission.as_ref().map(|a| {
         json!({ "tool": a.tool, "summary": a.summary, "kind": a.kind, "mode": a.mode })
     });
+    // Read the rows ONCE: the two keys below are the list and its length, and
+    // reading twice could serialize a count that disagrees with the rows beside
+    // it (the sweep runs on read).
+    let agents = state.agent_rows_now(session);
     let _ = state.sse_tx.send(SseEvent {
         event: "sessions".to_string(),
         company_id: None,
@@ -940,6 +1017,16 @@ pub(crate) fn broadcast_activity_delta(state: &AppState, session: &str) {
             // so the roster updates the "working" bucket/word/face live (and
             // clears it) without a refetch when the signal flips.
             "subagents_live": state.subagents_live(session),
+            // HOW MANY children have fresh first-hand evidence — the clause every
+            // surface but the chat's working row draws, replacing the raw count
+            // beside it: `subagents` is a number a lost `SubagentStop` can pin,
+            // this one counts rows that exist only because a hook carrying that
+            // exact `agent_id` arrived. …and the rows themselves, for the one
+            // surface that lists them. Both always present (0 / `[]` is how a
+            // client clears), both display-only: nothing downstream of them
+            // reaches the status classifier or the turn boundary.
+            "agents_live": agents.len(),
+            "agents": agents,
             // Server-clock ms stamp: the fase-A1 hook→UI latency anchor AND
             // the chat client's clock-skew source — every chat supersede
             // comparison runs in this clock domain (a0-findings §1 item 3).
@@ -1078,6 +1165,26 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    /// The wall-clock twin of a synthetic `base: Instant` in the row tests.
+    /// `agent_rows` takes both clocks — the monotonic one ages the ladder, the
+    /// wall-clock one is what goes on the wire — so a test that fabricates `now`
+    /// has to fabricate both, and only then are the stamps it asserts readable.
+    const WALL: i64 = 1_756_000_000_000;
+
+    /// `state`'s rows for `name` `secs` after `base`, on both clocks at once.
+    fn rows_at(
+        state: &AppState,
+        name: &str,
+        base: Instant,
+        secs: u64,
+    ) -> Vec<crate::state::AgentRow> {
+        state.agent_rows(
+            name,
+            base + std::time::Duration::from_secs(secs),
+            WALL + secs as i64 * 1_000,
+        )
+    }
+
     #[tokio::test]
     async fn subagent_count_rides_the_sessions_delta() {
         // The live overview gets the outstanding-subagent count on the SAME
@@ -1107,6 +1214,392 @@ mod tests {
             }
         }
         assert_eq!(last_count, Some(2), "the sessions delta must carry subagents: 2");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole admission rule for a per-agent row, both directions.
+    ///
+    /// `agent_id` is present iff the hook fired from INSIDE a subagent, so a
+    /// child's tool call earns a row carrying that child's own label, and the
+    /// byte-identical payload from the main thread earns nothing at all. That
+    /// asymmetry is what makes a ghost impossible: no row can exist without a
+    /// hook that named the agent.
+    #[tokio::test]
+    async fn a_child_tool_hook_opens_a_row_and_a_main_thread_one_does_not() {
+        let (state, dir) = test_state().await;
+
+        apply_payload(
+            &state,
+            "child",
+            "pre_tool",
+            &p(r#"{"agent_id":"a1","agent_type":"general-purpose","tool_name":"Bash","tool_input":{"command":"echo hi","description":"x"}}"#),
+        );
+        let rows = state.agent_rows_now("child");
+        assert_eq!(rows.len(), 1, "one child hook → exactly one row");
+        assert_eq!(rows[0].id, "a1");
+        assert_eq!(rows[0].agent_type, "general-purpose");
+        assert_eq!(
+            rows[0].label.as_deref(),
+            Some("⚡ x"),
+            "the row wears the child's OWN tool label",
+        );
+
+        // The same payload minus the id: the main thread's own Bash call.
+        apply_payload(
+            &state,
+            "main",
+            "pre_tool",
+            &p(r#"{"tool_name":"Bash","tool_input":{"command":"echo hi","description":"x"}}"#),
+        );
+        assert!(
+            state.agent_rows_now("main").is_empty(),
+            "no agent_id → no row (the main thread is not one of its own children)",
+        );
+        // …and the activity line it DID set is untouched by any of this.
+        assert_eq!(
+            state.session_activity("main").and_then(|a| a.activity).as_deref(),
+            Some("⚡ x"),
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Rows are ID-KEYED, so `SubagentStop` is idempotent where the count is
+    /// merely saturating — and the tombstone it leaves cannot be resurrected by a
+    /// straggler hook. The count itself must keep draining exactly as it does
+    /// today (this is additive; nothing about the old signal changes).
+    #[tokio::test]
+    async fn a_duplicate_subagent_stop_removes_the_row_once() {
+        let (state, dir) = test_state().await;
+        let s = "fanout";
+        let now = Instant::now();
+        let now_ms = WALL;
+
+        apply_payload(&state, s, "subagent_start", &p(r#"{"agent_id":"a1","agent_type":"Explore"}"#));
+        apply_payload(&state, s, "subagent_start", &p(r#"{"agent_id":"a2","agent_type":"Explore"}"#));
+        assert_eq!(state.agent_rows(s, now, now_ms).len(), 2);
+        assert_eq!(subagents(&state, s), 2);
+
+        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#));
+        let ids: Vec<_> = state.agent_rows(s, now, now_ms).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["a2".to_string()], "only the stopped child leaves");
+        assert_eq!(subagents(&state, s), 1);
+
+        // The SAME stop again: a no-op for the row (there is nothing left to
+        // remove), while the count decrements again exactly as it always has.
+        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#));
+        let ids: Vec<_> = state.agent_rows(s, now, now_ms).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["a2".to_string()], "the second stop changes nothing");
+        assert_eq!(subagents(&state, s), 0, "the count still drains as it did before");
+
+        // A straggler tool hook for the stopped child — hooks are fire-and-forget
+        // POSTs and can land out of order — must NOT bring it back.
+        apply_payload(
+            &state,
+            s,
+            "post_tool",
+            &p(r#"{"agent_id":"a1","agent_type":"Explore","tool_name":"Read","tool_input":{"file_path":"/x/y.rs"}}"#),
+        );
+        let ids: Vec<_> = state.agent_rows(s, now, now_ms).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["a2".to_string()], "a stop is final for that id");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The staleness ladder, as a pure function of `(started, last_evidence, now)`
+    /// — `now` is a parameter precisely so this needs no sleeping. There is no
+    /// reaper task and no counter to drift: a row is rendered iff it still has
+    /// first-hand evidence, and past ten minutes we stop claiming to know
+    /// anything about that agent at all.
+    #[tokio::test]
+    async fn agent_rows_age_from_live_through_quiet_to_gone() {
+        let (state, dir) = test_state().await;
+        let s = "ladder";
+        let base = Instant::now();
+        state.agents.entry(s.to_string()).or_default().insert(
+            "a1".to_string(),
+            crate::state::AgentRun {
+                agent_type: "workflow-subagent".to_string(),
+                label: Some("⚡ x".to_string()),
+                started: base,
+                last_evidence: base,
+                stopped: false,
+            },
+        );
+
+        // 30s — live. Well inside the 60s window, so the client renders it
+        // normally with its tool label. Both stamps are ABSOLUTE, so they read
+        // the same at every `now`: that is what lets the client age the row on
+        // its own instead of waiting for a delta to re-resolve a duration.
+        let rows = rows_at(&state, s, base, 30);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].started_ms, WALL);
+        assert_eq!(rows[0].last_evidence_ms, WALL);
+
+        // 5 min — quiet. Still rendered (an agent inside one long `Bash` is
+        // legitimately silent), dimmed, and the copy states the fact.
+        let rows = rows_at(&state, s, base, 300);
+        assert_eq!(rows.len(), 1, "a quiet row is still a row");
+        assert_eq!(rows[0].last_evidence_ms, WALL, "the stamp does not move with `now`");
+
+        // 11 min — gone, and reclaimed on the way through.
+        let rows = rows_at(&state, s, base, 660);
+        assert!(rows.is_empty(), "past ten minutes we no longer claim to know");
+        assert!(!state.agents.contains_key(s), "the empty entry is dropped too");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The prompt edge, with the one deliberate exception. A new prompt drops
+    /// everything that belonged to the turn that ended — but a child that is
+    /// PROVABLY still working survives it, mirroring the count's own
+    /// no-force-0-on-`Stop` rule for background workflows.
+    #[tokio::test]
+    async fn a_new_prompt_prunes_quiet_rows_and_keeps_working_ones() {
+        let (state, dir) = test_state().await;
+        let s = "prompted";
+        let base = Instant::now();
+
+        // The ladder half, on a synthetic clock: one row 10 min quiet, one 5s.
+        {
+            let mut runs = state.agents.entry(s.to_string()).or_default();
+            for (id, evidence_at) in [
+                ("stale", base),
+                ("working", base + std::time::Duration::from_secs(595)),
+            ] {
+                runs.insert(
+                    id.to_string(),
+                    crate::state::AgentRun {
+                        agent_type: "workflow-subagent".to_string(),
+                        label: None,
+                        started: base,
+                        last_evidence: evidence_at,
+                        stopped: false,
+                    },
+                );
+            }
+        }
+        assert!(
+            state.prune_agents_for_prompt(s, base + std::time::Duration::from_secs(600)),
+            "dropping a row IS a change — the client is holding the longer list",
+        );
+        let ids: Vec<_> = rows_at(&state, s, base, 600).into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec!["working".to_string()],
+            "5s-old evidence survives the prompt; 10-min-old does not",
+        );
+
+        // The wiring half, on the real clock: the `UserPromptSubmit` arm runs the
+        // prune (the finished child goes) without touching the live one.
+        let w = "wired";
+        apply_payload(&state, w, "subagent_start", &p(r#"{"agent_id":"live","agent_type":"Explore"}"#));
+        apply_payload(&state, w, "subagent_start", &p(r#"{"agent_id":"done","agent_type":"Explore"}"#));
+        apply_payload(&state, w, "subagent_stop", &p(r#"{"agent_id":"done"}"#));
+        apply_payload(&state, w, "user_prompt", &p("{}"));
+        let ids: Vec<_> = state.agent_rows_now(w).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["live".to_string()], "the prompt arm prunes the finished child");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The cap, and what it evicts. One conversation on this host has 899
+    /// subagent transcripts; a fan-out session's map must not grow with every
+    /// child it ever spawned. The row evicted is always the one whose evidence
+    /// is oldest — which is by construction a quiet or finished child, never one
+    /// that is still calling tools.
+    #[tokio::test]
+    async fn the_row_map_is_capped_and_evicts_the_oldest_evidence() {
+        let (state, dir) = test_state().await;
+        let s = "swarm";
+
+        // 40 children, oldest first (each `touch` stamps `Instant::now()`, which
+        // is monotonic, so insertion order IS evidence order).
+        for i in 0..40u32 {
+            apply_payload(
+                &state,
+                s,
+                "pre_tool",
+                &p(&format!(
+                    r#"{{"agent_id":"a{i}","agent_type":"general-purpose","tool_name":"Bash","tool_input":{{"description":"d{i}"}}}}"#
+                )),
+            );
+        }
+        let rows = state.agent_rows_now(s);
+        assert_eq!(rows.len(), 32, "the map is capped at 32 rows per session");
+        let ids: std::collections::HashSet<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(!ids.contains("a0"), "the oldest evidence was evicted");
+        assert!(ids.contains("a39"), "the newest child is always kept");
+
+        // A lifecycle edge drops the lot: a brand-new Claude process inherits no
+        // children, and neither does a finished one.
+        apply_payload(&state, s, "session_start", &p("{}"));
+        assert!(state.agent_rows_now(s).is_empty());
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The rows ride the SAME change-only `sessions` delta the count already
+    /// does — one key beside it, always present so an empty array clears the
+    /// client's list. No new event type, no new endpoint.
+    #[tokio::test]
+    async fn agent_rows_ride_the_sessions_delta() {
+        let (state, dir) = test_state().await;
+        let s = "delta-agents";
+        let mut rx = state.sse_tx.subscribe();
+
+        apply_payload(
+            &state,
+            s,
+            "pre_tool",
+            &p(r#"{"agent_id":"a1","agent_type":"workflow-subagent","tool_name":"Bash","tool_input":{"description":"probe"}}"#),
+        );
+
+        let mut last: Option<Value> = None;
+        let mut last_live: Option<i64> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.event == "sessions" {
+                if let Some(d) = ev.payload.get("delta").and_then(|d| d.as_array()).and_then(|a| a.first()) {
+                    if d.get("name").and_then(|n| n.as_str()) == Some(s) {
+                        last = d.get("agents").cloned();
+                        last_live = d.get("agents_live").and_then(|v| v.as_i64());
+                    }
+                }
+            }
+        }
+        let agents = last.expect("the sessions delta must carry an `agents` key");
+        let agents = agents.as_array().expect("`agents` is always an array");
+        assert_eq!(agents.len(), 1);
+        // The COUNT rides the same frame, and must agree with the list beside it:
+        // every surface but the chat's working row draws the clause from this
+        // number alone, so a disagreement is a clause that opens a different list.
+        assert_eq!(
+            last_live,
+            Some(agents.len() as i64),
+            "`agents_live` is the length of the `agents` beside it",
+        );
+        assert_eq!(agents[0]["id"], "a1");
+        assert_eq!(agents[0]["type"], "workflow-subagent");
+        assert_eq!(agents[0]["label"], "⚡ probe");
+        // Absolute server-clock stamps, in the same domain as the delta's own
+        // `activity_at` — the client ages the row against them and never has to
+        // re-anchor a duration against its own clock.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for key in ["started_ms", "last_evidence_ms"] {
+            let at = agents[0][key].as_i64().unwrap_or_else(|| panic!("`{key}` is a number"));
+            assert!(
+                (now_ms - at).abs() < 60_000,
+                "`{key}` is a wall-clock stamp near now, not a duration ({at})",
+            );
+        }
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The stop a change-only broadcast used to swallow.
+    ///
+    /// `dec_subagents` reports no change when the count is already 0, and 0 is
+    /// the NORMAL state under a workflow child (no `SubagentStart` fires for
+    /// one). Before the row's own removal reported itself, the tombstone landed
+    /// server-side and no delta was sent, so every connected client kept drawing
+    /// a child that had finished — the stale clause wearing a new shape.
+    #[tokio::test]
+    async fn a_stop_at_count_zero_still_broadcasts_the_shorter_list() {
+        let (state, dir) = test_state().await;
+        let s = "workflow-child";
+
+        // A workflow child: a tool hook carrying its id, and no `SubagentStart`,
+        // so the row exists while the count never left 0.
+        apply_payload(
+            &state,
+            s,
+            "pre_tool",
+            &p(r#"{"agent_id":"a1","agent_type":"workflow-subagent","tool_name":"Bash","tool_input":{"description":"probe"}}"#),
+        );
+        assert_eq!(subagents(&state, s), 0, "no SubagentStart fired, so the count is 0");
+        assert_eq!(state.agent_rows_now(s).len(), 1);
+
+        let mut rx = state.sse_tx.subscribe();
+        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#));
+
+        let mut agents: Option<Value> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.event == "sessions" {
+                if let Some(d) = ev.payload.get("delta").and_then(|d| d.as_array()).and_then(|a| a.first()) {
+                    if d.get("name").and_then(|n| n.as_str()) == Some(s) {
+                        agents = d.get("agents").cloned();
+                    }
+                }
+            }
+        }
+        let agents = agents.expect("the stop must broadcast, count or no count");
+        assert_eq!(
+            agents.as_array().map(Vec::len),
+            Some(0),
+            "and the array it carries is empty — that is what clears the client",
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The visible order does not move under the reader.
+    ///
+    /// Only the first six rows of a fan-out are drawn, so the sort key decides
+    /// WHICH agents a phone shows. Ordering by recency of evidence made that set
+    /// rotate on every hook any child posted; ordering by spawn time (within the
+    /// live/quiet bucket) means the only rank change is the one that means
+    /// something — a row going quiet and sinking.
+    #[tokio::test]
+    async fn the_visible_order_holds_when_a_younger_child_posts_a_hook() {
+        let (state, dir) = test_state().await;
+        let s = "swarm-order";
+        let base = Instant::now();
+        {
+            let mut runs = state.agents.entry(s.to_string()).or_default();
+            for (id, started_at) in [("old", base), ("young", base + std::time::Duration::from_secs(5))] {
+                runs.insert(
+                    id.to_string(),
+                    crate::state::AgentRun {
+                        agent_type: "workflow-subagent".to_string(),
+                        label: None,
+                        started: started_at,
+                        last_evidence: started_at,
+                        stopped: false,
+                    },
+                );
+            }
+        }
+        let ids = |rows: Vec<crate::state::AgentRow>| -> Vec<String> {
+            rows.into_iter().map(|r| r.id).collect()
+        };
+        assert_eq!(ids(rows_at(&state, s, base, 10)), vec!["old", "young"]);
+
+        // The YOUNGER child posts a tool hook: freshest evidence, and with the
+        // old sort it would have jumped the queue.
+        state.agents.get_mut(s).unwrap().get_mut("young").unwrap().last_evidence =
+            base + std::time::Duration::from_secs(20);
+        assert_eq!(
+            ids(rows_at(&state, s, base, 20)),
+            vec!["old", "young"],
+            "a hook from a child must not re-rank the list a reader is scanning",
+        );
+
+        // …and the one rank change that IS meaningful: `old` crosses 60s of
+        // silence, so it dims and sinks below the child still working.
+        assert_eq!(
+            ids(rows_at(&state, s, base, 70)),
+            vec!["young", "old"],
+            "live rows lead; a quiet one sinks",
+        );
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);

@@ -66,10 +66,20 @@ describe('markStateForSession draws the working face for a live workflow', () =>
 })
 
 describe('subagentsClause — the shared parallelism formatter', () => {
-  test('only ≥ 2 subagents produce the clause', () => {
+  test('only ≥ 2 evidence-bearing agents produce the clause', () => {
     expect(subagentsClause(undefined)).toBe('')
+    expect(subagentsClause(null)).toBe('')
     expect(subagentsClause(0)).toBe('')
     expect(subagentsClause(1)).toBe('')
-    expect(subagentsClause(3)).toBe(' · 3 subagents')
+    expect(subagentsClause(3)).toBe(' · 3 agents')
+  })
+
+  test('the clause reads agents_live, so a stale count can no longer speak', () => {
+    // The whole point of the change: `subagents` is a number a lost
+    // `SubagentStop` can pin, and it used to be the only thing this formatter
+    // read. `agents_live` counts children with first-hand evidence, so a session
+    // with none says nothing, whatever the count claims.
+    const ghost = { subagents: 5, agents_live: 0 }
+    expect(subagentsClause(ghost.agents_live)).toBe('')
   })
 })

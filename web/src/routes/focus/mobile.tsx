@@ -712,7 +712,7 @@ export function MobileFocus({ mockSessions, mockTeams, mockName }: MobileFocusPr
               title={sessionTitle(current)}
               status={current.status}
               activity={current.activity}
-              subagents={current.subagents}
+              agentsLive={current.agents_live}
               error={current.error}
               blocked={current.blocked ?? undefined}
               rateLimits={current.rate_limits ?? undefined}

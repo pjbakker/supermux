@@ -374,6 +374,25 @@ pub struct SessionView {
     /// common case) so a resting session's wire shape is unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub subagents_live: bool,
+    /// **Which subagents are actually running, and what each is doing** — the
+    /// per-agent rows ([`crate::state::AgentRun`]), keyed by Claude's own
+    /// `agent_id`. Unlike `subagents` (a number that a lost `SubagentStop` can
+    /// pin, and that says nothing about WHICH children exist) a row exists only
+    /// because a hook carrying that exact id arrived, so it cannot be a ghost.
+    /// This is what every surface renders; the count stays on the wire for the
+    /// status/notification paths that already read it.
+    ///
+    /// DISPLAY-ONLY: derived here at serialization time and consumed only by
+    /// presentational components. Omitted when empty (the common case) so a
+    /// resting session's wire shape is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub agents: Vec<crate::state::AgentRow>,
+    /// `agents.len()`, pre-derived: every surface that only draws the calm
+    /// `· N agents` clause (tile, roster, focus header, quick-peek) reads this
+    /// integer, and only the chat's working row — which LISTS the children —
+    /// takes the rows. Same display-only posture, omitted when 0.
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub agents_live: u32,
     /// The LIVE permission dialog, from the `PermissionRequest` hook: Claude is
     /// displaying a permission prompt for this tool call and is blocked on a
     /// human. In-memory only; cleared as soon as anything proves the dialog
@@ -587,6 +606,11 @@ fn view(
     // truth — the tailer's `subagent_active_at` map — lives on the state the
     // caller holds, not on `act`).
     subagents_live: bool,
+    // The per-agent rows as of the caller's `now`
+    // ([`crate::state::AppState::agent_rows`]). Threaded in for the same reason
+    // as `subagents_live`: its ground truth is a map on the state, and `view`
+    // stays a pure function of its arguments.
+    agents: Vec<crate::state::AgentRow>,
     // The statusline snapshot, when the opt-in tap is installed AND has fired
     // for this session. Threaded in rather than fetched here so `view` stays a
     // pure function of its arguments (every caller already holds the state).
@@ -659,6 +683,8 @@ fn view(
         activity_kind: act.as_ref().and_then(|a| a.activity_kind.clone()),
         subagents: act.as_ref().map(|a| a.subagents).unwrap_or(0),
         subagents_live,
+        agents_live: agents.len() as u32,
+        agents,
         permission_request: act.as_ref().and_then(|a| {
             a.permission.as_ref().map(|ask| PermissionRequestInfo {
                 tool: ask.tool.clone(),
@@ -980,6 +1006,7 @@ pub async fn list(state: &AppState) -> Result<Vec<SessionView>, AppError> {
                 rt_map.get(&s.name),
                 state.session_activity(&s.name),
                 state.subagents_live(&s.name),
+                state.agent_rows_now(&s.name),
                 state.statusline(&s.name),
             )
         })
@@ -996,6 +1023,7 @@ pub async fn get(state: &AppState, name: &str) -> Result<SessionView, AppError> 
         rt.as_ref(),
         state.session_activity(name),
         state.subagents_live(name),
+        state.agent_rows_now(name),
         state.statusline(name),
     ))
 }
@@ -1019,6 +1047,7 @@ pub async fn list_archived(state: &AppState) -> Result<Vec<SessionView>, AppErro
                 rt_map.get(&s.name),
                 state.session_activity(&s.name),
                 state.subagents_live(&s.name),
+                state.agent_rows_now(&s.name),
                 state.statusline(&s.name),
             )
         })

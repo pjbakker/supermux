@@ -83,6 +83,11 @@ export const MENTIONS: ReadonlyMap<string, string> = new Map(
 
 /* ── sessions ────────────────────────────────────────────────────────────── */
 
+/** An agent row's stamps are ABSOLUTE server-clock ms, so a fixture states the
+ *  age it wants and lets the clock resolve it — a hard-coded stamp would age
+ *  into `no tool call for 9h` the first time this file is a day old. */
+const ago = (ms: number) => Date.now() - ms
+
 const DIR = '/opt/projects/supermux/server'
 
 function session(over: Partial<TileSession> & { name: string }): TileSession {
@@ -709,12 +714,39 @@ export function liveStates(nowMs: number): LiveState[] {
         name: RELEASE_TRAIN,
         display_name: 'Release Train',
         status: 'active',
-        activity: '⚡ cargo test --lib money',
-        subagents: 3,
+        // This state has an overlay, so the running RECEIPT takes the live slot
+        // and the clause is the header pill's — which reads the number, never
+        // the rows. The rows have their own bench in `fanout` below.
+        agents_live: 3,
       }),
       entries: release,
       turnAgo: 42,
       overlay,
+    },
+    {
+      // The FAN-OUT: a turn whose work is happening in children, which is the
+      // one thing this surface used to be unable to say. No overlay, so the
+      // working row itself renders (with an overlay the running receipt takes
+      // the live slot) — this is the bench for its `· N agents` control and the
+      // list it opens, at 390px with the composer up.
+      id: 'fanout',
+      title: 'Fan-out — the working row’s agent list (tap `· 4 agents`)',
+      board: 'P12 working row + subagent visibility §5',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        status: 'active',
+        activity: '🤖 Review the ledger rounding',
+        agents: [
+          { id: 'f1', type: 'general-purpose', label: '📖 ledger.rs', started_ms: ago(41_000), last_evidence_ms: ago(900) },
+          { id: 'f2', type: 'general-purpose', label: '⚡ cargo test --lib money', started_ms: ago(38_000), last_evidence_ms: ago(3_100) },
+          { id: 'f3', type: 'Explore', label: '🔍 round_half_even', started_ms: ago(22_000), last_evidence_ms: ago(12_400) },
+          // Inside one long command: the row dims and states the fact.
+          { id: 'f4', type: 'workflow-subagent', started_ms: ago(19_000), last_evidence_ms: ago(191_000) },
+        ],
+      }),
+      entries: release,
+      turnAgo: 42,
     },
     {
       id: 'provisional',
@@ -1556,6 +1588,7 @@ export const STATE_IDS = [
   'idle',
   'busy-header',
   'working',
+  'fanout',
   'provisional',
   'permission',
   'delegation',

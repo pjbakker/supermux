@@ -83,7 +83,7 @@ describe('the stack, top to bottom', () => {
     session: session({
       status: 'active',
       activity: '⚡ cargo check',
-      subagents: 3,
+      agents_live: 3,
       permission_request: { tool: 'Bash', summary: '⚡ cargo publish --dry-run', kind: 'bash' },
     }),
     turnStart: serverNowMs() - 12_000,
@@ -108,7 +108,7 @@ describe('the stack, top to bottom', () => {
     expect(out).toContain('cargo publish --dry-run') // the ask
     expect(out).toContain('Read') // a hook receipt
     expect(out).toContain('cargo check') // the call that is running
-    expect(out).toContain('3 subagents · 12s') // its clock, on the same line
+    expect(out).toContain('3 agents · 12s') // its clock, on the same line
   })
 
   /**
@@ -116,7 +116,7 @@ describe('the stack, top to bottom', () => {
    *
    * The overlay group and the working row are fed by the SAME `activity`, so
    * this frame used to draw one tool call twice — `••• cargo check 12s` in the
-   * group and `◌ cargo check · 3 subagents` on a pill directly under it (with
+   * group and `◌ cargo check · 3 agents` on a pill directly under it (with
    * the permission card above, the QA counted three). The group's last line is
    * the running call; it takes the clock, and there is no second row.
    */
@@ -270,12 +270,26 @@ describe('the working row’s first rung', () => {
     expect(text(rowAt(1_000))).toContain('Thinking…')
   })
 
-  test('the subagents clause survives the reskin', () => {
-    expect(text(rowAt(1_000, { activity: '⚡ tests', subagents: 3 }))).toContain(
-      'tests · 3 subagents',
+  test('the agents clause survives the reskin', () => {
+    // The working row is the one surface that counts the ROWS it can open, so
+    // its fixture hands it rows rather than `agents_live`.
+    const rows = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `a${i}`,
+        type: 'general-purpose',
+        started_ms: serverNowMs() - 9_000,
+        last_evidence_ms: serverNowMs() - 500,
+      }))
+    expect(text(rowAt(1_000, { activity: '⚡ tests', agents: rows(3) }))).toContain(
+      'tests · 3 agents',
     )
-    // One sub-agent is not parallelism worth a clause (A1 rule, unchanged).
-    expect(text(rowAt(1_000, { activity: '⚡ tests', subagents: 1 }))).not.toContain('subagents')
+    // One child is not parallelism worth a clause (A1 rule, unchanged).
+    expect(text(rowAt(1_000, { activity: '⚡ tests', agents: rows(1) }))).not.toContain('agents')
+    // …and a session with a pinned COUNT but no evidence-bearing rows says
+    // nothing at all — the ghost this change exists to kill.
+    expect(
+      text(rowAt(1_000, { activity: '⚡ tests', subagents: 5, agents: [] })),
+    ).not.toContain('agents')
   })
 })
 
