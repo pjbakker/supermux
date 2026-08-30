@@ -11,13 +11,16 @@ name: nightly
 #      90-second staleness clock (measured 126 s and 90 s in CI — 216 s of a
 #      569 s passing suite). They are correct, they are not flaky, and no test
 #      trick shortens a timer the product owns. They run here, every night.
-#   1b. `@quarantine` e2e specs — `chat-toggle-focus-leak` (180 s) and
-#      `chat-ws-restart-reseeds` (35 s). NOT the same thing as `@extended`:
-#      these are BROKEN, never observed green, red on main in run 32700541733
-#      and on every run since. They are here rather than on the PR gate because
-#      215 s per pull request re-proves a defect that is already known, and
-#      because a permanently-red gate teaches people to ignore the gate. A red
-#      nightly on these is the correct state until the tag comes off.
+#   1b. `@quarantine` e2e specs — EMPTY today; the lane stays armed. NOT the
+#      same thing as `@extended`: `@quarantine` marks a spec that is BROKEN and
+#      not yet diagnosed, parked here because a permanently-red PR gate teaches
+#      people to ignore the gate. Both entries the list has ever had are
+#      resolved: `chat-ws-restart-reseeds` left in the v0.6.1 fork integration
+#      (fixture fix), and `chat-toggle-focus-leak` (red since run 32700541733)
+#      turned out to be a STALE SPEC — it clicked the renderer switch on the
+#      desktop chat-active seam, a control that surface deliberately retired —
+#      and is a PR gate spec again now that it drives the seam's real
+#      affordances.
 #   2. The wide `install-smoke` matrix (debian-12 + ubuntu-22.04, and the
 #      `port-conflict` scenario) — see the WHY in `install-smoke.yml`, which
 #      carries its own `schedule:` trigger for exactly that reason.
@@ -43,11 +46,11 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch
         with:
           toolchain: stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -63,7 +66,7 @@ jobs:
       - name: Build the server binary
         working-directory: server
         run: cargo build --bin supermux-server
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: supermux-server-debug
           path: server/target/debug/supermux-server
@@ -80,17 +83,17 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.10
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: supermux-server-debug
           path: server/target/debug
       - name: Make the server binary executable
         run: chmod +x server/target/debug/supermux-server
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -98,7 +101,7 @@ jobs:
       - name: Install web deps
         working-directory: web
         run: bun install --frozen-lockfile
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('web/bun.lock') }}
@@ -116,7 +119,7 @@ jobs:
       - name: Full smoke suite (shard ${{ matrix.shard }}/4)
         working-directory: web
         run: bun x playwright test tests/e2e/smoke --shard=${{ matrix.shard }}/4 --grep-invert "@slow|@needs-claude"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: nightly-playwright-report-shard-${{ matrix.shard }}

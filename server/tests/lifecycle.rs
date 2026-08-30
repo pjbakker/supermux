@@ -40,6 +40,7 @@ async fn test_app() -> (axum::Router, std::path::PathBuf) {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: Default::default(),
+        swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -66,6 +67,7 @@ async fn new_state() -> (AppState, std::path::PathBuf) {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: Default::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
@@ -338,6 +340,36 @@ async fn start_nonexistent_returns_404() {
     let (status, _) = send(&app, Method::POST, "/api/sessions/ghost/start", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A session whose stored `dir` was deleted (a worktree removed, a project
+/// moved) used to fail ENOENT deep in the holder spawn and reach the user as a
+/// bare 500 "internal server error". The start must instead answer 400 with the
+/// path in it — the one fact the user can act on. No tmux gate: a local session
+/// defaults to the native runtime, and the probe returns before any spawn.
+#[tokio::test]
+async fn start_missing_dir_returns_clear_error() {
+    let (app, dir) = test_app().await;
+    let name = format!("nodir{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let missing = dir.join("gone").join(&name).display().to_string();
+
+    // Creating the session succeeds: the dir is only needed at start.
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "name": name, "provider": "shell", "dir": missing })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = send(&app, Method::POST, &format!("/api/sessions/{name}/start"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(err.contains(&missing), "the error must name the directory: {err}");
+    assert!(err.contains("does not exist"), "…and say it is missing: {err}");
+
+    teardown(&app, &name, dir).await;
 }
 
 /// `GET /peek` serves BOTH capture modes off one endpoint: the default

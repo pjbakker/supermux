@@ -244,20 +244,21 @@ impl SessionConfig {
     /// Wire the store's `connect(service)` tool into this bot's launch (spec §8
     /// step 2): add the `connect` MCP server to the SAME inline `--mcp-config`
     /// (under `--strict-mcp-config`) and allow-list `mcp__connect__connect` so the
-    /// call reaches the PreToolUse detector rather than being dropped. The server's
-    /// tool carries the `requiresUserInteraction` marker, so the call always stops
-    /// for the human and supermux raises the inline Connect card — the credential
-    /// never travels the tool. `emit` is [`crate::connectors::connect_server::emit`]
+    /// call reaches the PreToolUse detector rather than being dropped. The detector
+    /// raises the inline Connect card while the call itself returns at once — the
+    /// tool deliberately carries NO `requiresUserInteraction` marker (that would
+    /// force Claude Code's own terminal dialog, which chat cannot answer, and park
+    /// the bot). The credential never travels the tool, and the GRANT still needs a
+    /// human tap on the card. `emit` is [`crate::connectors::connect_server::emit`]
     /// (no env, no secret). Idempotent-ish: only added to already-active bots, so a
     /// plain pane never gets it.
     pub fn apply_connect_affordance(&mut self, emit: Value) {
         self.active = true;
         self.mcp_servers
             .insert(crate::connectors::connect_server::SERVER_KEY.to_string(), emit);
-        // Allow-list BOTH tools: the interactive `connect` (still stops for the human
-        // via its `requiresUserInteraction` marker) and the NON-interactive
-        // `list_connectors` (P2d — a plain read that auto-approves, never routed to
-        // the human).
+        // Allow-list BOTH tools so neither prompts in the terminal: `connect` (it
+        // raises the in-chat card via the PreToolUse detector and returns) and
+        // `list_connectors` (P2d — a plain read).
         for rule in ["mcp__connect__connect", "mcp__connect__list_connectors"] {
             let r = Value::String(rule.to_string());
             if !self.allow_rules.contains(&r) {
@@ -847,6 +848,7 @@ mod tests {
     async fn browser_state() -> (crate::state::AppState, PathBuf) {
         let dir = temp_dir();
         let config = crate::config::Config {
+            swarm_reaper: Default::default(),
             data_dir: dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             extra_binds: vec![],

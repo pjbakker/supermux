@@ -103,6 +103,10 @@ export interface SessionSummary {
   /** Epoch seconds when `last_send_text` was written. Absent iff
    *  `last_send_text` is absent. */
   last_send_at?: number
+  /** The Claude config dir this session boots on (server migration 0041).
+   *  Empty string / absent = the daemon default account. The tile renders its
+   *  last path segment as a small tag; see `configDirTag`. */
+  config_dir?: string
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,6 +269,10 @@ export interface ApiSession {
   created_at?: string
   /** Who created the session (server `SessionView.creator`). */
   creator?: string
+  /** The Claude config dir this session boots on (server migration 0041).
+   *  Empty string / absent = the daemon default account. The tile renders its
+   *  last path segment as a small tag; see `configDirTag`. */
+  config_dir?: string
   /** Free-text description (searchable). */
   desc?: string
   /** Tags (searchable). */
@@ -303,6 +311,11 @@ export interface ApiSession {
    *  instead of relaunching the agent. Omitted from the wire when false, so
    *  `get`/`list`/SSE rows never carry it — it is purely the PATCH advisory. */
   restart_required?: boolean
+  /** The disposable marker (migration 0025): archive this session the moment
+   *  it stops. Written by the workflows editor's "archive on stop" toggle
+   *  (stamped server-side via the workflows create/patch API) and by
+   *  disposable spawns on POST /api/sessions. */
+  archive_on_stop?: boolean
   /** Cross-device seen cursor (migration 0029) — server-clock **ms** at which
    *  this session was last read on ANY device, or null/absent for never seen.
    *  Merged newest-wins with the localStorage cursor in `use-attention.ts`;
@@ -416,8 +429,8 @@ export interface ApiSession {
    *  same `sessions` SSE delta (`null` clears). Every string in it is authored
    *  by the MCP server — see `components/chat/elicitation.ts`. */
   elicitation?: ElicitationAsk | null
-  /** **A bot's `connect(service)` tool is asking for a human** (the `_meta`
-   *  `requiresUserInteraction` marker reached the prompt). supermux renders the
+  /** **A bot's `connect(service)` tool is asking for a human** (the server's
+   *  PreToolUse detector saw the call; the tool itself does not stall). supermux renders the
    *  inline Connect card from this — a secure sign-in / API-key paste that POSTs
    *  straight to the vault, NEVER an MCP elicitation (spec forbids elicitation
    *  for secrets). Rides the same `sessions` SSE delta (`null` clears). The
@@ -468,6 +481,18 @@ export interface ApiSession {
  *  older payloads / optimistic rows that omit `display_name`. */
 export function displayLabel(s: { name: string; display_name?: string }): string {
   return s.display_name?.trim() ? s.display_name : s.name
+}
+
+/** The tile's account marker for a session's `config_dir`: the LAST path
+ *  segment, which is the part that names the account
+ *  (`/home/agent/.claude-second` -> `.claude-second`). Returns `null` when the
+ *  session has no config dir, which is the whole existing fleet, so the tile
+ *  renders nothing and takes no space. */
+export function configDirTag(configDir?: string): string | null {
+  const trimmed = configDir?.trim()
+  if (!trimmed) return null
+  const segments = trimmed.split('/').filter(Boolean)
+  return segments.length ? segments[segments.length - 1] : trimmed
 }
 
 /** The title for the big surfaces (overview tile + focus header). A user-set

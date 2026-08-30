@@ -714,6 +714,28 @@ pub async fn claim_run_key(
     Ok(res.rows_affected() > 0)
 }
 
+/// When the `(workflow_id, scheduled_for_ts)` key was claimed (unix seconds), or
+/// `None` when nobody ever claimed it.
+///
+/// A lost claim only tells the caller that SOMEONE holds the key; it does not
+/// say whether that holder is still alive. Since `next_run` is advanced by the
+/// holder alone, a key whose claimant died leaves the workflow due forever — so
+/// the tick needs to read the key back, not just fail to take it. `fired_at` has
+/// been written by [`claim_run_key`] since 0038 and was never read until now.
+pub async fn run_key_fired_at(
+    pool: &SqlitePool,
+    workflow_id: &str,
+    scheduled_for_ts: i64,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT fired_at FROM workflow_run_keys WHERE workflow_id = ? AND scheduled_for_ts = ?",
+    )
+    .bind(workflow_id)
+    .bind(scheduled_for_ts)
+    .fetch_optional(pool)
+    .await
+}
+
 // ── session cascades ────────────────────────────────────────────────────────
 //
 // `workflows.session` has NO foreign key (0038, deliberately — spec §2.4), so
@@ -852,6 +874,33 @@ pub async fn resync_company_ids(pool: &SqlitePool) -> sqlx::Result<u64> {
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+/// One archived `schedules` row from the 0038 port (`workflows_import_log`).
+/// `row_json` stays the raw TEXT here; the HTTP layer parses it for the reader.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct ImportLogRow {
+    pub old_id: String,
+    /// 1 = became a workflow, 0 = refused.
+    pub ported: i64,
+    /// '' when ported cleanly; else why not.
+    pub reason: String,
+    /// The complete pre-drop `schedules` row as JSON.
+    pub row_json: String,
+    pub at: i64,
+}
+
+/// The whole schedules-port archive, refused rows first (those are the ones a
+/// user must act on), then by drop time. The table is written exactly once, by
+/// migration 0038, and never grows — no pagination needed.
+pub async fn import_log(pool: &SqlitePool) -> sqlx::Result<Vec<ImportLogRow>> {
+    sqlx::query_as::<_, ImportLogRow>(
+        "SELECT old_id, ported, reason, row_json, at
+           FROM workflows_import_log
+          ORDER BY ported ASC, at ASC, old_id ASC",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 #[cfg(test)]

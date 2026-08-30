@@ -507,6 +507,7 @@ mod tests {
             HumanAuthConfig::default()
         };
         let config = Config {
+            swarm_reaper: Default::default(),
             data_dir: dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             extra_binds: vec![],
@@ -557,6 +558,7 @@ mod tests {
         assert!(human_auth.invite_enabled(), "the invite surface is live");
         assert!(human_auth.human_surface_active());
         let config = Config {
+            swarm_reaper: Default::default(),
             data_dir: dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             extra_binds: vec![],

@@ -167,36 +167,22 @@ pub async fn tick_once(state: &AppState) -> anyhow::Result<()> {
                 // long job, and it is carried over deliberately.
                 match db::workflows::claim_run_key(&state.pool, &wf.id, scheduled_for_ts).await {
                     Ok(true) => {
-                        let _ = db::workflows::insert_run(
-                            &state.pool,
-                            &wf.id,
-                            now.timestamp(),
-                            "tick",
-                            "skipped",
+                        skip_and_advance(
+                            state,
+                            &wf,
+                            now,
                             "missed window",
+                            "its fire window was missed",
                         )
                         .await;
-                        let next = engine::recompute_next(&wf, now);
-                        let _ = db::workflows::advance_next(&state.pool, &wf.id, next).await;
                         tracing::info!(workflow = %wf.id, "advanced past a missed window (not fired)");
-                        // Surface it — this path used to be log-only, i.e.
-                        // invisible. Company-stamped so the bot's own people see
-                        // it, not just the owner.
-                        let _ = state.sse_tx.send(SseEvent::for_company(
-                            "alerts",
-                            json!({
-                                "level": "info",
-                                "source": "workflows",
-                                "workflow": wf.id,
-                                "detail": format!(
-                                    "Skipped workflow '{}' — its fire window was missed",
-                                    wf.title
-                                ),
-                            }),
-                            wf.company_id,
-                        ));
                     }
-                    Ok(false) => {} // already handled — leave next_run to record_fire
+                    // The claim lost, so a key for THIS window already exists.
+                    // Usually that means a run holds it and `record_fire` owns
+                    // the advance — but a key whose claimant is gone wedges the
+                    // workflow forever, so this arm has to look before it walks
+                    // away.
+                    Ok(false) => sweep_if_stale(state, &wf, now, scheduled_for_ts).await,
                     Err(e) => tracing::warn!(workflow = %wf.id, error = %e, "missed-window claim failed"),
                 }
                 continue;
@@ -231,6 +217,109 @@ pub async fn tick_once(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Record a `skipped` run for a window the tick will not fire, advance the
+/// cadence past it, and say so out loud. Shared by the two missed-window exits:
+/// a genuinely missed window, and one wedged behind a dead run's fire-key.
+///
+/// `note` is the ledger note; `reason` is the half-sentence a human reads in the
+/// alert. The frame is COMPANY-STAMPED for the same reason every other emit in
+/// this module is — an unstamped alert is owner-only, and the people whose bot
+/// just skipped a beat are the ones who need to see it.
+async fn skip_and_advance(
+    state: &AppState,
+    wf: &Workflow,
+    now: DateTime<Utc>,
+    note: &str,
+    reason: &str,
+) {
+    let _ =
+        db::workflows::insert_run(&state.pool, &wf.id, now.timestamp(), "tick", "skipped", note)
+            .await;
+    let next = engine::recompute_next(wf, now);
+    let _ = db::workflows::advance_next(&state.pool, &wf.id, next).await;
+    let _ = state.sse_tx.send(SseEvent::for_company(
+        "alerts",
+        json!({
+            "level": "info",
+            "source": "workflows",
+            "workflow": wf.id,
+            "detail": format!("Skipped workflow '{}' — {reason}", wf.title),
+        }),
+        wf.company_id,
+    ));
+}
+
+/// A missed-window fire-key claim that was LOST: sweep the window when no live
+/// run can be holding the key.
+///
+/// `next_run` is only ever advanced by the run that claimed the key (in
+/// `record_fire`, from `engine::finish`). So a key whose claimant never gets
+/// there — the process died mid-run, or `engine::start` returned an error after
+/// the claim was already committed — leaves the workflow due on every later
+/// tick, losing the claim to its own orphan key, forever. The key is persisted,
+/// so a restart does not help; this was a production wedge ("last fired 22h ago,
+/// next fire 22h ago") and the upgrade in 0038 copied the legacy scheduler's
+/// keys over, orphans included.
+///
+/// The evidence that the claimant is gone is the RUN LEDGER, not the clock: a
+/// chain of up to [`MAX_STEPS_PER_WORKFLOW`] steps at [`DEFAULT_STEP_TIMEOUT`]
+/// each may legitimately hold its key for hours, so any age threshold big enough
+/// to be safe is too big to be useful. Two guards keep the inference honest:
+///
+/// 1. `running_for` is re-read here rather than trusted from the top of the tick
+///    — that check falls THROUGH on `Err`, and a run can have opened since;
+/// 2. `fired_at` must be older than [`MISSED_WINDOW`], which excludes the sliver
+///    between `claim_run_key` and the `open_run` inside `engine::start`.
+///
+/// On any uncertainty (a lookup error, a missing row) it logs and leaves the
+/// workflow alone: a wedged workflow is recoverable on the next tick, a spurious
+/// double-fire into a live pane is not.
+async fn sweep_if_stale(
+    state: &AppState,
+    wf: &Workflow,
+    now: DateTime<Utc>,
+    scheduled_for_ts: i64,
+) {
+    match db::workflows::running_for(&state.pool, &wf.id).await {
+        Ok(None) => {}
+        // A run is in flight: it holds the key and will advance the cadence.
+        Ok(Some(_)) => return,
+        Err(e) => {
+            tracing::warn!(workflow = %wf.id, error = %e, "stale fire-key: in-flight re-check failed");
+            return;
+        }
+    }
+    let fired_at = match db::workflows::run_key_fired_at(&state.pool, &wf.id, scheduled_for_ts).await
+    {
+        Ok(Some(ts)) => ts,
+        // Lost the claim but the row is gone — a cascade delete raced this tick.
+        Ok(None) => {
+            tracing::warn!(workflow = %wf.id, "fire-key claim lost but no key row found");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(workflow = %wf.id, error = %e, "fire-key age lookup failed");
+            return;
+        }
+    };
+    if now.timestamp() - fired_at <= MISSED_WINDOW.num_seconds() {
+        return; // young enough that a dispatch could still be on its way up
+    }
+    skip_and_advance(
+        state,
+        wf,
+        now,
+        "stale fire-key from a dead run",
+        "a previous run claimed this window and never finished",
+    )
+    .await;
+    tracing::warn!(
+        workflow = %wf.id,
+        fired_at,
+        "swept a stale fire-key: its run never advanced next_run",
+    );
+}
+
 // ── HTTP router ───────────────────────────────────────────────────────────────
 
 /// Build the workflows sub-router (no auth layer — applied by `http::router`).
@@ -252,6 +341,8 @@ pub fn router_for(state: AppState) -> Router {
         // (skills + user/managed commands + claude.ai MCP connectors — never
         // built-ins).
         .route("/api/workflows/commands", get(commands_handler))
+        // The 0038 schedules-port archive (owner/admin-only, like `/commands`).
+        .route("/api/workflows/import-log", get(import_log_handler))
         .route("/api/workflows/runs", get(all_runs_handler))
         .route(
             "/api/workflows/{id}",
@@ -354,6 +445,16 @@ pub struct CreateWorkflowInput {
     /// honoured, and `db::workflows::insert` re-derives it regardless.
     #[serde(default)]
     pub company_id: Option<i64>,
+    /// Archive the target session when it stops (migration 0025). NOT a
+    /// workflows column: the preference is stamped onto `sessions.
+    /// archive_on_stop` of the target session itself, the one place the stop
+    /// hook reads, so two workflows on one bot can never disagree about it.
+    /// `Some(v)` stamps `v`; absent leaves the session's marker untouched
+    /// (opt-in, default off, a fresh session row carries 0). The engine's
+    /// archive contract is unchanged: once the session archives itself, this
+    /// workflow reads as a readable SKIP ("paused until you unarchive").
+    #[serde(default)]
+    pub archive_on_stop: Option<bool>,
 
     // ── named ONLY so they can be refused with a sentence ──────────────────
     #[serde(default)]
@@ -496,7 +597,30 @@ pub async fn create(
     };
     let wf = db::workflows::insert(&state.pool, &wf).await?;
     let steps = db::workflows::replace_steps(&state.pool, &wf.id, &steps).await?;
+    stamp_archive_on_stop(state, &wf.session, input.archive_on_stop).await;
     Ok(db::workflows::WorkflowWithSteps { workflow: wf, steps })
+}
+
+/// Stamp the disposable marker (`sessions.archive_on_stop`, 0025) onto the
+/// workflow's target session, when the caller asked for it.
+///
+/// This is the workflows half of archive-on-stop, and deliberately the WHOLE
+/// half: the marker lives on the session row (the one place
+/// `lifecycle::maybe_archive_on_stop` reads), never on the workflow, so there
+/// is no second copy to drift. `None` touches nothing, so an old client that
+/// omits the field changes no behaviour. Best-effort: the workflow save
+/// already succeeded, and a marker on a row that vanished mid-request matches
+/// zero rows, which is logged rather than raised.
+async fn stamp_archive_on_stop(state: &AppState, session: &str, want: Option<bool>) {
+    let Some(on) = want else { return };
+    match db::sessions::set_archive_on_stop(&state.pool, session, on).await {
+        Ok(0) => tracing::warn!(
+            session,
+            "archive_on_stop stamp matched no session row; the marker was not written"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(session, error = %e, "archive_on_stop stamp failed"),
+    }
 }
 
 /// The per-step half of the funnel, shared by `create` and `PUT /{id}/steps`.
@@ -757,6 +881,11 @@ struct PatchInput {
     schedule_expr: Option<String>,
     #[serde(default)]
     on_complete: Option<serde_json::Value>,
+    /// Archive the target session when it stops (migration 0025): stamped onto
+    /// the SESSION row, exactly as on create; see `CreateWorkflowInput`.
+    /// `Some(false)` clears the marker, absent leaves it untouched.
+    #[serde(default)]
+    archive_on_stop: Option<bool>,
     // `session` and `company_id` are deliberately ABSENT rather than named: a
     // workflow cannot be reassigned to another bot (and therefore not to another
     // company) after it is created, and a client echoing back the object it just
@@ -828,6 +957,7 @@ async fn patch_handler(
         on_complete,
     };
     db::workflows::patch(&state.pool, &id, &patch).await?;
+    stamp_archive_on_stop(&state, &existing.session, input.archive_on_stop).await;
 
     let updated = db::workflows::get_with_steps(&state.pool, &id)
         .await?
@@ -906,11 +1036,19 @@ struct PreviewInput {
 /// excluded (a workflow step wants a skill/MCP, not `/clear`). Backed by the
 /// same filesystem read the Claude-tools registry uses — one source of truth.
 ///
-/// Moved from `scheduler::commands_handler` unchanged.
+/// Moved from `scheduler::commands_handler` — and, like its `/api/schedules`
+/// predecessor, **owner/admin-only**: the digest is a projection of the
+/// admin-gated claude-tools registry (global skills / commands / MCP connector
+/// names), and `?cwd=` points the filesystem read at an arbitrary directory.
+/// `member_may_reach` already denies the route (outer fence); this in-handler
+/// gate is the defense-in-depth half, same shape as the companies wizard
+/// endpoints. A member gets the uniform 404.
 async fn commands_handler(
     State(state): State<AppState>,
+    OptCtx(ctx): OptCtx,
     Query(q): Query<CommandsQuery>,
 ) -> Result<Json<Envelope<Vec<crate::claude_tools::registry::InstalledCommand>>>, AppError> {
+    crate::scope::require_admin(ctx.as_ref(), "/api/workflows/commands")?;
     let cwd = q.cwd.as_deref().filter(|s| !s.is_empty());
     Ok(ok(crate::claude_tools::registry::installed_commands(&state, cwd).await?))
 }
@@ -921,6 +1059,39 @@ struct CommandsQuery {
     /// commands are included alongside the global ones.
     #[serde(default)]
     cwd: Option<String>,
+}
+
+/// `GET /api/workflows/import-log` — the 0038 schedules-port archive, the real
+/// destination behind [`port`]'s `/settings#imported-schedules` notification.
+/// Migration 0038 dropped the `schedules` table irreversibly; every pre-drop row
+/// lives on in `workflows_import_log`, and this endpoint is the app's only way
+/// to read them back (a refused shell job's command line included, so the user
+/// can rebuild it by hand). Owner/admin-only — the archive is global,
+/// pre-company data.
+///
+/// Each entry carries the raw columns plus `row` — `row_json` parsed — so no
+/// client has to double-decode. `ported` is surfaced as a bool.
+async fn import_log_handler(
+    State(state): State<AppState>,
+    OptCtx(ctx): OptCtx,
+) -> Result<Json<Envelope<serde_json::Value>>, AppError> {
+    crate::scope::require_admin(ctx.as_ref(), "/api/workflows/import-log")?;
+    let rows = db::workflows::import_log(&state.pool).await?;
+    let data: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            let row: serde_json::Value =
+                serde_json::from_str(&r.row_json).unwrap_or(serde_json::Value::Null);
+            json!({
+                "old_id": r.old_id,
+                "ported": r.ported != 0,
+                "reason": r.reason,
+                "row": row,
+                "at": r.at,
+            })
+        })
+        .collect();
+    Ok(ok(serde_json::Value::Array(data)))
 }
 
 // ── run now, cancel, and the run ledger ───────────────────────────────────────

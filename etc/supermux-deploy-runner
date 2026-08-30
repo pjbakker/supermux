@@ -38,11 +38,16 @@
 #      live in their home; running as that user outside the supermux unit
 #      means no sandbox restrictions apply, so vendored-OpenSSL's `make`
 #      works fine),
-#   3. back up the currently-installed binary,
-#   4. install the freshly-built binary (atomic),
-#   5. systemctl restart the unit,
-#   6. verify is-active + loopback /api/health; ROLL BACK to the backup and
-#      restart if it does not come up — a bad build can never leave prod down.
+#   3. stop the unit and snapshot data.db (+ -wal/-shm) — migrations are a
+#      ONE-WAY DOOR (the previous binary refuses a migrated DB with sqlx
+#      VersionMissing, and migrations may DROP tables), so this snapshot is
+#      the ONLY way back; a deploy that cannot take it is ABORTED,
+#   4. back up the currently-installed binary,
+#   5. install the freshly-built binary (atomic),
+#   6. systemctl start the unit,
+#   7. verify is-active + loopback /api/health; ROLL BACK to the backup —
+#      binary AND DB snapshot — and restart if it does not come up: a bad
+#      build can never leave prod down OR bricked on a half-migrated DB.
 #   All output is teed to __DATA_DIR__/deploy/log and a final DEPLOY_RESULT=
 #   line + a status file are written (chowned to the service user) so the
 #   unprivileged agent can read the outcome after the restart blip.
@@ -387,9 +392,114 @@ ensure_network_up() {
   harden_host_reachability
 }
 
+# ── DB snapshot + restore (the way back through the migration one-way door) ──
+# The previous binary will NOT run on a migrated data.db: sqlx fails with
+# VersionMissing on unknown migration rows, and destructive migrations (0038
+# dropped a whole table) leave nothing to fall back on. So a binary-only
+# rollback after a migrating deploy bricks the service. The snapshot below is
+# taken while the unit is STOPPED — with no writer, a plain copy of data.db +
+# -wal + -shm is a consistent sqlite snapshot with zero tooling on the host —
+# and rollback() restores it alongside the previous binary.
+DB="$DATA_DIR/data.db"
+DB_SNAPSHOT_ROOT="$REQ_DIR/db-backups"
+DB_SNAPSHOT_KEEP=5
+DB_SNAPDIR=""          # set by snapshot_db when a snapshot was actually taken
+DB_WAS_PRESENT=0
+
+snapshot_db() {
+  if [ ! -f "$DB" ]; then
+    log "no $DB yet (first install) — nothing to snapshot"
+    return 0
+  fi
+  DB_WAS_PRESENT=1
+  local ts dir f suffix=""
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  dir="$DB_SNAPSHOT_ROOT/${ts}-${SHA:0:12}"
+  # Root-owned, 0700: the unprivileged agents must never be able to tamper
+  # with (or delete) the only way back.
+  install -d -m 0700 -o root -g root "$DB_SNAPSHOT_ROOT" "$dir" || return 1
+  for f in "$DB" "$DB-wal" "$DB-shm"; do
+    [ -f "$f" ] || continue
+    cp -p "$f" "$dir/$(basename "$f")" || { rm -rf "$dir"; return 1; }
+  done
+  # The main file must have copied byte-for-byte — a short copy (disk full)
+  # is worse than no snapshot because it LOOKS like a way back.
+  cmp -s "$DB" "$dir/data.db" || { rm -rf "$dir"; return 1; }
+  DB_SNAPDIR="$dir"
+  [ -f "$DB-wal" ] && suffix=" +wal"
+  [ -f "$DB-shm" ] && suffix="$suffix +shm"
+  log "snapshotted data.db$suffix -> $dir ($(du -sh "$dir" 2>/dev/null | cut -f1))"
+  prune_db_snapshots
+  return 0
+}
+
+prune_db_snapshots() {
+  # Keep the newest $DB_SNAPSHOT_KEEP snapshots. The dir names start with a
+  # UTC timestamp, so lexical sort IS chronological; never touch the one we
+  # just took. Best-effort — pruning must never fail a deploy.
+  local d n=0
+  for d in $(ls -1d "$DB_SNAPSHOT_ROOT"/*/ 2>/dev/null | sort -r); do
+    d="${d%/}"
+    n=$((n+1))
+    [ "$n" -le "$DB_SNAPSHOT_KEEP" ] && continue
+    [ "$d" = "$DB_SNAPDIR" ] && continue
+    rm -rf "$d" 2>/dev/null && log "pruned old DB snapshot $(basename "$d") (keeping newest $DB_SNAPSHOT_KEEP)"
+  done
+}
+
+restore_db() {
+  # Called from rollback() AFTER the previous binary is back in place. The
+  # restored files keep their snapshot ownership (cp -p as root), with an
+  # explicit chown as belt-and-suspenders — a root-owned data.db would leave
+  # the service up but unable to write.
+  local f
+  if [ -n "$DB_SNAPDIR" ]; then
+    rm -f "$DB" "$DB-wal" "$DB-shm"
+    for f in data.db data.db-wal data.db-shm; do
+      [ -f "$DB_SNAPDIR/$f" ] || continue
+      if ! cp -p "$DB_SNAPDIR/$f" "$DATA_DIR/$f"; then
+        log "CRITICAL: failed to restore $f from $DB_SNAPDIR — restore it by hand before restarting"
+        return 1
+      fi
+      chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/$f" 2>/dev/null || true
+    done
+    log "restored data.db from snapshot $DB_SNAPDIR (the previous binary refuses a migrated DB)"
+  elif [ "$DB_WAS_PRESENT" = "0" ] && [ -f "$DB" ]; then
+    # No DB existed before this deploy; the failed NEW binary created one at
+    # the NEW migration level, which the previous binary refuses
+    # (VersionMissing). It is seconds old and holds nothing the operator ever
+    # saw — remove it so the previous binary re-creates its own.
+    rm -f "$DB" "$DB-wal" "$DB-shm"
+    log "removed the data.db the failed new binary created (pre-deploy state had none)"
+  fi
+  return 0
+}
+
 step installing "Installing the new binary and restarting the service."
 
-# ── 1. back up the current binary (if any) so we can roll back ────────────────
+# ── 1. stop the service so nothing writes the DB during the snapshot ──────────
+# The old single `systemctl restart` after install becomes stop → snapshot →
+# install → start: the same stop/start pair, with the snapshot in the gap.
+# Costs about a second of extra downtime for a typical DB.
+WAS_ACTIVE=0
+if systemctl is-active --quiet "$UNIT"; then WAS_ACTIVE=1; fi
+if [ "$WAS_ACTIVE" = "1" ]; then
+  log "systemctl stop $UNIT (for a consistent DB snapshot)"
+  systemctl stop "$UNIT" || true
+fi
+
+# ── 2. snapshot the DB — ABORT the deploy if it cannot be taken ───────────────
+if ! snapshot_db; then
+  # Deploying without a snapshot is exactly the bricking risk this closes:
+  # nothing has been installed yet, so put the old binary's service back up
+  # and stop here.
+  if [ "$WAS_ACTIVE" = "1" ]; then
+    systemctl start "$UNIT" 2>/dev/null || true
+  fi
+  fail "DB snapshot of $DB failed (disk full? permissions?) — deploy ABORTED before touching the binary; the service was restarted on the current version"
+fi
+
+# ── 3. back up the current binary (if any) so we can roll back ────────────────
 if [ -f "$DEST" ]; then
   install -m 0755 -o root -g root "$DEST" "$BACKUP"
   log "backed up current binary -> $BACKUP"
@@ -398,7 +508,7 @@ else
   log "no existing $DEST to back up (first install)"
 fi
 
-# ── 2. install the freshly-built binary (atomic via install(1)) ───────────────
+# ── 4. install the freshly-built binary (atomic via install(1)) ───────────────
 install -m 0755 -o root -g root "$SRC" "$DEST" || fail "install of new binary failed"
 log "installed new binary -> $DEST ($(du -h "$DEST" | cut -f1))"
 
@@ -407,9 +517,9 @@ log "installed new binary -> $DEST ($(du -h "$DEST" | cut -f1))"
 # rolled back to the previous binary, leaving the file describing a commit that
 # is not actually running. See the success block after verify.
 
-# ── 3. restart the service ────────────────────────────────────────────────────
-log "systemctl restart $UNIT"
-systemctl restart "$UNIT"
+# ── 5. start the service ──────────────────────────────────────────────────────
+log "systemctl start $UNIT"
+systemctl start "$UNIT"
 
 # ── 4. verify is-active + health; roll back on failure ────────────────────────
 rollback() {
@@ -417,13 +527,22 @@ rollback() {
   if [ -f "$BACKUP" ]; then
     install -m 0755 -o root -g root "$BACKUP" "$DEST"
     log "restored previous binary from $BACKUP"
+    # The DB must travel back WITH the binary: if the new build migrated it,
+    # the restored binary would refuse to start (VersionMissing) — the exact
+    # bricking this rollback exists to prevent.
+    restore_db || true
   else
-    log "no backup to restore (was a first install) — leaving binary in place"
+    log "no backup to restore (was a first install) — leaving binary + DB in place"
   fi
   # Only ever restart the supermux SERVICE — never the network/host. And make
   # sure tailscaled/sshd are up (recovery-only start, no-op if already active)
   # so a rollback can never leave the box stranded.
   ensure_network_up
+  # A crash-looping new binary (Restart=always, RestartSec=2) can trip the
+  # unit's start-rate limit during the verify window, and a start-limit-hit
+  # unit refuses even a manual restart — clear it or this rollback restart
+  # is a guaranteed no-op exactly when it matters.
+  systemctl reset-failed "$UNIT" 2>/dev/null || true
   systemctl restart "$UNIT" || true
   sleep 2
   if systemctl is-active --quiet "$UNIT" && health_ok; then

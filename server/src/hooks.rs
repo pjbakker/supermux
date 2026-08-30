@@ -221,20 +221,92 @@ async fn hook_handler(
     // an arbitrary JSON Schema, which `elicitation::parse` reads structurally
     // rather than through a fixed struct.
     let raw_payload = body.payload.unwrap_or(Value::Null);
-    apply_payload(&state, &body.session, &body.event, &raw_payload);
+
+    // Is this POST the LEAD's own event, or one fired by an in-process teammate
+    // running under the same pane token? Decided ONCE per POST (the predicate is
+    // read twice below).
+    //
+    // Gated on the EVENT as well as on `agent_type`, and both halves matter.
+    // `foreign_agent` is consumed in exactly three places — the lifecycle gate
+    // and the `user_prompt` arm inside `apply_payload`, and the pointer gate
+    // below — all of which are `is_lifecycle_event` or `is_pointer_event`. The
+    // `agent_type` half alone would NOT keep this off the hot path: since the
+    // per-agent rows landed, every child tool hook (`pre_tool`, `post_tool`,
+    // `subagent_*`) carries an `agent_type` beside its `agent_id` — that is what
+    // `touch_agent_row` reads — so a subagent-heavy turn would pay an extra
+    // indexed SELECT per tool call on a `--max-time 1` request, for a value
+    // those events can never consume.
+    let foreign_agent = if (is_lifecycle_event(&body.event) || is_pointer_event(&body.event))
+        && has_agent_type(&raw_payload)
+    {
+        let tracked = db::sessions::cc_conversation_id(&state.pool, &body.session)
+            .await
+            .ok()
+            .flatten();
+        is_foreign_agent_payload(&raw_payload, tracked.as_deref())
+    } else {
+        false
+    };
+
+    apply_payload(&state, &body.session, &body.event, &raw_payload, foreign_agent);
 
     // A live agent file-write becomes a `files` SSE frame, so a file a bot
     // wrote seconds ago appears in the Files surface without a reload. Only the
     // qualifying subset of PostToolUse pays the extra indexed SELECT (every hook
     // already pays one for `verify_hook_token`).
+    //
+    // Stays AFTER `apply_payload`, as on main: a file-writing PostToolUse must
+    // publish its `sessions` activity delta before the `files` frame, or a
+    // client sees the file appear on a session that still looks idle.
     emit_agent_file_write(&state, &body.session, &body.event, &raw_payload).await;
 
-    if is_pointer_event(&body.event) {
+    // NEVER follow the pointer for an in-process teammate's own SessionStart OR
+    // UserPromptSubmit: those payloads carry the TEAMMATE's session id, so
+    // following one would point the lead's recall (and the chat tailer) at the
+    // subagent's transcript. A teammate fires UserPromptSubmit every time the
+    // lead messages it, so gating only the lifecycle events would leave the same
+    // corruption wide open. This complements `attribute_pointer`'s pane truth
+    // table, which cannot help here: an IN-PROCESS teammate fires from the
+    // lead's own pane, so pane attribution would Adopt its id.
+    //
+    // ...EXCEPT on a payload that ANNOUNCES a conversation switch. `foreign_agent`
+    // is `session_id != cc_conversation_id`, and `track_conversation_pointer` is
+    // the ONLY writer of `cc_conversation_id` — so on an `--agent` lead (which
+    // carries `agent_type` on its OWN payloads, see `is_foreign_agent_payload`)
+    // the gate above was self-latching: the first `/clear` moved Claude to a new
+    // conversation, the new id read as a teammate's, the pointer was never
+    // followed, and every later event compared against the SAME frozen id. The
+    // session then tailed a dead transcript forever ("chat empty" / stale recall)
+    // and its real SessionEnd never forced Stopped. There is no self-heal:
+    // `clear_stale_resume_link` only rescues a pointer whose FILE is gone, and
+    // `/clear` leaves the old transcript on disk.
+    //
+    // `source` is the field that separates the two cases, and it is Claude's own:
+    // an in-process teammate's SessionStart is `"source":"startup"` (captured
+    // shape in `is_foreign_agent_payload`), while only the pane's REAL agent can
+    // report `clear` or `resume`. `compact` is deliberately NOT here: compaction
+    // keeps the same file and the same `sessionId` (see
+    // `track_conversation_pointer`), so it needs no pointer move — and admitting
+    // it would re-open the teammate hole for a teammate that auto-compacts.
+    //
+    // Residual, accepted: a claude restarted BY HAND inside the pane reports
+    // `source:"startup"` with a fresh id and stays frozen. Narrowing that needs
+    // pane truth we do not have here.
+    if is_pointer_event(&body.event) && (!foreign_agent || announces_conversation_switch(&raw_payload))
+    {
         let id = raw_payload
             .get("session_id")
             .or_else(|| raw_payload.get("sessionId"))
             .and_then(Value::as_str);
         track_conversation_pointer(&state, &body.session, &body.pane, id).await;
+    } else if is_pointer_event(&body.event) {
+        // The drop that used to be silent. A frozen pointer is invisible in every
+        // surface it breaks, so it must leave one line behind.
+        tracing::debug!(
+            session = %body.session,
+            event = %body.event,
+            "hook: pointer not followed (payload attributed to an in-process teammate)",
+        );
     }
 
     // Re-tick the detector now so the status (e.g. Notification → waiting,
@@ -558,12 +630,43 @@ fn touch_agent_row(state: &AppState, session: &str, payload: &HookPayload) -> bo
 /// when the activity/error actually changed (change-only). Pure
 /// dispatch on the wire `event` token (accepts both the snake_case form supermux
 /// emits and Claude's PascalCase). NOTHING here is persisted to disk/DB.
-fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
+/// `foreign_agent` is [`is_foreign_agent_payload`], decided once by the caller:
+/// true when this payload was fired by an in-process TEAMMATE session rather
+/// than by the lead itself.
+fn apply_payload(
+    state: &AppState,
+    session: &str,
+    event: &str,
+    raw: &Value,
+    foreign_agent: bool,
+) {
     // The typed view of the same bytes, deserialized BY REFERENCE so nothing is
     // cloned. Both are needed: every arm but the elicitation pair reads named
     // fields, and `requested_schema` is an arbitrary JSON Schema that no fixed
     // struct can hold.
     let payload = &HookPayload::deserialize(raw).unwrap_or_default();
+
+    // An in-process teammate's OWN lifecycle is not the lead's. Since Claude Code
+    // 2.1.232 a named subagent in a session with agent teams enabled runs as a
+    // teammate with its own Claude session, and its SessionStart/SessionEnd hooks
+    // fire under the PARENT pane's `$SUPERMUX_SESSION` token. `TaskStop` on such a
+    // teammate emits `SessionEnd` (reason "other"), which used to force the LEAD
+    // Stopped mid-turn (and ring the crash notification for a session that never
+    // died). Ignore those events entirely here.
+    if foreign_agent && is_lifecycle_event(event) {
+        // Logged at info: a dropped lifecycle event is invisible in the UI (the
+        // lead simply keeps its status), so a misclassified LEAD event would be
+        // undiagnosable without this line.
+        tracing::info!(
+            name = %session,
+            event = %event,
+            payload_session_id = payload.session_id.as_deref().unwrap_or(""),
+            agent_type = payload.agent_type.as_deref().unwrap_or(""),
+            "ignoring lifecycle hook from an in-process teammate"
+        );
+        return;
+    }
+
     let changed = match event {
         // A tool call started → set the live activity label (`✎ tile.tsx`, …).
         // A payload with no tool name yields no label → leave activity as-is.
@@ -599,20 +702,22 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
             } else {
                 false
             };
-            // The store's `connect(service)` affordance (spec §8): its descriptor
-            // carries `requiresUserInteraction`, so Claude routes it to the human
-            // prompt and the turn stops. Recognise it here and raise the inline
-            // Connect card via `session.connect_request` (the credential never
-            // touches this plane — the card POSTs it straight to the vault).
+            // The store's `connect(service)` affordance (spec §8). This hook is the
+            // ONLY thing that raises the card: the tool itself is allow-listed and
+            // marker-free (it must NOT stop the turn — chat cannot answer Claude's
+            // terminal permission dialog), so it returns while the human answers
+            // here. The credential never touches this plane — the card POSTs it
+            // straight to the vault.
             let connect = match connect_ask::parse(payload) {
                 Some(ask) => state.set_connect_request(session, ask),
                 None => false,
             };
             // The Shared Browser connector's `request_human_takeover(reason)`
-            // affordance — the same `requiresUserInteraction` shape, so the call
-            // stops for the human here too. Raise the in-chat "take the wheel"
-            // card via `session.browser_takeover`; the takeover panel it opens
-            // is what actually drives the page.
+            // affordance. Unlike `connect` above, this one DOES keep the
+            // `requiresUserInteraction` marker and parks the call: the stall IS
+            // the drive lock, so the agent cannot touch the page while the human
+            // has the wheel. Raise the in-chat "take the wheel" card via
+            // `session.browser_takeover`; the panel it opens drives the page.
             let takeover = match takeover_ask::parse(payload, session) {
                 Some(ask) => state.set_browser_takeover(session, ask),
                 None => false,
@@ -796,8 +901,12 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
         }
         // A new prompt / a fresh session → the previous error is no longer
         // current (the user is acting again) → clear it, and reset the subagent
-        // count for the new turn.
-        "user_prompt" | "user_prompt_submit" | "UserPromptSubmit" => {
+        // count for the new turn. All three effects are LEAD state, so a
+        // teammate's own UserPromptSubmit (fired every time the lead messages it)
+        // must not run them: it would wipe the lead's error badge, zero its
+        // outstanding subagent count mid-turn and dismiss a permission ask the
+        // lead is still sitting on.
+        "user_prompt" | "user_prompt_submit" | "UserPromptSubmit" if !foreign_agent => {
             let err = state.clear_error(session);
             let sub = state.reset_subagents(session);
             // Rows follow the same edge as the count, with one deliberate
@@ -907,6 +1016,84 @@ fn apply_payload(state: &AppState, session: &str, event: &str, raw: &Value) {
     }
 }
 
+/// True when `event` is one of Claude's session LIFECYCLE events (the ones whose
+/// `apply_payload` arms touch the lead's forced status / turn state). Paired with
+/// [`is_foreign_agent_payload`] this is the "teammate lifecycle" guard; tool and
+/// turn events from a teammate are deliberately NOT filtered, so they still count
+/// toward the pane's live activity.
+fn is_lifecycle_event(event: &str) -> bool {
+    matches!(
+        event,
+        "session_start" | "SessionStart" | "session_end" | "SessionEnd"
+    )
+}
+
+/// A payload string field, trimmed to `None` when absent or blank. Read off the
+/// RAW value rather than the typed [`HookPayload`], so the teammate check in the
+/// handler costs no second deserialize on the hot POST path.
+fn payload_str<'a>(raw: &'a Value, key: &str) -> Option<&'a str> {
+    raw.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// True when `raw` carries a non-empty `agent_type` (whitespace counts as
+/// absent). The cheap first half of [`is_foreign_agent_payload`], used to skip the
+/// tie-breaker DB read on the common path.
+fn has_agent_type(raw: &Value) -> bool {
+    payload_str(raw, "agent_type").is_some()
+}
+
+/// A hook payload belongs to an in-process teammate (not the lead) when it carries
+/// a non-empty `agent_type` AND its `session_id` is not the lead's own tracked
+/// conversation id.
+///
+/// A teammate shares the pane's `$SUPERMUX_SESSION` (and therefore the hook
+/// token), so its events are indistinguishable by transport. Captured shapes:
+///   start: {"session_id":"<teammate>","agent_type":"general-purpose","hook_event_name":"SessionStart","source":"startup"}
+///   end:   {"session_id":"<teammate>","agent_type":"general-purpose","hook_event_name":"SessionEnd","reason":"other"}
+///
+/// `agent_type` alone is NOT enough: Claude sets it from the MAIN-THREAD agent
+/// type, so a lead launched with `claude --agent <name>` (or with `"agent"` in
+/// settings.json) also carries it on its own lifecycle payloads. Masking those
+/// would leave a zombie row: no forced Stopped, no teardown, forever. The lead's
+/// tracked id (`sessions.cc_conversation_id`) is the tie-breaker; when nothing is
+/// tracked yet the payload is accepted as the lead's (first contact establishes
+/// the id), so an `--agent` lead self-heals on its first SessionStart /
+/// UserPromptSubmit.
+/// Does this payload ANNOUNCE that the pane's agent moved to a new conversation
+/// file? `SessionStart` carries Claude's own `source`, and only the real agent in
+/// the pane can report these two:
+///   * `clear` — the human typed `/clear`; Claude opened a new transcript;
+///   * `resume` — a terminal-side `--resume` switched files.
+///
+/// `startup` is EXCLUDED because that is exactly what an in-process teammate
+/// fires, and `compact` because compaction does not change the file or the id
+/// (admitting it would let a compacting teammate steal the lead's pointer).
+fn announces_conversation_switch(raw: &Value) -> bool {
+    matches!(payload_str(raw, "source"), Some("clear") | Some("resume"))
+}
+
+fn is_foreign_agent_payload(raw: &Value, tracked_cc_id: Option<&str>) -> bool {
+    if !has_agent_type(raw) {
+        return false;
+    }
+    // Same camelCase tolerance the typed `session_id` field carries.
+    let sid = payload_str(raw, "session_id").or_else(|| payload_str(raw, "sessionId"));
+    let tracked = tracked_cc_id.map(str::trim).filter(|t| !t.is_empty());
+    match (sid, tracked) {
+        // Both known: the lead's own id is the lead's own event.
+        (Some(sid), Some(tracked)) => sid != tracked,
+        // Nothing tracked yet: give the payload to the lead so it can establish
+        // its id (an `--agent` lead would otherwise be masked forever).
+        (_, None) => false,
+        // A tracked lead id exists and this payload names no session at all, so it
+        // demonstrably is not the lead's own conversation.
+        (None, Some(_)) => true,
+    }
+}
+
 /// Did this `SessionEnd` represent a death the user did NOT cause?
 ///
 /// `clear` / `logout` / `prompt_input_exit` / `exit` are the human at the
@@ -961,6 +1148,29 @@ fn force_stopped(state: &AppState, session: &str) {
             company_id: None,
             payload: json!({ "delta": [{ "name": session, "status": Status::Stopped.as_str() }] }),
         });
+        // AFTER the status flip: SessionEnd means the lead agent is exiting right
+        // now, so capture its pid while it is still the pane's foreground job and
+        // let the teardown task wait out its death and reap the team's tmux
+        // server. This forks tmux, and the tile flip must not wait on that; the
+        // agent takes far longer than these few ms to actually leave the pane, and
+        // the teardown polls for its death anyway.
+        //
+        // This runs BEFORE the archive below on purpose: archiving kills the pane,
+        // and `lead_pid_of` reads the pane's foreground pgid — once the pane is
+        // gone there is no pid left to hand the teardown, and the team's tmux
+        // server would leak exactly on the disposable sessions that churn most.
+        if crate::sessions::swarm::teardown_enabled(&state) {
+            if let Ok(rt) = state.runtime_for(&session).await {
+                if let Some(pid) = crate::sessions::swarm::lead_pid_of(rt.as_ref()).await {
+                    crate::sessions::swarm::spawn_teardown_for_lead(pid);
+                }
+            }
+        }
+        // Disposable (archive_on_stop) sessions archive themselves when their
+        // agent ends. Guarded upstream in `apply_payload`: a foreign (teammate)
+        // SessionEnd never reaches `force_stopped`, so it can never archive the
+        // lead's live session.
+        crate::sessions::lifecycle::maybe_archive_on_stop(&state, &session).await;
     });
 }
 
@@ -1057,6 +1267,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -1119,6 +1330,8 @@ mod tests {
                 runtime: "native".to_string(),
                 model: String::new(),
                 company_id: Some(company.id),
+                archive_on_stop: false,
+                config_dir: String::new(),
             },
         )
         .await
@@ -1195,8 +1408,8 @@ mod tests {
         let s = "lead-3";
         let mut rx = state.sse_tx.subscribe();
 
-        apply_payload(&state, s, "subagent_start", &p("{}"));
-        apply_payload(&state, s, "subagent_start", &p("{}"));
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
 
         let mut last_count: Option<i64> = None;
         while let Ok(ev) = rx.try_recv() {
@@ -1235,6 +1448,7 @@ mod tests {
             "child",
             "pre_tool",
             &p(r#"{"agent_id":"a1","agent_type":"general-purpose","tool_name":"Bash","tool_input":{"command":"echo hi","description":"x"}}"#),
+            false,
         );
         let rows = state.agent_rows_now("child");
         assert_eq!(rows.len(), 1, "one child hook → exactly one row");
@@ -1252,6 +1466,7 @@ mod tests {
             "main",
             "pre_tool",
             &p(r#"{"tool_name":"Bash","tool_input":{"command":"echo hi","description":"x"}}"#),
+            false,
         );
         assert!(
             state.agent_rows_now("main").is_empty(),
@@ -1278,19 +1493,19 @@ mod tests {
         let now = Instant::now();
         let now_ms = WALL;
 
-        apply_payload(&state, s, "subagent_start", &p(r#"{"agent_id":"a1","agent_type":"Explore"}"#));
-        apply_payload(&state, s, "subagent_start", &p(r#"{"agent_id":"a2","agent_type":"Explore"}"#));
+        apply_payload(&state, s, "subagent_start", &p(r#"{"agent_id":"a1","agent_type":"Explore"}"#), false);
+        apply_payload(&state, s, "subagent_start", &p(r#"{"agent_id":"a2","agent_type":"Explore"}"#), false);
         assert_eq!(state.agent_rows(s, now, now_ms).len(), 2);
         assert_eq!(subagents(&state, s), 2);
 
-        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#));
+        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#), false);
         let ids: Vec<_> = state.agent_rows(s, now, now_ms).into_iter().map(|r| r.id).collect();
         assert_eq!(ids, vec!["a2".to_string()], "only the stopped child leaves");
         assert_eq!(subagents(&state, s), 1);
 
         // The SAME stop again: a no-op for the row (there is nothing left to
         // remove), while the count decrements again exactly as it always has.
-        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#));
+        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#), false);
         let ids: Vec<_> = state.agent_rows(s, now, now_ms).into_iter().map(|r| r.id).collect();
         assert_eq!(ids, vec!["a2".to_string()], "the second stop changes nothing");
         assert_eq!(subagents(&state, s), 0, "the count still drains as it did before");
@@ -1302,6 +1517,7 @@ mod tests {
             s,
             "post_tool",
             &p(r#"{"agent_id":"a1","agent_type":"Explore","tool_name":"Read","tool_input":{"file_path":"/x/y.rs"}}"#),
+            false,
         );
         let ids: Vec<_> = state.agent_rows(s, now, now_ms).into_iter().map(|r| r.id).collect();
         assert_eq!(ids, vec!["a2".to_string()], "a stop is final for that id");
@@ -1398,10 +1614,10 @@ mod tests {
         // The wiring half, on the real clock: the `UserPromptSubmit` arm runs the
         // prune (the finished child goes) without touching the live one.
         let w = "wired";
-        apply_payload(&state, w, "subagent_start", &p(r#"{"agent_id":"live","agent_type":"Explore"}"#));
-        apply_payload(&state, w, "subagent_start", &p(r#"{"agent_id":"done","agent_type":"Explore"}"#));
-        apply_payload(&state, w, "subagent_stop", &p(r#"{"agent_id":"done"}"#));
-        apply_payload(&state, w, "user_prompt", &p("{}"));
+        apply_payload(&state, w, "subagent_start", &p(r#"{"agent_id":"live","agent_type":"Explore"}"#), false);
+        apply_payload(&state, w, "subagent_start", &p(r#"{"agent_id":"done","agent_type":"Explore"}"#), false);
+        apply_payload(&state, w, "subagent_stop", &p(r#"{"agent_id":"done"}"#), false);
+        apply_payload(&state, w, "user_prompt", &p("{}"), false);
         let ids: Vec<_> = state.agent_rows_now(w).into_iter().map(|r| r.id).collect();
         assert_eq!(ids, vec!["live".to_string()], "the prompt arm prunes the finished child");
 
@@ -1429,6 +1645,7 @@ mod tests {
                 &p(&format!(
                     r#"{{"agent_id":"a{i}","agent_type":"general-purpose","tool_name":"Bash","tool_input":{{"description":"d{i}"}}}}"#
                 )),
+                false,
             );
         }
         let rows = state.agent_rows_now(s);
@@ -1439,7 +1656,7 @@ mod tests {
 
         // A lifecycle edge drops the lot: a brand-new Claude process inherits no
         // children, and neither does a finished one.
-        apply_payload(&state, s, "session_start", &p("{}"));
+        apply_payload(&state, s, "session_start", &p("{}"), false);
         assert!(state.agent_rows_now(s).is_empty());
 
         state.pool.close().await;
@@ -1460,6 +1677,7 @@ mod tests {
             s,
             "pre_tool",
             &p(r#"{"agent_id":"a1","agent_type":"workflow-subagent","tool_name":"Bash","tool_input":{"description":"probe"}}"#),
+            false,
         );
 
         let mut last: Option<Value> = None;
@@ -1523,12 +1741,13 @@ mod tests {
             s,
             "pre_tool",
             &p(r#"{"agent_id":"a1","agent_type":"workflow-subagent","tool_name":"Bash","tool_input":{"description":"probe"}}"#),
+            false,
         );
         assert_eq!(subagents(&state, s), 0, "no SubagentStart fired, so the count is 0");
         assert_eq!(state.agent_rows_now(s).len(), 1);
 
         let mut rx = state.sse_tx.subscribe();
-        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#));
+        apply_payload(&state, s, "subagent_stop", &p(r#"{"agent_id":"a1"}"#), false);
 
         let mut agents: Option<Value> = None;
         while let Ok(ev) = rx.try_recv() {
@@ -1614,14 +1833,14 @@ mod tests {
         let (state, dir) = test_state().await;
         let s = "lead-stop";
 
-        apply_payload(&state, s, "subagent_start", &p("{}"));
-        apply_payload(&state, s, "subagent_start", &p("{}"));
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
         assert_eq!(state.session_activity(s).map(|a| a.subagents), Some(2));
         // The workflow is provably live (open subagent hooks).
         assert!(state.subagents_live(s));
 
         // The MAIN turn ends. The count MUST survive.
-        apply_payload(&state, s, "stop", &p("{}"));
+        apply_payload(&state, s, "stop", &p("{}"), false);
         assert_eq!(
             state.session_activity(s).map(|a| a.subagents),
             Some(2),
@@ -1630,8 +1849,8 @@ mod tests {
         assert!(state.subagents_live(s), "the workflow still reads live after main Stop");
 
         // A SubagentStop drains it — the honest way the count now falls.
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
         assert!(
             !state.subagents_live(s),
             "draining every subagent (SubagentStop) ends the live signal"
@@ -1650,14 +1869,14 @@ mod tests {
         let (state, dir) = test_state().await;
 
         // No outstanding subagent → a tool hook allocates nothing / not live.
-        apply_payload(&state, "plain", "pre_tool", &p(r#"{"tool_name":"Read"}"#));
+        apply_payload(&state, "plain", "pre_tool", &p(r#"{"tool_name":"Read"}"#), false);
         assert!(!state.subagents_live("plain"));
 
         // With a subagent outstanding, a parent tool hook refreshes liveness.
         let s = "lead-tool";
-        apply_payload(&state, s, "subagent_start", &p("{}"));
-        apply_payload(&state, s, "stop", &p("{}"));
-        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Bash","tool_input":{"command":"x"}}"#));
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        apply_payload(&state, s, "stop", &p("{}"), false);
+        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Bash","tool_input":{"command":"x"}}"#), false);
         assert!(state.subagents_live(s), "a parent tool hook keeps the workflow live");
 
         state.pool.close().await;
@@ -1674,13 +1893,14 @@ mod tests {
             s,
             "pre_tool",
             &p(r#"{"tool_name":"Edit","tool_input":{"file_path":"src/tile.tsx"}}"#),
+            false,
         );
         let act = state.session_activity(s).unwrap();
         assert_eq!(act.activity.as_deref(), Some("✎ tile.tsx"));
         assert_eq!(act.activity_kind.as_deref(), Some("edit"));
 
         // Stop clears the live activity; the snapshot prunes empty → None.
-        apply_payload(&state, s, "stop", &p("{}"));
+        apply_payload(&state, s, "stop", &p("{}"), false);
         assert!(state.session_activity(s).is_none(), "Stop clears activity");
 
         state.pool.close().await;
@@ -1700,17 +1920,18 @@ mod tests {
             s,
             "pre_tool",
             &p(r#"{"tool_name":"Task","tool_input":{"description":"review"}}"#),
+            false,
         );
         assert!(state.session_activity(s).is_some(), "pre_tool set an activity");
 
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
         assert!(
             state.session_activity(s).is_some(),
             "SubagentStop must NOT clear the main session's activity"
         );
 
         // The real main Stop still clears it.
-        apply_payload(&state, s, "stop", &p("{}"));
+        apply_payload(&state, s, "stop", &p("{}"), false);
         assert!(state.session_activity(s).is_none(), "main Stop clears activity");
 
         state.pool.close().await;
@@ -1747,7 +1968,7 @@ mod tests {
         );
 
         // The new process boots → SessionStart must wipe the stale turn.
-        apply_payload(&state, s, "session_start", &p("{}"));
+        apply_payload(&state, s, "session_start", &p("{}"), false);
         assert_eq!(
             state.turn_state(s),
             TurnState::default(),
@@ -1768,39 +1989,39 @@ mod tests {
         let (state, dir) = test_state().await;
         let s = "lead-2";
 
-        apply_payload(&state, s, "subagent_start", &p("{}"));
-        apply_payload(&state, s, "subagent_start", &p("{}"));
-        apply_payload(&state, s, "subagent_start", &p("{}"));
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
         assert_eq!(subagents(&state, s), 3, "three subagents started");
 
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
         assert_eq!(subagents(&state, s), 2, "one finished → 2 outstanding");
 
         // Saturating: more stops than starts must clamp at 0, never underflow.
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
         assert_eq!(subagents(&state, s), 0, "saturating dec floors at 0");
 
         // A fresh turn resets the count.
-        apply_payload(&state, s, "subagent_start", &p("{}"));
-        apply_payload(&state, s, "subagent_start", &p("{}"));
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
         assert_eq!(subagents(&state, s), 2);
-        apply_payload(&state, s, "user_prompt", &p("{}"));
+        apply_payload(&state, s, "user_prompt", &p("{}"), false);
         assert_eq!(subagents(&state, s), 0, "a new prompt resets the count");
 
         // The main Stop leaves the count INTACT now: a session that dispatched a
         // background workflow keeps a truthful count after the main agent returns
         // to its prompt (this is what lets the roster read it as WORKING). The
         // count falls only when its SubagentStops arrive.
-        apply_payload(&state, s, "subagent_start", &p("{}"));
-        apply_payload(&state, s, "subagent_start", &p("{}"));
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
         assert_eq!(subagents(&state, s), 2);
-        apply_payload(&state, s, "stop", &p("{}"));
+        apply_payload(&state, s, "stop", &p("{}"), false);
         assert_eq!(subagents(&state, s), 2, "main Stop must NOT force-0 the count");
         // Its SubagentStops drain it the honest way.
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
         assert_eq!(subagents(&state, s), 0, "SubagentStop drains the count to 0");
 
         state.pool.close().await;
@@ -1817,13 +2038,14 @@ mod tests {
             s,
             "stop_failure",
             &p(r#"{"error_type":"rate_limit","message":"quota exceeded"}"#),
+            false,
         );
         let err = state.session_activity(s).unwrap().error.unwrap();
         assert_eq!(err.0, "rate_limit");
         assert_eq!(err.1, "quota exceeded");
 
         // The next UserPromptSubmit clears the (now-stale) error.
-        apply_payload(&state, s, "user_prompt", &p("{}"));
+        apply_payload(&state, s, "user_prompt", &p("{}"), false);
         assert!(
             state.session_activity(s).and_then(|a| a.error).is_none(),
             "UserPromptSubmit clears the error"
@@ -1839,10 +2061,10 @@ mod tests {
         let s = "worker-1";
 
         // A live activity to be cleared by the end.
-        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Bash","tool_input":{"command":"sleep 1"}}"#));
+        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Bash","tool_input":{"command":"sleep 1"}}"#), false);
         assert!(state.session_activity(s).is_some());
 
-        apply_payload(&state, s, "session_end", &p("{}"));
+        apply_payload(&state, s, "session_end", &p("{}"), false);
         // Activity cleared.
         assert!(
             state.session_activity(s).and_then(|a| a.activity).is_none(),
@@ -1864,7 +2086,7 @@ mod tests {
         state.set_error(s, "billing_error".into(), "card declined".into());
         state.set_forced_status(s, Status::Stopped);
 
-        apply_payload(&state, s, "session_start", &p("{}"));
+        apply_payload(&state, s, "session_start", &p("{}"), false);
         assert!(
             state.session_activity(s).and_then(|a| a.error).is_none(),
             "SessionStart clears the error"
@@ -1882,15 +2104,15 @@ mod tests {
         let mut rx = state.sse_tx.subscribe();
 
         // A clean PostToolUse (no error) is a no-op for activity → no broadcast.
-        apply_payload(&state, s, "post_tool", &p(r#"{"tool_name":"Read"}"#));
+        apply_payload(&state, s, "post_tool", &p(r#"{"tool_name":"Read"}"#), false);
         assert!(rx.try_recv().is_err(), "clean post_tool must not broadcast");
 
         // A PreToolUse with no tool name is also a no-op.
-        apply_payload(&state, s, "pre_tool", &p("{}"));
+        apply_payload(&state, s, "pre_tool", &p("{}"), false);
         assert!(rx.try_recv().is_err(), "tool-less pre_tool must not broadcast");
 
         // A real activity change DOES broadcast a `sessions` delta.
-        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Read","tool_input":{"file_path":"a.rs"}}"#));
+        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Read","tool_input":{"file_path":"a.rs"}}"#), false);
         let ev = rx.try_recv().expect("activity change broadcasts");
         assert_eq!(ev.event, "sessions");
 
@@ -1926,7 +2148,7 @@ mod tests {
         let s = "worker-perm";
         let mut rx = state.sse_tx.subscribe();
 
-        apply_payload(&state, s, "permission_request", &p(LIVE_PERMISSION_REQUEST));
+        apply_payload(&state, s, "permission_request", &p(LIVE_PERMISSION_REQUEST), false);
 
         let ask = state
             .session_activity(s)
@@ -1945,7 +2167,7 @@ mod tests {
         assert_eq!(d["permission_request"]["mode"], json!("default"));
 
         // Re-firing the identical dialog is not a change → no second broadcast.
-        apply_payload(&state, s, "permission_request", &p(LIVE_PERMISSION_REQUEST));
+        apply_payload(&state, s, "permission_request", &p(LIVE_PERMISSION_REQUEST), false);
         assert!(rx.try_recv().is_err(), "an unchanged ask must not re-broadcast");
 
         state.pool.close().await;
@@ -1968,14 +2190,14 @@ mod tests {
         ] {
             let (state, dir) = test_state().await;
             let s = "worker-perm";
-            apply_payload(&state, s, "permission_request", &p(LIVE_PERMISSION_REQUEST));
+            apply_payload(&state, s, "permission_request", &p(LIVE_PERMISSION_REQUEST), false);
             assert!(
                 state.session_activity(s).and_then(|a| a.permission).is_some(),
                 "{event}: precondition — an ask is live"
             );
 
             let mut rx = state.sse_tx.subscribe();
-            apply_payload(&state, s, event, &p(payload));
+            apply_payload(&state, s, event, &p(payload), false);
             assert!(
                 state.session_activity(s).and_then(|a| a.permission).is_none(),
                 "{event} must clear the live permission request"
@@ -2003,7 +2225,7 @@ mod tests {
         let s = "worker-elicit";
         let mut rx = state.sse_tx.subscribe();
 
-        apply_payload(&state, s, "elicitation", &p(LIVE_ELICITATION));
+        apply_payload(&state, s, "elicitation", &p(LIVE_ELICITATION), false);
 
         let ask = state
             .session_activity(s)
@@ -2019,7 +2241,7 @@ mod tests {
         assert_eq!(d["elicitation"]["fields"][1]["options"][0]["label"], json!("Production"));
 
         // Claude Code re-raising the identical ask is not a change → silence.
-        apply_payload(&state, s, "elicitation", &p(LIVE_ELICITATION));
+        apply_payload(&state, s, "elicitation", &p(LIVE_ELICITATION), false);
         assert!(rx.try_recv().is_err(), "an unchanged ask must not re-broadcast");
 
         state.pool.close().await;
@@ -2039,6 +2261,7 @@ mod tests {
             s,
             "elicitation",
             &p(r#"{"message":"Enter your Anthropic API key","requested_schema":{"type":"object","properties":{"key":{"type":"string"}}}}"#),
+            false,
         );
         assert!(
             state.session_activity(s).and_then(|a| a.elicitation).is_none(),
@@ -2066,14 +2289,14 @@ mod tests {
         ] {
             let (state, dir) = test_state().await;
             let s = "worker-elicit";
-            apply_payload(&state, s, "elicitation", &p(LIVE_ELICITATION));
+            apply_payload(&state, s, "elicitation", &p(LIVE_ELICITATION), false);
             assert!(
                 state.session_activity(s).and_then(|a| a.elicitation).is_some(),
                 "{event}: precondition — a form is live"
             );
 
             let mut rx = state.sse_tx.subscribe();
-            apply_payload(&state, s, event, &p(payload));
+            apply_payload(&state, s, event, &p(payload), false);
             assert!(
                 state.session_activity(s).and_then(|a| a.elicitation).is_none(),
                 "{event} must clear the live elicitation"
@@ -2093,9 +2316,9 @@ mod tests {
         // human answered.
         let (state, dir) = test_state().await;
         let s = "worker-elicit";
-        apply_payload(&state, s, "elicitation", &p(LIVE_ELICITATION));
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
-        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Read","tool_input":{"file_path":"a.rs"}}"#));
+        apply_payload(&state, s, "elicitation", &p(LIVE_ELICITATION), false);
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
+        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Read","tool_input":{"file_path":"a.rs"}}"#), false);
         assert!(
             state.session_activity(s).and_then(|a| a.elicitation).is_some(),
             "nothing here proves the form was answered"
@@ -2121,7 +2344,7 @@ mod tests {
         let s = "worker-connect";
         let mut rx = state.sse_tx.subscribe();
 
-        apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT));
+        apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT), false);
 
         let ask = state
             .session_activity(s)
@@ -2133,7 +2356,7 @@ mod tests {
         assert_eq!(d["connect_request"]["connector_id"], json!("pmcp-notion"));
 
         // Re-firing the identical call is not a change → silence.
-        apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT));
+        apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT), false);
         assert!(rx.try_recv().is_err(), "an unchanged connect ask must not re-broadcast");
 
         state.pool.close().await;
@@ -2160,7 +2383,7 @@ mod tests {
         let s = "worker-question";
         let mut rx = state.sse_tx.subscribe();
 
-        apply_payload(&state, s, "pre_tool", &p(LIVE_ASK_QUESTION));
+        apply_payload(&state, s, "pre_tool", &p(LIVE_ASK_QUESTION), false);
         let ask = state
             .session_activity(s)
             .and_then(|a| a.question_request)
@@ -2175,7 +2398,7 @@ mod tests {
         assert_eq!(d["question_request"]["options"], json!(["Apple", "Banana", "Cherry"]));
 
         // The permission dialog that follows must NOT record a permission card.
-        apply_payload(&state, s, "permission_request", &p(LIVE_ASK_QUESTION_PERMISSION));
+        apply_payload(&state, s, "permission_request", &p(LIVE_ASK_QUESTION_PERMISSION), false);
         assert!(
             state.session_activity(s).and_then(|a| a.permission).is_none(),
             "the AskUserQuestion permission card is suppressed in favour of the question card",
@@ -2201,14 +2424,14 @@ mod tests {
         ] {
             let (state, dir) = test_state().await;
             let s = "worker-question";
-            apply_payload(&state, s, "pre_tool", &p(LIVE_ASK_QUESTION));
+            apply_payload(&state, s, "pre_tool", &p(LIVE_ASK_QUESTION), false);
             assert!(
                 state.session_activity(s).and_then(|a| a.question_request).is_some(),
                 "{event}: precondition — a question ask is live"
             );
 
             let mut rx = state.sse_tx.subscribe();
-            apply_payload(&state, s, event, &p(payload));
+            apply_payload(&state, s, event, &p(payload), false);
             assert!(
                 state.session_activity(s).and_then(|a| a.question_request).is_none(),
                 "{event} must clear the live question request"
@@ -2235,7 +2458,7 @@ mod tests {
         let s = "worker-browser";
         let mut rx = state.sse_tx.subscribe();
 
-        apply_payload(&state, s, "pre_tool", &p(LIVE_TAKEOVER));
+        apply_payload(&state, s, "pre_tool", &p(LIVE_TAKEOVER), false);
 
         let ask = state
             .session_activity(s)
@@ -2249,7 +2472,7 @@ mod tests {
         assert!(d["browser_takeover"]["reason"].as_str().unwrap().contains("2FA"));
 
         // …and it clears when the tool call moves on (same rule as connect).
-        apply_payload(&state, s, "post_tool", &p(r#"{"tool_name":"mcp__browser__request_human_takeover"}"#));
+        apply_payload(&state, s, "post_tool", &p(r#"{"tool_name":"mcp__browser__request_human_takeover"}"#), false);
         assert!(
             state.session_activity(s).and_then(|a| a.browser_takeover).is_none(),
             "the card must not outlive the call"
@@ -2277,6 +2500,7 @@ mod tests {
             s,
             "notification",
             &p(r#"{"notification_type":"agent_needs_input","message":"Claude needs your input"}"#),
+            false,
         );
         assert_eq!(
             state.session_activity(s).and_then(|a| a.waiting_message).as_deref(),
@@ -2287,7 +2511,7 @@ mod tests {
         assert_eq!(d["waiting_message"], json!("Claude needs your input"));
 
         // A resolution event (the user's next prompt) clears it as null.
-        apply_payload(&state, s, "user_prompt", &p("{}"));
+        apply_payload(&state, s, "user_prompt", &p("{}"), false);
         assert!(
             state.session_activity(s).and_then(|a| a.waiting_message).is_none(),
             "the line must not outlive the Waiting state",
@@ -2301,6 +2525,7 @@ mod tests {
             s,
             "notification",
             &p(r#"{"notification_type":"auth_success","message":"Logged in"}"#),
+            false,
         );
         assert!(
             state.session_activity(s).and_then(|a| a.waiting_message).is_none(),
@@ -2313,6 +2538,7 @@ mod tests {
             s,
             "notification",
             &p(r#"{"notificationType":"idle_prompt","message":"   "}"#),
+            false,
         );
         assert!(
             state.session_activity(s).and_then(|a| a.waiting_message).is_none(),
@@ -2339,14 +2565,14 @@ mod tests {
         ] {
             let (state, dir) = test_state().await;
             let s = "worker-connect";
-            apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT));
+            apply_payload(&state, s, "pre_tool", &p(LIVE_CONNECT), false);
             assert!(
                 state.session_activity(s).and_then(|a| a.connect_request).is_some(),
                 "{event}: precondition — a connect ask is live"
             );
 
             let mut rx = state.sse_tx.subscribe();
-            apply_payload(&state, s, event, &p(payload));
+            apply_payload(&state, s, event, &p(payload), false);
             assert!(
                 state.session_activity(s).and_then(|a| a.connect_request).is_none(),
                 "{event} must clear the live connect request"
@@ -2365,10 +2591,10 @@ mod tests {
         // says nothing about the main agent's dialog — neither may clear the ask.
         let (state, dir) = test_state().await;
         let s = "worker-perm";
-        apply_payload(&state, s, "permission_request", &p(LIVE_PERMISSION_REQUEST));
-        apply_payload(&state, s, "subagent_stop", &p("{}"));
+        apply_payload(&state, s, "permission_request", &p(LIVE_PERMISSION_REQUEST), false);
+        apply_payload(&state, s, "subagent_stop", &p("{}"), false);
         assert!(state.session_activity(s).and_then(|a| a.permission).is_some());
-        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Read","tool_input":{"file_path":"a.rs"}}"#));
+        apply_payload(&state, s, "pre_tool", &p(r#"{"tool_name":"Read","tool_input":{"file_path":"a.rs"}}"#), false);
         assert!(
             state.session_activity(s).and_then(|a| a.permission).is_some(),
             "PreToolUse precedes the dialog; it must not clear the ask"
@@ -2386,7 +2612,7 @@ mod tests {
         let (state, dir) = test_state().await;
         let s = "worker-fail";
 
-        apply_payload(&state, s, "post_tool_failure", &p(LIVE_POST_TOOL_FAILURE));
+        apply_payload(&state, s, "post_tool_failure", &p(LIVE_POST_TOOL_FAILURE), false);
         let act = state.session_activity(s).unwrap();
         assert_eq!(act.activity.as_deref(), Some("✗ Read failed"));
         assert_eq!(act.activity_kind.as_deref(), Some("failed"));
@@ -2405,6 +2631,7 @@ mod tests {
             s,
             "post_tool",
             &p(r#"{"tool_name":"Bash","error_type":"non_zero_exit"}"#),
+            false,
         );
         let act = state.session_activity(s).unwrap();
         assert_eq!(act.activity.as_deref(), Some("✗ Bash failed"));
@@ -2425,6 +2652,7 @@ mod tests {
             s,
             "pre_tool",
             &p(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#),
+            false,
         );
         let ev = rx.try_recv().expect("activity broadcasts");
         assert_eq!(ev.event, "sessions");
@@ -2689,5 +2917,220 @@ mod tests {
             assert!(!is_pointer_event(e),
                     "{e} must NOT move the pointer (subagent hooks would thrash it)");
         }
+    }
+
+    #[tokio::test]
+    async fn teammate_session_end_is_ignored() {
+        // Since Claude Code 2.1.232 a named in-process teammate has its OWN Claude
+        // session and fires its own lifecycle hooks under the PARENT pane's
+        // `$SUPERMUX_SESSION`. `TaskStop` on such a teammate emits SessionEnd with
+        // reason "other". It must NOT force the lead Stopped (the lead is still
+        // working) and must not touch the lead's live activity.
+        let (state, dir) = test_state().await;
+        let s = "lead-teammate-end";
+
+        apply_payload(
+            &state,
+            s,
+            "pre_tool",
+            &p(r#"{"tool_name":"Bash","tool_input":{"command":"sleep 1"}}"#),
+            false,
+        );
+        assert!(state.session_activity(s).is_some(), "precondition: a live activity");
+
+        apply_payload(
+            &state,
+            s,
+            "session_end",
+            &p(r#"{"session_id":"x","agent_type":"general-purpose","reason":"other"}"#),
+            // the caller decided this payload is a teammate's (its session_id is
+            // not the lead's tracked conversation id)
+            true,
+        );
+
+        assert!(
+            state.session_activity(s).and_then(|a| a.activity).is_some(),
+            "a teammate SessionEnd must NOT clear the lead's activity"
+        );
+        assert_eq!(
+            state.take_forced_status(s),
+            None,
+            "a teammate SessionEnd must NOT force the lead Stopped"
+        );
+
+        // The lead's OWN SessionEnd (no agent_type) still forces Stopped.
+        apply_payload(&state, s, "session_end", &p("{}"), false);
+        assert_eq!(state.take_forced_status(s), Some(Status::Stopped));
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn teammate_session_start_is_ignored() {
+        // The teammate's startup hook likewise must not read as "the lead
+        // rebooted": it would clear the pending forced-stop and wipe the lead's
+        // in-progress turn state mid-turn.
+        use crate::sessions::status::{HookEvent, TurnState};
+        let (state, dir) = test_state().await;
+        let s = "lead-teammate-start";
+
+        state.set_error(s, "billing_error".into(), "card declined".into());
+        state.set_forced_status(s, Status::Stopped);
+        state.record_hook(s, HookEvent::UserPromptSubmit);
+        state.record_hook(s, HookEvent::PreToolUse);
+        assert_ne!(
+            state.turn_state(s),
+            TurnState::default(),
+            "precondition: a turn is in progress"
+        );
+
+        apply_payload(
+            &state,
+            s,
+            "session_start",
+            &p(r#"{"session_id":"x","agent_type":"general-purpose","source":"startup"}"#),
+            // the caller decided this payload is a teammate's (its session_id is
+            // not the lead's tracked conversation id)
+            true,
+        );
+
+        assert_eq!(
+            state.take_forced_status(s),
+            Some(Status::Stopped),
+            "a teammate SessionStart must NOT clear the lead's forced status"
+        );
+        assert!(
+            state.session_activity(s).and_then(|a| a.error).is_some(),
+            "a teammate SessionStart must NOT clear the lead's error"
+        );
+        assert_ne!(
+            state.turn_state(s),
+            TurnState::default(),
+            "a teammate SessionStart must NOT reset the lead's turn state"
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn foreign_agent_payload_needs_both_agent_type_and_a_different_id() {
+        // No agent_type at all: always the lead's own payload.
+        assert!(!is_foreign_agent_payload(&p(r#"{"session_id":"lead-1"}"#), Some("lead-1")));
+        assert!(!is_foreign_agent_payload(&p(r#"{"session_id":"other"}"#), Some("lead-1")));
+
+        // agent_type but nothing tracked yet: accept it as the lead's, so a lead
+        // launched as `claude --agent <name>` can establish its own id instead of
+        // being masked forever.
+        assert!(!is_foreign_agent_payload(
+            &p(r#"{"session_id":"lead-1","agent_type":"reviewer"}"#),
+            None
+        ));
+        assert!(!is_foreign_agent_payload(
+            &p(r#"{"session_id":"lead-1","agent_type":"reviewer"}"#),
+            Some("")
+        ));
+
+        // agent_type + the SAME id as the lead's tracked conversation: the
+        // `--agent` lead's own lifecycle, must still be handled.
+        assert!(!is_foreign_agent_payload(
+            &p(r#"{"session_id":"lead-1","agent_type":"reviewer"}"#),
+            Some("lead-1")
+        ));
+
+        // agent_type + a DIFFERENT id: a real in-process teammate.
+        assert!(is_foreign_agent_payload(
+            &p(r#"{"session_id":"teammate-9","agent_type":"general-purpose"}"#),
+            Some("lead-1")
+        ));
+        // agent_type, a tracked lead id, and no session_id at all: not the lead's.
+        assert!(is_foreign_agent_payload(
+            &p(r#"{"agent_type":"general-purpose"}"#),
+            Some("lead-1")
+        ));
+
+        // An empty / whitespace agent_type counts as ABSENT (never mask a real
+        // lifecycle event on it: the failure mode is a zombie session).
+        assert!(!is_foreign_agent_payload(
+            &p(r#"{"session_id":"teammate-9","agent_type":""}"#),
+            Some("lead-1")
+        ));
+        assert!(!is_foreign_agent_payload(
+            &p(r#"{"session_id":"teammate-9","agent_type":"  "}"#),
+            Some("lead-1")
+        ));
+    }
+
+    /// The wedge the `announces_conversation_switch` escape hatch exists for.
+    ///
+    /// `is_foreign_agent_payload` is CORRECT to call this foreign — it cannot tell
+    /// an `--agent` lead's new conversation from a teammate's by id alone — which
+    /// is exactly why the pointer gate must not rely on it by itself. Pinned so a
+    /// future tightening of the classifier cannot silently re-freeze the pointer.
+    #[test]
+    fn an_agent_leads_own_post_clear_start_still_classifies_as_foreign() {
+        assert!(is_foreign_agent_payload(
+            &p(r#"{"session_id":"conv-B","agent_type":"reviewer","source":"clear"}"#),
+            Some("conv-A")
+        ));
+    }
+
+    /// `/clear` and a terminal-side `--resume` are the two switches only the pane's
+    /// REAL agent can announce, so they release the pointer gate. `startup` must
+    /// NOT: that is the captured shape of an in-process teammate's SessionStart,
+    /// and admitting it would re-open the transcript-stealing bug the filter fixed.
+    /// `compact` must not either — compaction keeps the same file and id, so there
+    /// is nothing to follow and a compacting teammate would steal the pointer.
+    #[test]
+    fn only_clear_and_resume_announce_a_conversation_switch() {
+        assert!(announces_conversation_switch(&p(r#"{"source":"clear"}"#)));
+        assert!(announces_conversation_switch(&p(r#"{"source":"resume"}"#)));
+
+        assert!(!announces_conversation_switch(&p(r#"{"source":"startup"}"#)));
+        assert!(!announces_conversation_switch(&p(r#"{"source":"compact"}"#)));
+        assert!(!announces_conversation_switch(&p(r#"{"source":""}"#)));
+        assert!(!announces_conversation_switch(&p(r#"{}"#)));
+        // A teammate's UserPromptSubmit carries no `source` at all, so the every-
+        // prompt corruption path stays closed.
+        assert!(!announces_conversation_switch(
+            &p(r#"{"session_id":"teammate-9","agent_type":"general-purpose"}"#)
+        ));
+        assert!(!has_agent_type(&p(r#"{"agent_type":" "}"#)));
+    }
+
+    #[tokio::test]
+    async fn teammate_user_prompt_leaves_the_lead_error_and_subagents_alone() {
+        // A teammate fires UserPromptSubmit every time the lead messages it. That
+        // is not the lead acting, so it must not clear the lead's error badge nor
+        // force-0 its outstanding-subagent count mid-turn.
+        let (state, dir) = test_state().await;
+        let s = "lead-teammate-prompt";
+
+        state.set_error(s, "billing_error".into(), "card declined".into());
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        apply_payload(&state, s, "subagent_start", &p("{}"), false);
+        assert_eq!(subagents(&state, s), 2, "precondition: two outstanding");
+
+        apply_payload(
+            &state,
+            s,
+            "user_prompt_submit",
+            &p(r#"{"session_id":"teammate-9","agent_type":"general-purpose"}"#),
+            true,
+        );
+        assert!(
+            state.session_activity(s).and_then(|a| a.error).is_some(),
+            "a teammate prompt must NOT clear the lead's error"
+        );
+        assert_eq!(subagents(&state, s), 2, "a teammate prompt must NOT reset the count");
+
+        // The lead's OWN prompt still does both.
+        apply_payload(&state, s, "user_prompt_submit", &p("{}"), false);
+        assert!(state.session_activity(s).and_then(|a| a.error).is_none());
+        assert_eq!(subagents(&state, s), 0);
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -51,6 +51,7 @@ async fn setup() -> (AppState, axum::Router, std::path::PathBuf) {
         auth_token: BEARER.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: Default::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
@@ -584,7 +585,7 @@ async fn the_preview_endpoint_reads_the_closing_line_off_disk_verbatim() {
         .await
         .unwrap();
 
-    let proj = supermux_server::sessions::resumable::project_dir_for(work.to_str().unwrap());
+    let proj = supermux_server::sessions::resumable::project_dir_for("", work.to_str().unwrap());
     std::fs::create_dir_all(&proj).unwrap();
     let transcript = proj.join(format!("{conv}.jsonl"));
     let closing = "DONE-MARKER-7 all checks pass";

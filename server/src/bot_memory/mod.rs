@@ -354,6 +354,8 @@ mod tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
+            config_dir: String::new(),
         }
     }
 

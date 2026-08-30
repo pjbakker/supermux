@@ -33,9 +33,9 @@ fn tmux_available() -> bool {
     which::which("tmux").is_ok()
 }
 
-// tungstenite 0.24 (the client side) uses `String`/`Vec<u8>` payloads.
+// tungstenite >=0.26 (the client side) takes `Utf8Bytes`/`Bytes` payloads.
 fn text(s: &str) -> Msg {
-    Msg::Text(s.to_owned())
+    Msg::Text(s.into())
 }
 
 async fn spawn_server(ws: WsConfig) -> (AppState, SocketAddr, PathBuf) {
@@ -50,6 +50,7 @@ async fn spawn_server(ws: WsConfig) -> (AppState, SocketAddr, PathBuf) {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws,
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -163,6 +164,9 @@ async fn make_session(state: &AppState, name: &str) {
             runtime: Some("tmux".into()),
             model: None,
             company_id: None,
+            archive_on_stop: None,
+            config_dir: None,
+            ..Default::default()
         },
     )
     .await

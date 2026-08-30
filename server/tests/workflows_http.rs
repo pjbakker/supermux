@@ -42,6 +42,7 @@ pub async fn spawn_harness() -> Harness {
     let dir = std::env::temp_dir().join(format!("supermux-wf-http-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.clone(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],
@@ -976,6 +977,84 @@ async fn commands_endpoint_excludes_builtins_and_requires_auth() {
             assert_ne!(cmd, builtin, "built-in {builtin} must be excluded");
         }
     }
+    h.cleanup();
+}
+
+/// `/api/workflows/import-log` serves the schedules-port archive — every
+/// pre-0038 `schedules` row, ported or refused, exactly as `workflows_import_log`
+/// holds it. This is the destination behind the post-upgrade
+/// `/settings#imported-schedules` notification (`workflows::port`): without it
+/// the archive of an irreversible migration is unreachable from the app.
+#[tokio::test]
+async fn import_log_endpoint_serves_the_archived_rows() {
+    let h = spawn_harness().await;
+
+    // No bearer → 401, like every other protected route.
+    let unauth = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/workflows/import-log")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // Empty archive (a database that never held a `schedules` row) → empty list,
+    // not an error.
+    let (st0, body0) = send(&h.app, Method::GET, "/api/workflows/import-log", None).await;
+    assert_eq!(st0, StatusCode::OK);
+    assert_eq!(body0["data"].as_array().map(Vec::len), Some(0));
+
+    // Seed what 0038 would have archived: one refused row, one ported row.
+    for (old_id, ported, reason, row_json, at) in [
+        (
+            "SCH-shell",
+            0i64,
+            "kind shell has no Workflows v1 equivalent",
+            r#"{"id":"SCH-shell","kind":"shell","command":"echo hi","schedule_expr":"@daily","enabled":1,"last_run":1756000000}"#,
+            1_756_000_100i64,
+        ),
+        ("SCH-ok", 1i64, "", r#"{"id":"SCH-ok","kind":"prompt","prompt":"do it"}"#, 1_756_000_101i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO workflows_import_log (old_id, ported, reason, row_json, at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(old_id)
+        .bind(ported)
+        .bind(reason)
+        .bind(row_json)
+        .bind(at)
+        .execute(&h.state.pool)
+        .await
+        .unwrap();
+    }
+
+    let (st, body) = send(&h.app, Method::GET, "/api/workflows/import-log", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let rows = body["data"].as_array().expect("data is an array");
+    assert_eq!(rows.len(), 2, "both archived rows are served: {body}");
+
+    // Refused rows first (they are the ones the user must act on), then ported.
+    let refused = &rows[0];
+    assert_eq!(refused["old_id"], "SCH-shell");
+    assert_eq!(refused["ported"], false);
+    assert_eq!(refused["reason"], "kind shell has no Workflows v1 equivalent");
+    assert_eq!(refused["at"], 1_756_000_100i64);
+    // `row_json` comes back PARSED, so the UI (and a curl user) can read the
+    // command line without double-decoding.
+    assert_eq!(refused["row"]["command"], "echo hi");
+    assert_eq!(refused["row"]["kind"], "shell");
+
+    let ported = &rows[1];
+    assert_eq!(ported["old_id"], "SCH-ok");
+    assert_eq!(ported["ported"], true);
+    assert_eq!(ported["row"]["prompt"], "do it");
+
     h.cleanup();
 }
 

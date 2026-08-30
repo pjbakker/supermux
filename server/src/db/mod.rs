@@ -77,6 +77,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,
@@ -120,8 +121,8 @@ mod tests {
             .unwrap()
             .get("n");
         assert_eq!(
-            applied, 38,
-            "expected thirty-eight applied migrations (0001-0005, 0007-0024, 0026-0040)"
+            applied, 40,
+            "expected forty applied migrations (0001-0005, 0007-0041)"
         );
 
         // 0037 applied cleanly: the new nullable company_id column exists and a
@@ -185,6 +186,111 @@ mod tests {
         );
 
         pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `config_dir` (migration 0041) threads NewSession -> INSERT -> row, and a
+    /// duplicate inherits it, so a cloned session boots on the same account.
+    /// An unset value reads back as the empty string, which every consumer
+    /// treats as "use the daemon default".
+    #[tokio::test]
+    async fn config_dir_survives_create_and_duplicate() {
+        let (pool, dir) = test_pool().await;
+
+        let mut new = sessions::NewSession {
+            name: "acct".into(),
+            display_name: "acct".into(),
+            dir: "/tmp".into(),
+            desc: String::new(),
+            provider: "claude".into(),
+            creator: String::new(),
+            flags: String::new(),
+            tags: "[]".into(),
+            branch: String::new(),
+            mcp: String::new(),
+            worktree: false,
+            worktree_repo: String::new(),
+            host_id: None,
+            company_id: None,
+            runtime: "native".into(),
+            model: String::new(),
+            archive_on_stop: false,
+            config_dir: "/home/agent/.claude-second".into(),
+        };
+        sessions::create(&pool, &new).await.unwrap();
+
+        let row = sessions::get(&pool, "acct").await.unwrap().unwrap();
+        assert_eq!(row.config_dir, "/home/agent/.claude-second");
+
+        sessions::duplicate(&pool, "acct", "acct-copy").await.unwrap();
+        let copy = sessions::get(&pool, "acct-copy").await.unwrap().unwrap();
+        assert_eq!(
+            copy.config_dir, "/home/agent/.claude-second",
+            "a duplicate must boot on the same account as its source"
+        );
+
+        // Unset is the empty string, never NULL: the column is NOT NULL DEFAULT ''.
+        new.name = "plain".into();
+        new.display_name = "plain".into();
+        new.config_dir = String::new();
+        sessions::create(&pool, &new).await.unwrap();
+        let plain = sessions::get(&pool, "plain").await.unwrap().unwrap();
+        assert_eq!(plain.config_dir, "");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The production claim behind migration 0041: a row that already existed
+    /// when the column was added keeps today's behaviour. Apply the chain up to
+    /// 0040, insert a session through the pre-0041 column set, then apply the
+    /// rest and read the value back. `DEFAULT ''` is what makes a legacy row
+    /// mean "daemon default"; a NULL there would break every consumer that
+    /// calls `config_dir.trim()`.
+    #[tokio::test]
+    async fn a_row_created_before_0041_backfills_to_the_empty_config_dir() {
+        use sqlx::migrate::Migrate;
+        use sqlx::{sqlite::SqliteConnection, Connection};
+        let dir = std::env::temp_dir().join(format!("supermux-mig0041-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.db");
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect");
+        let migrator = sqlx::migrate!("./migrations");
+        conn.ensure_migrations_table().await.unwrap();
+        for m in migrator.iter().filter(|m| m.version < 41) {
+            conn.apply(m).await.expect("pre-0041 migration applies");
+        }
+        // The pre-0041 column set: `config_dir` does not exist yet to bind.
+        sqlx::query(
+            "INSERT INTO sessions (name, dir, provider, created_at)
+             VALUES ('legacy', '/tmp', 'claude', 0)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        migrator
+            .run(&mut conn)
+            .await
+            .expect("0041 applies over an existing row");
+        let config_dir: String =
+            sqlx::query_scalar("SELECT config_dir FROM sessions WHERE name = 'legacy'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            config_dir, "",
+            "an existing row must backfill to the daemon default"
+        );
+
+        conn.close().await.ok();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -338,6 +444,8 @@ mod tests {
             company_id: Some(acme),
             runtime: "native".into(),
             model: String::new(),
+            archive_on_stop: false,
+            config_dir: String::new(),
         };
         sessions::create(&pool, &ns).await.unwrap();
         let got = sessions::get(&pool, "bot-a").await.unwrap().unwrap();
@@ -365,6 +473,8 @@ mod tests {
             company_id: None,
             runtime: "native".into(),
             model: String::new(),
+            archive_on_stop: false,
+            config_dir: String::new(),
         };
         sessions::create(&pool, &main).await.unwrap();
         let got_main = sessions::get(&pool, "main-a").await.unwrap().unwrap();

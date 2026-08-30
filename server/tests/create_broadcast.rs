@@ -39,6 +39,7 @@ fn temp_config() -> (Config, PathBuf) {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
@@ -75,6 +76,9 @@ fn create_input(name: &str, dir: &std::path::Path) -> CreateInput {
         runtime: Some("native".to_string()),
         model: None,
         company_id: None,
+        archive_on_stop: None,
+        config_dir: None,
+        ..Default::default()
     }
 }
 

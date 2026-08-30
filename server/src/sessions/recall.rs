@@ -6,8 +6,10 @@
 //! row) is unchanged; this endpoint is what the popover lazy-loads when the
 //! user opens it.
 //!
-//! Reuses [`super::resumable`]'s `claude_config_dir()` + `project_dir_for()`
-//! helpers and its streaming-parse-with-substring-gate pattern. The on-disk
+//! Reuses [`super::resumable`]'s `claude_config_dir_for()` +
+//! `project_dir_for()` helpers and its streaming-parse-with-substring-gate
+//! pattern, so the transcripts come from the session's own `config_dir` when it
+//! has one and from the daemon default otherwise. The on-disk
 //! work runs under `spawn_blocking` — same shape as the resumable list at
 //! `sessions::mod::resumable_list_handler` — so the async runtime stays cool
 //! even on multi-MB transcripts.
@@ -290,6 +292,14 @@ pub async fn handler(
     // Clamp limit before crossing the thread boundary.
     let limit = q.limit.clamp(1, LIMIT_MAX);
     let dir = session.dir.clone();
+    // Same rule as the launch line (migration 0041): a session's own config dir
+    // only applies when it actually boots claude, so a shell row that carries
+    // one (via `duplicate`) still recalls the daemon's transcripts.
+    let config_dir = if super::lifecycle::launches_claude(&session.provider) {
+        session.config_dir.clone()
+    } else {
+        String::new()
+    };
     let cc_id = session.cc_conversation_id.clone();
     let codex_id = session.codex_session_id.clone();
     let provider = session.provider.clone();
@@ -320,6 +330,7 @@ pub async fn handler(
             )
         } else {
             gather(
+                &config_dir,
                 &dir,
                 &cc_id,
                 q.scope,
@@ -346,6 +357,7 @@ pub async fn handler(
 /// Build the response from a session's working dir. Thin wrapper over
 /// [`gather_in_proj`] that resolves the cwd to its Claude project folder.
 fn gather(
+    config_dir: &str,
     dir: &str,
     cc_id: &str,
     scope: Scope,
@@ -356,7 +368,7 @@ fn gather(
     before: Option<&str>,
     limit: usize,
 ) -> RecallResponse {
-    let proj = resumable::project_dir_for(dir);
+    let proj = resumable::project_dir_for(config_dir, dir);
     gather_in_proj(
         &proj,
         cc_id,

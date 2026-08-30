@@ -956,10 +956,21 @@ async fn start_handler(
                 mcp: None,
                 worktree: spawn.worktree,
                 host_id: None,
-                // Board-spawned sessions take the default (tmux) runtime.
+                // No host_id here, so leaving runtime absent resolves to native (the
+                // local-session default in `sessions::create`), not tmux.
                 runtime: None,
                 model: None,
                 company_id: None,
+                // Board-spawned sessions stay visible after they stop: a human is
+                // driving the card and may want the scrollback.
+                archive_on_stop: None,
+                // Prompt delivery and the spawn guard belong to the on-demand
+                // spawn API; this path starts and steers the session itself.
+                prompt: None,
+                unless_live_prefix: None,
+                max_quiet_secs: None,
+                // Boots on the daemon default Claude login.
+                config_dir: None,
             };
             crate::sessions::create(&state, create_input).await?;
             // Boot it so the steering deliver-loop has a live pane to talk to.
@@ -1590,6 +1601,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,

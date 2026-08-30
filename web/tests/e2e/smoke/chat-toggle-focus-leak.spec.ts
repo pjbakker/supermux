@@ -49,30 +49,19 @@ test.describe('the renderer toggle never leaks keystrokes into the pty', () => {
     await backend?.dispose()
   })
 
-  // @quarantine — BROKEN, NOT SLOW, and the distinction is the whole point of
-  // the tag. This spec has never been observed green: red on main in run
-  // 32700541733 (both retries), red on this branch in 33320742166,
-  // 33321339241 and 33321899002, red locally on a hardened runner. It times out
-  // on its FIRST action — `getByTestId('renderer-terminal')` — because the
-  // renderer switch is not in the chat header on the page it lands on at all;
-  // everything after that line is unreached.
-  //
-  // It costs 180 s of a TEN-MINUTE PR budget on every pull request, which is 3
-  // of the 10 minutes spent re-proving something already known, and it is the
-  // single reason shard 1 was 6.3 min while the other three were 2.1-3.6.
-  //
-  // Quarantine is not deletion and it is not @extended. `@extended` means "slow
-  // by construction, still passing"; `@quarantine` means "this is a real defect
-  // in the spec or the product and nobody has finished diagnosing it". It runs
-  // every night in `nightly.yml` (which excludes only `@slow` / `@needs-claude`),
-  // so the failure stays visible in a place where it is the headline instead of
-  // background noise on a gate people have learned to ignore. Take the tag off
-  // in the same commit that makes it pass.
-  test('@quarantine chat → terminal → chat: the caret is in the composer and the pty sees nothing', async ({
+  // WAS `@quarantine` — the diagnosis is finished and the defect was in the
+  // SPEC, not the product. It timed out on its first action,
+  // `getByTestId('renderer-terminal')`, because the DESKTOP chat-active seam
+  // deliberately retired the standalone switch bar (`desktop-split.tsx` renders
+  // `RendererSwitch` only while the terminal shows and chat is merely
+  // eligible); this spec predated that and kept clicking a control the surface
+  // no longer has. The toggle below now goes through the seam's REAL
+  // affordances: chat → terminal is the global `t` hotkey (the only chat-side
+  // escape on desktop), terminal → chat is the switch bar that direction still
+  // renders — which is also the direction guard (c) exists for.
+  test('chat → terminal → chat: the caret is in the composer and the pty sees nothing', async ({
     page,
   }) => {
-    test.setTimeout(180_000)
-
     const fx = await chatSession(backend, 'leak')
     fx.write(CONV, ['LEAK-SEED-0001'])
     await fx.hook(CONV)
@@ -84,9 +73,20 @@ test.describe('the renderer toggle never leaks keystrokes into the pty', () => {
     await expectTokenOnce(page, 'LEAK-SEED-0001')
     await expect(page.getByTestId('chat-composer-field')).toBeVisible()
 
-    // ── the toggle, both ways ───────────────────────────────────────────────
-    await page.getByTestId('renderer-terminal').click()
+    // ── the toggle, both ways, through the desktop seam's real affordances ──
+    // Chat → Terminal is the `t` hotkey. It refuses a `t` that comes from
+    // inside the chat surface (refusal 5b — the very injection this spec
+    // guards), so the caret is parked outside the surface first; from `<body>`
+    // the key reaches the document listener and flips the renderer.
+    await page.evaluate(() => {
+      const el = document.activeElement
+      if (el instanceof HTMLElement) el.blur()
+    })
+    await page.keyboard.press('t')
     await expect(page.locator('.xterm')).toBeVisible()
+    // Terminal → Chat through the switch bar, which this direction still
+    // renders (`chatOn && !chatActive`) — and which is the direction that must
+    // hand the caret on to the composer.
     await page.getByTestId('renderer-chat').click()
     await expect(page.getByTestId('chat-panel')).toBeVisible()
 

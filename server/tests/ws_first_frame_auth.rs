@@ -26,9 +26,9 @@ const TOKEN: &str = "first-frame-auth-secret";
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-// tungstenite 0.24 (the client side) uses `String`/`Vec<u8>` payloads.
+// tungstenite >=0.26 (the client side) takes `Utf8Bytes`/`Bytes` payloads.
 fn text(s: &str) -> Msg {
-    Msg::Text(s.to_owned())
+    Msg::Text(s.into())
 }
 
 async fn spawn_server() -> (SocketAddr, PathBuf) {
@@ -43,6 +43,7 @@ async fn spawn_server() -> (SocketAddr, PathBuf) {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
             push_sub: None,
             github_token: None,

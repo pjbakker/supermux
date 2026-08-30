@@ -45,6 +45,7 @@ fn temp_config() -> (Config, PathBuf) {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
@@ -79,6 +80,8 @@ fn new_session(name: &str, dir: &std::path::Path) -> db::sessions::NewSession {
         runtime: "native".to_string(),
         model: String::new(),
         company_id: None,
+        archive_on_stop: false,
+        config_dir: String::new(),
     }
 }
 

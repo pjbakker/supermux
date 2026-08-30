@@ -64,6 +64,7 @@ async fn session_create_and_start_never_install_the_statusline() {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: Default::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
@@ -101,6 +102,9 @@ async fn session_create_and_start_never_install_the_statusline() {
             runtime: Some("tmux".into()),
             model: None,
             company_id: None,
+            archive_on_stop: None,
+            config_dir: None,
+            ..Default::default()
         },
     )
     .await

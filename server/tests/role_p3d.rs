@@ -75,6 +75,7 @@ async fn fixture() -> Fixture {
     std::fs::create_dir_all(&root_b).unwrap();
 
     let config = Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.clone(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],
@@ -348,6 +349,22 @@ async fn member_cannot_reach_global_admin_routers() {
     assert_eq!(
         get_cookie(&f.app, "/api/workflowsx", &alice).await, nf,
         "member 404s /api/workflowsx (segment boundary)",
+    );
+    // …but two workflows subpaths stay global-admin: the installed-command
+    // digest (global skills/commands/MCP names + an operator-directed `?cwd=`
+    // filesystem read — its predecessor `/api/schedules/commands` was
+    // admin-gated) and the schedules-port archive (pre-company global rows).
+    assert_eq!(
+        get_cookie(&f.app, "/api/workflows/commands", &alice).await, nf,
+        "member 404s GET /api/workflows/commands (admin-only digest)",
+    );
+    assert_eq!(
+        get_cookie(&f.app, "/api/workflows/commands?cwd=/etc", &alice).await, nf,
+        "member 404s the digest regardless of ?cwd=",
+    );
+    assert_eq!(
+        get_cookie(&f.app, "/api/workflows/import-log", &alice).await, nf,
+        "member 404s GET /api/workflows/import-log (admin-only archive)",
     );
 }
 
@@ -668,6 +685,7 @@ async fn no_human_fixture() -> axum::Router {
     let dir = std::env::temp_dir().join(format!("supermux-p3d-nh-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.clone(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],

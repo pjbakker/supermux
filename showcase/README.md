@@ -16,6 +16,9 @@ density+sort → mobile → outro) and writes the result to
   stays full-bleed.
 - `verification.json` — per-beat manifest with timestamps, frame
   paths, and human-readable evidence notes from the visual inspection.
+  Its `outputs` paths are historical: the rendered GIF/MP4 were dropped
+  from git on 2026-08-30 (13.4 MB nothing linked to). Re-run `record.ts`
+  to regenerate them locally.
 
 ## Run
 

@@ -1,10 +1,13 @@
-//! **A bot's `connect(service)` tool stopped for a human.**
+//! **A bot's `connect(service)` tool is asking for a human.**
 //!
-//! The connector store's `connect` affordance (spec §8) is an MCP tool whose
-//! descriptor carries the `anthropic/requiresUserInteraction` marker
-//! ([`crate::connectors::connect_tool_descriptor`]): when a bot calls it, Claude
-//! Code always routes it to the human prompt instead of auto-running it, and the
-//! turn stops there. Until this module existed, supermux had NO idea that had
+//! The connector store's `connect` affordance (spec §8) is an MCP tool
+//! ([`crate::connectors::connect_tool_descriptor`]) that names the connector a bot
+//! wants. This detector is the ONLY thing that turns that call into a human-facing
+//! surface: the tool is allow-listed and carries no `requiresUserInteraction`
+//! marker on purpose (that marker forces Claude Code's own TERMINAL permission
+//! dialog, which the chat renderer cannot answer — the bot would park behind an
+//! invisible prompt), so the call returns immediately and only the card here asks
+//! the human. Until this module existed, supermux had NO idea that had
 //! happened — `session.connect_request` was declared on the wire and read by the
 //! web `ConnectCard`, but nothing server-side ever populated it, so an agent
 //! calling `connect()` could never raise the inline card in production (round-1

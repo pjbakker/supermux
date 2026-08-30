@@ -128,7 +128,10 @@ pub struct SessionActivity {
     /// text (see `sessions::elicitation`).
     pub elicitation: Option<ElicitationAsk>,
     /// **The live connect ask** (`connectors.connect`): a bot's `connect(service)`
-    /// tool carried the `requiresUserInteraction` marker and stopped for a human.
+    /// tool named a connector it wants the human to approve. The tool itself does
+    /// NOT stall (no `requiresUserInteraction` marker — that would raise Claude
+    /// Code's own terminal dialog, which chat cannot answer); this card is the
+    /// human's only surface, and the grant lands only when they tap it.
     /// Set by the `PreToolUse` hook when it recognises the connect affordance
     /// ([`crate::sessions::connect_ask::parse`]) and cleared by the same
     /// "something after it happened" events as [`permission`](Self::permission) —
@@ -443,6 +446,12 @@ pub struct AppState {
     /// because its only key (`workflow_runs.id`) is a per-database
     /// AUTOINCREMENT — see [`crate::workflows::engine::RunRegistry`].
     pub workflow_runs: Arc<crate::workflows::engine::RunRegistry>,
+    /// Per-prefix spawn-guard locks for `CreateInput.unless_live_prefix`:
+    /// the liveness check and the session INSERT must be atomic per prefix,
+    /// or two concurrent dispatch cycles both pass the check (the TOCTOU
+    /// double-boot class the server-side guard exists to close). Entries are
+    /// tiny and few (one per operator identity); never cleaned up.
+    pub spawn_guards: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Per-session status watch channels (the wait-primitive seam).
     /// Empty until the detector drives updates; the map + cleanup ensures
     /// churn never leaks entries.
@@ -808,6 +817,7 @@ impl AppState {
             session_locks: Arc::new(DashMap::new()),
             send_dedup: Arc::new(crate::sessions::send_dedup::SendDedup::default()),
             workflow_runs: Arc::new(crate::workflows::engine::RunRegistry::default()),
+            spawn_guards: Arc::new(DashMap::new()),
             status_watch: Arc::new(DashMap::new()),
             hook_tokens: Arc::new(DashMap::new()),
             pane_conversations: Arc::new(DashMap::new()),
@@ -1963,6 +1973,16 @@ impl AppState {
             .clone()
     }
 
+    /// Get (creating on first use) the spawn-guard lock for `prefix`.
+    /// Keyed by the prefix, not by session name: the whole point is to
+    /// serialize spawns whose names differ but whose identity does not.
+    pub fn spawn_guard_for(&self, prefix: &str) -> Arc<Mutex<()>> {
+        self.spawn_guards
+            .entry(prefix.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Drop every per-session in-memory map entry for `name` (cleanup
     /// rule). Called from `sessions::delete` so weeks of session churn don't leak
     /// `DashMap` entries.
@@ -2310,6 +2330,7 @@ mod pending_edit_tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,

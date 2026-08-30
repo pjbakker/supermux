@@ -26,10 +26,14 @@ TOOLS
   browser_screenshot()                     → a JPEG of the viewport, as an MCP image
   request_human_takeover(reason, …)        → hand the wheel to the human, and PARK
 
-`request_human_takeover` carries the `anthropic/requiresUserInteraction` marker,
-exactly like the store's `connect` tool: Claude routes it to the human instead of
+`request_human_takeover` carries the `anthropic/requiresUserInteraction` marker —
+the ONLY supermux tool that still does. Claude parks the call instead of
 auto-running it, and supermux's PreToolUse detector turns it into the in-chat
-"take the wheel" card that opens the takeover panel on the human's phone.
+"take the wheel" card that opens the takeover panel on the human's phone. The
+stall is the point: while the human drives, the agent must not act on the page.
+The store's `connect` tool dropped the marker for exactly the opposite reason —
+it has nothing to wait for, so parking it only hid the bot behind a terminal
+dialog the chat renderer cannot answer.
 
 Transport: MCP stdio — newline-delimited JSON-RPC 2.0, one message per line.
 Nothing but protocol JSON goes to stdout (diagnostics go to stderr).
@@ -247,6 +251,12 @@ TAKEOVER_TOOL = {
         },
         "required": ["reason"],
     },
+    # KEEP the marker here — this is the one tool that WANTS to stall. The drive
+    # lock hands the page to the human, and the agent must not act on it until they
+    # hand it back; the parked call IS the lock. (The store's `connect` tool
+    # deliberately dropped the marker: it has nothing to wait for, and the terminal
+    # dialog the marker forces is one the chat renderer cannot answer, so it parked
+    # bots for hours. Here the human is already being sent to the takeover panel.)
     "_meta": {REQUIRES_USER_INTERACTION_META: True},
 }
 

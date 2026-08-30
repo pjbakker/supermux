@@ -90,6 +90,7 @@ fn config_round_trips_remote_callback_url() {
         auth_token: "tok".to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: Some("https://supermux.tailnet.ts.net:8823".to_string()),
         push_sub: None,
         github_token: None,
@@ -116,6 +117,7 @@ fn config_round_trips_remote_callback_url() {
         auth_token: "tok".to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: None,
         push_sub: None,
         github_token: None,
@@ -160,6 +162,7 @@ fn effective_remote_callback_url_resolution_order() {
         auth_token: "tok".to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url: remote.map(|s| s.to_string()),
         push_sub: None,
         github_token: None,
@@ -235,6 +238,7 @@ async fn spawn_server(remote_callback_url: Option<String>) -> Fixture {
         auth_token: TOKEN.to_string(),
         provider_defaults: ProviderDefaults::default(),
         ws: WsConfig::default(),
+        swarm_reaper: Default::default(),
         remote_callback_url,
         push_sub: None,
         github_token: None,
@@ -422,7 +426,7 @@ async fn end_to_end_remote_session() {
     let url = format!("ws://{}/ws/sessions/{session}", f.addr);
     let (mut ws, _resp) =
         tokio_tungstenite::connect_async(url).await.expect("ws connect");
-    ws.send(Msg::Text(format!(r#"{{"type":"auth","token":"{TOKEN}"}}"#)))
+    ws.send(Msg::Text(format!(r#"{{"type":"auth","token":"{TOKEN}"}}"#).into()))
         .await
         .unwrap();
     // Read until we see auth_ok or time out.

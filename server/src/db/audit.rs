@@ -3,7 +3,8 @@
 //! Every destructive HTTP call records a row. Callers write `file.put` and
 //! `file.delete`, and reuse [`log`] for `session.delete`, `schedule.run`, etc.
 //! The `actor` is `user` for HTTP-originated calls, `scheduler` for
-//! tick-originated calls, and `agent:<name>` for cross-session calls.
+//! tick-originated calls, `agent:<name>` for cross-session calls, and
+//! `reaper` for scheduled/background maintenance (the swarm sweep).
 //!
 //! **Secret hygiene.** `detail` must never contain secret values — only
 //! metadata (path, byte count, which env var). Callers are responsible for
@@ -284,6 +285,7 @@ mod tests {
             auth_token: "test-token".to_string(),
             provider_defaults: Default::default(),
             ws: Default::default(),
+            swarm_reaper: Default::default(),
             remote_callback_url: None,
             push_sub: None,
             github_token: None,

@@ -22,6 +22,7 @@ async fn test_state() -> (AppState, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("supermux-ea-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.clone(),
         bind: "127.0.0.1:8823".parse().unwrap(),
         extra_binds: vec![],
@@ -162,7 +163,12 @@ async fn cf_token_missing_scope_is_rejected() {
     )
     .await;
     match res {
-        Err(AppError::BadRequest(msg)) => assert!(msg.contains("scope"), "msg: {msg}"),
+        // The message must NAME the permission to add — "something went wrong"
+        // is what sent the owner back to Cloudflare guessing.
+        Err(AppError::BadRequest(msg)) => assert!(
+            msg.contains("missing a permission") && msg.contains("Cloudflare Tunnel"),
+            "msg: {msg}"
+        ),
         other => panic!("expected missing-scope BadRequest, got {other:?}"),
     }
     cleanup(state, dir).await;

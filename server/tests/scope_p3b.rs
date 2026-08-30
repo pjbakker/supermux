@@ -92,6 +92,8 @@ async fn make_session(state: &AppState, name: &str, company: Option<i64>, dir: &
             runtime: "native".to_string(),
             model: String::new(),
             company_id: company,
+            archive_on_stop: false,
+            config_dir: String::new(),
         },
     )
     .await
@@ -124,6 +126,8 @@ async fn make_remote_session(
             runtime: "native".to_string(),
             model: String::new(),
             company_id: company,
+            archive_on_stop: false,
+            config_dir: String::new(),
         },
     )
     .await
@@ -141,6 +145,7 @@ async fn fixture() -> Fixture {
     std::fs::write(root_b.join("secret.txt"), b"bravo-company-b").unwrap();
 
     let config = Config {
+        swarm_reaper: Default::default(),
         data_dir: dir.clone(),
         bind: "127.0.0.1:0".parse().unwrap(),
         extra_binds: vec![],
@@ -654,7 +659,7 @@ async fn ws_probe(addr: std::net::SocketAddr, session: &str, cookie: &str) -> (b
         .insert(header::COOKIE, format!("supermux_hsess={cookie}").parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("ws upgrade");
     // A human authenticates by cookie; the first frame is consumed regardless.
-    ws.send(Msg::Text(r#"{"type":"auth","token":""}"#.to_string())).await.unwrap();
+    ws.send(Msg::Text(r#"{"type":"auth","token":""}"#.into())).await.unwrap();
 
     let mut auth_ok = false;
     let mut code = None;

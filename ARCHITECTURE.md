@@ -55,7 +55,7 @@ A design reference for contributors. Setup and deploy live in [`README.md`](READ
 | `push.rs` | VAPID keypair, subscriptions, send fan-out (web-push + reqwest rustls). |
 | `prefs.rs` | Snippets + kbd-groups CRUD. |
 | `claude_config.rs` | Writes `~/.claude/settings.json` for the service user. |
-| `sessions/` | tmux lifecycle, pty reader, status detector, teams, host pool, transport, steering deliver loop. |
+| `sessions/` | tmux lifecycle, pty reader, status detector, teams, host pool, transport, steering deliver loop, swarm reaper (`swarm.rs`). |
 | `ws/` | WebSocket router — pty fan-out (`broadcast::channel<Bytes>` per session), in-band first-frame auth. |
 | `board/` | Issue tracker, hook protocol (`/api/hook/board/*`), iCal feed, claim flow, dispatch. The Kanban PAGE was removed in fase B2 — the API, the hook edge, the iCal feed and the `supermux-task` skill are unchanged, and issues are read from session detail and the team card (`web/src/components/issues/`). |
 | `scheduler/` | 10s tick, expression parser (`cron`, `every Nm/Nh`, named), runner (tmux/shell/boot), watch mode. |
@@ -119,11 +119,38 @@ The board hook protocol and the scheduler's watch mode both subscribe to the sam
 
 ---
 
+## Swarm reaper
+
+`server/src/sessions/swarm.rs`.
+
+Agent teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) run each team on its own private tmux server, socket `$TMUX_TMPDIR/tmux-<uid>/claude-swarm-<lead pid>` (tmux always adds the per-uid subdirectory). Nothing upstream tears that server down when the lead agent exits, so every finished team leaves a detached server full of idle teammate processes. The reaper kills those. The periodic sweep kills a server only when all three hold: the lead PID is gone, the server has no attached tmux clients, and it is older than the grace period. The targeted teardown applies the first two only — it fires on an event that already proved the session ended, so there is nothing for a grace period to protect. A live PID is never trusted as proof that the team is active (PIDs get recycled); it only ever means "keep", which is the safe side. Leftover socket files are garbage-collected separately, and only when tmux positively answers that nothing is listening on them; an inconclusive probe leaves the file alone. Known limitation: a zombie lead process (one that exited but was never reaped by its parent) keeps `/proc/<pid>` alive, so its team server is kept until the zombie is reaped.
+
+Two entry points share those rules. Session stop, archive, delete, and the `SessionEnd` hook fire a targeted teardown for that session's lead, so a tracked exit cleans up almost immediately. A periodic sweep is the safety net for leads that die without an event (OOM kill, crash), and it also does the socket-file cleanup; the first tick runs at boot. A sweep that killed a server or removed a socket file writes an `audit_log` row with actor `reaper` carrying the full outcome; a sweep that killed something also raises an SSE `alerts` event.
+
+Only the local host is swept. A session running on a remote host over SSH keeps its agent-team server on that remote box, where neither the sweep (it reads the local `/proc`) nor the targeted teardown can see it.
+
+Configuration is the `[swarm_reaper]` block in `~/.supermux/config.toml`:
+
+```toml
+[swarm_reaper]
+enabled = true        # master switch: periodic sweep AND targeted teardown
+grace_secs = 7200     # never kill a server younger than this, clamped to at least 60
+interval_secs = 1800  # sweep cadence, clamped to at least 60
+```
+
+`enabled = false` turns the whole feature off — the periodic sweep and the targeted teardown at stop/archive/delete/`SessionEnd` alike. That switch exists for an operator who has been burned by it, and a switch that silenced only the timer while every stop still killed a tmux server would mean "off, mostly". Turning it back on reclaims whatever leaked in the meantime on the next sweep.
+
+Both durations are clamped to a 60-second floor, on the config block and on the `--grace-secs` flag alike. `grace_secs` is the only thing between a lead that exited seconds ago and a SIGKILL of the server its teammates are still flushing through, so a `grace_secs = 0` typo is clamped rather than honoured; the effective values are logged at startup.
+
+For a sweep by hand there is `supermux-server swarm-reaper [--dry-run] [--grace-secs N]`. It needs no DB and no listener, and like `pty-holder` it takes no `--help` by convention. It does not read the `[swarm_reaper]` block: without `--grace-secs` it uses the built-in default of 7200 seconds, so a config that widened or narrowed the grace period has to be repeated on the command line. Dry-run reports what a real run would do and changes nothing; it cannot always predict which socket files a real run would remove, because the servers it only marks for killing are still alive and still answering on their sockets. INFO tracing goes to the same terminal as the stdout report, so use `RUST_LOG=warn` for a clean one.
+
+---
+
 ## Database
 
-`server/migrations/0001..0018_*.sql` — applied at startup. Highlights:
+`server/migrations/0001..0041_*.sql`, applied at startup. Highlights:
 
-- `sessions` + `session_runtime` — the source-of-truth row per tmux session; ANSI-capture preview lives in `runtime`.
+- `sessions` + `session_runtime`: the source-of-truth row per tmux session; ANSI-capture preview lives in `runtime`. `sessions.config_dir` (migration 0041) pins which Claude login a session boots on: it is exported as `CLAUDE_CONFIG_DIR` in the launch line of every session that launches `claude`, and the Resume picker and recall read that account's transcripts. Empty means the daemon default (`$CLAUDE_CONFIG_DIR` of the server process, else `~/.claude`). Local sessions only: a `config_dir` together with a `host_id` is a 400.
 - `issues` + `acceptance_items` + `issue_links` + `issue_tags` + `boards` + `delegations` — the board.
 - `schedules` + `schedule_runs` + `schedule_run_keys` — scheduler + idempotency.
 - `audit_log` — every mutation. Append-only.
@@ -133,6 +160,34 @@ The board hook protocol and the scheduler's watch mode both subscribe to the sam
 - `skills`, `tracked_files`, `kbd_groups`, `snippets` — supporting stores.
 
 Migrations are forward-only. Schema changes go in a new file `00NN_<name>.sql`.
+
+A session with its own `config_dir` gets its status hooks written INTO that
+account: `claude_config::install_hooks` already takes an explicit settings path,
+and session start hands it `<config_dir>/settings.json` for a local row that has
+one. So a second-account session reports real hook status rather than falling
+back to the regex and pty heartbeat path, and no `settings.json` symlink is
+needed for status to work.
+
+The hooks are the exception. Everything else supermux installs
+or edits resolves the DAEMON's config dir from the server process environment,
+never the session's column, so a session on a second account does not inherit:
+
+- **Slash commands.** `agents/skills.rs` writes them to
+  `$CLAUDE_CONFIG_DIR/commands` of the server process, so a second-account
+  session sees none of the supermux-installed commands.
+- **MCP servers.** `claude_tools/atomic.rs` and `claude_tools/mcp.rs` edit the
+  daemon account's `.claude.json`, so supermux-managed MCP servers are missing
+  from the second account.
+- **Teammate scanning.** `teams/scan.rs` reads the daemon's teams/tasks files.
+  This one is currently unreachable: team start hard-codes `config_dir: None`,
+  so every teammate session runs on the daemon account anyway.
+- **The statusline tap.** `chat/statusline.rs` resolves
+  `claude_config::local_settings_path()` for both the opt-in install and the
+  uninstall, so the tap is written to and removed from the daemon account only.
+
+Symlinking `commands/` and the MCP config into the second account is the
+remedy. Without it the session works, it just lacks the supermux-installed
+extras, which is worth knowing before debugging it as "supermux is broken".
 
 ---
 

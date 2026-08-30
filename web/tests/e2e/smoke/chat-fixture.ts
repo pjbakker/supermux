@@ -80,12 +80,43 @@ process.env.CLAUDE_CONFIG_DIR ??= mkdtempSync(join(tmpdir(), 'a6t3-claude-cfg-')
 // PATH alone is not enough, because the pane's shell sources the developer's
 // `~/.bashrc`, which re-prepends `~/.local/bin` — where a REAL claude lives —
 // in front of the shim. No rc file, no shadowing.
+//
+// THE PROMPT IS `❯ `, AND THAT IS LOAD-BEARING. `POST /send` gates every send to
+// an AGENT-provider session on the CURRENT screen of the pty
+// (`lifecycle.rs::send_block`, wave-7 #111 + wave-8 #113): unless the bottom
+// rows carry the agent's own composer glyph (`❯`/`❱`, `agent_composer_visible`)
+// or a busy footer, the server answers 409 instead of typing a message into a
+// bare shell or a boot modal that would swallow it. Note it is
+// `agent_composer_visible`, NOT the looser `agent_ui_visible`: the send path was
+// deliberately moved off the latter, because a dialog's caret is the same glyph.
+// That guard is right, and it is not test-aware: a stand-in agent whose pane
+// draws `t3$ ` is, to the server, a shell the agent exited to, so a composer
+// send from these specs came back 409 and the row escalated to `undelivered`.
+// The stand-in has to look like the thing it stands in for. Bash keeps this
+// glyph on the last row for the rest of the pane's life, so a second send is
+// admitted the same way the first is.
+//
+// THE FIRST GATE IS NOT THE TEXT ONE, and it is the reason this trick works at
+// all. On the native runtime `send_block` is preceded by a refuse when
+// `shell_is_foreground()` is true (native `tpgid == pid`) — and this pane IS a
+// bash. It survives because the launch command is TYPED into the pane's shell
+// rather than exec'd by the holder, so the shim's bash runs as a forked child in
+// its own pgid and the holder's shell is no longer the foreground job. A future
+// fixture that gets its agent exec'd into the pane instead will be refused here
+// before the prompt glyph is ever read.
+//
+// ONE FRAGILITY THE GLYPH BUYS: the stand-in is a real bash, so whatever a spec
+// sends is EXECUTED and echoed back. Today the only sender writes a literal that
+// bash rejects with "command not found", after which it redraws `❯ ` and the next
+// send is admitted. A spec sending text that echoes as a NUMBERED row (`1. foo`)
+// would render the pane as `❯ 1. foo`, which `selection_screen` refuses — a 409
+// that would look like a product bug rather than a fixture artefact.
 const SHIM_DIR = mkdtempSync(join(tmpdir(), 'a6t3-shim-'))
 const SHIM_HOME = mkdtempSync(join(tmpdir(), 'a6t3-home-'))
 writeFileSync(
   join(SHIM_DIR, 'claude'),
   '#!/bin/sh\nprintf %s "$SUPERMUX_HOOK_TOKEN" > "$PWD/.hook-token"\n' +
-    "exec env PS1='t3$ ' bash --norc --noprofile -i\n",
+    "exec env PS1='❯ ' bash --norc --noprofile -i\n",
 )
 chmodSync(join(SHIM_DIR, 'claude'), 0o755)
 

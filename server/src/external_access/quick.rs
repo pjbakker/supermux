@@ -29,6 +29,13 @@ pub struct QuickTunnelHandle {
     pub host: String,
     /// The supervised `cloudflared` child. `None` for a test/fake handle.
     child: Option<tokio::process::Child>,
+    /// The task that KEEPS READING the child's stderr for as long as it lives.
+    /// It is not diagnostics — it is life support: cloudflared logs to stderr
+    /// forever, and Go's runtime turns an `EPIPE` on fd 2 into a fatal SIGPIPE.
+    /// Dropping the read end therefore KILLS the tunnel within a second or two
+    /// (measured: `rc = -13`). Holding the reader here keeps the pipe open.
+    /// `None` for a test/fake handle.
+    drain: Option<tokio::task::JoinHandle<()>>,
     /// Unix seconds when it was started.
     pub started_at: i64,
 }
@@ -46,6 +53,9 @@ impl QuickTunnelHandle {
 
     /// SIGTERM the child (best-effort). Consumes the handle.
     pub async fn terminate(mut self) {
+        if let Some(drain) = self.drain.take() {
+            drain.abort();
+        }
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -57,6 +67,9 @@ impl Drop for QuickTunnelHandle {
     fn drop(&mut self) {
         // Best-effort SIGTERM if the handle is dropped without an explicit stop
         // (e.g. process teardown). `start_kill` is non-blocking.
+        if let Some(drain) = self.drain.take() {
+            drain.abort();
+        }
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
         }
@@ -122,30 +135,46 @@ impl QuickTunnelHost for RealQuickTunnelHost {
             .take()
             .ok_or_else(|| QuickError::Spawn("no stderr pipe".to_string()))?;
 
-        // Scan stderr line-by-line for the URL, bounded by a timeout. On timeout
-        // (or EOF without a URL) SIGTERM the child and report NoUrl.
-        let scan = async {
+        // ONE long-lived reader task owns the pipe for the child's whole life. It
+        // announces the first trycloudflare URL over a oneshot and then keeps
+        // draining until EOF (i.e. until the child exits).
+        //
+        // WHY it must keep reading rather than stop at the URL: cloudflared never
+        // stops logging to stderr, and Go kills the process on `EPIPE` to fd 2.
+        // The previous shape dropped the `BufReader` the moment the URL matched,
+        // so the tunnel we had just handed the user died on its very next log
+        // line — `status` then reported `active:false` forever and the invite
+        // wizard silently fell back to its chooser. Verified on this box: pipe
+        // closed ⇒ `rc = -13` (SIGPIPE) in under 2s; pipe drained ⇒ alive.
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let drain = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
+            let mut tx = Some(tx);
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(url) = extract_trycloudflare_url(&line) {
-                    return Some(url);
+                if tx.is_some() {
+                    if let Some(url) = extract_trycloudflare_url(&line) {
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send(url);
+                        }
+                    }
                 }
             }
-            None
-        };
+        });
 
-        match tokio::time::timeout(URL_SCAN_TIMEOUT, scan).await {
-            Ok(Some(url)) => {
+        match tokio::time::timeout(URL_SCAN_TIMEOUT, rx).await {
+            Ok(Ok(url)) => {
                 let host = host_of(&url);
                 Ok(QuickTunnelHandle {
                     url,
                     host,
                     child: Some(child),
+                    drain: Some(drain),
                     started_at: chrono::Utc::now().timestamp(),
                 })
             }
             _ => {
-                // Timed out or stderr closed with no URL — tear the child down.
+                // Timed out, or stderr closed with no URL — tear the child down.
+                drain.abort();
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 Err(QuickError::NoUrl)
@@ -213,6 +242,7 @@ impl QuickTunnelHost for MockQuickTunnelHost {
             url,
             host,
             child: None, // no real process in tests
+            drain: None,
             started_at: chrono::Utc::now().timestamp(),
         })
     }
@@ -255,6 +285,53 @@ mod tests {
     fn host_of_strips_scheme_and_trailing_slash() {
         assert_eq!(host_of("https://calm-frog.trycloudflare.com/"), "calm-frog.trycloudflare.com");
         assert_eq!(host_of("https://x.trycloudflare.com"), "x.trycloudflare.com");
+    }
+
+    /// Regression (invite wizard: "Create a temporary link" did nothing).
+    ///
+    /// `start` used to drop the stderr reader as soon as it matched the URL. A
+    /// child that keeps logging then takes an `EPIPE`/SIGPIPE on its next write
+    /// and dies — so the tunnel the user had just been handed was already gone
+    /// by the time `status` asked, and the wizard fell back to its chooser.
+    ///
+    /// The stand-in cloudflared prints a trycloudflare banner and then keeps
+    /// logging forever; it can only still be alive a second later if the pipe
+    /// is being drained. No network, no real cloudflared.
+    #[tokio::test]
+    async fn real_host_keeps_the_child_alive_while_it_keeps_logging() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("supermux-quick-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let bin = dir.join("fake-cloudflared");
+        {
+            let mut f = std::fs::File::create(&bin).expect("create");
+            f.write_all(
+                b"#!/bin/sh\n\
+                  echo 'INF |  https://fake-drain-1234.trycloudflare.com  |' >&2\n\
+                  while true; do echo 'INF still tunnelling' >&2 || exit 7; sleep 0.05; done\n",
+            )
+            .expect("write");
+        }
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mut handle = RealQuickTunnelHost
+            .start(&bin, "http://127.0.0.1:9")
+            .await
+            .expect("the banner URL is captured");
+        assert_eq!(handle.host, "fake-drain-1234.trycloudflare.com");
+
+        // Long enough for many more stderr writes to land — with a closed pipe
+        // the child is dead well inside this window.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            handle.is_alive(),
+            "the child must survive its own logging (stderr stays drained)"
+        );
+
+        handle.terminate().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
