@@ -42,6 +42,27 @@ const COLD_START_PTY_IDLE: Duration = Duration::from_secs(300);
 /// used to guarantee.
 const SUBAGENT_LIVE_WINDOW: Duration = Duration::from_secs(10);
 
+/// How recently a per-agent row ([`AgentRun`]) must have carried a hook to read
+/// as LIVE rather than QUIET. Deliberately NOT [`SUBAGENT_LIVE_WINDOW`]'s 10s:
+/// an agent sitting inside one `Bash` is legitimately silent, and Claude Code's
+/// `Bash` timeout ceiling is 600s — a 10s window would blink every row in and
+/// out, which is worse jank than the stale count these rows replace.
+const AGENT_LIVE_WINDOW: Duration = Duration::from_secs(60);
+
+/// How long a row survives with no fresh evidence before it is DROPPED entirely.
+/// Past this we no longer claim to know anything about that agent, so it stops
+/// being rendered rather than aging into a ghost. The failure direction is
+/// deliberately FALSE-QUIET, never false-busy: a genuinely working agent inside
+/// one very long command can dim and then vanish, and reappears on its next
+/// hook. Nothing but a hook carrying that exact `agent_id` can make a row exist.
+const AGENT_GONE_AFTER: Duration = Duration::from_secs(600);
+
+/// Hard cap on rows per session, evicting the oldest evidence first. One
+/// conversation on this host has 899 subagent transcripts; without a cap a
+/// fan-out session's map would grow with every child it ever spawned. Rows are
+/// ~120 B, so the worst case is ~4 KB per session.
+const AGENT_ROWS_MAX: usize = 32;
+
 /// A per-session status snapshot pushed through [`AppState::status_watch`]:
 /// `(status, version)`. The channel + version counter form the
 /// multi-signal-status groundwork; the status payload is the
@@ -156,6 +177,83 @@ impl SessionActivity {
             && self.question_request.is_none()
             && self.waiting_message.is_none()
     }
+}
+
+/// One SUBAGENT supermux has first-hand evidence of, keyed by Claude's own
+/// `agent_id` ([`crate::sessions::activity::HookPayload::agent_id`]).
+///
+/// **This is not a count.** The outstanding-subagent count
+/// ([`SessionActivity::subagents`]) can be pinned by a lost `SubagentStop` and
+/// says nothing about WHICH children exist or what they are doing; it also feeds
+/// the status classifier and the finish notification, so it cannot be changed
+/// without changing those. These rows are a separate, purely additive record
+/// built from bytes supermux already received and discarded: a row EXISTS only
+/// because a hook carrying that exact `agent_id` arrived, which is why a ghost
+/// is structurally impossible here.
+///
+/// DISPLAY-ONLY, and structurally so: written only by the `pre_tool` /
+/// `post_tool` / `subagent_start` / `subagent_stop` arms of
+/// [`crate::hooks`], read only by the SSE delta and the `SessionView`
+/// serializer. It is passed to NOTHING else — not `StatusDetector::detect`, not
+/// `notify`, not the turn boundary. (The known bug this invariant exists for:
+/// `SubagentStop` once ended the MAIN turn.)
+///
+/// In-memory only, never persisted — same posture as the activity line, and for
+/// the same reason: `label` is agent-authored text.
+#[derive(Debug, Clone)]
+pub struct AgentRun {
+    /// The child's KIND, verbatim from the hook (`general-purpose`,
+    /// `workflow-subagent`, …). Shown only when there is no `label`: workflow
+    /// children have no human name anywhere on the wire, and inventing one would
+    /// be the same lie as the count.
+    pub agent_type: String,
+    /// The [`crate::sessions::activity::activity_label`] of this agent's NEWEST
+    /// tool call (`⚡ run the test suite`). `None` until its first tool hook — a
+    /// `SubagentStart` proves the child exists but says nothing about its work.
+    pub label: Option<String>,
+    /// First sighting, for the `Ns` elapsed the client renders.
+    pub started: Instant,
+    /// The newest hook that carried this `agent_id`. THE staleness clock: see
+    /// [`AGENT_LIVE_WINDOW`] / [`AGENT_GONE_AFTER`].
+    pub last_evidence: Instant,
+    /// `SubagentStop` was seen for this id. A TOMBSTONE, not a removal: hooks
+    /// are fire-and-forget POSTs on a shared token, so a straggler `PostToolUse`
+    /// can arrive after the stop, and a removed row would let it RESURRECT a
+    /// finished agent as a row that then sits quiet for ten minutes — exactly
+    /// the ghost these rows exist to abolish. Stopped rows are never rendered
+    /// and are reclaimed by the same [`AGENT_GONE_AFTER`] sweep as the rest.
+    pub stopped: bool,
+}
+
+impl AgentRun {
+    /// Is this row past the point where we still claim to know anything about
+    /// the agent? Pure over `(last_evidence, now)` so the sweep is testable
+    /// without sleeping.
+    fn is_gone(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_evidence) >= AGENT_GONE_AFTER
+    }
+}
+
+/// The WIRE shape of one [`AgentRun`] — what `SessionView.agents` and the
+/// `sessions` SSE delta carry. Both durations are milliseconds resolved against
+/// the server clock at serialization time, so the client needs no clock of its
+/// own: it renders `since_ms` as a self-advancing elapsed leaf and reads
+/// `quiet_ms` for the live/quiet distinction.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AgentRow {
+    /// Claude's `agent_id` — the React key, and the reason two rows can never
+    /// merge or double-count.
+    pub id: String,
+    #[serde(rename = "type")]
+    pub agent_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Milliseconds since the first hook carrying this id.
+    pub since_ms: u64,
+    /// Milliseconds since the NEWEST hook carrying it. The client dims a row
+    /// past [`AGENT_LIVE_WINDOW`] and says the FACT (`no tool call for 3m`) —
+    /// never "stopped", never "done", never a verdict.
+    pub quiet_ms: u64,
 }
 
 /// One server-sent event: `{ type, payload }`.
@@ -376,6 +474,20 @@ pub struct AppState {
     /// though it never bumped the count. Memory-only; cleared on delete/rename;
     /// naturally decays via [`SUBAGENT_LIVE_WINDOW`] (no reaper task needed).
     pub subagent_active_at: Arc<DashMap<String, Instant>>,
+    /// Per-session `agent_id → `[`AgentRun`] — the subagents supermux has
+    /// FIRST-HAND evidence of, as opposed to the count next door which is a
+    /// number that can drift. Fed from `agent_id`/`agent_type`, two fields every
+    /// Claude hook already carried and that supermux discarded until now
+    /// ([`AppState::touch_agent`] / [`AppState::stop_agent`]); read back by
+    /// [`AppState::agent_rows`]. No migration, no disk walk, no new endpoint, no
+    /// reaper task — rows age out on read ([`AGENT_GONE_AFTER`]).
+    ///
+    /// A separate map from `session_activity` on purpose: this is the one piece
+    /// of subagent state that is display-only ALL THE WAY DOWN, and keeping it
+    /// off `SessionActivity` means it cannot be picked up by the change-detection
+    /// that gates broadcasts, the status classifier, or the finish gate.
+    /// Memory-only; cleared on session start/end/delete, renamed with the session.
+    pub agents: Arc<DashMap<String, HashMap<String, AgentRun>>>,
     /// Per-session "hooks are LIVE" flag. Set the moment ANY authenticated hook
     /// POST arrives from the session (`/api/_internal/hook`), so it goes true
     /// within the boot window — the `SessionStart` hook fires when Claude
@@ -692,6 +804,7 @@ impl AppState {
             pane_conversations: Arc::new(DashMap::new()),
             last_hook: Arc::new(DashMap::new()),
             subagent_active_at: Arc::new(DashMap::new()),
+            agents: Arc::new(DashMap::new()),
             hooks_live: Arc::new(DashMap::new()),
             detector_wake: Arc::new(DashMap::new()),
             chat_pointer_wake: Arc::new(DashMap::new()),
@@ -1397,6 +1510,140 @@ impl AppState {
         })
     }
 
+    // ── per-agent rows (DISPLAY-ONLY, see `AgentRun`) ────────────────────────
+
+    /// Record first-hand evidence that subagent `id` of `name` is alive: a hook
+    /// that carried this `agent_id`. Upserts the row, refreshes its evidence
+    /// clock, and — when the hook was a TOOL call — replaces its label with what
+    /// that child is doing right now.
+    ///
+    /// Two rules make this safe to call from every arm:
+    ///
+    /// * **A stopped row is never touched.** `SubagentStop` is final for an id,
+    ///   and hooks are fire-and-forget POSTs that can arrive out of order, so a
+    ///   straggler must not resurrect a finished agent (see [`AgentRun::stopped`]).
+    /// * **`label: None` never erases a label.** `SubagentStart` carries no tool,
+    ///   and a re-notified agent must not lose the sentence it already earned.
+    pub fn touch_agent(&self, name: &str, id: &str, agent_type: Option<&str>, label: Option<String>) {
+        if id.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut runs = self.agents.entry(name.to_string()).or_default();
+        if let Some(run) = runs.get_mut(id) {
+            if run.stopped {
+                return;
+            }
+            run.last_evidence = now;
+            if let Some(l) = label {
+                run.label = Some(l);
+            }
+            if let Some(t) = agent_type.filter(|t| !t.is_empty()) {
+                run.agent_type = t.to_string();
+            }
+            return;
+        }
+        // A NEW id. Enforce the cap before inserting, evicting the row whose
+        // evidence is oldest — which is always a quiet or tombstoned one, since
+        // anything working keeps bumping its own clock.
+        while runs.len() >= AGENT_ROWS_MAX {
+            let oldest = runs
+                .iter()
+                .min_by_key(|(_, r)| r.last_evidence)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    runs.remove(&k);
+                }
+                None => break,
+            }
+        }
+        runs.insert(
+            id.to_string(),
+            AgentRun {
+                agent_type: agent_type.unwrap_or_default().to_string(),
+                label,
+                started: now,
+                last_evidence: now,
+                stopped: false,
+            },
+        );
+    }
+
+    /// `SubagentStop` for `id`: tombstone the row so it stops rendering and can
+    /// never be resurrected by a late hook. ID-KEYED, therefore idempotent — a
+    /// duplicated stop is a no-op the second time and can drive nothing negative.
+    ///
+    /// An UNKNOWN id is deliberately not inserted: with no row there is nothing
+    /// to hide, and allocating a tombstone for a child we never saw work would
+    /// spend a slot of the cap on a signal that renders nothing.
+    pub fn stop_agent(&self, name: &str, id: &str) {
+        if let Some(mut runs) = self.agents.get_mut(name) {
+            if let Some(run) = runs.get_mut(id) {
+                run.stopped = true;
+            }
+        }
+    }
+
+    /// The rows of `name` that still have fresh first-hand evidence, as of `now`
+    /// — freshest first, so the live children lead and the quiet ones sink.
+    ///
+    /// `now` is a parameter rather than `Instant::now()` so the staleness ladder
+    /// is testable without sleeping. Reclaims gone rows on the way through (the
+    /// sweep is a read, not a task) and drops the session entry once it is empty,
+    /// so an idle session leaks nothing.
+    pub fn agent_rows(&self, name: &str, now: Instant) -> Vec<AgentRow> {
+        let mut rows = Vec::new();
+        let mut empty = false;
+        if let Some(mut runs) = self.agents.get_mut(name) {
+            runs.retain(|_, r| !r.is_gone(now));
+            rows = runs
+                .iter()
+                .filter(|(_, r)| !r.stopped)
+                .map(|(id, r)| AgentRow {
+                    id: id.clone(),
+                    agent_type: r.agent_type.clone(),
+                    label: r.label.clone(),
+                    since_ms: now.saturating_duration_since(r.started).as_millis() as u64,
+                    quiet_ms: now.saturating_duration_since(r.last_evidence).as_millis() as u64,
+                })
+                .collect();
+            empty = runs.is_empty();
+        }
+        if empty {
+            self.agents.remove(name);
+        }
+        // Freshest first, then by id so the order is stable across ticks (a list
+        // that reshuffles under a reader is its own kind of lie).
+        rows.sort_by(|a, b| a.quiet_ms.cmp(&b.quiet_ms).then_with(|| a.id.cmp(&b.id)));
+        rows
+    }
+
+    /// A new prompt: drop every row that is not PROVABLY still working as of
+    /// `now`, and keep the ones that are. The asymmetry is deliberate and mirrors
+    /// what the outstanding count already does on this edge: a background
+    /// workflow whose children are mid-tool survives the human's next prompt,
+    /// because it really is still running; everything else belongs to the turn
+    /// that just ended and must not be carried into the new one.
+    pub fn prune_agents_for_prompt(&self, name: &str, now: Instant) {
+        let mut empty = false;
+        if let Some(mut runs) = self.agents.get_mut(name) {
+            runs.retain(|_, r| {
+                !r.stopped && now.saturating_duration_since(r.last_evidence) < AGENT_LIVE_WINDOW
+            });
+            empty = runs.is_empty();
+        }
+        if empty {
+            self.agents.remove(name);
+        }
+    }
+
+    /// Drop every row for `name` — `SessionStart` / `SessionEnd`. A brand-new (or
+    /// finished) Claude process inherits no children.
+    pub fn clear_agents(&self, name: &str) {
+        self.agents.remove(name);
+    }
+
     /// Set `name`'s live permission request (from a `PermissionRequest` payload:
     /// the dialog is UP and Claude is blocked on a human). Returns whether it
     /// changed — re-firing the identical dialog broadcasts nothing.
@@ -1668,6 +1915,7 @@ impl AppState {
         self.pane_conversations.retain(|(s, _), _| s != name);
         self.last_hook.remove(name);
         self.subagent_active_at.remove(name);
+        self.agents.remove(name);
         self.hooks_live.remove(name);
         self.detector_wake.remove(name);
         self.chat_pointer_wake.remove(name);
@@ -1771,6 +2019,9 @@ impl AppState {
         }
         if let Some((_, v)) = self.subagent_active_at.remove(old) {
             self.subagent_active_at.insert(new.to_string(), v);
+        }
+        if let Some((_, v)) = self.agents.remove(old) {
+            self.agents.insert(new.to_string(), v);
         }
         if let Some((_, v)) = self.hooks_live.remove(old) {
             self.hooks_live.insert(new.to_string(), v);

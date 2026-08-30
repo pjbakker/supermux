@@ -103,6 +103,28 @@ pub struct HookPayload {
     /// nothing. Snake_case on the wire; aliased to the camel form.
     #[serde(default, alias = "notificationType")]
     pub notification_type: Option<String>,
+    /// **The subagent this hook fired from.** Claude Code's base payload schema
+    /// `and`s this into EVERY event, and its own docstring is the rule we follow:
+    /// *"Present only when the hook fires from within a subagent … Absent for the
+    /// main thread, even in --agent sessions. Use this field (not `agent_type`) to
+    /// distinguish subagent calls from main-thread calls."*
+    ///
+    /// So its PRESENCE is the whole signal: a `PreToolUse` carrying it is a
+    /// CHILD's tool call arriving on the shared parent token, and it is the only
+    /// first-hand evidence that a specific subagent exists and is working right
+    /// now. supermux already forwarded these bytes verbatim and discarded them
+    /// ([`crate::state::AppState::touch_agent`] is what now reads them).
+    /// Captured live on 2.1.251 for BOTH kinds of child — an `Agent`/`Task`
+    /// worker and a `workflow-subagent`.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// The subagent's KIND (`general-purpose` / `Explore` / `workflow-subagent` /
+    /// a user-defined agent name). Rides with [`agent_id`](Self::agent_id) on
+    /// every child hook. Display-only, and never the presence test — a
+    /// main-thread hook can be absent both, but only `agent_id` is documented as
+    /// the discriminator.
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 /// The live "Claude is asking permission to do X" state, derived from a
