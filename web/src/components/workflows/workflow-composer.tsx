@@ -559,7 +559,9 @@ export function ComposerBody({
             </p>
             <p className="text-[12px] leading-snug text-muted-foreground">
               For throwaway bots: the session tidies itself away the moment it
-              stops. Its workflows pause until you unarchive it.
+              stops &mdash; including when you stop it yourself. This is a
+              property of the bot, so it applies to its other workflows too, and
+              all of them pause until you unarchive it.
             </p>
           </div>
           {/* the app's switch primitive, not a hand-rolled one: this row is the
