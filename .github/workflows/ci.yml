@@ -254,25 +254,28 @@ jobs:
       # exists to stop. They all still run in the un-filtered `bun run
       # test:e2e:smoke` on a developer machine, which is where they can pass.
       #
-      # Measured split of the 73 eligible tests: 19 / 19 / 17 / 18. Retries are no
-      # longer global — see playwright.config.ts.
+      # Measured split of the 73 eligible tests: 19 / 19 / 17 / 18 (74 eligible
+      # since the quarantine lift below). Retries are no longer global — see
+      # playwright.config.ts.
       # THREE exclusions, three different reasons, and keeping them distinct is
       # what stops this list becoming a junk drawer:
       #
       #   `@slow` / `@needs-claude` — CANNOT pass here. Both need the real
       #     `claude` CLI on PATH, and a hosted runner has none.
-      #   `@quarantine` — BROKEN. `chat-toggle-focus-leak` (180 s) has never been
-      #     observed green: red on main in run 32700541733 and on every run
-      #     since. That is 180 s of a ten-minute budget spent re-proving a known
-      #     defect, and it is why shard 1 was 6.3 min against 2.1-3.6 for the
-      #     other three. It runs nightly, where a failure is the headline rather
-      #     than background noise on a gate people have learned to ignore. The
-      #     tag comes off in the commit that fixes it — see the spec for its
-      #     diagnosis so far.
-      #     `chat-ws-restart-reseeds` (35 s) was the second entry here and is
-      #     NO LONGER QUARANTINED: the v0.6.1 fork integration fixed the fixture
-      #     that made it fail (its stand-in agent drew a bare shell prompt, so
-      #     the send guard answered 409), so it is back on the PR gate.
+      #   `@quarantine` — BROKEN, not yet diagnosed. The list is EMPTY today;
+      #     the filter stays so the next quarantine is one tag away rather than
+      #     one workflow edit away. A quarantined spec runs nightly, where its
+      #     failure is the headline rather than background noise on a gate
+      #     people have learned to ignore, and the tag comes off in the commit
+      #     that fixes it. History, so nobody re-quarantines by pattern-match:
+      #     `chat-ws-restart-reseeds` (35 s) left when the v0.6.1 fork
+      #     integration fixed its fixture (the stand-in agent drew a bare shell
+      #     prompt, so the send guard answered 409); `chat-toggle-focus-leak`
+      #     (red since run 32700541733) left when its 180 s timeout turned out
+      #     to be a STALE FIRST ACTION — it clicked the renderer switch on the
+      #     desktop chat-active seam, a control that surface deliberately
+      #     retired — not a product defect; it now drives the seam's real
+      #     affordances (`t` hotkey in, switch bar back) and passes in ~7 s.
       #   `@extended` — SLOW BY CONSTRUCTION, and still passing. Measured on run
       # 33318390754, two specs cost 216 s of a 569 s passing-suite:
       # `chat-ws-staleness-ceiling` (126 s) has to sit out the product's real

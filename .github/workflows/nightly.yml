@@ -11,14 +11,16 @@ name: nightly
 #      90-second staleness clock (measured 126 s and 90 s in CI — 216 s of a
 #      569 s passing suite). They are correct, they are not flaky, and no test
 #      trick shortens a timer the product owns. They run here, every night.
-#   1b. `@quarantine` e2e specs — `chat-toggle-focus-leak` (180 s). NOT the same
-#      thing as `@extended`: this one is BROKEN, never observed green, red on
-#      main in run 32700541733 and on every run since. It is here rather than on
-#      the PR gate because 180 s per pull request re-proves a defect that is
-#      already known, and because a permanently-red gate teaches people to
-#      ignore the gate. A red nightly on it is the correct state until the tag
-#      comes off. `chat-ws-restart-reseeds` was the second entry and left the
-#      quarantine in the v0.6.1 fork integration — it is a PR gate spec again.
+#   1b. `@quarantine` e2e specs — EMPTY today; the lane stays armed. NOT the
+#      same thing as `@extended`: `@quarantine` marks a spec that is BROKEN and
+#      not yet diagnosed, parked here because a permanently-red PR gate teaches
+#      people to ignore the gate. Both entries the list has ever had are
+#      resolved: `chat-ws-restart-reseeds` left in the v0.6.1 fork integration
+#      (fixture fix), and `chat-toggle-focus-leak` (red since run 32700541733)
+#      turned out to be a STALE SPEC — it clicked the renderer switch on the
+#      desktop chat-active seam, a control that surface deliberately retired —
+#      and is a PR gate spec again now that it drives the seam's real
+#      affordances.
 #   2. The wide `install-smoke` matrix (debian-12 + ubuntu-22.04, and the
 #      `port-conflict` scenario) — see the WHY in `install-smoke.yml`, which
 #      carries its own `schedule:` trigger for exactly that reason.
