@@ -534,7 +534,12 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
             Err(e) => {
                 tracing::debug!(tab = %row.id, error = %e, "keepalive: could not wake");
                 let entry = health.entry(row.id.clone()).or_default();
-                let step = decide(entry, Outcome::Pinged(Ping::Unclear), Plan::Refresh(row.keepalive_every), false);
+                let step = decide(
+                    entry,
+                    Outcome::Pinged(Ping::Unclear),
+                    Plan::Refresh(row.keepalive_every),
+                    false,
+                );
                 apply(state, row, step).await;
                 continue;
             }
@@ -569,7 +574,12 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
                 Vec::new()
             }
         };
-        let plan = plan_for(auth_deadline(&jar, now));
+        // A FRESH clock, not the sweep's: a slow ping (up to the 10 s stall
+        // guard) plus the tabs ahead of this one can put seconds between `now`
+        // and this read, and every one of them would be counted as extra
+        // session lifetime — an interval set slightly past the real deadline.
+        let read_at = chrono::Utc::now().timestamp();
+        let plan = plan_for(auth_deadline(&jar, read_at));
         let entry = health.entry(row.id.clone()).or_default();
         let step = decide(
             entry,
