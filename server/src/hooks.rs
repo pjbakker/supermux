@@ -1084,6 +1084,11 @@ fn force_stopped(state: &AppState, session: &str) {
             company_id: None,
             payload: json!({ "delta": [{ "name": session, "status": Status::Stopped.as_str() }] }),
         });
+        // Disposable (archive_on_stop) sessions archive themselves when their
+        // agent ends. Guarded upstream in `apply_payload`: a foreign (teammate)
+        // SessionEnd never reaches `force_stopped`, so it can never archive the
+        // lead's live session.
+        crate::sessions::lifecycle::maybe_archive_on_stop(&state, &session).await;
     });
 }
 
