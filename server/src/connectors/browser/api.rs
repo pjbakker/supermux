@@ -253,6 +253,7 @@ async fn patch_handler(
     let mut keepalive_every = None;
     let mut keepalive_action = None;
     let mut clear_stamp = false;
+    let mut keepalive_audit: Option<(bool, String)> = None;
     if let Some(on) = body.keepalive_enabled {
         let row = load(&state, &id).await?;
         if on {
@@ -276,18 +277,10 @@ async fn patch_handler(
         }
         // Off leaves `keepalive_every` / `keepalive_action` alone — harmless,
         // and it keeps the last learned cadence visible if it is turned back on.
-        let _ = crate::db::audit::log(
-            &state.pool,
-            "user",
-            if on {
-                "browser.keepalive_on"
-            } else {
-                "browser.keepalive_off"
-            },
-            &format!("tab:{id}"),
-            json!({ "url": row.url }),
-        )
-        .await;
+        //
+        // The audit row is written AFTER the update below, not here: a failed
+        // write must not leave a record claiming a change that never happened.
+        keepalive_audit = Some((on, keepalive::host_of(&row.url)));
     }
     let patch = db_tabs::TabPatch {
         title: body.title,
@@ -304,6 +297,24 @@ async fn patch_handler(
         keepalive_clear_stamp: clear_stamp,
     };
     db_tabs::update(&state.pool, &id, &patch).await?;
+    if let Some((on, host)) = keepalive_audit {
+        // The HOST, never the url. A workspace tab's url can carry a magic-link
+        // or a session token in its query string, and the sweep's own sign-out
+        // audit logs only the host — this is the one place that would have
+        // persisted a credential-bearing url.
+        let _ = crate::db::audit::log(
+            &state.pool,
+            "user",
+            if on {
+                "browser.keepalive_on"
+            } else {
+                "browser.keepalive_off"
+            },
+            &format!("tab:{id}"),
+            json!({ "host": host }),
+        )
+        .await;
+    }
     let row = load(&state, &id).await?;
     let live = state.browser.live_tabs().await;
     Ok(Json(tab_json(&state, &row, &live).await))

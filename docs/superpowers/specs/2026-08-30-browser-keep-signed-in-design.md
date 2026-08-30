@@ -248,7 +248,15 @@ pub fn classify(raw: &str) -> Ping {
     let status: u16 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let _redirected = it.next();               // redundant with the path; kept so a log line reads on its own
     let path = it.next().unwrap_or("");
-    if status == 401 || status == 403 { return Ping::Suspicious }
+    if status == 401 { return Ping::Suspicious }
+    // 403 IS NOT 401: an automated same-origin GET of `/` is exactly what a
+    // bot-detection edge (a managed challenge, an anti-CSRF filter) answers 403
+    // to while the human session is fine — and a `needs_login` claim there can
+    // never self-heal, because the same fetch keeps being blocked. It needs the
+    // login-shaped path to corroborate it.
+    if status == 403 {
+        return if looks_like_login_path(path) { Ping::Suspicious } else { Ping::Unclear }
+    }
     if (200..400).contains(&status) {
         if looks_like_login_path(path) { return Ping::Suspicious }
         return Ping::Alive
@@ -269,8 +277,12 @@ pub fn looks_like_login_path(path: &str) -> bool {
 Per-tab in-memory health, owned as a local by the single sweeper task — no `Mutex`, no `AppState` field, nothing to serialise:
 
 ```rust
-struct Health { strikes: u8, last_suspicious: bool, jitter: i64, defer_until: i64 }
+struct Health { strikes: u8, last_suspicious: bool, quiet: u8, jitter: i64, defer_until: i64 }
 ```
+
+`quiet` counts consecutive **no-write** ticks. A tick that writes nothing leaves the row due, which is the confirmation mechanism — and also the one way this feature can become a 60-second ping loop: a site alternating `Suspicious` and `Unclear` resets one counter with each answer and reaches neither back-off. After `QUIET_TICKS` (4) the sweep stamps at the plan's interval, claiming nothing.
+
+`last_suspicious` is **dropped after every write** and the second strike re-derived from the row's own `login_state`: while a row says `needs_login`, one `Suspicious` re-stamps it at 10 min (no push, no spin); the moment a human clears the tab back to `ok`, the next single `Suspicious` has to earn its 409 again.
 
 Applying an outcome:
 
@@ -282,6 +294,9 @@ Applying an outcome:
 | `Unclear`, strikes < 3 | nothing | 60 s |
 | `Unclear`, strikes ≥ 3 | `last_keepalive_at=now` only — **never a `login_state` write** | the plan's interval |
 | `Plan::Watch` | `keepalive_action='watch'`, `keepalive_every=10`, `last_keepalive_at=now`; **no `login_state`, no `probed_now`** — we did not check the sign-in, so we claim nothing about it | 10 min |
+| `Suspicious` while the row already says `needs_login` | re-stamp at 10 min, **no push** | 10 min |
+| 4 consecutive no-write ticks | `last_keepalive_at=now` only, plan's cadence — **never a `login_state` write** | the plan's interval |
+| the cookie read itself **failed** | the row's **current** `keepalive_every`/`keepalive_action` carried forward — a failed read is not an empty jar, and replanning on one releases watch mode | unchanged |
 | Human holds the wheel | nothing | +2 min |
 
 **Why two consecutive Suspicious ticks and not one:** the cost of a false positive is that `tools.rs` 409s every agent verb on the tab and raises a takeover ask in chat. The cost of the second tick is 60 seconds of extra patience.
@@ -399,13 +414,17 @@ The row, in `pageRows()` (`workspace.tsx:447`), directly above `Sharing & settin
 
 | Tab state | Label | Detail |
 |---|---|---|
-| no active tab, or url not `http(s)` | *(disabled)* **Keep me signed in** | *hint:* `Only web pages can be kept signed in` |
+| no active tab, or url not `http(s)` **and off** | *(disabled)* **Keep me signed in** | *hint:* `Only web pages can be kept signed in` |
+| url not `http(s)` but **on** | **Stop keeping signed in** | `Not a web page — nothing to check here.` — never greyed: it still holds a slot, so the way off has to stay reachable |
 | off | **Keep me signed in** | `Refresh bol.com in the background so bots stay signed in.` |
 | on, `last_keepalive_at === null` | **Stop keeping signed in** | `Starting — first check within a minute.` |
 | on, `action === 'soft'`, healthy | **Stop keeping signed in** | `Every 45 min · checked 12 min ago.` |
 | on, `action === 'watch'` | **Stop keeping signed in** | `Watching only — this site expires sessions in minutes; refreshing would fight that.` |
 | on, `login_state === 'needs_login'` | **Stop keeping signed in** | `Signed out — take the wheel and sign in again.` |
-| on, `now − last_keepalive_at > 3 × every × 60` | **Stop keeping signed in** | `Hasn't been able to check since 2 h ago.` |
+| on, `last_probe_at === null` | **Stop keeping signed in** | `Hasn't been able to check yet.` |
+| on, `now − last_probe_at > 3 × every × 60` | **Stop keeping signed in** | `Hasn't been able to check since 2 h ago.` |
+
+**The age comes from `last_probe_at`, never `last_keepalive_at`.** The latter is only the scheduler's cursor: the sweep stamps it on *every* tick it completes, including the ticks that learned nothing (an unclear streak backing off, a wake that kept failing, a page it cannot ping). Reading the age off it renders `Every 15 min · checked 1 min ago.` over a tab whose every ping has failed for a day — and because the row keeps being stamped, the stale line can never fire either. That is the exact false green light §7.3 forbids. Watch mode is checked **before** the age lines: it pings nothing by design, so its probe stamp stands still and any age there would read as neglect.
 
 Interval wording is coarse, via one helper: `every < 120 ⇒ "45 min"`, else `"6 h"` (`Math.round(every / 60)`). Ages reuse the existing `ago()` (`browser.ts:313`). **No live countdown** — a backgrounded PWA must not re-render a clock nobody is watching; the line is recomputed when the menu opens.
 
@@ -474,7 +493,7 @@ pub fn spawn(state: AppState) {
 3. `auth_deadline` ⇒ `None` for a session-only jar, and for an empty jar.
 4. `auth_deadline` ignores an already-expired cookie.
 5. `plan_for`: `None`⇒`Refresh(15)`; `Some(1800)`⇒`Refresh(15)`; `Some(2880)`⇒`Refresh(24)`; `Some(601)`⇒`Refresh(5)` (floor); `Some(599)`⇒`Watch`; `Some(14*86400)`⇒`Refresh(360)` (ceiling).
-6. `classify`: `"basic 200 0 /"`⇒`Alive`; `"basic 200 0 /home"`⇒`Alive`; `"basic 200 0 /login"`⇒`Suspicious`; `"basic 401 0 /"`⇒`Suspicious`; `"basic 403 0 /"`⇒`Suspicious`; `"basic 404 0 /"`⇒`Unclear`; `"basic 500 0 /"`⇒`Unclear`; `"error TypeError"`⇒`Unclear`; `"error TimeoutError"`⇒`Unclear`; `"skip 0 0 "`⇒`Unclear`; `""`⇒`Unclear`.
+6. `classify`: `"basic 200 0 /"`⇒`Alive`; `"basic 200 0 /home"`⇒`Alive`; `"basic 200 0 /login"`⇒`Suspicious`; `"basic 401 0 /"`⇒`Suspicious`; `"basic 403 0 /"`⇒`Unclear` (a bare 403 is the edge talking) and `"basic 403 1 /login"`⇒`Suspicious`; `"basic 404 0 /"`⇒`Unclear`; `"basic 500 0 /"`⇒`Unclear`; `"error TypeError"`⇒`Unclear`; `"error TimeoutError"`⇒`Unclear`; `"skip 0 0 "`⇒`Unclear`; `""`⇒`Unclear`.
 7. `looks_like_login_path`: true for `/login`, `/users/sign_in`, `/auth/login`, `/sso`, `/oauth/authorize`; **false for `/`, `/home`, `/dashboard`, `/logistics`, `/assorted`** — the substring trap that would 409 every bot on those tabs.
 8. The outcome state machine: `Alive` stamps and writes `ok`; one `Suspicious` writes nothing; two consecutive `Suspicious` write `needs_login` with `every = 10`; `Suspicious` → `Alive` writes `ok` and clears strikes; three `Unclear` stamp without ever touching `login_state`.
 9. `due_at`: `None` ⇒ `0` (due now); `Some(t)` ⇒ `t + every*60 + jitter`; the drawn jitter is within ±10 % of the interval.
@@ -491,7 +510,7 @@ pub fn spawn(state: AppState) {
 
 **`web/tests/unit/` component test:** `browser-menu` renders `detail` as a second line inside the same single `<button role="menuitem">`, keeps roving focus and `disabled` behaviour, and rows without `detail` render unchanged; `pageRows()` includes `keepalive`, disabled when there is no active tab.
 
-**Bench:** two tabs added to `web/src/routes/dev-browser-workspace.fixture.ts` — one refreshing (`action:'soft'`, `every:45`, checked 12 min ago) and one watching (`action:'watch'`) — plus the four new fields on all eight existing fixtures, so the offline mobile rig can shoot the row at 390 px.
+**Bench:** three tabs added to `web/src/routes/dev-browser-workspace.fixture.ts` — one refreshing (`action:'soft'`, `every:45`, checked 12 min ago), one watching (`action:'watch'`) and one stamped-but-stuck (`last_keepalive_at` a minute ago, `last_probe_at` a day ago) — plus the four new fields on all eight existing fixtures, so the offline mobile rig can shoot the row at 390 px.
 
 **Gates (both must be green before the PR):**
 

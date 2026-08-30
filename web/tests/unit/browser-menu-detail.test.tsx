@@ -91,12 +91,24 @@ describe('BrowserMenuItem.detail', () => {
   })
 
   test('disabled still greys the row and keeps the reason on its title', () => {
-    const html = menu([{ id: 'keepalive', ...keepAliveRow(tab({ url: 'about:blank' }), NOW) }])
+    const html = menu([
+      {
+        id: 'keepalive',
+        ...keepAliveRow(tab({ url: 'about:blank', keepalive_enabled: false }), NOW),
+      },
+    ])
     expect(html).toContain('disabled=""')
     expect(html).toContain('title="Only web pages can be kept signed in"')
     expect(html).toContain('Keep me signed in')
     // Nothing is claimed about a page that cannot be pinged.
     expect(html).not.toContain('data-browser-menu-detail')
+  })
+
+  test('an ENABLED tab on a non-web page is not greyed — the way off stays live', () => {
+    const html = menu([{ id: 'keepalive', ...keepAliveRow(tab({ url: 'about:blank' }), NOW) }])
+    expect(html).not.toContain('disabled=""')
+    expect(html).toContain('Stop keeping signed in')
+    expect(html).toContain('Not a web page')
   })
 
   test('the label is the VERB, and it flips with the state', () => {

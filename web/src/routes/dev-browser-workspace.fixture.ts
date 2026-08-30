@@ -1,4 +1,4 @@
-// Fixtures for /dev/browser-workspace — ten tabs that between them cover every
+// Fixtures for /dev/browser-workspace — eleven tabs that between them cover every
 // state the rail has to draw, offline.
 //
 // Chosen deliberately, not decoratively:
@@ -10,9 +10,10 @@
 //   · a tab with a 90-character title, which is the exact input that breaks a
 //     rail that is not `min-w-0` + fixed-width all the way down;
 //   · a tab lent via `*`, so the sheet's shared-grant honesty line renders;
-//   · a tab with KEEP-ME-SIGNED-IN on and healthy, and one in WATCH mode —
-//     the two states whose ⋯ detail line has to stay legible at 390px, and the
-//     only place the longest string this feature ships gets drawn.
+//   · a tab with KEEP-ME-SIGNED-IN on and healthy, one in WATCH mode, and one
+//     that is on but has NOT been able to check — the three states whose ⋯
+//     detail line has to stay legible at 390px, and the only place the longest
+//     string this feature ships gets drawn.
 //
 // DEV-only and lazily imported by the bench route, so none of it reaches the
 // production bundle.
@@ -174,6 +175,28 @@ export const BENCH_TABS: BrowserTab[] = [
     grants: [grant('tb_keepalive', 'Ada')],
     created_at: NOW - 300_000,
     last_used_at: NOW - 1_200,
+  },
+  {
+    // ON BUT STUCK — the honest line. Every tick completes (the row is stamped
+    // one minute ago) and every ping fails, so the age has to come from
+    // `last_probe_at`; taking it from the stamp rendered "checked 1 min ago"
+    // over a tab that has learned nothing for a day.
+    id: 'tb_stuck',
+    title: 'Warehouse portal',
+    url: 'https://wms.example/dash',
+    pinned: false,
+    company_id: null,
+    origins: ['wms.example'],
+    login_state: 'ok',
+    last_probe_at: NOW - 86_400,
+    live: true,
+    keepalive_enabled: true,
+    keepalive_every: 15,
+    last_keepalive_at: NOW - 60,
+    keepalive_action: 'soft',
+    grants: [grant('tb_stuck', 'Ada')],
+    created_at: NOW - 500_000,
+    last_used_at: NOW - 4_000,
   },
   {
     // WATCH MODE — the one state where supermux says no. Its copy is the

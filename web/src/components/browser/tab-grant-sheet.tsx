@@ -184,7 +184,10 @@ export function TabGrantSheet({
               State-first here (the ⋯ menu says the verb), because this is where
               there is room for the COST: an enabled tab is held open, and a
               held-open tab keeps the browser process up. Say so. */}
-          {onKeepAlive && canKeepSignedIn(tab.url) && (
+          {/* `|| keepalive_enabled`: a tab that drifted to a non-http page is
+              still ON and still costs a slot, so the way to switch it off has
+              to stay reachable. */}
+          {onKeepAlive && (canKeepSignedIn(tab.url) || tab.keepalive_enabled) && (
             <button
               type="button"
               data-tab-keepalive={tab.id}

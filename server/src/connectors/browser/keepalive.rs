@@ -32,7 +32,12 @@
 //! CSRF/consent cookie sitting beside a 10-minute httpOnly auth cookie is the
 //! common shape; picking the minimum naively mis-times the schedule and (in the
 //! design this replaces) refused to enable on perfectly healthy sites.
-//! [`auth_deadline`] prefers httpOnly candidates for that reason.
+//! [`auth_deadline`] prefers httpOnly candidates for that reason. And a jar
+//! that could not be READ is not an empty jar: an empty one plans the blind
+//! 15-minute refresh, so folding a CDP error into `Vec::new()` released watch
+//! mode and pinged the one class of site this feature promises not to ping (a
+//! short idle timeout is a deliberate security control). A failed read carries
+//! the row's own plan forward — see [`plan_after_read`].
 //!
 //! # Why the cookie read happens AFTER the ping
 //!
@@ -96,6 +101,12 @@ pub const MAX_WAKES_PER_TICK: usize = 2;
 pub const UNCLEAR_STRIKES: u8 = 3;
 /// A tick skipped because the human holds the wheel retries after this.
 pub const HUMAN_DEFER_SECS: i64 = 120;
+/// Consecutive 60-second retries (ticks that write nothing) before the sweep
+/// gives up on an answer and falls back to the plan's interval. Four leaves
+/// every deliberate retry — a two-strike confirmation, an unclear streak —
+/// room to finish, and still bounds a flapping site at four requests instead of
+/// one a minute forever.
+pub const QUIET_TICKS: u8 = 4;
 
 /// `keepalive_action` — soft mode: fetch-ping, then read the jar.
 pub const ACTION_SOFT: &str = "soft";
@@ -220,6 +231,38 @@ pub fn plan_for(ttl_secs: Option<i64>) -> Plan {
     }
 }
 
+/// The plan for the next tick, given what the cookie read actually returned.
+///
+/// **`None` means the READ FAILED, and that is not the same fact as an empty
+/// jar.** `auth_deadline(&[])` is `None` and `plan_for(None)` is the blind
+/// 15-minute refresh, so folding a `cookies()` error into `Vec::new()` made a
+/// transient CDP failure (a detached session, a timeout) do two things this
+/// feature promises never to do:
+///
+///   · it **released watch mode** — the row's `keepalive_action` was rewritten
+///     from `watch` to `soft`, and the next tick started pinging the one class
+///     of site §2.4 says supermux will not ping: a bank tab whose 5-15 minute
+///     idle timeout is a deliberate security control. A target that fails the
+///     read repeatedly would be pinged every 15 minutes forever;
+///   · it **reset a learned cadence** — a healthy tab that had settled on 6 h
+///     dropped to 15 min, quadrupling its traffic, on nothing but an error.
+///
+/// So a failed read carries the row's own plan forward and changes nothing. The
+/// clamp is only a guard on a garbage column value; the cadence itself is never
+/// invented here.
+pub fn plan_after_read(
+    jar: Option<&[CookieLite]>,
+    now: i64,
+    current_action: &str,
+    current_every: i64,
+) -> Plan {
+    match jar {
+        Some(cookies) => plan_for(auth_deadline(cookies, now)),
+        None if is_watch_mode(current_action) => Plan::Watch,
+        None => Plan::Refresh(current_every.clamp(FLOOR_MINUTES, CEILING_MINUTES)),
+    }
+}
+
 // ── reading the ping ─────────────────────────────────────────────────────────
 
 /// What one ping said about the sign-in.
@@ -252,8 +295,23 @@ pub fn classify(raw: &str) -> Ping {
     // entry reads on its own.
     let _redirected = it.next();
     let path = it.next().unwrap_or("");
-    if status == 401 || status == 403 {
+    if status == 401 {
         return Ping::Suspicious;
+    }
+    // **403 IS NOT 401.** An automated same-origin GET of `/` carrying
+    // `Sec-Fetch-Dest: empty` is exactly the shape a bot-detection edge
+    // (a Cloudflare/Akamai managed challenge, an anti-CSRF filter) answers with
+    // 403 while the human's session is perfectly valid. Reading that as a
+    // sign-out 409s every bot on a tab that is signed in, and the documented
+    // self-heal ("any Alive writes ok") can never arrive, because the very same
+    // fetch keeps being blocked. So 403 has to be corroborated by the
+    // login-shaped path; on its own it is the site's problem, not a claim.
+    if status == 403 {
+        return if looks_like_login_path(path) {
+            Ping::Suspicious
+        } else {
+            Ping::Unclear
+        };
     }
     if (200..400).contains(&status) {
         if looks_like_login_path(path) {
@@ -330,8 +388,13 @@ pub struct Step {
 pub struct Health {
     /// Consecutive [`Ping::Unclear`] answers.
     pub strikes: u8,
-    /// Was the previous outcome [`Ping::Suspicious`]?
+    /// Is a Suspicious strike currently armed? Dropped after every write, and
+    /// re-derived from the row's own `login_state` — see [`decide`].
     pub last_suspicious: bool,
+    /// Consecutive [`Write::Nothing`] ticks. A row that writes nothing stays
+    /// due, so this is the only thing standing between a flapping site and a
+    /// 60-second ping forever.
+    pub quiet: u8,
     /// The ±10 % offset drawn at the last stamp, in seconds.
     pub jitter: i64,
     /// Unix seconds before which this tab is not touched (the human-driving
@@ -353,10 +416,54 @@ pub struct Health {
 ///   requested nothing, so it knows nothing new, and saying otherwise would be
 ///   the false green light the workspace exists to prevent.
 pub fn decide(health: &mut Health, outcome: Outcome, plan: Plan, was_needs_login: bool) -> Step {
+    let step = judge(health, outcome, plan, was_needs_login);
+    if !matches!(step.write, Write::Nothing) {
+        health.quiet = 0;
+        return step;
+    }
+    // A `Write::Nothing` leaves `last_keepalive_at` alone, which leaves the row
+    // DUE — that is the whole two-strike mechanism, and it is also the one way
+    // this feature can turn into a 60-second ping loop. A site alternating
+    // Suspicious and Unclear (a 401 flapping with a 429/5xx — i.e. one that is
+    // already shedding load) resets one counter with each answer and reaches
+    // neither back-off, so it would be fetched 1440 times a day: exactly the
+    // traffic profile FLOOR_MINUTES exists to prevent. Cap the retries and fall
+    // back to the plan's interval, claiming nothing about the sign-in.
+    health.quiet = health.quiet.saturating_add(1);
+    if health.quiet < QUIET_TICKS {
+        return step;
+    }
+    health.quiet = 0;
+    Step {
+        write: Write::Stamp {
+            every: plan.minutes(),
+            action: plan.action(),
+            login_state: None,
+            probed: false,
+        },
+        push_signed_out: false,
+    }
+}
+
+/// [`decide`]'s state machine proper. Split out so the retry cap above wraps
+/// every branch rather than being repeated in three of them.
+fn judge(health: &mut Health, outcome: Outcome, plan: Plan, was_needs_login: bool) -> Step {
     match outcome {
         Outcome::Pinged(Ping::Suspicious) => {
             health.strikes = 0;
-            if health.last_suspicious {
+            // Two strikes to CLAIM a sign-out; one to re-confirm one the row
+            // already carries. The arm is **dropped after every write** and
+            // re-derived from the row's own `login_state`, so:
+            //
+            //   · while the row says `needs_login`, each Suspicious re-stamps
+            //     at the 10-minute cadence instead of spinning at 60 s;
+            //   · the moment a human clears the tab back to `ok` (the PATCH
+            //     accepts `login_state`), the next single Suspicious has to
+            //     earn its 409 again. Latching the arm made one ping silently
+            //     revert the correction — and re-fire the push, and re-409
+            //     every bot on the tab — with no second-strike grace at all.
+            if health.last_suspicious || was_needs_login {
+                health.last_suspicious = false;
                 // Confirmed. The cadence drops to 10 min because this is also
                 // how a re-sign-in is noticed and the 409 gate lifted.
                 Step {
@@ -516,9 +623,17 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
         }
         // `about:blank` and friends cannot be pinged (`location.origin` is
         // `'null'`), and there is nothing to learn from their jar. Stamp so the
-        // row does not spin, and try again at the blind interval.
+        // row does not spin, and try again at the blind interval — but keep the
+        // row's own MODE: a watch-mode tab that sits on `about:blank` for a
+        // moment must not come back as a soft-pinged one and fire a ping at the
+        // site that put it in watch mode.
         if !row.url.starts_with("http") {
-            stamp(state, &row.id, BLIND_MINUTES, ACTION_SOFT, None, false).await;
+            let action = if is_watch_mode(&row.keepalive_action) {
+                ACTION_WATCH
+            } else {
+                ACTION_SOFT
+            };
+            stamp(state, &row.id, BLIND_MINUTES, action, None, false).await;
             continue;
         }
         if !live.contains(&row.id) {
@@ -534,11 +649,14 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
             Err(e) => {
                 tracing::debug!(tab = %row.id, error = %e, "keepalive: could not wake");
                 let entry = health.entry(row.id.clone()).or_default();
+                // A wake failure teaches us nothing about the jar either, so it
+                // carries the row's plan forward for the same reason a failed
+                // cookie read does.
                 let step = decide(
                     entry,
                     Outcome::Pinged(Ping::Unclear),
-                    Plan::Refresh(row.keepalive_every),
-                    false,
+                    plan_after_read(None, now, &row.keepalive_action, row.keepalive_every),
+                    row.login_state == db_tabs::LOGIN_NEEDED,
                 );
                 apply(state, row, step).await;
                 continue;
@@ -567,11 +685,14 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
         };
         // AFTER the ping — a sliding site reads its full window here, and its
         // half-window before. See the module header.
-        let jar: Vec<CookieLite> = match tab.page().cookies().await {
-            Ok(cs) => cs.iter().map(CookieLite::from_cdp).collect(),
+        // `None`, never an empty Vec: a failed read is not an empty jar, and
+        // conflating the two is what un-latched watch mode. See
+        // [`plan_after_read`].
+        let jar: Option<Vec<CookieLite>> = match tab.page().cookies().await {
+            Ok(cs) => Some(cs.iter().map(CookieLite::from_cdp).collect()),
             Err(e) => {
                 tracing::debug!(tab = %row.id, error = %e, "keepalive: cookie read failed");
-                Vec::new()
+                None
             }
         };
         // A FRESH clock, not the sweep's: a slow ping (up to the 10 s stall
@@ -579,7 +700,12 @@ pub async fn sweep(state: &AppState, health: &mut HashMap<String, Health>) {
         // and this read, and every one of them would be counted as extra
         // session lifetime — an interval set slightly past the real deadline.
         let read_at = chrono::Utc::now().timestamp();
-        let plan = plan_for(auth_deadline(&jar, read_at));
+        let plan = plan_after_read(
+            jar.as_deref(),
+            read_at,
+            &row.keepalive_action,
+            row.keepalive_every,
+        );
         let entry = health.entry(row.id.clone()).or_default();
         let step = decide(
             entry,
@@ -660,9 +786,11 @@ async fn stamp(
     }
 }
 
-/// Host for the copy, falling back to the raw url — never a panic and never an
-/// empty title.
-fn host_of(url: &str) -> String {
+/// Host for the copy and for every audit row — falling back to the raw url, so
+/// it is never a panic and never an empty title. **Audit rows log this, never
+/// the url**: a tab's url can carry a magic-link or session token in its query
+/// string.
+pub fn host_of(url: &str) -> String {
     url.split("://")
         .nth(1)
         .and_then(|rest| rest.split('/').next())
@@ -748,13 +876,113 @@ mod tests {
         assert_eq!(classify("basic 200 1 /home"), Ping::Alive);
         assert_eq!(classify("basic 200 0 /login"), Ping::Suspicious);
         assert_eq!(classify("basic 401 0 /"), Ping::Suspicious);
-        assert_eq!(classify("basic 403 0 /"), Ping::Suspicious);
         assert_eq!(classify("basic 404 0 /"), Ping::Unclear);
         assert_eq!(classify("basic 500 0 /"), Ping::Unclear);
         assert_eq!(classify("error TypeError"), Ping::Unclear);
         assert_eq!(classify("error TimeoutError"), Ping::Unclear);
         assert_eq!(classify("skip 0 0 "), Ping::Unclear);
         assert_eq!(classify(""), Ping::Unclear);
+    }
+
+    /// A 403 on `/` is what a bot-detection edge answers an automated
+    /// same-origin GET with while the human's session is fine. Reading it as a
+    /// sign-out 409s every bot on a signed-in tab, and the self-heal can never
+    /// arrive because the same fetch keeps being blocked — a permanent outage
+    /// caused entirely by the feature that exists to prevent one. 401 stays a
+    /// strong signal; 403 needs the login-shaped path to corroborate it.
+    #[test]
+    fn a_bare_403_is_the_edge_talking_not_a_sign_out() {
+        assert_eq!(classify("basic 403 0 /"), Ping::Unclear);
+        assert_eq!(classify("basic 403 0 /dashboard"), Ping::Unclear);
+        assert_eq!(classify("basic 403 1 /home"), Ping::Unclear);
+        // Corroborated: bounced to a sign-in wall AND refused.
+        assert_eq!(classify("basic 403 1 /login"), Ping::Suspicious);
+        assert_eq!(classify("basic 403 1 /auth/signin"), Ping::Suspicious);
+        // And a WAF that answers 403 forever never claims anything: three
+        // Unclears back off to the plan's interval with no `login_state` write.
+        let mut h = Health::default();
+        let plan = Plan::Refresh(15);
+        for _ in 0..12 {
+            let s = decide(&mut h, Outcome::Pinged(classify("basic 403 0 /")), plan, false);
+            match s.write {
+                Write::Nothing => {}
+                Write::Stamp { login_state, .. } => assert_eq!(login_state, None),
+            }
+            assert!(!s.push_signed_out);
+        }
+    }
+
+    /// F2's regression: `cookies()` returning `Err` was folded into an empty
+    /// `Vec`, and an empty jar plans the blind 15-minute REFRESH — so one CDP
+    /// error released watch mode and started pinging a bank tab.
+    #[test]
+    fn a_failed_cookie_read_carries_the_row_forward_and_never_releases_watch() {
+        let now = 1_000_000;
+        // Watch mode survives the error.
+        assert_eq!(plan_after_read(None, now, ACTION_WATCH, 10), Plan::Watch);
+        // A learned 6 h cadence is not reset to the blind 15 min.
+        assert_eq!(plan_after_read(None, now, ACTION_SOFT, 360), Plan::Refresh(360));
+        assert_eq!(plan_after_read(None, now, "reload", 45), Plan::Refresh(45));
+        // A garbage column value is still clamped into the legal range.
+        assert_eq!(plan_after_read(None, now, ACTION_SOFT, 0), Plan::Refresh(FLOOR_MINUTES));
+        assert_eq!(
+            plan_after_read(None, now, ACTION_SOFT, 99_999),
+            Plan::Refresh(CEILING_MINUTES)
+        );
+        // A jar that was actually READ and is empty still means "nothing known".
+        assert_eq!(plan_after_read(Some(&[]), now, ACTION_WATCH, 10), Plan::Refresh(BLIND_MINUTES));
+        let jar = [c(now as f64 + 1800.0, false, true)];
+        assert_eq!(plan_after_read(Some(&jar), now, ACTION_WATCH, 10), Plan::Refresh(15));
+    }
+
+    /// The two-strike arm has to RE-ARM. It used to latch: after a confirmed
+    /// sign-out `last_suspicious` stayed true forever, so a human clearing the
+    /// tab back to `ok` had their correction reverted by a single ping — with
+    /// another "Signed out of X" push and another 409 on every bot.
+    #[test]
+    fn a_human_clearing_the_tab_buys_a_fresh_second_strike() {
+        let mut h = Health::default();
+        let plan = Plan::Refresh(45);
+        assert_eq!(decide(&mut h, Outcome::Pinged(Ping::Suspicious), plan, false).write, Write::Nothing);
+        let s = decide(&mut h, Outcome::Pinged(Ping::Suspicious), plan, false);
+        assert!(s.push_signed_out, "the confirmed claim pushes once");
+
+        // The row now says needs_login. While it does, each Suspicious simply
+        // re-stamps at the 10-minute cadence — no push, and no 60-second spin.
+        for _ in 0..3 {
+            let s = decide(&mut h, Outcome::Pinged(Ping::Suspicious), plan, true);
+            assert!(matches!(s.write, Write::Stamp { every: NEEDS_LOGIN_MINUTES, .. }));
+            assert!(!s.push_signed_out);
+        }
+
+        // The human clears it back to `ok`. One ping must NOT undo that.
+        let s = decide(&mut h, Outcome::Pinged(Ping::Suspicious), plan, false);
+        assert_eq!(s.write, Write::Nothing, "a cleared tab earns its second strike again");
+        assert!(!s.push_signed_out, "and never re-pushes off a single strike");
+    }
+
+    /// A site alternating Suspicious and Unclear resets one counter with each
+    /// answer, so it reached neither back-off and was fetched every 60 s
+    /// forever — the exact traffic profile FLOOR_MINUTES exists to prevent.
+    #[test]
+    fn a_flapping_site_is_bounded_and_falls_back_to_the_plan() {
+        let mut h = Health::default();
+        let plan = Plan::Refresh(45);
+        let flap = [Ping::Suspicious, Ping::Unclear];
+        let mut stamps = 0;
+        for i in 0..40 {
+            let s = decide(&mut h, Outcome::Pinged(flap[i % 2]), plan, false);
+            if let Write::Stamp { every, login_state, probed, .. } = s.write {
+                stamps += 1;
+                assert_eq!(every, 45, "back off to the plan's interval");
+                assert_eq!(login_state, None, "and claim nothing about the sign-in");
+                assert!(!probed);
+            }
+            assert!(!s.push_signed_out);
+        }
+        // 40 ticks, capped at one retry burst each: the row is stamped (and so
+        // stops being due) roughly every QUIET_TICKS minutes instead of never.
+        assert_eq!(stamps, 40 / QUIET_TICKS as usize);
     }
 
     #[test]

@@ -9,11 +9,18 @@
 //   · a phone has no hover, so the ⋯ row's `hint` (a `title=` attribute) is
 //     invisible there. The detail line is the state, not a tooltip;
 //   · every string has to FIT: the menu is a fixed 232px popup and the detail
-//     line clamps at two lines, which is 88 characters. The test asserts it.
+//     line clamps at two lines, which is `DETAIL_MAX` characters — the MEASURED
+//     54, not an estimate. The test asserts it against the constant.
 //
 // HONESTY RULES, in the same order the branches are written:
 //   1. Never say "you are signed in". Say when it last CHECKED, or say why it
-//      cannot.
+//      cannot. "Checked" means a PING happened — `last_probe_at`, never
+//      `last_keepalive_at`. The latter is only the scheduler's cursor: the
+//      sweep stamps it on every tick it completes, INCLUDING the ticks that
+//      learned nothing (an unclear streak backing off, a wake that failed, a
+//      page that cannot be pinged). Reading the age off it renders
+//      "checked 1 min ago" over a tab whose every ping has failed for a day —
+//      the false green light this whole surface exists to prevent.
 //   2. `needs_login` outranks everything except "not started yet": a signed-out
 //      tab 409s every bot on it, and that is the fact the owner has to act on.
 //   3. A tab that has fallen behind says so with the age, rather than showing a
@@ -80,6 +87,13 @@ export function keepAliveRow(
   const ON_LABEL = 'Stop keeping signed in'
 
   if (!tab || !canKeepSignedIn(tab.url)) {
+    // An ENABLED tab that has drifted to a non-http page must stay SWITCHABLE.
+    // Greying it here stranded the setting: the row still held one of the four
+    // slots and the sweep still stamped it, with no way for the owner to reach
+    // the toggle short of navigating back to the site first.
+    if (tab?.keepalive_enabled) {
+      return { label: ON_LABEL, detail: 'Not a web page — nothing to check here.' }
+    }
     return {
       label: OFF_LABEL,
       disabled: true,
@@ -103,10 +117,8 @@ export function keepAliveRow(
   if (tab.login_state === 'needs_login') {
     return { label: ON_LABEL, detail: 'Signed out — take the wheel and sign in again.' }
   }
-  const age = Math.max(0, now - tab.last_keepalive_at)
-  if (age > STALE_INTERVALS * Math.max(1, tab.keepalive_every) * 60) {
-    return { label: ON_LABEL, detail: `Hasn't been able to check since ${ago(age)}.` }
-  }
+  // Watch mode BEFORE any age line: it deliberately pings nothing, so
+  // `last_probe_at` stands still by design and an age would read as neglect.
   if (isWatching(tab)) {
     return {
       label: ON_LABEL,
@@ -114,6 +126,17 @@ export function keepAliveRow(
       // does not fit two clamped lines and lives in the sheet, which has room.
       detail: 'Watching only — this site signs out in minutes.',
     }
+  }
+  // `last_probe_at`, NOT `last_keepalive_at` — see honesty rule 1. A tab whose
+  // every ping fails (a 404/5xx root, a cross-origin SSO bounce the fetch
+  // rejects, a wake that keeps failing) is still stamped every tick, so an age
+  // taken from the stamp can never go stale and the row lies indefinitely.
+  if (tab.last_probe_at === null) {
+    return { label: ON_LABEL, detail: "Hasn't been able to check yet." }
+  }
+  const age = Math.max(0, now - tab.last_probe_at)
+  if (age > STALE_INTERVALS * Math.max(1, tab.keepalive_every) * 60) {
+    return { label: ON_LABEL, detail: `Hasn't been able to check since ${ago(age)}.` }
   }
   return {
     label: ON_LABEL,
@@ -132,6 +155,16 @@ export interface KeepAliveSheetRow {
 }
 
 export function keepAliveSheetRow(tab: BrowserTab): KeepAliveSheetRow {
+  if (tab.keepalive_enabled && !canKeepSignedIn(tab.url)) {
+    // Still ON, and still switchable off from here — but claiming it is being
+    // kept signed in would be a lie: there is no origin to ping.
+    return {
+      on: true,
+      title: 'Paused on this page',
+      detail:
+        'This tab is not on a web page, so there is nothing to check. Go back to the site, or turn this off.',
+    }
+  }
   if (!tab.keepalive_enabled) {
     return {
       on: false,

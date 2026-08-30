@@ -12,10 +12,10 @@
  *     workspace was built to prevent.
  *
  *   · a line that DOES NOT FIT. The ⋯ menu is a fixed 232px popup and the
- *     detail clamps at two lines. A sentence past ~88 characters is silently
- *     truncated on a phone, which turns the honest half into the invisible
- *     half. Every string this module can produce is measured below — including
- *     the ones with a hostname interpolated into them.
+ *     detail clamps at two lines. A sentence past `DETAIL_MAX` (the MEASURED
+ *     54) is silently truncated on a phone, which turns the honest half into
+ *     the invisible half. Every string this module can produce is measured
+ *     below — including the ones with a hostname interpolated into them.
  *
  *   · the WATCH state described as refreshing. Watch mode is the one case where
  *     supermux deliberately does nothing: the site expires sessions in minutes
@@ -66,7 +66,7 @@ function tab(over: Partial<BrowserTab> = {}): BrowserTab {
 describe('the ⋯ row', () => {
   test('a page the ping cannot reach is greyed, with the reason — never hidden', () => {
     for (const url of ['about:blank', 'chrome://newtab', 'file:///etc/hosts', '']) {
-      const row = keepAliveRow(tab({ url }), NOW)
+      const row = keepAliveRow(tab({ url, keepalive_enabled: false }), NOW)
       expect(row.disabled).toBe(true)
       expect(row.label).toBe('Keep me signed in')
       expect(row.hint).toBe('Only web pages can be kept signed in')
@@ -112,10 +112,62 @@ describe('the ⋯ row', () => {
         keepalive_action: 'soft',
         keepalive_every: 45,
         last_keepalive_at: NOW - 720,
+        last_probe_at: NOW - 720,
       }),
       NOW,
     )
     expect(row.detail).toBe('Every 45 min · checked 12 min ago.')
+  })
+
+  test('"checked" means a PING, never a tick — the false green light', () => {
+    // THE regression. The sweep stamps `last_keepalive_at` on every tick it
+    // completes, including the ones that learned nothing: an unclear streak
+    // backing off, a wake that failed, a root that answers 404 forever, a
+    // cross-origin SSO bounce the fetch rejects. A tab whose every ping has
+    // failed for a day was rendering "checked 1 min ago" — and because the row
+    // kept being stamped, the stale branch could never fire either.
+    const row = keepAliveRow(
+      tab({
+        keepalive_enabled: true,
+        keepalive_action: 'soft',
+        keepalive_every: 15,
+        last_keepalive_at: NOW - 60,
+        last_probe_at: NOW - 86_400,
+      }),
+      NOW,
+    )
+    expect(row.detail).toBe("Hasn't been able to check since 1 d ago.")
+    expect(row.detail).not.toContain('checked 1 min ago')
+  })
+
+  test('on, stamped but never once probed, says so', () => {
+    const row = keepAliveRow(
+      tab({
+        keepalive_enabled: true,
+        keepalive_action: 'soft',
+        last_keepalive_at: NOW - 60,
+        last_probe_at: null,
+      }),
+      NOW,
+    )
+    expect(row.detail).toBe("Hasn't been able to check yet.")
+  })
+
+  test('an enabled tab that drifts to a non-web page stays switchable', () => {
+    // It is still ON, still costs one of the four slots and is still stamped by
+    // the sweep — so greying the row here stranded the setting with no way to
+    // reach the toggle.
+    const row = keepAliveRow(
+      tab({ keepalive_enabled: true, url: 'about:blank', last_keepalive_at: NOW - 60 }),
+      NOW,
+    )
+    expect(row.label).toBe('Stop keeping signed in')
+    expect(row.disabled).toBeFalsy()
+    expect(row.detail).toBe('Not a web page — nothing to check here.')
+    // And the sheet offers the same way out, without claiming it is working.
+    const sheet = keepAliveSheetRow(tab({ keepalive_enabled: true, url: 'about:blank' }))
+    expect(sheet.on).toBe(true)
+    expect(sheet.title).toBe('Paused on this page')
   })
 
   test('watch mode says WATCHING, and never says refreshing', () => {
@@ -125,6 +177,10 @@ describe('the ⋯ row', () => {
         keepalive_action: 'watch',
         keepalive_every: 10,
         last_keepalive_at: NOW - 300,
+        // Watch mode pings NOTHING, so the probe stamp stands still by design.
+        // An age line here would read as neglect, and a stale line would be a
+        // false alarm about a tab that is behaving exactly as designed.
+        last_probe_at: NOW - 30 * 86_400,
       }),
       NOW,
     )
@@ -156,7 +212,8 @@ describe('the ⋯ row', () => {
         keepalive_enabled: true,
         keepalive_action: 'soft',
         keepalive_every: every,
-        last_keepalive_at: NOW - cutoff,
+        last_keepalive_at: NOW,
+        last_probe_at: NOW - cutoff,
       }),
       NOW,
     )
@@ -167,7 +224,10 @@ describe('the ⋯ row', () => {
         keepalive_enabled: true,
         keepalive_action: 'soft',
         keepalive_every: every,
-        last_keepalive_at: NOW - cutoff - 1,
+        // Stamped one second ago — the tick RAN, it just did not learn
+        // anything, which is precisely the case the stale line is for.
+        last_keepalive_at: NOW - 1,
+        last_probe_at: NOW - cutoff - 1,
       }),
       NOW,
     )
@@ -197,10 +257,13 @@ describe('the ⋯ row', () => {
       tab({ keepalive_enabled: true, keepalive_action: 'soft', last_keepalive_at: NOW - 60 }),
       tab({ keepalive_enabled: true, keepalive_action: 'watch', last_keepalive_at: NOW - 60 }),
       tab({ keepalive_enabled: true, login_state: 'needs_login', last_keepalive_at: NOW - 60 }),
+      tab({ keepalive_enabled: true, last_keepalive_at: NOW - 60, last_probe_at: null }),
+      tab({ keepalive_enabled: true, url: 'about:blank', last_keepalive_at: NOW - 60 }),
       tab({
         keepalive_enabled: true,
         keepalive_every: 360,
         last_keepalive_at: NOW - 30 * 86_400,
+        last_probe_at: NOW - 30 * 86_400,
       }),
     ]
     for (const t of cases) {
