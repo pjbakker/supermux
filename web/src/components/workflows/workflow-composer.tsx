@@ -26,6 +26,7 @@ import { cn } from '@/lib/utils'
 import { springs } from '@/lib/springs'
 import { useToast } from '@/components/ui/use-toast'
 import { SessionPicker } from '@/components/session/session-picker'
+import { Switch } from '@/components/settings/primitives'
 import { useCompanyScope } from '@/components/roster/use-company-scope'
 import { displayLabel } from '@/lib/api/sessions'
 import { useSessions } from '@/hooks/use-sessions'
@@ -561,28 +562,14 @@ export function ComposerBody({
               stops. Its workflows pause until you unarchive it.
             </p>
           </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={archiveOnStop}
-            aria-label="Archive the bot's session when it stops"
-            onClick={() => setArchiveTouched(!archiveOnStop)}
-            className={cn(
-              'relative inline-flex h-7 w-12 shrink-0 items-center rounded-full p-0.5 transition-colors',
-              'before:absolute before:-inset-2.5 before:content-[""]',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-              archiveOnStop ? 'bg-primary' : 'bg-muted',
-            )}
-          >
-            <motion.span
-              layout
-              transition={springs.toggleSnap}
-              className={cn(
-                'block size-6 rounded-full bg-white shadow-sm',
-                archiveOnStop ? 'ml-auto' : 'ml-0',
-              )}
-            />
-          </button>
+          {/* the app's switch primitive, not a hand-rolled one: this row is the
+              settings idiom (label + description + switch), and `Switch` already
+              carries the 44pt hit area, the focus ring and the toggle spring */}
+          <Switch
+            checked={archiveOnStop}
+            onCheckedChange={setArchiveTouched}
+            ariaLabel="Archive the bot's session when it stops"
+          />
         </section>
       </div>
 

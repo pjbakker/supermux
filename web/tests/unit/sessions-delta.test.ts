@@ -153,6 +153,15 @@ describe('applyDelta — tombstone must not strand a real restore (w7 regression
     const goneArch = applyDelta([row({ name: 'ar' })], [{ name: 'ar', archived: true }], true, tomb2, 0)
     const afterArch = applyDelta(goneArch, [{ name: 'ar', preview_lines: ['ghost'] }], true, tomb2, 500)
     expect(afterArch.map((s) => s.name)).toEqual([])
+
+    // The production shape of that partial (ported PR #54): archiving also STOPS
+    // the session, and the stop broadcasts its own thin `{name, status}` delta
+    // from a SEPARATE task, so it can land after the archive removed the row. It
+    // carries no dir/provider either, so the same discriminator must deny it.
+    const tomb3 = new Map<string, number>()
+    const goneTwin = applyDelta([row({ name: 'tw' })], [{ name: 'tw', archived: true }], true, tomb3, 1000)
+    const afterTwin = applyDelta(goneTwin, [{ name: 'tw', status: 'stopped' }], true, tomb3, 1300)
+    expect(afterTwin.map((s) => s.name)).toEqual([])
   })
 })
 
@@ -238,21 +247,12 @@ describe('applyDelta — the archive twin-broadcast race (ported PR #54)', () =>
   // partial can land AFTER the archive's removal delta. That exact shape is the
   // bug the old archive-tombstone PR chased: an unknown name on a `sessions`
   // event (allowAdd = true) used to be re-inserted as a synthetic idle stub with
-  // an empty dir and preview — a ghost tile that only a reload cleared. The
-  // removal tombstone above covers it; these cases pin the archive-specific
-  // shapes so a future edit to the discriminator cannot quietly lose them.
-
-  test('the twin late `status: stopped` partial does not resurrect the tile', () => {
-    const tomb = new Map<string, number>()
-    const alive = [row({ name: 'keep' }), row({ name: 'arch', status: 'active' })]
-    // The archive broadcast drops the row and tombstones the name.
-    const gone = applyDelta(alive, [{ name: 'arch', archived: true }], true, tomb, 1000)
-    expect(gone.map((s) => s.name)).toEqual(['keep'])
-    // The stop's own `sessions` delta lands 300ms later, on the add-allowing
-    // path. It carries no `dir`/`provider`, so it is a synthetic partial: deny.
-    const after = applyDelta(gone, [{ name: 'arch', status: 'stopped' }], true, tomb, 1300)
-    expect(after.map((s) => s.name)).toEqual(['keep'])
-  })
+  // an empty dir and preview — a ghost tile that only a reload cleared.
+  //
+  // The `sessions`-channel half of that race is folded into the synthetic-partial
+  // test above, next to the assertion it duplicates. What is left here is what
+  // that test cannot say: the `status` CHANNEL (allowAdd = false, a second
+  // independent guard), and the out-of-band re-insert that no delta performed.
 
   test('the same stop arriving on the `status` channel is a no-op too', () => {
     const tomb = new Map<string, number>()
@@ -285,19 +285,5 @@ describe('applyDelta — the archive twin-broadcast race (ported PR #54)', () =>
     expect(after.map((s) => s.name)).toEqual(['arch'])
     expect(after[0].preview_lines).toEqual(['back'])
     expect(tomb.has('arch')).toBe(false)
-  })
-
-  test('after an unarchive full row, trailing archive-era partials still merge', () => {
-    const tomb = new Map<string, number>()
-    const gone = applyDelta([row({ name: 'arch', status: 'active' })], [{ name: 'arch', archived: true }], true, tomb, 0)
-    // Unarchive re-broadcasts the whole SessionView with `archived: false`
-    // (sessions/lifecycle.rs::unarchive) — authoritative, so the tile is back.
-    const back = applyDelta(gone, [row({ name: 'arch', status: 'stopped', archived: false })], true, tomb, 200)
-    expect(back.map((s) => s.name)).toEqual(['arch'])
-    // A partial queued before the unarchive arrives after it: it must merge into
-    // the restored row, not be swallowed by a stale tombstone.
-    const after = applyDelta(back, [{ name: 'arch', preview_lines: ['tail'] }], true, tomb, 300)
-    expect(after.map((s) => s.name)).toEqual(['arch'])
-    expect(after[0].preview_lines).toEqual(['tail'])
   })
 })
