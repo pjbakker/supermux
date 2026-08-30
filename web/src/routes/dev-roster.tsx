@@ -195,6 +195,9 @@ BENCH_QC.setQueryData<NotesResponse>(['learned-notes', BOT_PANEL_BENCH_NAME, '']
   bot_count: 2,
   role_count: 1,
   role: 'implementer',
+  // `wired` = the route answered 200 — i.e. the memory tier is ON for this bot.
+  // The bench frames the populated list, not the "memory isn't on yet" state.
+  wired: true,
   notes: [
     {
       slug: 'build-gate-is-build-perf',
@@ -239,6 +242,7 @@ BENCH_QC.setQueryData<NotesResponse>(['learned-notes', BOT_PANEL_BENCH_NAME, 'mi
   bot_count: 1,
   role_count: 0,
   role: 'implementer',
+  wired: true,
   notes: [
     {
       slug: 'never-edit-server-migrations',

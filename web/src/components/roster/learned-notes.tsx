@@ -13,6 +13,12 @@
  * search that would quietly disagree with its memory. An empty box lists the
  * whole union (private ∪ role), freshest first.
  *
+ * Three states, not two. "The tier is OFF for this session" (the route 404s) and
+ * "the bot is in the tier and has written nothing yet" (200 + `[]`) are different
+ * facts, and printing the second for the first is what made memory look built and
+ * dead. The off state names the switch — a role or a company, then a restart —
+ * and carries the restart button, because the hook is wired at LAUNCH.
+ *
  * Markdown sits behind `React.lazy`, exactly as `transcript-item.tsx` does it:
  * the `react-markdown` stack stays in its own chunk and never lands in this
  * panel's weight; the Suspense fallback renders the same body as pre-wrapped
@@ -28,6 +34,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, Info, Search } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
+import { RestartToApply } from '@/components/roster/granted-connectors'
 import {
   getNote,
   listNotes,
@@ -72,6 +79,12 @@ export function LearnedNotes({ name }: { name: string }) {
   })
 
   const notes = data?.notes ?? []
+  // Three states, not two. The route 404s while the memory tier is OFF for this
+  // session, and folding that into the same empty list made the panel say "this
+  // bot hasn't written any notes yet" about a store that does not exist — the
+  // one sentence that made the whole feature look built-but-dead. `wired` is the
+  // client's reading of 200-vs-404 (`lib/api/memory.ts`).
+  const notWired = Boolean(data) && !data?.wired
   // Derived, not synced: a row the current result set no longer contains simply
   // renders collapsed. Storing that in an effect would be a second source of
   // truth for the same fact, one render behind.
@@ -101,9 +114,18 @@ export function LearnedNotes({ name }: { name: string }) {
       {isLoading ? (
         <div className="h-16 animate-pulse rounded-xl border border-border bg-muted/30" />
       ) : notes.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-border bg-muted/20 px-4 py-4 text-[13px] leading-relaxed text-muted-foreground">
+        <div className="flex flex-col items-start gap-2.5 rounded-xl border border-dashed border-border bg-muted/20 px-4 py-4 text-[13px] leading-relaxed text-muted-foreground">
           {searching ? (
             <>No note matches “{debounced}”.</>
+          ) : notWired ? (
+            <>
+              {/* The tier is wired at LAUNCH (the recall hook rides the session's
+                  config overlay), so a bot that just got its role gains memory on
+                  its next start — which is exactly what this button does. */}
+              Memory isn’t on for this bot yet. Give it a role or a company above, then restart
+              it — after that it writes what it learns here.
+              <RestartToApply name={name} />
+            </>
           ) : (
             <>
               This bot hasn’t written any notes yet — the core notes above are its curated index.
@@ -124,20 +146,24 @@ export function LearnedNotes({ name }: { name: string }) {
         </ul>
       )}
 
-      <p className="flex items-start gap-1.5 text-[11.5px] leading-snug text-muted-foreground">
-        <Info className="mt-px size-3.5 shrink-0" aria-hidden />
-        {data && (data.bot_count > 0 || data.role_count > 0) ? (
-          <span>
-            {data.bot_count} private
-            {data.role_count > 0 && data.role
-              ? ` · ${data.role_count} shared with role ${data.role}`
-              : ''}{' '}
-            · the bot writes these; you read them.
-          </span>
-        ) : (
-          <span>The bot writes these itself; this view is read-only.</span>
-        )}
-      </p>
+      {/* Omitted while the tier is off: there is nothing to count, and "the bot
+          writes these itself" would state a capability this launch does not have. */}
+      {!notWired && (
+        <p className="flex items-start gap-1.5 text-[11.5px] leading-snug text-muted-foreground">
+          <Info className="mt-px size-3.5 shrink-0" aria-hidden />
+          {data && (data.bot_count > 0 || data.role_count > 0) ? (
+            <span>
+              {data.bot_count} private
+              {data.role_count > 0 && data.role
+                ? ` · ${data.role_count} shared with role ${data.role}`
+                : ''}{' '}
+              · the bot writes these; you read them.
+            </span>
+          ) : (
+            <span>The bot writes these itself; this view is read-only.</span>
+          )}
+        </p>
+      )}
     </section>
   )
 }

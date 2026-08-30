@@ -54,14 +54,21 @@ export interface NotesResponse {
   role_count: number
   /** The role key whose shared tier was unioned in; empty for a private-only bot. */
   role: string
+  /** `false` ⇒ the memory tier is NOT enabled for this session (the route
+   *  404'd), as opposed to enabled-and-empty. Client-side only: the API already
+   *  draws this distinction with its status code, and flattening both into one
+   *  empty list is what let the panel say "this bot hasn't written any notes
+   *  yet" about a store that does not exist for it. */
+  wired: boolean
 }
 
-const EMPTY: NotesResponse = { notes: [], bot_count: 0, role_count: 0, role: '' }
+const EMPTY: NotesResponse = { notes: [], bot_count: 0, role_count: 0, role: '', wired: false }
 
-/** A `404` here means "this session is not a bot" (no role, no core notes, no
- *  store) — an empty archive, not a broken call. A bot that simply hasn't
- *  written anything yet answers `200` with an empty list. Either way the panel
- *  shows its empty state; anything else is a real error and propagates. */
+/** A `404` here means "this session is not a bot" (no company, no role, no core
+ *  notes, no store) — the tier is off, not broken, so it is not an error to
+ *  surface. It comes back `wired: false` so the panel can say THAT rather than
+ *  claiming an empty archive; a real bot that simply hasn't written anything yet
+ *  answers `200` with an empty list and `wired: true`. Anything else propagates. */
 function emptyOn404(e: unknown): NotesResponse {
   if (e instanceof ApiError && e.status === 404) return EMPTY
   throw e
@@ -73,7 +80,8 @@ const base = (name: string) => `/api/sessions/${encodeURIComponent(name)}/memory
  *  (private ∪ role), freshest first. */
 export async function listNotes(name: string): Promise<NotesResponse> {
   try {
-    return await settingsRequest<NotesResponse>(`${base(name)}/notes`)
+    // The server does not send `wired` — reaching a 200 IS the flag.
+    return { ...(await settingsRequest<NotesResponse>(`${base(name)}/notes`)), wired: true }
   } catch (e) {
     return emptyOn404(e)
   }
@@ -89,7 +97,7 @@ export async function searchNotes(
   const params = new URLSearchParams({ q })
   if (limit) params.set('limit', String(limit))
   try {
-    return await settingsRequest<NotesResponse>(`${base(name)}/search?${params}`)
+    return { ...(await settingsRequest<NotesResponse>(`${base(name)}/search?${params}`)), wired: true }
   } catch (e) {
     return emptyOn404(e)
   }
