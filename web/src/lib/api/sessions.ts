@@ -57,8 +57,9 @@ export interface AgentRow {
   label?: string
   /** Milliseconds since this agent was first seen. */
   since_ms: number
-  /** Milliseconds since its newest hook. Past `AGENT_QUIET_AFTER_MS` the row is
-   *  QUIET: it stays, dims, and says the fact — never "stopped", never "done". */
+  /** Milliseconds since its newest hook. Past `AGENT_QUIET_AFTER_MS`
+   *  (`components/chat/agent-rows.ts`) the row is QUIET: it stays, dims, and says
+   *  the fact — never "stopped", never "done", never a verdict. */
   quiet_ms: number
 }
 

@@ -468,6 +468,10 @@ export function LiveLayer({
         working &&
         !liveRow && (
           <WorkingRow
+            // Keyed by session: the agent list's expansion lives in component
+            // state and must not survive a switch to a different session, whose
+            // children are different children.
+            key={name}
             // The run grammar, applied to the live band: the overlay receipts
             // directly above are the SAME speaker, so their mark is already
             // hanging in the gutter — repeating it one row later would draw the

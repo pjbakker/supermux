@@ -1367,6 +1367,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The cap, and what it evicts. One conversation on this host has 899
+    /// subagent transcripts; a fan-out session's map must not grow with every
+    /// child it ever spawned. The row evicted is always the one whose evidence
+    /// is oldest — which is by construction a quiet or finished child, never one
+    /// that is still calling tools.
+    #[tokio::test]
+    async fn the_row_map_is_capped_and_evicts_the_oldest_evidence() {
+        let (state, dir) = test_state().await;
+        let s = "swarm";
+
+        // 40 children, oldest first (each `touch` stamps `Instant::now()`, which
+        // is monotonic, so insertion order IS evidence order).
+        for i in 0..40u32 {
+            apply_payload(
+                &state,
+                s,
+                "pre_tool",
+                &p(&format!(
+                    r#"{{"agent_id":"a{i}","agent_type":"general-purpose","tool_name":"Bash","tool_input":{{"description":"d{i}"}}}}"#
+                )),
+            );
+        }
+        let rows = state.agent_rows(s, Instant::now());
+        assert_eq!(rows.len(), 32, "the map is capped at 32 rows per session");
+        let ids: std::collections::HashSet<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(!ids.contains("a0"), "the oldest evidence was evicted");
+        assert!(ids.contains("a39"), "the newest child is always kept");
+
+        // A lifecycle edge drops the lot: a brand-new Claude process inherits no
+        // children, and neither does a finished one.
+        apply_payload(&state, s, "session_start", &p("{}"));
+        assert!(state.agent_rows(s, Instant::now()).is_empty());
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The rows ride the SAME change-only `sessions` delta the count already
     /// does — one key beside it, always present so an empty array clears the
     /// client's list. No new event type, no new endpoint.

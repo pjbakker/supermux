@@ -47,6 +47,7 @@ export {
 } from './facepile'
 export { ImageLightbox, type ImageLightboxProps } from './image-lightbox'
 export {
+  AgentDotIcon,
   ArrowIcon,
   AtIcon,
   BackIcon,
@@ -88,4 +89,4 @@ export {
   type MentionChipProps,
   type SystemLineProps,
 } from './system-line'
-export { WorkingRow, type WorkingRowProps } from './working-row'
+export { AgentList, WorkingRow, type AgentListProps, type AgentListRow, type WorkingRowProps } from './working-row'

@@ -723,6 +723,31 @@ export function liveStates(nowMs: number): LiveState[] {
       overlay,
     },
     {
+      // The FAN-OUT: a turn whose work is happening in children, which is the
+      // one thing this surface used to be unable to say. No overlay, so the
+      // working row itself renders (with an overlay the running receipt takes
+      // the live slot) — this is the bench for its `· N agents` control and the
+      // list it opens, at 390px with the composer up.
+      id: 'fanout',
+      title: 'Fan-out — the working row’s agent list (tap `· 4 agents`)',
+      board: 'P12 working row + subagent visibility §5',
+      session: session({
+        name: RELEASE_TRAIN,
+        display_name: 'Release Train',
+        status: 'active',
+        activity: '🤖 Review the ledger rounding',
+        agents: [
+          { id: 'f1', type: 'general-purpose', label: '📖 ledger.rs', since_ms: 41_000, quiet_ms: 900 },
+          { id: 'f2', type: 'general-purpose', label: '⚡ cargo test --lib money', since_ms: 38_000, quiet_ms: 3_100 },
+          { id: 'f3', type: 'Explore', label: '🔍 round_half_even', since_ms: 22_000, quiet_ms: 12_400 },
+          // Inside one long command: the row dims and states the fact.
+          { id: 'f4', type: 'workflow-subagent', since_ms: 19_000, quiet_ms: 191_000 },
+        ],
+      }),
+      entries: release,
+      turnAgo: 42,
+    },
+    {
       id: 'provisional',
       title: 'Provisional — the pty tail, visibly unconfirmed',
       board: 'P13 (master plan §4.2)',
@@ -1562,6 +1587,7 @@ export const STATE_IDS = [
   'idle',
   'busy-header',
   'working',
+  'fanout',
   'provisional',
   'permission',
   'delegation',

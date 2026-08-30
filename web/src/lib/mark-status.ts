@@ -132,12 +132,6 @@ export function attentionFor(s: AttentionInput | null | undefined): AttentionTie
   return null
 }
 
-/** How long a row may go without a hook before it reads QUIET rather than live.
- *  Mirrors the server's `AGENT_LIVE_WINDOW` (state.rs) — deliberately 60s and
- *  not the 10s subagent-liveness window, because an agent sitting inside one
- *  `Bash` is legitimately silent and Claude Code's `Bash` ceiling is 600s. */
-export const AGENT_QUIET_AFTER_MS = 60_000
-
 /** The calm ` · N agents` parallelism clause, shared by the chat WorkingRow, the
  *  tile's activity line and the Grok roster's state word so they never drift.
  *  Empty below 2 — one agent is not "parallel", and the clause is a parallelism
