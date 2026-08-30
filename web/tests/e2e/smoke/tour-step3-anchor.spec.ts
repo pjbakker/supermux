@@ -62,8 +62,18 @@ test.describe('onboarding tour', () => {
       page.getByRole('dialog', { name: /Tour step 3 of \d/ }),
     ).toBeVisible({ timeout: 10_000 })
 
-    // The copy names its new home.
-    await expect(page.getByText(/Schedules live in Settings now/)).toBeVisible()
+    // The copy names its new home. Asserted on the WORD, not on the sentence:
+    // this line used to read `/Schedules live in Settings now/` and the string
+    // no longer existed anywhere in `src/` — B1's fold shipped, the copy was
+    // rewritten to "Workflows are in Settings…" (`src/brand/copy.ts`
+    // ONBOARDING.tour[2]) and this spec spent 90 s timing out on a tour that
+    // was working perfectly. The load-bearing claim was never the wording; it
+    // is that step 3 tells the user WHERE the thing moved to, which is the same
+    // claim the anchor assertion below makes structurally.
+    await expect(
+      page.getByRole('dialog', { name: /Tour step 3 of \d/ }),
+      'step 3 must name Settings as the new home',
+    ).toContainText('Settings')
 
     // ── The load-bearing assertion: anchored, not centred ───────────────────
     const geom = await page.evaluate(() => {
