@@ -1,24 +1,38 @@
 import { defineConfig } from '@playwright/test'
 import { HARDENED_HOST_CHROMIUM_ARGS } from './tests/e2e/launch-args'
 
-// Smoke e2e — the FOUR most-critical
-// early-warning tests, run against a REAL supermux-server binary booted per-test on
-// an ephemeral port with an isolated temp data dir (see tests/e2e/smoke/harness.ts).
+// Smoke e2e — the early-warning suite (79 tests across 49 spec files; 73 of them
+// eligible on a hosted runner, see the @slow / @needs-claude note below). Every
+// test runs against a REAL supermux-server binary booted per-test on an ephemeral
+// port with an isolated temp data dir (see tests/e2e/smoke/harness.ts).
 //
 // No global webServer: each spec boots its own backend + Vite dev server through
 // the harness so a backend-kill/restart test (ws-reconnect) can drive the
 // process lifecycle directly. Vite proxies /api + /ws to the backend SAME-ORIGIN
 // (vite.config.ts reads SUPERMUX_E2E_BACKEND), so the app runs exactly as it does
 // behind the embedded static server — no CORS, no cross-origin WebSocket.
+//
+// TIMINGS. A boot-per-test suite is dominated by the boot: ~20s of binary + Vite
+// + tmux settle per test, so the whole suite is ~25 min end to end and one spec
+// file is ~30s. CI does NOT run it as one job — `ci.yml` shards it four ways
+// (`--shard=i/4`), each shard a fresh runner with its own binary and its own
+// `workers: 1`, which puts the e2e job's critical path at roughly a quarter of
+// the suite plus a two-minute artifact download. Do not raise `workers` to claw
+// that back: the harness's tmux/port pressure is why it is 1, and shards buy the
+// same parallelism across machines that do not share it.
 export default defineConfig({
   testDir: './tests/e2e/smoke',
   // Serial: each test owns a tmux-backed binary + dev server; running them in
-  // parallel would multiply port/tmux pressure on a dev laptop for no real gain
-  // on a 4-test suite. CI can still shard by spec file.
+  // parallel would multiply port/tmux pressure on one machine. Parallelism comes
+  // from `--shard` across CI runners instead (see the TIMINGS note above).
   fullyParallel: false,
   workers: 1,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
+  // Retries are NOT global — see the `chromium-flaky` project below. A blanket
+  // `retries: 1` costs nothing on a green run but it lets a genuinely
+  // nondeterministic spec pass on the second try forever, unnoticed, which is
+  // how a suite rots into "just re-run it". A spec that flakes earns the tag.
+  retries: 0,
   // Generous: booting a Rust binary + Vite + tmux pane settle dominates.
   timeout: 90_000,
   expect: { timeout: 10_000 },
@@ -35,9 +49,22 @@ export default defineConfig({
       : {},
   },
   projects: [
+    // Two chromium projects, split by tag, so RETRIES are scoped rather than
+    // global. Everything untagged runs once and must be deterministic; a spec
+    // whose nondeterminism is understood and accepted gets `@flaky` in its title
+    // and lands in the second project, which retries it twice in CI. The tag is
+    // the record: `grep -rn '@flaky' tests/e2e/smoke` is the list of specs the
+    // suite does not fully trust, and it is empty today.
     {
       name: 'chromium',
       use: { browserName: 'chromium' },
+      grepInvert: /@flaky/,
+    },
+    {
+      name: 'chromium-flaky',
+      use: { browserName: 'chromium' },
+      grep: /@flaky/,
+      retries: process.env.CI ? 2 : 0,
     },
     // Opt-in WebKit project — the closest proxy to iOS Safari / WKWebView, the
     // platform the mobile touch-scroll specs actually target. Off by default so
