@@ -2141,8 +2141,24 @@ async fn start_locked_inner(
             Some(id) => Arc::new(SshFileTransport::new(state.host_pool.clone(), HostId(id))),
             None => Arc::new(LocalFileTransport),
         };
-        if let Err(e) =
-            crate::claude_config::install_hooks(name, &hook_token, transport.as_ref(), None).await
+        // A session booting on its OWN Claude account (migration 0041) reads
+        // `<config_dir>/settings.json`, not the daemon's — so installing the
+        // hooks into the daemon's file would leave that session with no hook
+        // reporting at all, falling back to the regex bank + pty heartbeat (the
+        // known "stuck active" failure mode). `install_hooks` already takes an
+        // explicit settings path for exactly this kind of override; point it at
+        // the session's account so a second-account session is a first-class
+        // one. Local only: `config_dir` is refused for remote rows on create,
+        // and the remote branch resolves a relative path against the far $HOME.
+        let settings_override = (!s.config_dir.is_empty() && s.host_id.is_none())
+            .then(|| std::path::Path::new(&s.config_dir).join("settings.json"));
+        if let Err(e) = crate::claude_config::install_hooks(
+            name,
+            &hook_token,
+            transport.as_ref(),
+            settings_override.as_deref(),
+        )
+        .await
         {
             tracing::warn!(name = %name, error = %e, "install_hooks failed; status falls back to regex/heartbeat");
         }

@@ -161,14 +161,14 @@ For a sweep by hand there is `supermux-server swarm-reaper [--dry-run] [--grace-
 
 Migrations are forward-only. Schema changes go in a new file `00NN_<name>.sql`.
 
-A session with its own `config_dir` still gets its status hooks from the DAEMON's
-config dir: `claude_config::install_hooks` writes one `settings.json`, the one
-the server process resolves. A second account therefore needs its `settings.json`
-symlinked to the first account's file, which is how the second login is set up.
-Without that symlink the session still runs, but status detection falls back to
-the regex and pty heartbeat path instead of the hooks.
+A session with its own `config_dir` gets its status hooks written INTO that
+account: `claude_config::install_hooks` already takes an explicit settings path,
+and session start hands it `<config_dir>/settings.json` for a local row that has
+one. So a second-account session reports real hook status rather than falling
+back to the regex and pty heartbeat path, and no `settings.json` symlink is
+needed for status to work.
 
-The hooks are not the only daemon-scoped surface. Everything supermux installs
+The hooks are the exception. Everything else supermux installs
 or edits resolves the DAEMON's config dir from the server process environment,
 never the session's column, so a session on a second account does not inherit:
 
@@ -181,11 +181,13 @@ never the session's column, so a session on a second account does not inherit:
 - **Teammate scanning.** `teams/scan.rs` reads the daemon's teams/tasks files.
   This one is currently unreachable: team start hard-codes `config_dir: None`,
   so every teammate session runs on the daemon account anyway.
+- **The statusline tap.** `chat/statusline.rs` resolves
+  `claude_config::local_settings_path()` for both the opt-in install and the
+  uninstall, so the tap is written to and removed from the daemon account only.
 
-Symlinking `commands/` and the MCP config into the second account is the same
-remedy as for `settings.json`. Without it the session works, it just lacks the
-supermux-installed extras, which is worth knowing before debugging it as
-"supermux is broken".
+Symlinking `commands/` and the MCP config into the second account is the
+remedy. Without it the session works, it just lacks the supermux-installed
+extras, which is worth knowing before debugging it as "supermux is broken".
 
 ---
 
