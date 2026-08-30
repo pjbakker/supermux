@@ -1922,6 +1922,29 @@ async fn start_locked(
         // ("a fault reads as gone"), so a transient probe glitch on a session
         // that is actually running now lands here — and must not tear down that
         // live session's cached stream on the way to a spawn that fails.
+
+        // THE GROUND UNDER US. The sibling `holder_bin` guard above names a
+        // missing BINARY; this one names a missing CWD. A stored `dir` that no
+        // longer exists (a worktree removed, a project moved) fails ENOENT
+        // inside `cmd.spawn()` down in the runtime, and `AppError::Internal`
+        // deliberately answers a bare 500 "internal server error" — so the one
+        // fact the user can actually act on never reaches the wire. Say it here.
+        //
+        // LOCAL ROWS ONLY: a remote session's `dir` lives on the far side of the
+        // SSH ControlMaster, where this `is_dir()` would measure the wrong box.
+        // Gated on `host_id`, not runtime, so a local tmux row is covered too.
+        //
+        // INSIDE `freshly_spawned` deliberately: a start on an already-alive
+        // session (resume, or a plain no-op) never spawns and stays
+        // byte-identical, so a dir deleted under a RUNNING agent does not
+        // newly fail the resume that still works.
+        if s.host_id.is_none() && !dir.is_dir() {
+            return Err(AppError::BadRequest(format!(
+                "session directory '{}' does not exist; create it or update the session's directory",
+                s.dir
+            )));
+        }
+
         // COMPANY ISOLATION (companies §4.4). Build the per-spawn confinement
         // plan for a company session (`None` for a main/PA bot or under
         // isolation_mode=off) and spawn through the confining seam. On THIS box
