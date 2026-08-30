@@ -52,7 +52,7 @@ export function useCreateCompany() {
   })
 }
 
-/** `PATCH /api/companies/{id}` — update settings (name / accent / brief /
+/** `PATCH /api/companies/{id}` — update settings (name / brief /
  *  default_connectors / archived). Invalidates `['companies']`. */
 export function useUpdateCompany() {
   const qc = useQueryClient()

@@ -25,6 +25,9 @@ export interface SpaceCard {
   /** Hue seed for `<CompanyMark>`. Empty for HQ (which uses `<HqMark>`). */
   slug: string
   name: string
+  /** The company's uploaded logo, resolved by `<CompanyMark>` itself. `null` for
+   *  HQ, which draws the brand mark instead. */
+  logo: Pick<Company, 'id' | 'has_logo' | 'updated_at'> | null
   /** Bots living in this space. HQ's are the sessions with no company. */
   bots: number
   /** Where tapping the card navigates. HQ has no single root — the route
@@ -76,6 +79,7 @@ export function spaceCards(
       id: null,
       slug: '',
       name: 'HQ',
+      logo: null,
       bots: count(null),
       path: null,
       activity: activity[activityKey(null)] ?? null,
@@ -89,6 +93,7 @@ export function spaceCards(
       id: c.id,
       slug: c.slug,
       name: c.display_name,
+      logo: { id: c.id, has_logo: c.has_logo, updated_at: c.updated_at },
       bots: count(c.id),
       path: c.root_dir,
       activity: activity[activityKey(c.id)] ?? null,

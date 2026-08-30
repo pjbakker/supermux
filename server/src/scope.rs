@@ -262,6 +262,17 @@ pub fn member_may_reach(method: &Method, path: &str) -> bool {
             if !rest.is_empty() && !rest.contains('/') {
                 return true;
             }
+            // …plus the ONE subpath that is a read of the company's own identity:
+            // `{id}/logo`, the bytes behind `<CompanyMark>`. A member is told
+            // `has_logo` by the row they can already read, so denying the image
+            // just paints an empty tile on every companies surface they have.
+            // `logo::get_handler` runs its own `Scope::sees` check, so this cannot
+            // become a cross-company read.
+            if let Some(id) = rest.strip_suffix("/logo") {
+                if !id.is_empty() && !id.contains('/') {
+                    return true;
+                }
+            }
         }
     }
     // Workflows (spec §5.1). The whole surface — list/create/read/patch/steps/
@@ -480,6 +491,13 @@ mod tests {
         assert!(member_may_reach(&get, "/api/agents/bot/wait"));
         assert!(member_may_reach(&get, "/api/companies"));
         assert!(member_may_reach(&get, "/api/companies/1"));
+        // …and the company mark's bytes — otherwise every `<CompanyMark>` a member
+        // sees paints an empty tile. Read-only: the write verbs stay denied.
+        assert!(member_may_reach(&get, "/api/companies/1/logo"));
+        assert!(!member_may_reach(&put, "/api/companies/1/logo"));
+        assert!(!member_may_reach(&del, "/api/companies/1/logo"));
+        assert!(!member_may_reach(&post, "/api/companies/1/logo/from-url"));
+        assert!(!member_may_reach(&get, "/api/companies//logo"));
         // Workflows — the WHOLE surface. Its predecessor was owner-only as a
         // sub-router, so a member got a blanket 404 on their own bot's jobs; the
         // real fence is the per-handler `Scope::sees` 404 inside `workflows`.

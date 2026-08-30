@@ -402,17 +402,46 @@ fn gather_in_proj(
     let mut cursor_consumed = cursor.is_none();
     let target = limit + 1;
 
-    'files: for path in &files {
-        // `read_user_turns` walks the file FORWARD and reverses its own output
-        // so the file's own entries arrive newest-first.
-        // `Arc` on both arms so the cached vector is never deep-cloned just to
-        // be iterated; only the <= `limit + 1` entries that survive the
-        // filters are cloned.
-        let file_entries = if chat {
+    // `read_user_turns` walks the file FORWARD and reverses its own output so a
+    // file's entries arrive newest-first. `Arc` on both arms so the cached vector
+    // is never deep-cloned just to be iterated; only the <= `limit + 1` entries
+    // that survive the filters are cloned.
+    let load = |path: &PathBuf| {
+        if chat {
             read_chat_turns_cached(path)
         } else {
             std::sync::Arc::new(read_user_turns(path, include_sidechains))
-        };
+        }
+    };
+
+    // A Session whose conversation was split by a cwd change has SEVERAL copies of
+    // the same `<cc_id>.jsonl`, and those copies can OVERLAP: a stale copy's mtime
+    // says "older" while its entries sit inside the live copy's range. Walking
+    // them file-by-file would then emit a non-monotonic stream (and repeat any
+    // turn both copies hold), so the copies are merged on CONTENT — de-duped by
+    // turn uuid, newest `ts` first — and walked as ONE stream. Project scope keeps
+    // the lazy per-file walk: its files are DIFFERENT conversations, it can hold
+    // dozens, and the `limit + 1` target usually lands in the first.
+    let merged = (matches!(scope, Scope::Session) && files.len() > 1).then(|| {
+        let mut merged: Vec<RecallEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in &files {
+            for entry in load(path).iter() {
+                if seen.insert(entry.uuid.clone()) {
+                    merged.push(entry.clone());
+                }
+            }
+        }
+        // Stable, so equal-`ts` turns keep the newest-copy-first file order.
+        merged.sort_by(|a, b| b.ts.cmp(&a.ts));
+        std::sync::Arc::new(merged)
+    });
+    let streams: Box<dyn Iterator<Item = std::sync::Arc<Vec<RecallEntry>>> + '_> = match merged {
+        Some(one) => Box::new(std::iter::once(one)),
+        None => Box::new(files.iter().map(load)),
+    };
+
+    'files: for file_entries in streams {
         for entry in file_entries.iter() {
             if !cursor_consumed {
                 if let Some((ref c_sid, ref c_uuid)) = cursor {
@@ -498,15 +527,16 @@ fn gather_in_proj(
 /// and the answer only ever shows in the live-terminal (a separate transport).
 /// The pty is fine; only the transcript path was wrong.
 ///
-/// WHY MERGE, NOT REPLACE. The copies are DISJOINT time-ranges of ONE conversation
-/// split by cwd changes (measured on the real stuck session: the registered-dir
-/// copy held turns through 08-26, the diverged copy 08-27→08-28, no overlap).
-/// Reading only the newest would drop the older scrollback; reading only the
-/// registered one drops the live turns. The union — keyed on the shared
-/// conversation UUID — is the true transcript, so we return every copy and let the
-/// existing newest-first walk merge them (the same way `Scope::Project` already
-/// tolerates mtime-ordered files). Turn UUIDs are unique, so the `(session_id,
-/// uuid)` cursor still resolves across copies.
+/// WHY MERGE, NOT REPLACE. The copies are time-ranges of ONE conversation split by
+/// cwd changes. Reading only the newest would drop the older scrollback; reading
+/// only the registered one drops the live turns. The union — keyed on the shared
+/// conversation UUID — is the true transcript, so we return every copy.
+///
+/// The mtime order here is only a starting hint: copies can OVERLAP (a stale copy
+/// whose entries sit inside the live copy's range), so `gather_in_proj` merges
+/// them on CONTENT — de-duped by turn uuid, sorted by `ts` — rather than trusting
+/// this order to be the transcript order. Turn UUIDs are unique, so the
+/// `(session_id, uuid)` cursor still resolves across copies.
 ///
 /// The common (undiverged) case is unchanged: exactly one copy exists — `proj`'s
 /// own — so this returns `[proj/<cc_id>.jsonl]`, byte-identical to before.
@@ -1883,6 +1913,54 @@ mod tests {
         let live = texts.iter().position(|t| t.contains("Gisteren")).unwrap();
         let hist = texts.iter().position(|t| t.contains("oude vraag")).unwrap();
         assert!(live < hist, "live turn must sit above the old history: {texts:?}");
+    }
+
+    #[test]
+    fn session_scope_orders_overlapping_copies_by_time_not_by_file() {
+        // Copies are NOT guaranteed disjoint: on this box the registered-dir copy
+        // (newer mtime) spans 07-31→08-27 while the diverged copy (older mtime)
+        // spans 08-26→08-27 — INSIDE it. File-by-file concatenation then emits
+        // 08-27, 07-31, 08-27 again: scrambled history, and a turn both copies
+        // hold shows twice. Merge on content: newest-first by `ts`, uuid-unique.
+        let root = temp_dir();
+        let proj = root.join("-opt-projects-companies-keuzenl-ipc");
+        let diverged = root.join("-opt-projects-ipc-astro");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&diverged).unwrap();
+        let cc = "7f7a6b59";
+
+        let wide = write_jsonl(
+            &proj,
+            cc,
+            &[
+                &user_line("u1", "2026-07-31T14:39:00Z", "oudste vraag", false),
+                &user_line("shared", "2026-08-27T10:00:00Z", "gedeelde turn", false),
+                &user_line("u3", "2026-08-27T22:41:00Z", "nieuwste vraag", false),
+            ],
+        );
+        set_mtime(&wide, 2_000);
+        let inner = write_jsonl(
+            &diverged,
+            cc,
+            &[
+                &user_line("u2", "2026-08-26T23:01:00Z", "middelste vraag", false),
+                &user_line("shared", "2026-08-27T10:00:00Z", "gedeelde turn", false),
+            ],
+        );
+        set_mtime(&inner, 1_000);
+
+        let resp = gather_in_proj(&proj, cc, Scope::Session, "", false, true, false, None, 10);
+        let texts: Vec<&str> = resp.entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "nieuwste vraag",
+                "gedeelde turn",
+                "middelste vraag",
+                "oudste vraag"
+            ],
+            "copies must interleave by time, and a shared uuid must appear once",
+        );
     }
 
     #[test]

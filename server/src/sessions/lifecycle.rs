@@ -1148,13 +1148,24 @@ fn at_trust_dialog(capture: &str) -> bool {
 /// stops). Returns an EMPTY sequence when the affirmative option or the cursor
 /// can't be located, so a parse miss WAITS and retries — never a blind Enter that
 /// could confirm "No, exit".
+///
+/// The affirmative is matched on the OPTION line ("Yes…" after the cursor glyph
+/// and any "1." numbering), NOT on any line mentioning trust: the dialog's own
+/// header — "Do you trust the files in this folder?" — mentions it too, and
+/// locking onto the header put the cursor permanently "below Yes", turning the
+/// already-correct old layout into an Up that wraps a two-option menu onto
+/// "No, exit". Both cursor glyphs Claude Code has drawn (`❯`, `›`) count.
 fn keys_to_accept_trust(capture: &str) -> Vec<&'static str> {
     let lines: Vec<&str> = capture.lines().collect();
     let yes = lines.iter().position(|l| {
         let x = l.to_lowercase();
-        x.contains("trust this folder") || x.contains("trust the files")
+        let x = x.trim_start_matches(['❯', '›', '>', ' ', '\t']);
+        let x = x.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ');
+        x.starts_with("yes")
     });
-    let cursor = lines.iter().position(|l| l.contains('❯'));
+    let cursor = lines
+        .iter()
+        .position(|l| l.contains('❯') || l.contains('›'));
     match (yes, cursor) {
         (Some(y), Some(c)) if c == y => vec!["Enter"], // already on "Yes"
         (Some(y), Some(c)) if c < y => vec!["Down", "Enter"], // "Yes" is below
@@ -3270,6 +3281,28 @@ mod agent_ready_heuristics_tests {
         let cap = "Is this a project you created or one you trust?\n \
                    ❯ 1. Yes, I trust this folder\n   2. No, exit";
         assert_eq!(keys_to_accept_trust(cap), vec!["Enter"]);
+    }
+
+    #[test]
+    fn accept_trust_ignores_the_dialog_header_that_also_says_trust() {
+        // REGRESSION: the real header IS "Do you trust the files in this folder?",
+        // so matching any line that mentions trust locked onto the header (line 0)
+        // and every layout read as "Yes is above the cursor" → an Up that wraps a
+        // two-option menu onto "No, exit". Both real layouts must still be right.
+        let old = "Do you trust the files in this folder?\n\
+                   ❯ 1. Yes, I trust this folder\n   2. No, exit";
+        assert_eq!(keys_to_accept_trust(old), vec!["Enter"]);
+        let flipped = "Do you trust the files in this folder?\n\
+                       ❯ No, exit\n  Yes, I trust this folder";
+        assert_eq!(keys_to_accept_trust(flipped), vec!["Down", "Enter"]);
+    }
+
+    #[test]
+    fn accept_trust_reads_the_alternate_cursor_glyph() {
+        // Claude Code has drawn the menu cursor as `›` as well as `❯`; a glyph we
+        // don't know is a parse miss that hangs the boot to timeout.
+        let cap = "Do you trust the files in this folder?\n› No, exit\n  Yes, I trust this folder";
+        assert_eq!(keys_to_accept_trust(cap), vec!["Down", "Enter"]);
     }
 
     #[test]

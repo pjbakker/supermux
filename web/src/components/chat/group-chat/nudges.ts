@@ -44,3 +44,27 @@ export function collapseNudges(rows: readonly GroupChatRow[]): GroupChatRow[] {
   }
   return out
 }
+
+/**
+ * Which DISPLAY row carries the "New" divider for `firstUnreadSeq`.
+ *
+ * The read boundary is measured over the RAW rows — a render-time fold must
+ * never move it — but the feed renders the COLLAPSED list, and a fold swallows
+ * every seq in a run except the first. A boundary that lands mid-run therefore
+ * names a row that is no longer rendered, and the divider silently vanishes
+ * while the badge still says "1 new". Resolve it to the row that ABSORBED it:
+ * the last display row at or before the anchor (rows are seq-ascending).
+ * `null` in ⇒ `null` out — a fully-read feed draws no line.
+ */
+export function unreadAnchor(
+  displayRows: readonly GroupChatRow[],
+  firstUnreadSeq: number | null,
+): number | null {
+  if (firstUnreadSeq === null) return null
+  let anchor: number | null = null
+  for (const row of displayRows) {
+    if (row.seq > firstUnreadSeq) break
+    anchor = row.seq
+  }
+  return anchor
+}

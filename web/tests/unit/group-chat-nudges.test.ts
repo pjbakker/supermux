@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from 'bun:test'
 
-import { collapseNudges } from '../../src/components/chat/group-chat/nudges'
+import { collapseNudges, unreadAnchor } from '../../src/components/chat/group-chat/nudges'
 import type { GroupChatRow } from '../../src/components/chat/group-chat/types'
 
 const routed = (seq: number, ts: number, tag: string, seed = 'acme-assistant'): GroupChatRow => ({
@@ -78,5 +78,29 @@ describe('collapseNudges', () => {
 
   test('an empty feed is the identity', () => {
     expect(collapseNudges([])).toEqual([])
+  })
+})
+
+describe('unreadAnchor — the "New" line survives the fold', () => {
+  test('a boundary INSIDE a folded run lands on the row that absorbed it', () => {
+    // The reader was at the bottom when nudge seq 10 landed (read up to 10), then
+    // scrolled up while seq 11 of the same turn arrived. 11 folds into 10, so
+    // matching the raw anchor against the display list would draw NO divider.
+    const display = collapseNudges([routed(10, 100, 'ada'), routed(11, 101, 'max')])
+    expect(display.map((r) => r.seq)).toEqual([10])
+    expect(unreadAnchor(display, 11)).toBe(10)
+  })
+
+  test('a boundary at the head of a run is that row, unchanged', () => {
+    const display = collapseNudges([reply(9, 99, 'ada'), routed(10, 100, 'ada'), routed(11, 101, 'max')])
+    expect(unreadAnchor(display, 10)).toBe(10)
+  })
+
+  test('a fully-read feed draws no line', () => {
+    expect(unreadAnchor(collapseNudges([routed(1, 100, 'ada')]), null)).toBeNull()
+  })
+
+  test('an empty feed has no anchor', () => {
+    expect(unreadAnchor([], 5)).toBeNull()
   })
 })

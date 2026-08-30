@@ -30,9 +30,6 @@ pub struct Company {
     pub archived: i64,
     pub created_at: i64,
     pub updated_at: i64,
-    /// `#rrggbb` the client sampled from the logo (or picked) — colours the nav
-    /// ring / chips / group-chat accent. `None` → the generated slug hue.
-    pub accent: Option<String>,
     /// (Stage 2) shared mission/handbook injected into every company bot.
     pub brief: Option<String>,
     /// (Stage 2) JSON array of connector ids a new company bot inherits.
@@ -46,7 +43,7 @@ pub struct Company {
 /// The column list every `Company` SELECT shares. `has_logo` is computed so the
 /// BLOB stays out of the row; the trailing alias order matches the struct.
 const COMPANY_COLS: &str = "id, slug, display_name, root_dir, archived, created_at, updated_at, \
-     accent, brief, default_connectors, (logo IS NOT NULL) AS has_logo";
+     brief, default_connectors, (logo IS NOT NULL) AS has_logo";
 
 /// List companies, alphabetically by display name. Archived rows are hidden
 /// unless `include_archived` is set (the switcher passes `false`; a management
@@ -149,8 +146,7 @@ pub async fn set_logo(pool: &SqlitePool, id: i64, bytes: &[u8], mime: &str) -> s
     Ok(res.rows_affected() > 0)
 }
 
-/// Clear the logo (back to the generated mark). Leaves `accent` alone — the
-/// caller decides whether to also drop the derived accent.
+/// Clear the logo (back to the generated mark).
 pub async fn clear_logo(pool: &SqlitePool, id: i64) -> sqlx::Result<bool> {
     let now = chrono::Utc::now().timestamp();
     let res =
@@ -159,18 +155,6 @@ pub async fn clear_logo(pool: &SqlitePool, id: i64) -> sqlx::Result<bool> {
             .bind(id)
             .execute(pool)
             .await?;
-    Ok(res.rows_affected() > 0)
-}
-
-/// Set (or clear, with `None`) the accent `#rrggbb`. Bumps `updated_at`.
-pub async fn set_accent(pool: &SqlitePool, id: i64, accent: Option<&str>) -> sqlx::Result<bool> {
-    let now = chrono::Utc::now().timestamp();
-    let res = sqlx::query("UPDATE companies SET accent = ?, updated_at = ? WHERE id = ?")
-        .bind(accent)
-        .bind(now)
-        .bind(id)
-        .execute(pool)
-        .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -296,14 +280,12 @@ mod tests {
             "Acme Corp"
         );
 
-        // Branding: no logo/accent by default; set + read back; clear.
-        assert!(!c.has_logo && c.accent.is_none());
+        // Branding: no logo by default; set + read back; clear.
+        assert!(!c.has_logo);
         assert!(get_logo(&pool, c.id).await.unwrap().is_none());
         assert!(set_logo(&pool, c.id, b"\x89PNG-bytes", "image/png").await.unwrap());
-        assert!(set_accent(&pool, c.id, Some("#3da0ff")).await.unwrap());
         let got = get(&pool, c.id).await.unwrap().unwrap();
         assert!(got.has_logo, "has_logo flips without loading the blob");
-        assert_eq!(got.accent.as_deref(), Some("#3da0ff"));
         let (bytes, mime) = get_logo(&pool, c.id).await.unwrap().unwrap();
         assert_eq!(bytes, b"\x89PNG-bytes");
         assert_eq!(mime, "image/png");

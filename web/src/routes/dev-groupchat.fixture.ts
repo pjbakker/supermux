@@ -12,7 +12,9 @@
 // deterministic: `Date.now()` would make every VR diff fail on the clock.
 import type { ChannelMember, GroupChatRow } from '@/components/chat/group-chat'
 
-export const CANARY = { slug: 'canary', display_name: 'Canary' }
+// `has_logo` stays false: the bench draws the GENERATED mark, so the offline
+// artboard needs no authed image fetch to render exactly as it screenshots.
+export const CANARY = { id: 1, slug: 'canary', display_name: 'Canary', has_logo: false }
 
 /** 2026-08-26 09:00:00Z, the bench's zero. */
 const T0 = 1_787_734_800

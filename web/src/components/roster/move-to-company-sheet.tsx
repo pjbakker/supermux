@@ -177,6 +177,7 @@ export function MoveToCompanySheet({
                 name={destCompany.display_name}
                 size={32}
                 className="shrink-0"
+                logo={destCompany}
               />
             ) : (
               <HqMark size={32} />

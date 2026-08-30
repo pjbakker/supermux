@@ -76,7 +76,7 @@ export function SpacesGrid({
                 {card.kind === 'hq' ? (
                   <HqMark size={40} />
                 ) : (
-                  <CompanyMark slug={card.slug} name={card.name} size={40} />
+                  <CompanyMark slug={card.slug} name={card.name} size={40} logo={card.logo} />
                 )}
                 <span className="min-w-0">
                   <span className="block truncate text-sm font-medium">

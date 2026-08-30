@@ -1148,13 +1148,12 @@ export const companiesApi = {
     }),
 
   /** `PATCH /api/companies/{id}` — update any settings field(s): `display_name`,
-   *  `accent` (#rrggbb, `""` clears), `brief`, `default_connectors`, `archived`.
-   *  Returns the refreshed row. */
+   *  `brief`, `default_connectors`, `archived`. Returns the refreshed row. */
   patch: (
     id: number,
-    fields: Partial<
-      Pick<Company, 'display_name' | 'accent' | 'brief' | 'default_connectors'>
-    > & { archived?: boolean },
+    fields: Partial<Pick<Company, 'display_name' | 'brief' | 'default_connectors'>> & {
+      archived?: boolean
+    },
   ): Promise<Company> =>
     sessReq(`/api/companies/${id}`, {
       method: 'PATCH',
@@ -1180,8 +1179,7 @@ export const companiesApi = {
       body: JSON.stringify({ url }),
     }),
 
-  /** `DELETE /api/companies/{id}/logo` — back to the generated mark (also clears
-   *  the logo-derived accent). */
+  /** `DELETE /api/companies/{id}/logo` — back to the generated mark. */
   deleteLogo: (id: number): Promise<Company> =>
     sessReq(`/api/companies/${id}/logo`, { method: 'DELETE' }),
 

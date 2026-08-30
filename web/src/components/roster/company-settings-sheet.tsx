@@ -1,13 +1,17 @@
 /**
  * `<CompanySettingsSheet>` — per-company branding + identity, opened from the
  * company switcher (a safe action, above the delete danger zone). Stage 1:
- *   · Logo — upload an image OR grab a site's favicon by URL (Google's favicon
- *     service, server-side). On success the client samples the logo's dominant
- *     colour and stores it as the company `accent`, so the nav ring / chips match
- *     the mark automatically — no separate colour pick needed (a manual override
- *     is offered for the no-logo case / taste).
+ *   · Logo — upload an image OR grab a site's favicon by URL (icon.horse /
+ *     Google's favicon service, server-side). A picked photo is downscaled to the
+ *     icon box first, so the camera-roll gesture works instead of bouncing off
+ *     the server's size cap.
  *   · Name — the mutable `display_name`. The `#slug` is immutable (it is the
  *     folder + URL key) so it is shown read-only.
+ *
+ * The company's COLOUR is not a setting: `<CompanyMark>` derives it from the
+ * immutable slug (the hue firewall), so there is nothing here to pick. An earlier
+ * pass shipped a colour swatch that wrote an `accent` nothing ever read — a
+ * control with no effect — and it is gone rather than decorative.
  *
  * Uses the canonical `<ResponsiveSheet>` (Vaul bottom sheet on coarse pointers,
  * `side="right"` on desktop) so it feels like one system with the create/delete
@@ -21,10 +25,23 @@ import { Input } from '@/components/ui/input'
 import { ResponsiveSheet } from '@/components/ui/responsive-sheet'
 import { CompanyMark } from '@/components/roster/company-mark'
 import { useCompanyLogo, useUpdateCompany } from '@/hooks/use-companies'
-import { companyLogoUrl, type Company } from '@/lib/companies'
-import { dominantColor, dominantColorOfFile } from '@/lib/dominant-color'
-import { apiToken, apiUrl } from '@/lib/api/client'
+import { type Company } from '@/lib/companies'
+import { downscaleLogo } from '@/lib/logo-image'
 import { SessionError } from '@/lib/api'
+
+/** The server's sentence, without the typed-error prefix its envelope carries
+ *  (`bad request: …`) — that prefix is wire shape, not copy — and punctuated like
+ *  the sheet's own copy. Falls back to the caller's sentence for a transport
+ *  failure that carries no message of its own. */
+function serverSentence(e: unknown, fallback: string): string {
+  if (!(e instanceof SessionError)) return fallback
+  const msg = e.message
+    .replace(/^(bad request|conflict|not found|forbidden|too many):\s*/i, '')
+    .trim()
+  if (!msg) return fallback
+  const sentence = msg.charAt(0).toUpperCase() + msg.slice(1)
+  return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`
+}
 
 export interface CompanySettingsSheetProps {
   open: boolean
@@ -46,19 +63,6 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
   React.useEffect(() => setName(company.display_name), [company.display_name])
 
   const hasLogo = !!company.has_logo
-  const accent = company.accent ?? undefined
-
-  /** After a logo lands, sample its dominant colour and store it as the accent so
-   *  the surrounding UI matches the mark. Best-effort — a sampling miss just
-   *  leaves the accent untouched. */
-  async function deriveAccent(sampleSrc: string, fromFile: Blob | null) {
-    try {
-      const hex = fromFile ? await dominantColorOfFile(fromFile) : await dominantColor(sampleSrc)
-      if (hex) await update.mutateAsync({ id: company.id, fields: { accent: hex } })
-    } catch {
-      /* leave the accent as-is */
-    }
-  }
 
   async function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
@@ -66,10 +70,11 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
     if (!file) return
     setErr(null)
     try {
-      const row = await upload.mutateAsync({ id: company.id, file })
-      await deriveAccent(companyLogoUrl(row) ?? '', file)
+      // A phone photo is megabytes; the logo box is 256px. Downscale first so the
+      // camera-roll pick succeeds instead of tripping the server's size cap.
+      await upload.mutateAsync({ id: company.id, file: await downscaleLogo(file) })
     } catch (e) {
-      setErr(e instanceof SessionError ? e.message : 'Upload failed.')
+      setErr(serverSentence(e, 'Upload failed.'))
     }
   }
 
@@ -78,14 +83,10 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
     if (!trimmed) return
     setErr(null)
     try {
-      const row = await fromUrl.mutateAsync({ id: company.id, url: trimmed })
+      await fromUrl.mutateAsync({ id: company.id, url: trimmed })
       setUrl('')
-      // Sample from the freshly-served logo (same-origin → canvas is readable).
-      // The `?_token=` rides along so the <img> load is authed.
-      const served = companyLogoUrl(row, apiToken())
-      if (served) await deriveAccent(apiUrl(served), null)
     } catch (e) {
-      setErr(e instanceof SessionError ? e.message : 'Could not fetch that favicon.')
+      setErr(serverSentence(e, 'Could not fetch that favicon.'))
     }
   }
 
@@ -94,7 +95,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
     try {
       await remove.mutateAsync(company.id)
     } catch (e) {
-      setErr(e instanceof SessionError ? e.message : 'Could not remove the logo.')
+      setErr(serverSentence(e, 'Could not remove the logo.'))
     }
   }
 
@@ -105,16 +106,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
     try {
       await update.mutateAsync({ id: company.id, fields: { display_name: trimmed } })
     } catch (e) {
-      setErr(e instanceof SessionError ? e.message : 'Could not rename.')
-    }
-  }
-
-  async function onAccentPick(hex: string) {
-    setErr(null)
-    try {
-      await update.mutateAsync({ id: company.id, fields: { accent: hex } })
-    } catch {
-      /* ignore */
+      setErr(serverSentence(e, 'Could not rename.'))
     }
   }
 
@@ -138,8 +130,8 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
             <div className="min-w-0">
               <div className="text-[13px] font-medium text-ink">Logo</div>
               <div className="text-[12px] leading-snug text-ink-2">
-                Upload an image, or pull the favicon from a website. The accent
-                colour is sampled from it.
+                Upload an image (PNG or JPEG — big ones are scaled down), or pull
+                the favicon from a website.
               </div>
             </div>
           </div>
@@ -148,7 +140,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
             <input
               ref={fileInput}
               type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml,image/x-icon"
+              accept="image/png,image/jpeg,image/webp,image/gif,image/x-icon"
               className="hidden"
               onChange={onPickFile}
             />
@@ -206,35 +198,6 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
               {fromUrl.isPending ? <Loader2 className="size-4 animate-spin" /> : 'Get favicon'}
             </Button>
           </div>
-        </section>
-
-        {/* ── Accent ───────────────────────────────────────────────────────── */}
-        <section className="flex items-center justify-between gap-3">
-          <div className="min-w-0">
-            <div className="text-[13px] font-medium text-ink">Accent</div>
-            <div className="text-[12px] leading-snug text-ink-2">
-              {hasLogo ? 'Sampled from your logo. Tap to override.' : 'Tap to pick a colour.'}
-            </div>
-          </div>
-          {/* The swatch IS the control: the native colour input is `sr-only`
-              and the tinted circle is its label, so tapping the circle opens the
-              OS picker. Named (`htmlFor` + an sr-only text) rather than an
-              anonymous wrapper — a screen reader otherwise reaches an unlabelled
-              colour field. */}
-          <label
-            htmlFor="company-accent"
-            className="size-9 flex-none cursor-pointer rounded-full border border-border"
-            style={{ background: accent ?? 'var(--sm-fill-soft)' }}
-          >
-            <span className="sr-only">Accent colour</span>
-            <input
-              id="company-accent"
-              type="color"
-              className="sr-only"
-              value={accent ?? '#3da0ff'}
-              onChange={(e) => onAccentPick(e.target.value)}
-            />
-          </label>
         </section>
 
         {/* ── Name ─────────────────────────────────────────────────────────── */}

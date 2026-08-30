@@ -23,6 +23,8 @@
  * as "a space") but shows the actual brand mark, not the invented rainbow spark
  * it used to. `<HqMark>` is the HQ analogue of `<CompanyMark>`.
  */
+import * as React from 'react'
+
 import { characterFromSeed, bodyColor, accentInk } from '@/brand/marks'
 import { useTheme } from '@/components/theme-provider'
 import { Logo } from '@/components/logo'
@@ -103,7 +105,17 @@ export function CompanyMark({
   const { resolvedTheme } = useTheme()
   const isDark = dark ?? resolvedTheme === 'dark'
   const hue = characterFromSeed(slug).hue
-  const logoUrl = logo ? companyLogoUrl(logo, apiToken()) : null
+  // The URL that FAILED to load, not a boolean: a re-upload (or a fresh token)
+  // changes the URL, which un-fails the mark by itself — no effect, no stale flag.
+  const [failedUrl, setFailedUrl] = React.useState<string | null>(null)
+  // `has_logo` gates the token read as well as the URL: a company with no logo
+  // needs neither, and a mark rendered outside the browser (bun's SSR tests)
+  // never touches `window` for a monogram it was going to draw anyway.
+  const resolved = logo?.has_logo ? companyLogoUrl(logo, apiToken()) : null
+  // `has_logo` says the bytes EXIST, not that this viewer can load them: a 404
+  // (a scoped member, a rotated token) or an offline miss must fall through to the
+  // generated monogram, never leave an empty tinted tile.
+  const logoUrl = resolved && resolved !== failedUrl ? resolved : null
   // An uploaded logo replaces the generated monogram, keeping the rounded-square
   // tile geometry so the company silhouette is unchanged. It sits on a SUBTLE
   // tile tinted from the company's own hue — light enough that a dark / mono-glyph
@@ -128,6 +140,7 @@ export function CompanyMark({
         <img
           src={logoUrl}
           alt=""
+          onError={() => setFailedUrl(logoUrl)}
           style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
         />
       </span>

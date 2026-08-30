@@ -20,8 +20,6 @@ export interface Company {
   archived: number
   created_at?: number
   updated_at?: number
-  /** `#rrggbb` accent (sampled from the logo, or picked). Absent → slug hue. */
-  accent?: string | null
   /** (Stage 2) shared brief injected into every company bot. */
   brief?: string | null
   /** (Stage 2) default-connectors JSON for new bots. */

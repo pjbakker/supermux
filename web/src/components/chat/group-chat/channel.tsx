@@ -39,6 +39,7 @@ import { PAPER } from '@/brand/tokens'
 import { useTheme } from '@/components/theme-provider'
 import { CompanyMark } from '@/components/roster/company-mark'
 import { HumanMark } from '@/components/roster/human-mark'
+import { type Company } from '@/lib/companies'
 import { cn } from '@/lib/utils'
 
 import {
@@ -56,7 +57,7 @@ import {
 import { ChatLoadingSkeleton } from '../chat-loading-skeleton'
 import { ChannelComposer } from './channel-composer'
 
-import { collapseNudges } from './nudges'
+import { collapseNudges, unreadAnchor } from './nudges'
 import { isGrouped, type ChannelMember, type GroupChatKind, type GroupChatRow } from './types'
 
 // Full markdown for message bodies — bots post code fences, bullet lists and
@@ -369,8 +370,10 @@ function UnreadDivider() {
 /* ── the channel ─────────────────────────────────────────────────────────── */
 
 export interface ChatChannelProps {
-  /** The company this channel belongs to — its mark and its `#slug`. */
-  company: { slug: string; display_name: string }
+  /** The company this channel belongs to — its mark and its `#slug`. The
+   *  identity fields ride along so the header mark shows the UPLOADED logo, the
+   *  same way every other company surface does. */
+  company: Pick<Company, 'id' | 'slug' | 'display_name' | 'has_logo' | 'updated_at'>
   /** Everyone in the channel, in roster order. Drives the header facepile AND
    *  the `@mention` resolver, so a mention can only ever name a real member. */
   members: readonly ChannelMember[]
@@ -476,6 +479,13 @@ export function ChatChannel({
   // Merge each Router turn's one-per-bot `routed` rows into a single "Nudged
   // @a @b" line for display; the raw `rows` still drive seq/baseline/paging.
   const displayRows = React.useMemo(() => collapseNudges(rows), [rows])
+  // The fold can swallow the row the unread anchor names, so resolve the anchor
+  // onto the row that absorbed it — otherwise the "New" line disappears while the
+  // badge still counts the message.
+  const unreadAnchorSeq = React.useMemo(
+    () => unreadAnchor(displayRows, firstUnreadSeq ?? null),
+    [displayRows, firstUnreadSeq],
+  )
 
   // The arrival pop is for milestones that LAND, not for the history that was
   // already here. The hero MOUNTS EMPTY (loading), so freezing at mount would
@@ -545,7 +555,12 @@ export function ChatChannel({
       >
         {headerLeading}
         {/* The company hue lives HERE and nowhere else on the surface (§7.2.4). */}
-        <CompanyMark slug={company.slug} name={company.display_name} size={24} />
+        <CompanyMark
+          slug={company.slug}
+          name={company.display_name}
+          size={24}
+          logo={company}
+        />
         <div className="min-w-0 flex-1">
           <p className="truncate text-[15px] font-semibold tracking-[-0.2px] text-ink">
             #{company.slug}
@@ -643,7 +658,7 @@ export function ChatChannel({
               return (
                 <React.Fragment key={row.seq}>
                   {newDay && <DayDivider ts={row.ts} />}
-                  {firstUnreadSeq === row.seq && i > 0 && <UnreadDivider />}
+                  {unreadAnchorSeq === row.seq && i > 0 && <UnreadDivider />}
                   <ChannelRow
                     row={row}
                     grouped={grouped}

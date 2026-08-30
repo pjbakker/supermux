@@ -170,9 +170,6 @@ pub struct PatchCompanyInput {
     pub display_name: Option<String>,
     #[serde(default)]
     pub archived: Option<bool>,
-    /// `#rrggbb` accent, or `""` to clear back to the slug hue. Absent = leave.
-    #[serde(default)]
-    pub accent: Option<String>,
     /// (Stage 2) shared company brief; `""` clears. Absent = leave.
     #[serde(default)]
     pub brief: Option<String>,
@@ -180,10 +177,6 @@ pub struct PatchCompanyInput {
     #[serde(default)]
     pub default_connectors: Option<String>,
 }
-
-/// A 6-digit `#rrggbb`. The client samples the accent from the logo, so this is a
-/// belt-and-braces server check, not the primary UX.
-static HEX_COLOR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^#[0-9a-fA-F]{6}$").unwrap());
 
 /// DELETE response body: the cascade removed EVERYTHING that belonged to the
 /// company. `deleted_bots` lists every session slug torn down (the Main Assistant
@@ -520,19 +513,6 @@ async fn patch_handler(
     // UNIQUE row survived archival, so it cannot have been re-created.
     if let Some(archived) = input.archived {
         companies::set_archived(&state.pool, id, archived).await?;
-    }
-    // Accent: a `#rrggbb`, or `""` to clear back to the slug hue.
-    if let Some(accent) = input.accent.as_deref() {
-        let accent = accent.trim();
-        if accent.is_empty() {
-            companies::set_accent(&state.pool, id, None).await?;
-        } else if HEX_COLOR_RE.is_match(accent) {
-            companies::set_accent(&state.pool, id, Some(accent)).await?;
-        } else {
-            return Err(AppError::BadRequest(format!(
-                "accent must be #rrggbb (got {accent:?})"
-            )));
-        }
     }
     // Stage-2 fields: stored now, consumed by bot provisioning later. `""` clears.
     if let Some(brief) = input.brief.as_deref() {

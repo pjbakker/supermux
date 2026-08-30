@@ -1,9 +1,9 @@
 //! Company logo: upload, serve, clear, and "grab the favicon from a URL".
 //!
 //! Storage is a BLOB on the `companies` row (small images; the upload path caps
-//! the size), served back with its stored mime. The client samples the dominant
-//! colour from the image and PATCHes it as the company `accent`, so no image
-//! decoding happens server-side.
+//! the size), served back with its stored mime. Raster only — see
+//! [`is_supported_image`] — and no image decoding happens server-side; the client
+//! downscales an oversized photo before it uploads.
 //!
 //! `from_url` grabs a site's icon via KEYLESS favicon services — icon.horse
 //! (which resolves the site's best icon, apple-touch preferred) with Google's
@@ -33,10 +33,21 @@ use crate::state::AppState;
 const MAX_LOGO_BYTES: usize = 512 * 1024;
 
 /// The image content types we accept — an icon, not an arbitrary upload.
+///
+/// RASTER ONLY, deliberately: the stored bytes are served back same-origin from
+/// a directly-navigable, `?_token=`-authenticated URL, and an `image/svg+xml`
+/// document runs its own inline `<script>` under the app's CSP. This is the same
+/// rule `files::upload_disposition` already keeps for uploads (svg/html are never
+/// inline) — kept here by never storing an SVG at all, since icon.horse and
+/// Google's faviconV2 return raster anyway.
 fn is_supported_image(mime: &str) -> bool {
     matches!(
         mime.split(';').next().unwrap_or("").trim(),
-        "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/svg+xml" | "image/x-icon"
+        "image/png"
+            | "image/jpeg"
+            | "image/webp"
+            | "image/gif"
+            | "image/x-icon"
             | "image/vnd.microsoft.icon"
     )
 }
@@ -71,19 +82,21 @@ async fn store_logo(
     bytes: &[u8],
     mime: &str,
 ) -> Result<Json<Envelope<Company>>, AppError> {
+    // The strings here are USER-FACING copy — the settings sheet prints the
+    // server's sentence verbatim — so they read as sentences, not as debug dumps.
     let mime = mime.split(';').next().unwrap_or("").trim();
     if !is_supported_image(mime) {
-        return Err(AppError::BadRequest(format!(
-            "unsupported image type {mime:?} (png/jpeg/webp/gif/svg/ico only)"
-        )));
+        return Err(AppError::BadRequest(
+            "that file isn't an image we can use (PNG, JPEG, WebP, GIF or ICO)".into(),
+        ));
     }
     if bytes.is_empty() {
-        return Err(AppError::BadRequest("empty image".into()));
+        return Err(AppError::BadRequest("that image is empty".into()));
     }
     if bytes.len() > MAX_LOGO_BYTES {
         return Err(AppError::BadRequest(format!(
-            "image too large ({} bytes; max {MAX_LOGO_BYTES})",
-            bytes.len()
+            "that image is too large — keep it under {} KB",
+            MAX_LOGO_BYTES / 1024
         )));
     }
     companies::set_logo(&state.pool, id, bytes, mime).await?;
@@ -95,10 +108,19 @@ async fn store_logo(
 
 /// `GET /api/companies/{id}/logo` — the stored bytes with their mime, or 404 when
 /// the company has no logo (the client then renders the generated mark).
+///
+/// READ, not admin: a scoped member has to see their OWN company's mark (it is on
+/// every companies surface). The scope check lives HERE — the same
+/// `Scope::of` + `sees` shape the sibling company reads use — so the member
+/// allowlist entry for this path can never become a cross-company logo read.
 pub async fn get_handler(
     State(state): State<AppState>,
+    ctx: crate::scope::OptCtx,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !crate::scope::Scope::of(ctx.0.as_ref()).sees(Some(id)) {
+        return Err(AppError::NotFound(format!("company id={id}")));
+    }
     let (bytes, mime) = companies::get_logo(&state.pool, id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("no logo for company id={id}")))?;
@@ -117,8 +139,7 @@ pub async fn get_handler(
     ))
 }
 
-/// `DELETE /api/companies/{id}/logo` — back to the generated mark. Also clears
-/// the derived accent, since it was sampled from the logo we just removed.
+/// `DELETE /api/companies/{id}/logo` — back to the generated mark.
 pub async fn delete_handler(
     State(state): State<AppState>,
     ctx: crate::scope::OptCtx,
@@ -126,7 +147,6 @@ pub async fn delete_handler(
 ) -> Result<Json<Envelope<Company>>, AppError> {
     crate::scope::require_admin(ctx.0.as_ref(), &format!("/api/companies/{id}/logo"))?;
     companies::clear_logo(&state.pool, id).await?;
-    companies::set_accent(&state.pool, id, None).await?;
     let row = companies::get(&state.pool, id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("company id={id}")))?;
@@ -138,8 +158,8 @@ pub struct FromUrlInput {
     pub url: String,
 }
 
-/// `POST /api/companies/{id}/logo/from-url` — grab the site's favicon via
-/// Google's free favicon service and store it. Admin-only.
+/// `POST /api/companies/{id}/logo/from-url` — grab the site's icon via the two
+/// keyless services below and store it. Admin-only.
 pub async fn from_url_handler(
     State(state): State<AppState>,
     ctx: crate::scope::OptCtx,
@@ -193,7 +213,7 @@ pub async fn from_url_handler(
         }
     }
     Err(AppError::BadRequest(format!(
-        "no usable icon found for {domain:?}"
+        "we couldn't find an icon for {domain}"
     )))
 }
 
@@ -215,10 +235,12 @@ fn domain_of(raw: &str) -> Result<String, AppError> {
     let host = parsed
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
-        .ok_or_else(|| AppError::BadRequest(format!("could not read a domain from {raw:?}")))?;
+        .ok_or_else(|| AppError::BadRequest("that doesn't look like a website address".into()))?;
     // A real domain has a dot and no whitespace; reject obvious junk.
     if !host.contains('.') || host.contains(char::is_whitespace) {
-        return Err(AppError::BadRequest(format!("{host:?} is not a domain")));
+        return Err(AppError::BadRequest(format!(
+            "{host} doesn't look like a website address"
+        )));
     }
     Ok(host)
 }
@@ -226,6 +248,19 @@ fn domain_of(raw: &str) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scriptable_types_are_never_stored() {
+        // The stored bytes come back same-origin from a navigable URL, so an SVG
+        // (or an HTML file wearing an image mime) would be active content on the
+        // app origin. Same rule `files::upload_disposition` keeps for uploads.
+        assert!(!is_supported_image("image/svg+xml"));
+        assert!(!is_supported_image("image/svg+xml; charset=utf-8"));
+        assert!(!is_supported_image("text/html"));
+        assert!(is_supported_image("image/png"));
+        assert!(is_supported_image("image/jpeg; charset=binary"));
+        assert!(is_supported_image("image/x-icon"));
+    }
 
     #[test]
     fn domain_of_handles_urls_and_bare_domains() {
