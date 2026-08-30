@@ -129,6 +129,99 @@ async fn missed_window_skips_and_advances_without_firing() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Claim the fire-key for `at` as a run that then died would have left it —
+/// committed, with `fired_at` set `age_secs` ago and no run row to show for it.
+async fn orphan_fire_key(
+    state: &AppState,
+    id: &str,
+    at: chrono::DateTime<Utc>,
+    age_secs: i64,
+) {
+    sqlx::query(
+        "INSERT INTO workflow_run_keys (workflow_id, scheduled_for_ts, fired_at) VALUES (?, ?, ?)",
+    )
+    .bind(id)
+    .bind(at.timestamp())
+    .bind(Utc::now().timestamp() - age_secs)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+}
+
+/// The wedge: a fire-key left behind by a run that never finished (process
+/// killed mid-run, or `engine::start` erroring after the claim was committed).
+/// `next_run` is advanced ONLY by the claiming run, so every later tick finds
+/// the workflow due, loses the claim to its own orphan key, and advances
+/// nothing — forever, since the key survives restarts. With no live run to
+/// account for the key, the tick must sweep it: a visible `skipped` run and a
+/// cadence that moves on.
+#[tokio::test]
+async fn stale_fire_key_is_swept_and_next_run_advances() {
+    let (state, dir) = new_state().await;
+    seed(&state, &dir, "WF-stale", "stalebot").await;
+
+    let past = Utc::now() - chrono::Duration::seconds(300);
+    set_next_run(&state, "WF-stale", past).await;
+    orphan_fire_key(&state, "WF-stale", past, 1000).await;
+
+    workflows::tick_once(&state).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Sweeping is not firing: the window is written off, not delivered late.
+    let sess = db::sessions::get(&state.pool, "stalebot").await.unwrap().unwrap();
+    assert_eq!(sess.last_send_text, "", "sweeping a stale key must not deliver the step");
+
+    let runs = db::workflows::runs_for(&state.pool, "WF-stale", 20).await.unwrap();
+    assert!(
+        runs.iter()
+            .any(|r| r.status == "skipped" && r.note == "stale fire-key from a dead run"),
+        "expected a skipped/stale-key run, got {runs:?}"
+    );
+
+    let after = db::workflows::get(&state.pool, "WF-stale").await.unwrap().unwrap();
+    let next = chrono::DateTime::parse_from_rfc3339(after.next_run.as_deref().unwrap()).unwrap();
+    assert!(
+        next.with_timezone(&Utc) > Utc::now(),
+        "next_run must advance past the orphan key, got {next}"
+    );
+    assert_eq!(after.run_count, 0, "a swept window must not bump run_count");
+
+    let _ = sessions::lifecycle::stop(&state, "stalebot").await;
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The mirror of the sweep, and the reason it cannot key off age alone: a key
+/// claimed moments ago belongs to a dispatch that may not have opened its run
+/// row yet. Inside the missed-window tolerance the tick keeps its hands off —
+/// `record_fire` still owns the advance.
+#[tokio::test]
+async fn a_fresh_fire_key_is_left_alone() {
+    let (state, dir) = new_state().await;
+    seed(&state, &dir, "WF-fresh", "freshbot").await;
+
+    let past = Utc::now() - chrono::Duration::seconds(300);
+    set_next_run(&state, "WF-fresh", past).await;
+    orphan_fire_key(&state, "WF-fresh", past, 0).await;
+
+    workflows::tick_once(&state).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let runs = db::workflows::runs_for(&state.pool, "WF-fresh", 20).await.unwrap();
+    assert!(runs.is_empty(), "a fresh key records no run rows, got {runs:?}");
+
+    let after = db::workflows::get(&state.pool, "WF-fresh").await.unwrap().unwrap();
+    assert_eq!(
+        after.next_run.as_deref(),
+        Some(past.to_rfc3339().as_str()),
+        "next_run must stay untouched while the claiming dispatch may still be in flight",
+    );
+
+    let _ = sessions::lifecycle::stop(&state, "freshbot").await;
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `workflow_run_keys` UNIQUE makes a duplicate fire-key claim a no-op — the
 /// idempotency guard the tick relies on to avoid double-fires on restart.
 #[tokio::test]

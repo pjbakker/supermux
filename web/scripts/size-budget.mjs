@@ -1245,6 +1245,24 @@ const BUDGET_ENTRY_JS = 163 * KB
 //             was rejected for exactly that reason.
 // ceil(measured 440.32) + headroom = 441, the same rule every bump above used.
 //
+// RATCHETED 441 → 442 by the invite wizard's honesty + instruction fixes
+// (fix/invite-quick-tunnel). The 441 above was ceil(440.32), and the branch
+// parent measures 440.90 — 0.10 KB of headroom, the tripwire state this ledger
+// keeps documenting. Measured 441.35, and the +0.45 KB is COPY, not surface:
+//   +~0.3 KB  the rewritten "Connect your own domain" step. The old version was
+//             four lines that sent a person into a zone's menu hunting for a
+//             "Cloudflare Tunnel" item that lives at ACCOUNT level; it is now
+//             seven numbered taps naming the real 2026 pages (My Profile → API
+//             Tokens / Manage Account → API Tokens) and the four permission rows
+//             with what each one buys. The owner could not complete the step
+//             without it, so the bytes ARE the feature.
+//   +~0.15 KB the temporary link's honest STOPPED state — the panel that says
+//             "the tunnel stopped" instead of silently re-rendering the chooser,
+//             plus `lib/quick-tunnel`'s three-state view.
+// ALL of it lands OFF the hero path: `<InviteWizardSheet>` is `React.lazy` behind
+// the switcher's "Invite a teammate" row (its chunk grew 9.03 → 9.31 KB). The
+// gate that guards first paint is UNMOVED and green at 160.69 / 161 KB.
+// ceil(measured 441.35) + headroom = 442, the same rule every bump above used.
 // v0.6.1 pjbakker INTEGRATION: 441 -> 443. Measured 442.67 against 440.30 on
 // origin/main built the same way, i.e. +2.37 KB gz for the whole nine-branch
 // wave. The entry-chunk share of that is itemised at `BUDGET_ENTRY_JS` above;

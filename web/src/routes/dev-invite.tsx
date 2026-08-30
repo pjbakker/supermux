@@ -15,6 +15,7 @@
 //           /dev/invite?mock=1&entry=C       (already reachable — the repeat-invite path)
 //           /dev/invite?mock=1&entry=Q       (the "try without a domain" chooser — qt-choice)
 //           /dev/invite?mock=1&entry=Q&tunnel=1 (a temporary link already live — qt-success)
+//           /dev/invite?mock=1&entry=Q&tunnel=dead (the link's tunnel stopped — qt-stopped)
 //           /dev/invite?mock=1&entry=I       (the Cloudflare agent-inbox step — agent-inbox, pending)
 //
 // On a 390px viewport the ResponsiveSheet renders as the Vaul bottom-sheet; on a

@@ -43,7 +43,7 @@ jobs:
             runner: ubuntu-22.04-arm      # native ARM runner — no cross-compile
             arch_label: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install system build deps
         run: |
@@ -59,7 +59,7 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -68,7 +68,7 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('server/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -113,7 +113,7 @@ jobs:
           sha256sum "$OUT" > "${OUT}.sha256"
           ls -la "$OUT"*
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tarball-${{ matrix.target }}
           path: |
@@ -126,7 +126,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true

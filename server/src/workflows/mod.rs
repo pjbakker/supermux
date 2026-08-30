@@ -167,36 +167,22 @@ pub async fn tick_once(state: &AppState) -> anyhow::Result<()> {
                 // long job, and it is carried over deliberately.
                 match db::workflows::claim_run_key(&state.pool, &wf.id, scheduled_for_ts).await {
                     Ok(true) => {
-                        let _ = db::workflows::insert_run(
-                            &state.pool,
-                            &wf.id,
-                            now.timestamp(),
-                            "tick",
-                            "skipped",
+                        skip_and_advance(
+                            state,
+                            &wf,
+                            now,
                             "missed window",
+                            "its fire window was missed",
                         )
                         .await;
-                        let next = engine::recompute_next(&wf, now);
-                        let _ = db::workflows::advance_next(&state.pool, &wf.id, next).await;
                         tracing::info!(workflow = %wf.id, "advanced past a missed window (not fired)");
-                        // Surface it — this path used to be log-only, i.e.
-                        // invisible. Company-stamped so the bot's own people see
-                        // it, not just the owner.
-                        let _ = state.sse_tx.send(SseEvent::for_company(
-                            "alerts",
-                            json!({
-                                "level": "info",
-                                "source": "workflows",
-                                "workflow": wf.id,
-                                "detail": format!(
-                                    "Skipped workflow '{}' — its fire window was missed",
-                                    wf.title
-                                ),
-                            }),
-                            wf.company_id,
-                        ));
                     }
-                    Ok(false) => {} // already handled — leave next_run to record_fire
+                    // The claim lost, so a key for THIS window already exists.
+                    // Usually that means a run holds it and `record_fire` owns
+                    // the advance — but a key whose claimant is gone wedges the
+                    // workflow forever, so this arm has to look before it walks
+                    // away.
+                    Ok(false) => sweep_if_stale(state, &wf, now, scheduled_for_ts).await,
                     Err(e) => tracing::warn!(workflow = %wf.id, error = %e, "missed-window claim failed"),
                 }
                 continue;
@@ -229,6 +215,109 @@ pub async fn tick_once(state: &AppState) -> anyhow::Result<()> {
     // §3.6 — the reaper rides the same tick.
     engine::reap(state).await;
     Ok(())
+}
+
+/// Record a `skipped` run for a window the tick will not fire, advance the
+/// cadence past it, and say so out loud. Shared by the two missed-window exits:
+/// a genuinely missed window, and one wedged behind a dead run's fire-key.
+///
+/// `note` is the ledger note; `reason` is the half-sentence a human reads in the
+/// alert. The frame is COMPANY-STAMPED for the same reason every other emit in
+/// this module is — an unstamped alert is owner-only, and the people whose bot
+/// just skipped a beat are the ones who need to see it.
+async fn skip_and_advance(
+    state: &AppState,
+    wf: &Workflow,
+    now: DateTime<Utc>,
+    note: &str,
+    reason: &str,
+) {
+    let _ =
+        db::workflows::insert_run(&state.pool, &wf.id, now.timestamp(), "tick", "skipped", note)
+            .await;
+    let next = engine::recompute_next(wf, now);
+    let _ = db::workflows::advance_next(&state.pool, &wf.id, next).await;
+    let _ = state.sse_tx.send(SseEvent::for_company(
+        "alerts",
+        json!({
+            "level": "info",
+            "source": "workflows",
+            "workflow": wf.id,
+            "detail": format!("Skipped workflow '{}' — {reason}", wf.title),
+        }),
+        wf.company_id,
+    ));
+}
+
+/// A missed-window fire-key claim that was LOST: sweep the window when no live
+/// run can be holding the key.
+///
+/// `next_run` is only ever advanced by the run that claimed the key (in
+/// `record_fire`, from `engine::finish`). So a key whose claimant never gets
+/// there — the process died mid-run, or `engine::start` returned an error after
+/// the claim was already committed — leaves the workflow due on every later
+/// tick, losing the claim to its own orphan key, forever. The key is persisted,
+/// so a restart does not help; this was a production wedge ("last fired 22h ago,
+/// next fire 22h ago") and the upgrade in 0038 copied the legacy scheduler's
+/// keys over, orphans included.
+///
+/// The evidence that the claimant is gone is the RUN LEDGER, not the clock: a
+/// chain of up to [`MAX_STEPS_PER_WORKFLOW`] steps at [`DEFAULT_STEP_TIMEOUT`]
+/// each may legitimately hold its key for hours, so any age threshold big enough
+/// to be safe is too big to be useful. Two guards keep the inference honest:
+///
+/// 1. `running_for` is re-read here rather than trusted from the top of the tick
+///    — that check falls THROUGH on `Err`, and a run can have opened since;
+/// 2. `fired_at` must be older than [`MISSED_WINDOW`], which excludes the sliver
+///    between `claim_run_key` and the `open_run` inside `engine::start`.
+///
+/// On any uncertainty (a lookup error, a missing row) it logs and leaves the
+/// workflow alone: a wedged workflow is recoverable on the next tick, a spurious
+/// double-fire into a live pane is not.
+async fn sweep_if_stale(
+    state: &AppState,
+    wf: &Workflow,
+    now: DateTime<Utc>,
+    scheduled_for_ts: i64,
+) {
+    match db::workflows::running_for(&state.pool, &wf.id).await {
+        Ok(None) => {}
+        // A run is in flight: it holds the key and will advance the cadence.
+        Ok(Some(_)) => return,
+        Err(e) => {
+            tracing::warn!(workflow = %wf.id, error = %e, "stale fire-key: in-flight re-check failed");
+            return;
+        }
+    }
+    let fired_at = match db::workflows::run_key_fired_at(&state.pool, &wf.id, scheduled_for_ts).await
+    {
+        Ok(Some(ts)) => ts,
+        // Lost the claim but the row is gone — a cascade delete raced this tick.
+        Ok(None) => {
+            tracing::warn!(workflow = %wf.id, "fire-key claim lost but no key row found");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(workflow = %wf.id, error = %e, "fire-key age lookup failed");
+            return;
+        }
+    };
+    if now.timestamp() - fired_at <= MISSED_WINDOW.num_seconds() {
+        return; // young enough that a dispatch could still be on its way up
+    }
+    skip_and_advance(
+        state,
+        wf,
+        now,
+        "stale fire-key from a dead run",
+        "a previous run claimed this window and never finished",
+    )
+    .await;
+    tracing::warn!(
+        workflow = %wf.id,
+        fired_at,
+        "swept a stale fire-key: its run never advanced next_run",
+    );
 }
 
 // ── HTTP router ───────────────────────────────────────────────────────────────

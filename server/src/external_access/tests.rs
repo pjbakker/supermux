@@ -163,7 +163,12 @@ async fn cf_token_missing_scope_is_rejected() {
     )
     .await;
     match res {
-        Err(AppError::BadRequest(msg)) => assert!(msg.contains("scope"), "msg: {msg}"),
+        // The message must NAME the permission to add — "something went wrong"
+        // is what sent the owner back to Cloudflare guessing.
+        Err(AppError::BadRequest(msg)) => assert!(
+            msg.contains("missing a permission") && msg.contains("Cloudflare Tunnel"),
+            "msg: {msg}"
+        ),
         other => panic!("expected missing-scope BadRequest, got {other:?}"),
     }
     cleanup(state, dir).await;

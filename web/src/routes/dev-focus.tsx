@@ -22,6 +22,7 @@ import * as React from 'react'
 import { useParams } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 
+import { CC_SCREEN_ANSI, CC_SCREEN_LINES } from '@/routes/dev-focus.cast'
 import { DesktopFocus } from '@/routes/focus/desktop'
 import { MOCK_TILES } from '@/components/session-tile/mock'
 import { SESSIONS_KEY } from '@/hooks/use-sessions'
@@ -91,20 +92,38 @@ const MOCK_FOCUS_TEAMS: Team[] = [
 export default function DevFocus() {
   const { name } = useParams()
   const qc = useQueryClient()
+  // `?screen=cc` swaps the focused tile's six-line ROSTER tail for a full Claude
+  // Code screen (see dev-focus.cast.ts). Focus mode is the whole pty, so a
+  // capture of it has to carry the composer and its caret, not a tail.
+  const fullScreen =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('screen') === 'cc'
+  const focusName = name || FOCUS_NAME
+  const sessions = React.useMemo(
+    () =>
+      fullScreen
+        ? MOCK_TILES.map((t) =>
+            t.name === focusName
+              ? { ...t, preview_ansi: CC_SCREEN_ANSI, preview_lines: CC_SCREEN_LINES }
+              : t,
+          )
+        : MOCK_TILES,
+    [fullScreen, focusName],
+  )
   // Seed the shared `['sessions']` cache the LiveTerminal reads its cached-tail
   // overlay from (look-up by name — see `live-terminal.tsx`). Without this the
   // main pane has no last-screen to draw offline and boots an empty terminal.
   // Synchronous (useMemo, not an effect) so the cache holds the rows on the very
   // first render, before the terminal mounts and asks for them.
-  React.useMemo(() => qc.setQueryData(SESSIONS_KEY, MOCK_TILES), [qc])
+  React.useMemo(() => qc.setQueryData(SESSIONS_KEY, sessions), [qc, sessions])
   return (
     <div className="h-full w-full">
       <DesktopFocus
-        mockSessions={MOCK_TILES}
+        mockSessions={sessions}
         mockTeams={MOCK_FOCUS_TEAMS}
         // The route is captured without a `:name`; focus a concrete session so
         // the main pane is populated. An explicit `:name` still wins.
-        mockName={name || FOCUS_NAME}
+        mockName={focusName}
       />
     </div>
   )

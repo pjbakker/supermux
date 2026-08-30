@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install build deps
         run: |
@@ -64,7 +64,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -73,7 +73,7 @@ jobs:
           key: smoke-cargo-${{ hashFiles('server/Cargo.lock') }}
           restore-keys: smoke-cargo-
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: web/node_modules
           key: smoke-bun-${{ hashFiles('web/bun.lock') }}
@@ -82,7 +82,7 @@ jobs:
       - name: build tarball (release binary + etc/ + VERSION)
         run: bash tests/install/build-local-tarball.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: supermux-local-tarball
           path: tests/install/.cache/supermux-local.tar.gz
@@ -119,9 +119,9 @@ jobs:
         distro: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-24.04"]') || fromJSON('["ubuntu-24.04","ubuntu-22.04","debian-12"]') }}
         scenario: ${{ github.event_name == 'pull_request' && fromJSON('["dry-run","fresh","upgrade"]') || fromJSON('["dry-run","fresh","upgrade","port-conflict"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: supermux-local-tarball
           path: tests/install/.cache/

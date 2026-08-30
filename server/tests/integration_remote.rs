@@ -426,7 +426,7 @@ async fn end_to_end_remote_session() {
     let url = format!("ws://{}/ws/sessions/{session}", f.addr);
     let (mut ws, _resp) =
         tokio_tungstenite::connect_async(url).await.expect("ws connect");
-    ws.send(Msg::Text(format!(r#"{{"type":"auth","token":"{TOKEN}"}}"#)))
+    ws.send(Msg::Text(format!(r#"{{"type":"auth","token":"{TOKEN}"}}"#).into()))
         .await
         .unwrap();
     // Read until we see auth_ok or time out.

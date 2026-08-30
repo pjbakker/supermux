@@ -3,12 +3,19 @@
 //! in its toolset (spec §8 step 2; round-2 jury, claim 5 — the tool-exposure half).
 //!
 //! **What it is.** A tiny, credential-free, stdlib-only Python MCP stdio server
-//! (`connect_server.py`, embedded) that serves ONE tool, `connect`, carrying the
-//! [`super::REQUIRES_USER_INTERACTION_META`] marker. When a bot calls it, Claude
-//! Code routes the call to the human prompt (never auto-running it) and supermux's
-//! PreToolUse detector ([`crate::sessions::connect_ask`]) raises the inline
-//! Connect card. The secret never travels this server — the card POSTs it straight
-//! to the vault.
+//! (`connect_server.py`, embedded) that serves ONE interactive tool, `connect`.
+//! When a bot calls it, supermux's PreToolUse detector
+//! ([`crate::sessions::connect_ask`]) raises the inline Connect card in chat while
+//! the allow-listed call itself returns at once. The secret never travels this
+//! server — the card POSTs it straight to the vault.
+//!
+//! **No [`super::REQUIRES_USER_INTERACTION_META`] marker.** It carried one until
+//! it turned out to override `--permission-mode bypassPermissions` and raise
+//! Claude Code's own permission dialog in the TERMINAL — which the chat renderer
+//! cannot answer, so the bot sat parked for hours behind an invisible prompt while
+//! the chat card above it said "Added". The detector does not need the marker, so
+//! it is gone and the chat card is the only surface. The human still gates the
+//! GRANT: it happens only when they tap the card.
 //!
 //! **Why a whole server and not an inline descriptor.** Claude Code exposes MCP
 //! tools ONLY through spawned MCP servers (a `mcpServers` command it talks to over
@@ -269,9 +276,15 @@ mod tests {
     #[test]
     fn embedded_server_advertises_connect_and_list() {
         assert!(SERVER_PY.starts_with("#!/usr/bin/env python3"));
-        // Serves the connect tool with the interaction marker, over MCP stdio.
+        // Serves the connect tool over MCP stdio — and NOWHERE sets the interaction
+        // marker: that would park the bot on a terminal dialog chat cannot answer.
         assert!(SERVER_PY.contains("\"name\": \"connect\""));
-        assert!(SERVER_PY.contains(super::super::REQUIRES_USER_INTERACTION_META));
+        // Keyed on the `"_meta"` KEY, not the marker name: the file explains in
+        // prose why the marker is absent, so the name itself legitimately appears.
+        assert!(
+            !SERVER_PY.contains("\"_meta\""),
+            "no tool here may declare _meta — the interaction marker parks the bot on a terminal dialog chat cannot answer"
+        );
         assert!(SERVER_PY.contains("tools/list"));
         assert!(SERVER_PY.contains("tools/call"));
         assert!(SERVER_PY.contains("\"service\""));
@@ -531,12 +544,13 @@ mod tests {
 
     /// FUNCTIONAL: spawn the real server binary and drive it over MCP stdio the way
     /// Claude Code does — `initialize`, then `tools/list`, then `tools/call` — and
-    /// assert it advertises a `connect(service)` tool carrying the
-    /// `requiresUserInteraction` marker (round-2 claim 5: prove the tool is really
-    /// exposed by a live process, not a hand-written payload). Skipped when
-    /// `python3` is absent so it never breaks a minimal CI image.
+    /// assert it advertises a `connect(service)` tool with NO `_meta` interaction
+    /// marker (round-2 claim 5: prove the tool is really exposed by a live process,
+    /// not a hand-written payload — and that the live descriptor cannot park the
+    /// bot on Claude Code's terminal permission dialog). Skipped when `python3` is
+    /// absent so it never breaks a minimal CI image.
     #[test]
-    fn live_server_advertises_connect_with_the_interaction_marker() {
+    fn live_server_advertises_connect_without_the_interaction_marker() {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
 
@@ -575,21 +589,23 @@ mod tests {
         }));
         assert_eq!(init["result"]["serverInfo"]["name"], json!("connect"));
 
-        // tools/list — the connect tool with the interaction marker.
+        // tools/list — the connect tool, and NO interaction marker on it. With the
+        // marker Claude Code raises its own terminal permission dialog (overriding
+        // bypassPermissions); chat can't answer that, so the bot parks forever.
         let list = roundtrip(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
         let tools = list["result"]["tools"].as_array().unwrap();
         let connect = tools
             .iter()
             .find(|t| t["name"] == json!("connect"))
             .expect("connect tool advertised");
-        assert_eq!(
-            connect["_meta"][super::super::REQUIRES_USER_INTERACTION_META],
-            json!(true),
-            "connect tool carries the requiresUserInteraction marker"
+        assert!(
+            connect.get("_meta").is_none(),
+            "connect must NOT carry {} — it parks the bot on a terminal dialog: {connect}",
+            super::super::REQUIRES_USER_INTERACTION_META
         );
         assert_eq!(connect["inputSchema"]["required"][0], json!("service"));
 
-        // P2d — list_connectors is advertised too, and WITHOUT the interaction marker.
+        // P2d — list_connectors is advertised too, and equally marker-free.
         let listc = tools
             .iter()
             .find(|t| t["name"] == json!("list_connectors"))
@@ -606,6 +622,15 @@ mod tests {
         }));
         let text = call["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("pmcp-notion"), "names the requested service: {text}");
+        // HONESTY: the ask lives in server memory and dies on a restart, and nothing
+        // here can see whether the human ever looked. Claim the ask, never the
+        // outcome — and never that a card "was shown".
+        assert!(text.contains("asked the human"), "claims the ask: {text}");
+        assert!(!text.contains("was shown to the human"), "must not claim delivery: {text}");
+        assert!(
+            text.contains("\"connected\": false"),
+            "nothing is connected by this call: {text}"
+        );
 
         // P2d — no snapshot was passed (no argv[1]) → list_connectors degrades to an
         // empty list with a note, never crashing the loop.

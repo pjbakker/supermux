@@ -1,10 +1,19 @@
 /**
  * The inline CONNECT card — the Grok moment, supermux-native in chat.
  * ─────────────────────────────────────────────────────────────────────────────
- * A bot's `connect(service)` tool asked for a human (the `_meta`
- * `requiresUserInteraction` marker reached the prompt). Instead of a settings
- * excursion, ONE card slides into the transcript: sign in, or paste a key once,
- * and it flips to **Added · N tools**.
+ * A bot's `connect(service)` tool asked for a human (the server's PreToolUse
+ * detector saw the call). Instead of a settings excursion, ONE card slides into
+ * the transcript: sign in, or paste a key once, and it flips to **Added · N
+ * tools**.
+ *
+ * ## The human — not the bot — makes the grant
+ *
+ * This card is the ONLY thing that can grant a connector to a bot, and it only
+ * does so from a tap: `seal()` runs from `<ConnectFlow>`'s primary button
+ * ("Add" / "Connect"), never from an effect, never on mount — including the
+ * auth-`none` lane, where there is no credential to collect and it would be
+ * tempting to just land the grant. A bot must never be able to grant itself a
+ * connector, so the tool call raises this card and stops there.
  *
  * It reuses `DialogShell` (from `choice-card.tsx`) so it is visually one family
  * with the question / permission / form cards, and it hosts the SHARED
@@ -115,6 +124,8 @@ export function ConnectCard({
     return typeof n === 'number' ? (n === 1 ? '1 tool' : `${n} tools`) : ''
   }, [card, request.tool_count])
 
+  // Called ONLY from <ConnectFlow>'s primary button (its `submit`), so every path
+  // below is behind a human tap — the bot cannot grant itself a connector.
   const seal = async ({ fields }: { fields: Record<string, string> }): Promise<ConnectFlowResult> => {
     // No credential to seal (a `none` or `mcp_oauth` connector — the latter signs
     // in in the bot's terminal). Just land the grant so the connector is available;

@@ -222,8 +222,10 @@ impl CdpClient {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
+        // tungstenite >=0.26 takes Utf8Bytes, not String — the conversion is free
+        // (the String is moved into the shared buffer, not re-validated).
         let payload = frame.to_string();
-        if self.outbound.send(Message::Text(payload)).is_err() {
+        if self.outbound.send(Message::Text(payload.into())).is_err() {
             self.pending.lock().await.remove(&id);
             return Err(BrowserError::Transport("CDP writer is gone".to_string()));
         }
@@ -259,7 +261,7 @@ impl CdpClient {
             frame["sessionId"] = json!(sid);
         }
         self.outbound
-            .send(Message::Text(frame.to_string()))
+            .send(Message::Text(frame.to_string().into()))
             .map_err(|_| BrowserError::Transport("CDP writer is gone".to_string()))
     }
 
