@@ -102,13 +102,14 @@ export function CompanyMark({
   // Hooks run unconditionally, BEFORE the logo early-return (rules-of-hooks).
   const { resolvedTheme } = useTheme()
   const isDark = dark ?? resolvedTheme === 'dark'
+  const hue = characterFromSeed(slug).hue
   const logoUrl = logo ? companyLogoUrl(logo, apiToken()) : null
   // An uploaded logo replaces the generated monogram, keeping the rounded-square
-  // tile geometry so the company silhouette is unchanged. It sits on a neutral
-  // near-white plate with a little inset — the way a real app icon frames a
-  // favicon — so a DARK or transparent-glyph favicon (e.g. a black wordmark) is
-  // legible on the dark UI instead of vanishing into it, and a colourful icon
-  // still reads. `contain` shows the whole mark without cropping.
+  // tile geometry so the company silhouette is unchanged. It sits on a SUBTLE
+  // tile tinted from the company's own hue — light enough that a dark / mono-glyph
+  // favicon (a black wordmark) stays legible on the dark UI, but never a hard
+  // white plate (owner: white looked cheap in dark mode). `contain` + a small
+  // inset frames the icon the way an app icon is framed, without cropping.
   if (logoUrl) {
     return (
       <span
@@ -117,8 +118,10 @@ export function CompanyMark({
         style={{
           ...identityTileStyle(size),
           overflow: 'hidden',
-          background: '#f4f4f5',
-          padding: Math.max(1, Math.round(size * 0.1)),
+          // ~90% white lifted toward the brand hue: a soft, considered plate, not
+          // a flat white square.
+          background: `color-mix(in srgb, ${bodyColor(hue)} 10%, white)`,
+          padding: Math.max(1, Math.round(size * 0.12)),
           ...style,
         }}
       >
@@ -130,7 +133,6 @@ export function CompanyMark({
       </span>
     )
   }
-  const hue = characterFromSeed(slug).hue
   const wash = `color-mix(in srgb, ${bodyColor(hue)} 14%, transparent)`
   const ink = accentInk(hue, isDark)
   const mono = companyMonogram(name)

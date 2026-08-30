@@ -5,11 +5,13 @@
 //! colour from the image and PATCHes it as the company `accent`, so no image
 //! decoding happens server-side.
 //!
-//! `from_url` grabs a site's favicon via GOOGLE's free favicon service
-//! (`www.google.com/s2/favicons`). We only ever fetch from that one fixed,
-//! trusted host — the user's URL is reduced to a bare domain and handed to
-//! Google as a query param — so there is no arbitrary-host outbound fetch and no
-//! SSRF surface to guard.
+//! `from_url` grabs a site's icon via KEYLESS favicon services — icon.horse
+//! (which resolves the site's best icon, apple-touch preferred) with Google's
+//! faviconV2 as the fallback. We only ever fetch from those two fixed, trusted
+//! hosts — the user's URL is reduced to a bare domain and handed over as a path/
+//! query param — so there is no arbitrary-host outbound fetch and no SSRF surface
+//! to guard. No dark-variant (the keyless tradeoff); the client renders the mark
+//! on a subtle tile so a dark glyph stays legible without a hard-white plate.
 
 use std::time::Duration;
 
@@ -150,43 +152,49 @@ pub async fn from_url_handler(
         .ok_or_else(|| AppError::NotFound(format!("company id={id}")))?;
 
     // `domain_of` already rejects whitespace and requires a dot, so the host is a
-    // clean URL-safe token — safe to interpolate into the query directly.
+    // clean URL-safe token — safe to interpolate into a query directly.
     let domain = domain_of(input.url.trim())?;
-    // Google's favicon service — one fixed trusted host, `sz=128` for a crisp
-    // mark. The domain is a query param, so this never fetches the user's host.
-    let fav = format!("https://www.google.com/s2/favicons?sz=128&domain={domain}");
-    let url = Url::parse(&fav).map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
+    // KEYLESS, FIXED TRUSTED HOSTS (no arbitrary-host fetch → no SSRF surface):
+    //  1. icon.horse resolves the site's BEST icon for us — it prefers the
+    //     apple-touch-icon (a full app icon, up to 256px), which reads far better
+    //     as a tile than a 16px favicon.
+    //  2. Google's faviconV2 is the fallback when icon.horse is down / has nothing.
+    // Both return the site's DEFAULT icon (no dark-variant — that is the deliberate
+    // keyless tradeoff; the mark renders on a subtle tile so a dark glyph stays
+    // legible instead of forcing a hard-white plate).
+    let sources = [
+        format!("https://icon.horse/icon/{domain}"),
+        format!("https://www.google.com/s2/favicons?sz=128&domain={domain}"),
+    ];
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
-        .user_agent("supermux-favicon/1.0")
+        .user_agent("Mozilla/5.0 (compatible; supermux-favicon/1.0)")
         .build()
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("favicon fetch failed: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(AppError::BadRequest(format!(
-            "favicon service returned {}",
-            resp.status()
-        )));
+
+    for src in sources {
+        let Ok(url) = Url::parse(&src) else { continue };
+        let Ok(resp) = client.get(url).send().await else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let mime = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/png")
+            .to_string();
+        let Ok(bytes) = resp.bytes().await else { continue };
+        // Only accept a real, non-empty image within the cap; otherwise try the
+        // next source.
+        if is_supported_image(&mime) && !bytes.is_empty() && bytes.len() <= MAX_LOGO_BYTES {
+            return store_logo(&state, id, &bytes, &mime).await;
+        }
     }
-    let mime = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("image/png")
-        .to_string();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("favicon read failed: {e}")))?;
-    if bytes.len() > MAX_LOGO_BYTES {
-        return Err(AppError::BadRequest("favicon too large".into()));
-    }
-    store_logo(&state, id, &bytes, &mime).await
+    Err(AppError::BadRequest(format!(
+        "no usable icon found for {domain:?}"
+    )))
 }
 
 /// Reduce whatever the user pasted — a full URL or a bare domain — to a clean
