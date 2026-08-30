@@ -284,3 +284,109 @@ async fn a_teammate_session_end_never_archives_a_live_archive_on_stop_session() 
     state.pool.close().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// REGRESSION (the self-latching pointer). The teammate filter is
+/// `session_id != cc_conversation_id`, and the tracking block is the ONLY writer
+/// of `cc_conversation_id` — so for a lead that carries `agent_type` on its own
+/// payloads (`claude --agent <name>`), the first real conversation switch used to
+/// freeze the pointer permanently: the new id read as a teammate's, the pointer
+/// was not followed, and every later event was compared against the same stale
+/// id. The session then tailed a DEAD transcript forever (chat empty / stale
+/// recall) and its real `SessionEnd` never forced Stopped.
+///
+/// `/clear` announces itself with `"source":"clear"`, which only the pane's real
+/// agent can report. Driven through the real handler because the gate lives in
+/// the handler, not in `apply_payload`.
+#[tokio::test]
+async fn an_agent_lead_follows_its_own_conversation_switch_after_clear() {
+    let (state, app, dir) = setup().await;
+
+    // First contact establishes the id (nothing tracked yet).
+    post_hook(
+        &app,
+        "session_start",
+        serde_json::json!({ "session_id": "conv-a", "agent_type": "reviewer", "source": "startup" }),
+    )
+    .await;
+    assert_eq!(tracked(&state).await, "conv-a");
+
+    // The human types `/clear`: Claude opens a NEW transcript and says so.
+    assert_eq!(
+        post_hook(
+            &app,
+            "session_start",
+            serde_json::json!({
+                "session_id": "conv-b",
+                "agent_type": "reviewer",
+                "source": "clear",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        tracked(&state).await,
+        "conv-b",
+        "an --agent lead's post-/clear conversation must be followed, or chat and \
+         recall tail a dead transcript forever"
+    );
+
+    // ...and because the pointer moved, the lead's lifecycle is un-masked again:
+    // its own SessionEnd on the NEW conversation forces Stopped (before the fix
+    // this compared against the frozen `conv-a` and was dropped as a teammate's).
+    post_hook(
+        &app,
+        "session_end",
+        serde_json::json!({ "session_id": "conv-b", "agent_type": "reviewer", "reason": "other" }),
+    )
+    .await;
+    assert_eq!(
+        state.take_forced_status(SESSION),
+        Some(supermux_server::sessions::status::Status::Stopped),
+        "the un-frozen pointer must restore the lead's lifecycle handling"
+    );
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The escape hatch must NOT re-open the hole it sits next to: an in-process
+/// teammate's `SessionStart` is `"source":"startup"`, and a teammate's
+/// `UserPromptSubmit` (fired every time the lead messages it) carries no `source`
+/// at all. Neither may move a lead that already has an id.
+#[tokio::test]
+async fn a_teammate_start_still_cannot_move_a_tracked_pointer() {
+    let (state, app, dir) = setup().await;
+
+    post_hook(&app, "session_start", serde_json::json!({ "session_id": "lead-conv" })).await;
+    assert_eq!(tracked(&state).await, "lead-conv");
+
+    for payload in [
+        serde_json::json!({
+            "session_id": "teammate-9",
+            "agent_type": "general-purpose",
+            "source": "startup",
+        }),
+        // A teammate that auto-compacted. Compaction keeps the SAME file and id,
+        // so there is nothing to follow and this must stay filtered.
+        serde_json::json!({
+            "session_id": "teammate-9",
+            "agent_type": "general-purpose",
+            "source": "compact",
+        }),
+    ] {
+        post_hook(&app, "session_start", payload).await;
+        assert_eq!(tracked(&state).await, "lead-conv", "a teammate must never move the pointer");
+    }
+
+    post_hook(
+        &app,
+        "user_prompt_submit",
+        serde_json::json!({ "session_id": "teammate-9", "agent_type": "general-purpose" }),
+    )
+    .await;
+    assert_eq!(tracked(&state).await, "lead-conv");
+
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}

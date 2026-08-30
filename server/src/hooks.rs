@@ -268,12 +268,45 @@ async fn hook_handler(
     // corruption wide open. This complements `attribute_pointer`'s pane truth
     // table, which cannot help here: an IN-PROCESS teammate fires from the
     // lead's own pane, so pane attribution would Adopt its id.
-    if is_pointer_event(&body.event) && !foreign_agent {
+    //
+    // ...EXCEPT on a payload that ANNOUNCES a conversation switch. `foreign_agent`
+    // is `session_id != cc_conversation_id`, and `track_conversation_pointer` is
+    // the ONLY writer of `cc_conversation_id` — so on an `--agent` lead (which
+    // carries `agent_type` on its OWN payloads, see `is_foreign_agent_payload`)
+    // the gate above was self-latching: the first `/clear` moved Claude to a new
+    // conversation, the new id read as a teammate's, the pointer was never
+    // followed, and every later event compared against the SAME frozen id. The
+    // session then tailed a dead transcript forever ("chat empty" / stale recall)
+    // and its real SessionEnd never forced Stopped. There is no self-heal:
+    // `clear_stale_resume_link` only rescues a pointer whose FILE is gone, and
+    // `/clear` leaves the old transcript on disk.
+    //
+    // `source` is the field that separates the two cases, and it is Claude's own:
+    // an in-process teammate's SessionStart is `"source":"startup"` (captured
+    // shape in `is_foreign_agent_payload`), while only the pane's REAL agent can
+    // report `clear` or `resume`. `compact` is deliberately NOT here: compaction
+    // keeps the same file and the same `sessionId` (see
+    // `track_conversation_pointer`), so it needs no pointer move — and admitting
+    // it would re-open the teammate hole for a teammate that auto-compacts.
+    //
+    // Residual, accepted: a claude restarted BY HAND inside the pane reports
+    // `source:"startup"` with a fresh id and stays frozen. Narrowing that needs
+    // pane truth we do not have here.
+    if is_pointer_event(&body.event) && (!foreign_agent || announces_conversation_switch(&raw_payload))
+    {
         let id = raw_payload
             .get("session_id")
             .or_else(|| raw_payload.get("sessionId"))
             .and_then(Value::as_str);
         track_conversation_pointer(&state, &body.session, &body.pane, id).await;
+    } else if is_pointer_event(&body.event) {
+        // The drop that used to be silent. A frozen pointer is invisible in every
+        // surface it breaks, so it must leave one line behind.
+        tracing::debug!(
+            session = %body.session,
+            event = %body.event,
+            "hook: pointer not followed (payload attributed to an in-process teammate)",
+        );
     }
 
     // Re-tick the detector now so the status (e.g. Notification → waiting,
@@ -1027,6 +1060,19 @@ fn has_agent_type(raw: &Value) -> bool {
 /// tracked yet the payload is accepted as the lead's (first contact establishes
 /// the id), so an `--agent` lead self-heals on its first SessionStart /
 /// UserPromptSubmit.
+/// Does this payload ANNOUNCE that the pane's agent moved to a new conversation
+/// file? `SessionStart` carries Claude's own `source`, and only the real agent in
+/// the pane can report these two:
+///   * `clear` — the human typed `/clear`; Claude opened a new transcript;
+///   * `resume` — a terminal-side `--resume` switched files.
+///
+/// `startup` is EXCLUDED because that is exactly what an in-process teammate
+/// fires, and `compact` because compaction does not change the file or the id
+/// (admitting it would let a compacting teammate steal the lead's pointer).
+fn announces_conversation_switch(raw: &Value) -> bool {
+    matches!(payload_str(raw, "source"), Some("clear") | Some("resume"))
+}
+
 fn is_foreign_agent_payload(raw: &Value, tracked_cc_id: Option<&str>) -> bool {
     if !has_agent_type(raw) {
         return false;
@@ -3011,6 +3057,42 @@ mod tests {
         assert!(!is_foreign_agent_payload(
             &p(r#"{"session_id":"teammate-9","agent_type":"  "}"#),
             Some("lead-1")
+        ));
+    }
+
+    /// The wedge the `announces_conversation_switch` escape hatch exists for.
+    ///
+    /// `is_foreign_agent_payload` is CORRECT to call this foreign — it cannot tell
+    /// an `--agent` lead's new conversation from a teammate's by id alone — which
+    /// is exactly why the pointer gate must not rely on it by itself. Pinned so a
+    /// future tightening of the classifier cannot silently re-freeze the pointer.
+    #[test]
+    fn an_agent_leads_own_post_clear_start_still_classifies_as_foreign() {
+        assert!(is_foreign_agent_payload(
+            &p(r#"{"session_id":"conv-B","agent_type":"reviewer","source":"clear"}"#),
+            Some("conv-A")
+        ));
+    }
+
+    /// `/clear` and a terminal-side `--resume` are the two switches only the pane's
+    /// REAL agent can announce, so they release the pointer gate. `startup` must
+    /// NOT: that is the captured shape of an in-process teammate's SessionStart,
+    /// and admitting it would re-open the transcript-stealing bug the filter fixed.
+    /// `compact` must not either — compaction keeps the same file and id, so there
+    /// is nothing to follow and a compacting teammate would steal the pointer.
+    #[test]
+    fn only_clear_and_resume_announce_a_conversation_switch() {
+        assert!(announces_conversation_switch(&p(r#"{"source":"clear"}"#)));
+        assert!(announces_conversation_switch(&p(r#"{"source":"resume"}"#)));
+
+        assert!(!announces_conversation_switch(&p(r#"{"source":"startup"}"#)));
+        assert!(!announces_conversation_switch(&p(r#"{"source":"compact"}"#)));
+        assert!(!announces_conversation_switch(&p(r#"{"source":""}"#)));
+        assert!(!announces_conversation_switch(&p(r#"{}"#)));
+        // A teammate's UserPromptSubmit carries no `source` at all, so the every-
+        // prompt corruption path stays closed.
+        assert!(!announces_conversation_switch(
+            &p(r#"{"session_id":"teammate-9","agent_type":"general-purpose"}"#)
         ));
         assert!(!has_agent_type(&p(r#"{"agent_type":" "}"#)));
     }
