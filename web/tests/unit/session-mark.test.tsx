@@ -245,6 +245,9 @@ describe('the mouth is firewalled behind [data-grok]', () => {
   const MOUTH_STATES = ['streaming', 'done', 'failed'] as const
   const MOUTHLESS_STATES = ['idle', 'connecting', 'thinking', 'working', 'waiting', 'stopped'] as const
 
+  // Note the absence of a `grok` prop below: the markup is skin-blind, so the
+  // mouth is emitted off-grok too — which is WHY the CSS gate that follows must
+  // exist.
   test('the component paints a mouth on exactly streaming / done / failed', () => {
     for (const state of MOUTH_STATES) {
       const markup = renderToStaticMarkup(<SessionMark seed="Quill" state={state} />)
@@ -254,13 +257,6 @@ describe('the mouth is firewalled behind [data-grok]', () => {
       const markup = renderToStaticMarkup(<SessionMark seed="Quill" state={state} />)
       expect(markup).not.toContain('sm-mark__mouth')
     }
-  })
-
-  test('the mouth is emitted off-grok too — which is WHY the CSS gate must exist', () => {
-    // No `grok` prop is threaded to any call site; the markup is skin-blind.
-    // This test is the premise of the two that follow, not a defect.
-    const markup = renderToStaticMarkup(<SessionMark seed="Quill" state="done" />)
-    expect(markup).toContain('class="sm-mark__mouth"')
   })
 
   test('globals.css hides `.sm-mark__mouth` with an UNPREFIXED base rule', () => {

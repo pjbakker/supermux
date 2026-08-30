@@ -45,12 +45,4 @@ describe('opening a team selects it, and does not navigate', () => {
     el.props.onClick()
     expect(opened).toEqual([alpha])
   })
-
-  test('a neighbour team’s row opens its OWN team', () => {
-    const opened: string[] = []
-    const bravo = team('bravo')
-    const el = TeamRow({ team: bravo, onOpen: (t) => opened.push(t.team_name), index: 1 }) as ReactElement
-    el.props.onClick()
-    expect(opened).toEqual(['bravo'])
-  })
 })

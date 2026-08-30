@@ -1,27 +1,25 @@
 /**
  * The composer's attachment wiring (feat/grok-mode composer upgrade).
  * ─────────────────────────────────────────────────────────────────────────────
- * Two things a unit test can pin without jsdom:
+ * What a unit test can pin here without jsdom is ADDITIVE STRUCTURE.
+ * `attachments` is optional. Wired ⇒ the desktop attach disc appears in the
+ * leading pair and the chip row renders above the pill. Absent ⇒ neither does,
+ * so a composer that does not wire uploads is byte-identical to today. (A real
+ * pick / paste / drop is Playwright's job — the same SSR-vs-events split the mic
+ * and picker tests call out.)
  *
- *   1. ADDITIVE STRUCTURE. `attachments` is optional. Wired ⇒ the desktop attach
- *      disc appears in the leading pair and the chip row renders above the pill.
- *      Absent ⇒ neither does, so a composer that does not wire uploads is
- *      byte-identical to today. (A real pick / paste / drop is Playwright's job —
- *      the same SSR-vs-events split the mic and picker tests call out.)
- *
- *   2. THE OUTGOING PAYLOAD CONTRACT. On Send the wire text is
- *      `attachmentSentence(readyPaths()) + draft` — quoted absolute paths first,
- *      then the prose, and an image ALONE (empty draft) is a valid send. This is
- *      the exact composition `use-composer.ts::submit` folds in; the end-to-end
- *      POST-body assertion lives in the offline Playwright rig against
- *      `/dev/composer-attach`.
+ * The OUTGOING PAYLOAD CONTRACT is not pinned here. `attachmentSentence`'s
+ * formatting (quoting, separator, trailing space, empty list) lives in
+ * `chat-composer-insert.test.ts`, and the end-to-end POST body — the
+ * `attachmentSentence(readyPaths()) + draft` fold in `use-composer.ts::submit` —
+ * is asserted by the offline Playwright rig against `/dev/composer-attach`.
+ * Re-typing that concatenation in a unit test only tests the `+` operator.
  */
 import { describe, expect, test } from 'bun:test'
 import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import { ChatComposer } from '../../src/components/chat/composer'
-import { attachmentSentence } from '../../src/components/chat/composer-insert'
 import type { ComposerHandle } from '../../src/components/chat/use-composer'
 import type {
   StagedAttachment,
@@ -121,22 +119,5 @@ describe('ChatComposer — attachments are additive', () => {
     expect(html).toContain('data-testid="chat-send"')
     expect(html).toContain('Waiting for uploads…')
     expect(html).toContain('disabled')
-  })
-})
-
-describe('the outgoing payload contract (paths-first, quoted)', () => {
-  test('paths are quoted, space-separated, and precede the prose', () => {
-    const wire = attachmentSentence(['/data/uploads/a.png', '/data/uploads/b.pdf']) + 'look at these'
-    expect(wire).toBe('"/data/uploads/a.png" "/data/uploads/b.pdf" look at these')
-  })
-
-  test('an image alone is just the quoted path (empty prose)', () => {
-    const wire = attachmentSentence(['/data/uploads/a.png']) + ''
-    expect(wire).toBe('"/data/uploads/a.png" ')
-    expect(wire).toContain('/data/uploads/a.png')
-  })
-
-  test('no ready paths ⇒ the prose is unchanged', () => {
-    expect(attachmentSentence([]) + 'hello').toBe('hello')
   })
 })

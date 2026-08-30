@@ -67,6 +67,10 @@ describe('signInOps', () => {
  * The password must clear when the sheet closes — a secret must not sit in a
  * React tree behind it. Asserted on the source so a later tidy cannot quietly
  * drop one and leave the fill working but un-fillable.
+ *
+ * The 16px and clear-on-close halves are pinned (together with the OTP token and
+ * the never-auto-submit rule) by `browser-sign-in-smart.test.ts` >
+ * 'still carries the password-manager tokens + 16px + clear-on-close'.
  */
 describe('the sign-in sheet keeps the password-manager contract', () => {
   const src = readFileSync(new URL('../../src/components/browser/sign-in-sheet.tsx', import.meta.url), 'utf8')
@@ -79,11 +83,4 @@ describe('the sign-in sheet keeps the password-manager contract', () => {
     expect(src).toContain('<form')
   })
 
-  test('inputs are 16px so focusing one does not zoom iOS', () => {
-    expect(src).toContain('text-[16px]')
-  })
-
-  test('the password is cleared when the sheet closes', () => {
-    expect(src).toContain("setPassword('')")
-  })
 })

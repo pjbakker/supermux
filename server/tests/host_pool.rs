@@ -9,8 +9,11 @@
 //! cargo test --test host_pool -- --ignored host_pool_localhost
 //! ```
 //!
-//! The always-running test pins the cheapest contract: an unknown `host_id`
-//! → `Err` (no panics, no hangs, no spurious ssh process).
+//! Nothing here runs unattended: this file exists ONLY to keep that real-ssh
+//! round-trip runnable by hand. The always-on contracts — an unknown `host_id`
+//! and a soft-deleted one both `Err` immediately (no spawn, no hang, no panic),
+//! `verify` likewise, the control dir and socket paths, the per-host Arc — are
+//! unit tests inside `src/sessions/host_pool.rs`, which every CI run executes.
 
 use std::path::PathBuf;
 
@@ -46,27 +49,6 @@ async fn test_pool() -> (SqlitePool, PathBuf) {
     };
     let pool = db::init(&config).await.expect("db init");
     (pool, dir)
-}
-
-#[tokio::test]
-async fn transport_for_nonexistent_host_returns_err() {
-    // The cheapest acceptance bullet: an unknown id must Err immediately —
-    // no spawn, no hang, no panic. This runs in every CI without ssh.
-    let (pool, dir) = test_pool().await;
-    let hp = HostPool::new(pool.clone(), &dir);
-
-    let err = hp
-        .transport_for(424242)
-        .await
-        .expect_err("transport_for must Err on a non-existent host_id");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("424242") || msg.to_lowercase().contains("not found"),
-        "error must mention the missing id / 'not found'; got: {msg}"
-    );
-
-    pool.close().await;
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Localhost ssh round-trip — gated behind `#[ignore]` because the

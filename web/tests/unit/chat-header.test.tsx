@@ -266,9 +266,10 @@ describe('honesty — the offline dot (st-conn-offline)', () => {
 })
 
 describe('the renderer switch', () => {
-  // A binary Chat ⇄ Terminal toggle (`auto` retired). These A3 assertions keep
-  // the metrics and the e2e hooks pinned; the switch's own behaviour has its own
-  // file (`chat-renderer-switch.test.tsx`).
+  // A binary Chat ⇄ Terminal toggle (`auto` retired). What is pinned here is the
+  // e2e hooks only; the switch's own behaviour AND its A3 metrics (30px hairline
+  // pill, 13.4px labels, the capsule that moves with the selection) have their
+  // own file, `chat-renderer-switch.test.tsx`.
   const html = (value: 'chat' | 'terminal') =>
     renderToStaticMarkup(
       <RendererSwitch value={value} onChange={() => undefined} />,
@@ -282,21 +283,6 @@ describe('the renderer switch', () => {
     expect(out).toContain('role="tab"')
   })
 
-  test('the selection is a capsule that moves, not a colour on the label', () => {
-    const chat = html('chat')
-    expect(chat).toContain('bg-fill-soft-2')
-    expect(chat).toMatch(/aria-selected="true"[^>]*>[\s\S]*?bg-fill-soft-2/)
-    // …and it is the OTHER cell that carries it once the value flips.
-    expect(html('terminal')).toMatch(/renderer-terminal[\s\S]*?bg-fill-soft-2/)
-  })
-
-  test('the approved metrics: a 30px hairline pill, 13.4px labels', () => {
-    const out = html('chat')
-    expect(out).toContain('h-[30px]')
-    expect(out).toContain('border-hairline')
-    expect(out).toContain('text-[13.4px]')
-    expect(text(out)).toBe('Chat Terminal')
-  })
 })
 
 /**

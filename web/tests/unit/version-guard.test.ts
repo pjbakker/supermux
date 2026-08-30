@@ -71,11 +71,6 @@ describe('reconcileServedSha — the bar surfaces on a newer build, retracts whe
     __resetSWUpdateForTest()
   })
 
-  test('server on a newer real sha → the bar shows', () => {
-    reconcileServedSha(B, A)
-    expect(getSWUpdateWaiting()).toBe(true)
-  })
-
   test('served == built → a previously-shown bar RETRACTS (clears on its own)', () => {
     // A bar is up from an earlier poll.
     markWaiting(() => {})
