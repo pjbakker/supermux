@@ -26,6 +26,8 @@
 import { characterFromSeed, bodyColor, accentInk } from '@/brand/marks'
 import { useTheme } from '@/components/theme-provider'
 import { Logo } from '@/components/logo'
+import { companyLogoUrl } from '@/lib/companies'
+import { apiToken } from '@/lib/api/client'
 
 /** 1–2 letters from the display name: initials of the first two words, or the
  *  first 1–2 characters of a single word. Uppercased; always ≥1 char for any
@@ -51,10 +53,12 @@ export interface CompanyMarkProps {
    *  omitted the live resolved theme drives it. */
   dark?: boolean
   style?: React.CSSProperties
-  /** When the company has an uploaded logo, the URL that serves it
-   *  (`companyLogoUrl(company)`). Rendered as the tile image in place of the
-   *  generated monogram; `null`/absent falls back to the monogram. */
-  logoUrl?: string | null
+  /** The company's identity fields needed to resolve its uploaded logo. Pass the
+   *  whole `Company` (or any object with `{id, has_logo, updated_at}`) and the
+   *  mark resolves + auth-tokens the logo URL ITSELF — so every call site shows
+   *  the logo just by passing `logo={company}`, with no per-site wiring to forget.
+   *  Absent, or `has_logo` false → the generated monogram. */
+  logo?: { id: number; has_logo?: boolean; updated_at?: number } | null
 }
 
 /**
@@ -93,27 +97,35 @@ export function CompanyMark({
   className,
   dark,
   style,
-  logoUrl,
+  logo,
 }: CompanyMarkProps) {
   // Hooks run unconditionally, BEFORE the logo early-return (rules-of-hooks).
   const { resolvedTheme } = useTheme()
   const isDark = dark ?? resolvedTheme === 'dark'
+  const logoUrl = logo ? companyLogoUrl(logo, apiToken()) : null
   // An uploaded logo replaces the generated monogram, keeping the rounded-square
-  // tile geometry so the company silhouette is unchanged. `cover` crops a
-  // non-square favicon into the square without distortion.
+  // tile geometry so the company silhouette is unchanged. It sits on a neutral
+  // near-white plate with a little inset — the way a real app icon frames a
+  // favicon — so a DARK or transparent-glyph favicon (e.g. a black wordmark) is
+  // legible on the dark UI instead of vanishing into it, and a colourful icon
+  // still reads. `contain` shows the whole mark without cropping.
   if (logoUrl) {
     return (
       <span
         aria-hidden
         className={className}
-        style={{ ...identityTileStyle(size), overflow: 'hidden', ...style }}
+        style={{
+          ...identityTileStyle(size),
+          overflow: 'hidden',
+          background: '#f4f4f5',
+          padding: Math.max(1, Math.round(size * 0.1)),
+          ...style,
+        }}
       >
         <img
           src={logoUrl}
           alt=""
-          width={size}
-          height={size}
-          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+          style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
         />
       </span>
     )

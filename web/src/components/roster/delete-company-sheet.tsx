@@ -204,7 +204,7 @@ export function DeleteCompanySheet({
         <div className="flex items-center gap-3">
           <CompanyMark
             slug={company.slug}
-            name={company.display_name}
+            name={company.display_name} logo={company}
             size={40}
             className="grok-identity"
           />

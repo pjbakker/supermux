@@ -45,7 +45,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
   // Keep the name field in sync if the row refetches under us (another edit).
   React.useEffect(() => setName(company.display_name), [company.display_name])
 
-  const logo = companyLogoUrl(company, apiToken())
+  const hasLogo = !!company.has_logo
   const accent = company.accent ?? undefined
 
   /** After a logo lands, sample its dominant colour and store it as the accent so
@@ -133,7 +133,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
               slug={company.slug}
               name={company.display_name}
               size={56}
-              logoUrl={logo}
+              logo={company}
             />
             <div className="min-w-0">
               <div className="text-[13px] font-medium text-ink">Logo</div>
@@ -166,7 +166,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
               )}
               Upload image
             </Button>
-            {logo && (
+            {hasLogo && (
               <Button
                 type="button"
                 variant="ghost"
@@ -193,7 +193,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && onFetchUrl()}
-                placeholder="reisposter.nl"
+                placeholder="example.com"
                 inputMode="url"
                 autoCapitalize="off"
                 autoCorrect="off"
@@ -213,7 +213,7 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
           <div className="min-w-0">
             <div className="text-[13px] font-medium text-ink">Accent</div>
             <div className="text-[12px] leading-snug text-ink-2">
-              {logo ? 'Sampled from your logo. Tap to override.' : 'Tap to pick a colour.'}
+              {hasLogo ? 'Sampled from your logo. Tap to override.' : 'Tap to pick a colour.'}
             </div>
           </div>
           <label

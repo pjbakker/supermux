@@ -149,7 +149,7 @@ export function CompanyPicker({
           >
             <CompanyMark
               slug={c.slug}
-              name={c.display_name}
+              name={c.display_name} logo={c}
               size={markSize}
               className="shrink-0"
             />

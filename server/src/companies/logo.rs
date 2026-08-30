@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(domain_of("acme.com").unwrap(), "acme.com");
         assert_eq!(domain_of("https://acme.com/pricing").unwrap(), "acme.com");
         assert_eq!(domain_of("http://www.acme.co.uk").unwrap(), "www.acme.co.uk");
-        assert_eq!(domain_of("  reisposter.nl  ").unwrap(), "reisposter.nl");
+        assert_eq!(domain_of("  example.org  ").unwrap(), "example.org");
     }
 
     #[test]

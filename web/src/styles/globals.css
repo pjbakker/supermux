@@ -1439,6 +1439,25 @@
   -webkit-touch-callout: default;
 }
 
+/* ── Overview items are TAP TARGETS, not selectable text (iOS long-press) ─────
+   A bot tile / row is long-pressed for its actions menu. On iOS that gesture
+   ALSO fires native text selection + the Copy / Find Selection / Look Up callout
+   over whatever text sits under the finger (owner's IMG_2955/2956). Suppressing
+   selection + the callout on the item AND its children is the standard fix for
+   an interactive element — a control is not selectable prose. It is scoped to
+   the two overview slot wrappers (`group-tile-slot` / `group-row-slot`), so the
+   chat track and every other reading surface keep their own selection. The
+   descendant `*` beats the initial value a child text node would otherwise
+   inherit-then-ignore. */
+[data-vr="group-tile-slot"],
+[data-vr="group-tile-slot"] *,
+[data-vr="group-row-slot"],
+[data-vr="group-row-slot"] * {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
 /* ── The phone composer's contenteditable host ──────────────────────────────
    `plain-editable.tsx` — the field is a `contenteditable` on the phone so iOS
    stops drawing its prev/next/Done form-assistant bar above the keyboard (that

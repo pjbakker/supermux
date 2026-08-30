@@ -65,7 +65,7 @@ export function SpaceCrumb({
         className="ml-1 flex h-11 shrink-0 items-center gap-1.5 rounded-lg px-1.5 text-sm transition-colors hover:bg-accent active:bg-accent"
       >
         {current ? (
-          <CompanyMark slug={current.slug} name={current.display_name} size={22} />
+          <CompanyMark slug={current.slug} name={current.display_name} logo={current} size={22} />
         ) : (
           <HqMark size={22} />
         )}
@@ -115,7 +115,7 @@ export function SpaceCrumb({
                 close()
                 onPickSpace(c.id)
               }}
-              icon={<CompanyMark slug={c.slug} name={c.display_name} size={28} />}
+              icon={<CompanyMark slug={c.slug} name={c.display_name} logo={c} size={28} />}
               label={c.display_name}
             />
           ))}

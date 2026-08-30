@@ -166,7 +166,7 @@ export function GrantControl({
             onClick={() => grantTo('company')}
             label="This company"
             sub={company.display_name}
-            mark={<CompanyMark slug={company.slug} name={company.display_name} size={16} />}
+            mark={<CompanyMark slug={company.slug} name={company.display_name} logo={company} size={16} />}
           />
         )}
         {allowAll && (
