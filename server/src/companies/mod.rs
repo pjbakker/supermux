@@ -381,6 +381,7 @@ async fn provision_group_chat(state: &AppState, company: &Company) {
             runtime: None,
             model: None,
             company_id: Some(company.id),
+            archive_on_stop: None,
         },
     )
     .await;

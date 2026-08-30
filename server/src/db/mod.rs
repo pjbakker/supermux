@@ -120,8 +120,8 @@ mod tests {
             .unwrap()
             .get("n");
         assert_eq!(
-            applied, 38,
-            "expected thirty-eight applied migrations (0001-0005, 0007-0024, 0026-0040)"
+            applied, 39,
+            "expected thirty-nine applied migrations (0001-0005, 0007-0040)"
         );
 
         // 0037 applied cleanly: the new nullable company_id column exists and a
@@ -338,6 +338,7 @@ mod tests {
             company_id: Some(acme),
             runtime: "native".into(),
             model: String::new(),
+            archive_on_stop: false,
         };
         sessions::create(&pool, &ns).await.unwrap();
         let got = sessions::get(&pool, "bot-a").await.unwrap().unwrap();
@@ -365,6 +366,7 @@ mod tests {
             company_id: None,
             runtime: "native".into(),
             model: String::new(),
+            archive_on_stop: false,
         };
         sessions::create(&pool, &main).await.unwrap();
         let got_main = sessions::get(&pool, "main-a").await.unwrap().unwrap();

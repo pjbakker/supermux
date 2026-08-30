@@ -1183,6 +1183,12 @@ pub struct CreateInput {
     /// `company_id`, so `PATCH …/config` cannot reassign it.
     #[serde(default)]
     pub company_id: Option<i64>,
+    /// Auto-archive this session when it stops (migration 0025): the
+    /// disposable-spawn marker read by the stop hook. `Some(true)` only for
+    /// callers spawning throwaway sessions; `None`/`false` for every other
+    /// caller (opt-in, default off).
+    #[serde(default)]
+    pub archive_on_stop: Option<bool>,
 }
 
 pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView, AppError> {
@@ -1321,6 +1327,7 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         company_id: input.company_id,
         runtime: runtime_kind,
         model,
+        archive_on_stop: input.archive_on_stop.unwrap_or(false),
     };
     db::sessions::create(&state.pool, &new).await?;
     let hook_token = gen_hook_token();
@@ -2818,6 +2825,7 @@ mod tests {
             runtime: None,
             model: None,
             company_id: None,
+            archive_on_stop: None,
         }
     }
 

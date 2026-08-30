@@ -121,6 +121,11 @@ pub struct Session {
     /// [`crate::bot_memory`] / [`crate::sessions::connector_config`].
     #[serde(default)]
     pub role_id: Option<String>,
+    /// Disposable marker (0025): when 1, the stop hook archives this session the
+    /// moment it settles to `stopped`. Stamped on request by the create path and
+    /// the workflows plumbing; 0 for every other session.
+    #[serde(default)]
+    pub archive_on_stop: i64,
 }
 
 /// A row of the `session_runtime` table (ephemeral, persisted across restarts).
@@ -425,6 +430,8 @@ pub struct NewSession {
     /// (empty = provider default). Mirrors `runtime`: carried end-to-end so the
     /// create path persists it in one INSERT.
     pub model: String,
+    /// Auto-archive this session when it stops (the disposable marker, 0025).
+    pub archive_on_stop: bool,
 }
 
 /// Insert a full session config row. `created_at` is set to now.
@@ -433,8 +440,9 @@ pub async fn create(pool: &SqlitePool, s: &NewSession) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO sessions
             (name, display_name, dir, desc, provider, creator, flags, tags, branch, mcp,
-             worktree, worktree_repo, host_id, company_id, runtime, model, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             worktree, worktree_repo, host_id, company_id, runtime, model, archive_on_stop,
+             created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.name)
     .bind(&s.display_name)
@@ -452,6 +460,7 @@ pub async fn create(pool: &SqlitePool, s: &NewSession) -> sqlx::Result<()> {
     .bind(s.company_id)
     .bind(&s.runtime)
     .bind(&s.model)
+    .bind(s.archive_on_stop as i64)
     .bind(now)
     .execute(pool)
     .await?;
@@ -760,6 +769,19 @@ pub async fn set_archived(pool: &SqlitePool, name: &str, archived: bool) -> sqlx
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// True iff a LIVE (non-archived) row exists AND is flagged `archive_on_stop`.
+/// The stop hook's single gate: a missing row, an already-archived row, or an
+/// unflagged row all return false, so the caller never double-archives.
+pub async fn archive_pending(pool: &SqlitePool, name: &str) -> sqlx::Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM sessions WHERE name = ? AND archived = 0 AND archive_on_stop = 1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// Clear the Claude resume identifiers (used by the resume-picker fallback when

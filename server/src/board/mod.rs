@@ -960,6 +960,9 @@ async fn start_handler(
                 runtime: None,
                 model: None,
                 company_id: None,
+                // Board-spawned sessions stay visible after they stop: a human is
+                // driving the card and may want the scrollback.
+                archive_on_stop: None,
             };
             crate::sessions::create(&state, create_input).await?;
             // Boot it so the steering deliver-loop has a live pane to talk to.

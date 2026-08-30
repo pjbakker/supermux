@@ -1242,6 +1242,7 @@ mod tests {
                 runtime: "native".to_string(),
                 model: String::new(),
                 company_id: Some(company.id),
+                archive_on_stop: false,
             },
         )
         .await

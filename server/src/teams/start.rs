@@ -287,6 +287,7 @@ pub async fn start_team(
             // P3d — the LEAD inherits the caller's company (the handler already
             // forced a member's to their own; `None` for the owner path).
             company_id: input.company_id,
+            archive_on_stop: None,
         },
     )
     .await?;
@@ -708,6 +709,7 @@ mod tests {
                 runtime: Some("native".into()),
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
             },
         )
         .await
@@ -759,6 +761,7 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
             },
         )
         .await
@@ -799,6 +802,7 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
             },
         )
         .await
@@ -846,6 +850,7 @@ mod tests {
                 runtime: None,
                 model: None,
                 company_id: None,
+                archive_on_stop: None,
             },
         )
         .await
