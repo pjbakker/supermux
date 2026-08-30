@@ -5,17 +5,25 @@
 // startup-image"> PNG matched by a media query. This script renders one PNG per
 // supported iPhone size: a #0a0a0a field (identical to globals.css --background
 // and the manifest background_color, so there is NO flash of a wrong color)
-// with the amber app icon centered.
+// with the app icon centered.
 //
-// Run: `node scripts/build-splash.mjs` (needs `rsvg-convert` on PATH).
-// Output: web/public/splash/apple-splash-<w>-<h>.png. Re-run after the icon
-// changes; the generated files are committed (the build does not regenerate).
+// SINGLE SOURCE OF TRUTH: the mark is lifted straight out of public/icon.svg, so
+// the splash logo can never drift from the home-screen icon again. (It did: the
+// brand moved to the blue supermux chevrons while this script still hand-drew the
+// OLD amber terminal glyph, so every iOS launch screen showed a stale amber mark
+// under a blue icon.)
+//
+// Run: `node scripts/build-splash.mjs` (needs `rsvg-convert` on PATH). `splashSvg`
+// + `DEVICES` are exported so a headless browser can rasterize the identical SVGs
+// where rsvg-convert is unavailable. Output: web/public/splash/apple-splash-<w>-<h>.png.
+// Re-run after the icon changes; the generated files are committed (the build
+// does not regenerate).
 //
 // The device list + media queries are mirrored in src/lib/ios-splash.ts so the
 // runtime <link> tags and the rendered files never drift.
 
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
@@ -37,43 +45,55 @@ const DEVICES = [
 ]
 
 const BG = '#0a0a0a'
-const AMBER = '#f6ae31'
 
-// One splash SVG: dark field + centered icon mark (chevron + cursor block),
-// sized to ~22% of the shorter edge so it reads on every device.
-function splashSvg(w, h) {
-  const cx = w / 2
-  const cy = h / 2
+// The icon mark = public/icon.svg with its own dark background rect removed, so
+// only the logo paths sit over our splash field. `viewBox="0 0 1024 1024"` is
+// preserved, so nesting it in a `mark`×`mark` box scales it cleanly.
+export const ICON_INNER = (() => {
+  const svg = readFileSync(join(publicDir, 'icon.svg'), 'utf8')
+  const inner = svg
+    .replace(/^[\s\S]*?<svg[^>]*>/, '') // drop the outer <svg …>
+    .replace(/<\/svg>\s*$/, '') // drop the closing </svg>
+    .replace(/<rect\b[^>]*fill="#0a0a0a"[^>]*\/>/, '') // drop the opaque bg rect
+    .replace(/<title>[\s\S]*?<\/title>/, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .trim()
+  return inner
+})()
+
+// One splash SVG: dark field + centered icon mark, sized to ~22% of the shorter
+// edge so it reads on every device.
+export function splashSvg(w, h) {
   const mark = Math.round(Math.min(w, h) * 0.22)
-  const half = mark / 2
-  // Icon path coordinates are the icon.svg geometry, scaled into `mark`.
-  const s = mark / 512
-  const px = (x) => cx - half + x * s
-  const py = (y) => cy - half + y * s
-  const stroke = Math.round(44 * s)
+  const x = Math.round(w / 2 - mark / 2)
+  const y = Math.round(h / 2 - mark / 2)
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
   <rect width="${w}" height="${h}" fill="${BG}"/>
-  <path d="M${px(148)} ${py(176)} L${px(260)} ${py(256)} L${px(148)} ${py(336)}"
-        fill="none" stroke="${AMBER}" stroke-width="${stroke}"
-        stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="${px(278)}" y="${py(300)}" width="${86 * s}" height="${40 * s}" rx="${8 * s}" fill="${AMBER}"/>
+  <svg x="${x}" y="${y}" width="${mark}" height="${mark}" viewBox="0 0 1024 1024">
+    ${ICON_INNER}
+  </svg>
 </svg>`
 }
 
-rmSync(outDir, { recursive: true, force: true })
-mkdirSync(outDir, { recursive: true })
+export { DEVICES, outDir }
 
-for (const [w, h] of DEVICES) {
-  for (const [pw, ph] of [
-    [w, h],
-    [h, w],
-  ]) {
-    const name = `apple-splash-${pw}-${ph}.png`
-    const tmp = join(outDir, `.${name}.svg`)
-    writeFileSync(tmp, splashSvg(pw, ph))
-    execFileSync('rsvg-convert', ['-w', String(pw), '-h', String(ph), '-o', join(outDir, name), tmp])
-    rmSync(tmp)
-    console.log(`splash → ${name}`)
+// When run directly, rasterize with rsvg-convert (the sibling chromium script is
+// the fallback when it is not installed).
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  rmSync(outDir, { recursive: true, force: true })
+  mkdirSync(outDir, { recursive: true })
+  for (const [w, h] of DEVICES) {
+    for (const [pw, ph] of [
+      [w, h],
+      [h, w],
+    ]) {
+      const name = `apple-splash-${pw}-${ph}.png`
+      const tmp = join(outDir, `.${name}.svg`)
+      writeFileSync(tmp, splashSvg(pw, ph))
+      execFileSync('rsvg-convert', ['-w', String(pw), '-h', String(ph), '-o', join(outDir, name), tmp])
+      rmSync(tmp)
+      console.log(`splash → ${name}`)
+    }
   }
+  console.log(`done — ${DEVICES.length * 2} splash images in public/splash/`)
 }
-console.log(`done — ${DEVICES.length * 2} splash images in public/splash/`)
