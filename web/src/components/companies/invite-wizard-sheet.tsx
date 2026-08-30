@@ -68,6 +68,7 @@ import {
   type StepMeta,
 } from '@/components/companies/wizard-primitives'
 import type { ExternalStatus, QuickTunnelStatus } from '@/lib/api'
+import { quickTunnelView } from '@/lib/quick-tunnel'
 
 /** The minimal company identity the wizard needs. */
 export interface WizardCompany {
@@ -332,12 +333,21 @@ function DomainStep({
   const baseDomain = status?.box_status.base_domain ?? null
   const tunnel = status?.box_status.tunnel ?? 'none'
   const done = tunnel === 'healthy'
+  const startTunnel = () => startQuick.mutate(undefined, { onSuccess: () => refetch() })
 
-  // A temporary link is live → the ephemeral panel (upgrade / stop from here).
-  if (qt?.active) {
+  // The box knows about a temporary link → the ephemeral panel, LIVE or not.
+  // A tunnel that stopped is its own state (`quickTunnelView`), never a silent
+  // fall-back to the chooser: the operator asked for a link and one was created,
+  // so the panel has to say what became of it.
+  const qtView = quickTunnelView(qt)
+  if (qt && qtView !== 'none') {
     return (
       <QuickTunnelPanel
         qt={qt}
+        live={qtView === 'live'}
+        retrying={startQuick.isPending}
+        retryError={startQuick.isError ? errText(startQuick.error) : null}
+        onRetry={startTunnel}
         stopping={stopQuick.isPending}
         error={stopQuick.isError ? errText(stopQuick.error) : null}
         onStop={() => stopQuick.mutate(undefined, { onSuccess: () => refetch() })}
@@ -351,8 +361,11 @@ function DomainStep({
     return (
       <QuickTunnelChoice
         starting={startQuick.isPending}
+        // The POST returned a URL but `status` has not caught up yet — hold the
+        // working state instead of re-offering the button that just succeeded.
+        settling={startQuick.isSuccess && qtView === 'none'}
         error={startQuick.isError ? errText(startQuick.error) : null}
-        onQuick={() => startQuick.mutate(undefined, { onSuccess: () => refetch() })}
+        onQuick={startTunnel}
         onDomain={() => setPath('domain')}
       />
     )
@@ -469,15 +482,19 @@ function DomainStep({
  *  existing permanent BYO-domain + Google flow. Honest about the trade either way. */
 function QuickTunnelChoice({
   starting,
+  settling,
   error,
   onQuick,
   onDomain,
 }: {
   starting: boolean
+  /** The start call returned; the box has not reported the tunnel back yet. */
+  settling: boolean
   error: string | null
   onQuick: () => void
   onDomain: () => void
 }) {
+  const busy = starting || settling
   return (
     <div data-vr="qt-choice" className="flex flex-col gap-3">
       <p className="text-sm text-muted-foreground">
@@ -512,14 +529,18 @@ function QuickTunnelChoice({
         <Button
           type="button"
           onClick={onQuick}
-          disabled={starting}
+          disabled={busy}
           className="h-11 w-full"
           style={{ background: 'var(--sm-accent-fill)', color: 'var(--gr-onaccent)' }}
         >
-          {starting ? 'Creating your link…' : 'Create a temporary link'}
+          {starting ? 'Creating your link…' : settling ? 'Confirming your link…' : 'Create a temporary link'}
         </Button>
-        {starting && (
-          <StatusChip state="working" label="Starting the tunnel — a few seconds…" className="self-start" />
+        {busy && (
+          <StatusChip
+            state="working"
+            label={starting ? 'Starting the tunnel — a few seconds…' : 'Link created — waiting for supermux to confirm it…'}
+            className="self-start"
+          />
         )}
       </div>
 
@@ -544,6 +565,8 @@ function QuickTunnelChoice({
           type="button"
           variant="outline"
           onClick={onDomain}
+          // Only a request actually in flight blocks this — `settling` must never
+          // trap the operator on a card whose primary button is disabled.
           disabled={starting}
           className="h-11 w-full"
         >
@@ -559,65 +582,117 @@ function QuickTunnelChoice({
   )
 }
 
-// ── Step 1 (quick tunnel active) — the temporary-link panel ───────────────────
+// ── Step 1 (a quick tunnel exists) — the temporary-link panel ────────────────
 
-/** The live ephemeral link (design §5.2). Shows the trycloudflare URL prominently
- *  + copyable, a persistent (non-scary) honesty note, and a Stop/upgrade control. */
+/** The ephemeral link panel (design §5.2). Two honest faces:
+ *  - LIVE: the trycloudflare URL prominently + copyable, a persistent
+ *    (non-scary) honesty note, and a Stop/upgrade control.
+ *  - STOPPED: the box has a quick-tunnel record but the tunnel is NOT running,
+ *    so the address is dead. It says exactly that and offers "Try again" —
+ *    it never shows a copyable link the colleague cannot reach, and it never
+ *    pretends nothing happened.
+ */
 function QuickTunnelPanel({
   qt,
+  live,
+  retrying,
+  retryError,
+  onRetry,
   stopping,
   error,
   onStop,
 }: {
   qt: QuickTunnelStatus
+  live: boolean
+  retrying: boolean
+  retryError: string | null
+  onRetry: () => void
   stopping: boolean
   error: string | null
   onStop: () => void
 }) {
+  const tone = live ? 'var(--gr-work)' : 'var(--destructive)'
   return (
-    <div data-vr="qt-success" className="flex flex-col gap-4">
+    <div data-vr={live ? 'qt-success' : 'qt-stopped'} className="flex flex-col gap-4">
       <div
         className="flex flex-col gap-3 rounded-2xl border p-4"
         style={{
-          borderColor: 'color-mix(in oklab, var(--gr-work) 40%, var(--gr-line))',
-          background: 'color-mix(in oklab, var(--gr-work) 7%, transparent)',
+          borderColor: `color-mix(in oklab, ${tone} 40%, var(--gr-line))`,
+          background: `color-mix(in oklab, ${tone} 7%, transparent)`,
         }}
       >
         <StatusChip
-          state="done"
-          label="Temporary link — active"
+          state={live ? 'done' : 'error'}
+          label={live ? 'Temporary link — active' : 'Temporary link — not running'}
           className="self-start"
         />
-        <div className="flex flex-col gap-1.5">
-          <span className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
-            <Clock aria-hidden className="size-3.5" /> Your temporary web address
-          </span>
-          <CopyField value={qt.url} label="Copy the temporary link" />
-        </div>
+
+        {live ? (
+          <div className="flex flex-col gap-1.5">
+            <span className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
+              <Clock aria-hidden className="size-3.5" /> Your temporary web address
+            </span>
+            <CopyField value={qt.url} label="Copy the temporary link" />
+          </div>
+        ) : (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[12px] text-muted-foreground">
+              The address supermux created — nobody can reach it right now:
+            </span>
+            <span className="break-all font-mono text-[12.5px] text-muted-foreground line-through">
+              {qt.host}
+            </span>
+          </div>
+        )}
 
         <div
           className="flex items-start gap-2 rounded-xl px-3 py-2.5 text-[12.5px] leading-snug"
-          style={{ background: 'color-mix(in oklab, var(--gr-work) 12%, transparent)', color: 'var(--foreground)' }}
+          style={{ background: `color-mix(in oklab, ${tone} 12%, transparent)`, color: 'var(--foreground)' }}
         >
-          <AlertTriangle aria-hidden className="mt-0.5 size-4 shrink-0" style={{ color: 'var(--gr-work)' }} />
-          <span>
-            <span className="font-medium">Temporary</span> — this link changes each time supermux
-            restarts. Connect your own domain for a permanent address.
-          </span>
+          <AlertTriangle aria-hidden className="mt-0.5 size-4 shrink-0" style={{ color: tone }} />
+          {live ? (
+            <span>
+              <span className="font-medium">Temporary</span> — this link changes each time supermux
+              restarts. Connect your own domain for a permanent address.
+            </span>
+          ) : (
+            <span>
+              <span className="font-medium">The tunnel stopped.</span> supermux created this link,
+              but the process that serves it is no longer running, so the address is dead. Try again
+              — if it keeps stopping, connect your own domain instead.
+            </span>
+          )}
         </div>
       </div>
 
-      <p className="text-sm text-muted-foreground">
-        Continue to add colleagues — each gets their own link to join, no sign-in needed.
-      </p>
+      {live ? (
+        <p className="text-sm text-muted-foreground">
+          Continue to add colleagues — each gets their own link to join, no sign-in needed.
+        </p>
+      ) : (
+        <>
+          {retryError && <p className="text-sm text-destructive">{retryError}</p>}
+          <Button
+            type="button"
+            onClick={onRetry}
+            disabled={retrying || stopping}
+            className="self-start"
+            style={{ background: 'var(--sm-accent-fill)', color: 'var(--gr-onaccent)' }}
+          >
+            {retrying ? 'Creating your link…' : 'Try again'}
+          </Button>
+        </>
+      )}
 
       {error && <p className="text-sm text-destructive">{error}</p>}
       <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" variant="ghost" size="sm" onClick={onStop} disabled={stopping}>
-          {stopping ? 'Stopping…' : 'Stop / replace link'}
+        <Button type="button" variant="ghost" size="sm" onClick={onStop} disabled={stopping || retrying}>
+          {stopping ? 'Stopping…' : live ? 'Stop / replace link' : 'Clear this link'}
         </Button>
         <span className="text-[12px] text-muted-foreground">
-          Stopping lets you connect your own domain for a permanent address.
+          {live
+            ? 'Stopping lets you connect your own domain for a permanent address.'
+            : 'Clearing it takes you back to the two setup options.'}
         </span>
       </div>
     </div>

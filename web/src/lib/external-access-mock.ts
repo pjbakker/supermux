@@ -39,7 +39,8 @@ import { SessionError } from '@/lib/api'
 
 // Entry `Q` is the "try without a domain" quick-tunnel branch. `?tunnel=1` on top
 // of it seeds an ALREADY-active temporary link so the offline rig can screenshot
-// the success screen directly (without waiting for the provisioning spinner).
+// the success screen directly (without waiting for the provisioning spinner);
+// `?tunnel=dead` seeds one that is no longer running (the honest stopped panel).
 type Entry = 'A' | 'B' | 'C' | 'Q' | 'I'
 
 function readEntry(): Entry {
@@ -51,9 +52,18 @@ function readEntry(): Entry {
   return 'A'
 }
 
-function tunnelPreactive(): boolean {
-  if (typeof window === 'undefined') return false
-  return new URLSearchParams(window.location.search).get('tunnel') === '1'
+/** What `?tunnel=` seeds on entry Q:
+ *  - `1`    → an already-ACTIVE temporary link (the success panel).
+ *  - `dead` → a link the box still has a record of that is NOT running — the
+ *    honest "the tunnel stopped" panel. Seedable on purpose: that state used to
+ *    render as the chooser (i.e. as if the button had done nothing), so the
+ *    bench has to be able to show it. */
+function tunnelSeed(): 'none' | 'active' | 'dead' {
+  if (typeof window === 'undefined') return 'none'
+  const v = new URLSearchParams(window.location.search).get('tunnel')
+  if (v === '1') return 'active'
+  if (v === 'dead') return 'dead'
+  return 'none'
 }
 
 function multiZones(): boolean {
@@ -113,8 +123,14 @@ function initialState(entry: Entry): MockState {
   // the wizard opens on the two-card chooser. `?tunnel=1` seeds an already-live
   // temporary link so the success screen renders immediately.
   if (entry === 'Q') {
-    if (tunnelPreactive()) {
-      base.quickTunnel = { host: QUICK_HOST, companyId: 42, active: true, createdAt: now - 60_000 }
+    const seed = tunnelSeed()
+    if (seed !== 'none') {
+      base.quickTunnel = {
+        host: QUICK_HOST,
+        companyId: 42,
+        active: seed === 'active',
+        createdAt: now - 60_000,
+      }
     }
     return base
   }

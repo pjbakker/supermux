@@ -9,6 +9,7 @@
 // Wire shapes mirror `server/src/external_access/mod.rs` (committed 957674b) and
 // `server/src/db/human_users.rs` exactly — keep them in lockstep.
 
+import { quickTunnelPayload } from '../quick-tunnel'
 import { sessionRequest } from './sessions'
 
 // ── Wire types (mirror the Rust `Serialize` structs) ─────────────────────────
@@ -218,7 +219,7 @@ export const externalAccessApi = {
   startQuickTunnel: (companyId: number): Promise<QuickTunnelResult> =>
     sessionRequest('/api/external-access/quick-tunnel', {
       method: 'POST',
-      body: JSON.stringify({ company_id: companyId }),
+      body: JSON.stringify(quickTunnelPayload(companyId)),
     }),
 
   /** `DELETE /api/external-access/quick-tunnel` — stop the child + drop the
