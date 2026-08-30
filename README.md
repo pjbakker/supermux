@@ -12,7 +12,7 @@
        degrades to a clean static first frame. Click-through opens the HD MP4.
        Every frame is the real UI, shot from the app's own mock/dev surfaces. -->
   <a href="docs/hero.mp4"><img src="docs/hero.gif" width="900"
-     alt="supermux in use — a bot's thread on a phone with tool receipts ticking as it works; the desktop control room with every bot ranked by who needs you first; the company chat routing one question to two named bots; a lock-screen push the moment a bot needs a decision; taking the wheel in the company's shared browser; and the one-line install on a server"></a>
+     alt="supermux in use — a bot's thread on a phone with tool receipts ticking as it works; the desktop control room with every bot ranked by who needs you first; the company chat routing one question to two named bots; a lock-screen push the moment a bot needs a decision; taking the wheel in the company's shared browser; the same roster still running on a phone after the laptop closes; and the one-line install on a server"></a>
 </p>
 
 <p align="center"><sub>▶ <a href="docs/hero.mp4">Click for HD</a> · the loop above autoplays on GitHub</sub></p>
@@ -64,13 +64,13 @@ Then stand up your first company:
 A bot has a name, an avatar, and a role you assign — *Ada the developer*, *Iris the marketer*, *Sol in sales*. Each one gets **its own folder** on the box (its filesystem, scoped to what it's allowed to touch) and **its own connectors**. It's a full Claude Code agent with a job, not a scratch chat window.
 
 <p align="center">
-  <a href="docs/screenshots/v2/chat-phone.png"><img src="docs/screenshots/v2/chat-phone.png" alt="A bot's thread on a phone: two finished tool calls — Read money.rs and Grep parse_locale — with cargo test --lib money still running at 43 seconds, under the reply the owner just sent" width="300"></a>
+  <a href="docs/screenshots/chat-phone.png"><img src="docs/screenshots/chat-phone.png" alt="A bot's thread on a phone: two finished tool calls — Read money.rs and Grep parse_locale — with cargo test --lib money still spinning under a live timer, below the reply the owner just sent" width="300"></a>
 </p>
 
 <p align="center"><sub><em>Every tool call, as it happens.</em></sub></p>
 
 <p align="center">
-  <a href="docs/screenshots/v2/chat-desktop.png"><img src="docs/screenshots/v2/chat-desktop.png" alt="The same company on a desktop: a rail of seven named threads with Patch mid-reply and an unread dot on Quill, a 'Message from Patch' divider arriving inside another bot's thread, and a live 'asking Patch…' pill above the composer" width="900"></a>
+  <a href="docs/screenshots/chat-desktop.png"><img src="docs/screenshots/chat-desktop.png" alt="The same company on a desktop: a rail of seven named threads with Patch mid-reply and an unread dot on Quill, a 'Message from Patch' divider arriving inside another bot's thread, and a live 'asking Patch…' pill above the composer" width="900"></a>
 </p>
 
 <p align="center"><sub><em>Seven bots, one rail — and they can talk to each other.</em></sub></p>
@@ -80,7 +80,7 @@ A bot has a name, an avatar, and a role you assign — *Ada the developer*, *Iri
 Group bots into a **company** and they share connectors, a central **company chat**, and a shared browser. Bots **message each other and hand tasks off**: the marketer asks the developer for the changelog, the developer drops it in the shared drive, the sales bot picks it up. You set the direction; they do the passing.
 
 <p align="center">
-  <a href="docs/screenshots/v2/groupchat-phone.png"><img src="docs/screenshots/v2/groupchat-phone.png" alt="A company's group chat on a phone: the owner asks once, the Main Assistant fans the ask out to @chat-dataplane and @render-bug, and chat-dataplane is already answering below the unread divider" width="300"></a>
+  <a href="docs/screenshots/groupchat-phone.png"><img src="docs/screenshots/groupchat-phone.png" alt="A company's group chat on a phone: the owner asks once, the Main Assistant fans the ask out to @chat-dataplane and @render-bug, and chat-dataplane is already answering below the unread divider" width="300"></a>
 </p>
 
 <p align="center"><sub><em>You ask once. The router picks who does it.</em></sub></p>
@@ -90,7 +90,7 @@ Group bots into a **company** and they share connectors, a central **company cha
 Plug bots into the tools you already use — Gmail, GitHub, your database, anything — **with or without an MCP server or API**, via the connect concierge and one-tap sign-in. Grants are per-bot: a bot only reaches the connectors you hand it.
 
 <p align="center">
-  <a href="docs/screenshots/v2/connector-store.png"><img src="docs/screenshots/v2/connector-store.png" alt="The connector store with the Browse tab open and the All category selected: GitHub with 21 tools, Notion with 12, Stripe, PayPal, Plaid and Square, each with its own Connect button" width="900"></a>
+  <a href="docs/screenshots/connector-store.png"><img src="docs/screenshots/connector-store.png" alt="The connector store with the Browse tab open and the All category chip selected: GitHub with 21 tools, Notion with 12, and Stripe, each with its own Connect button, under a row of category filters" width="900"></a>
 </p>
 
 <p align="center"><sub><em>A store of tools, granted per bot — not per box.</em></sub></p>
@@ -100,7 +100,7 @@ Plug bots into the tools you already use — Gmail, GitHub, your database, anyth
 A **workflow** is an ordered list of prompts a bot runs on a trigger: chain the steps, run them on a schedule, and fire a completion action when it's done. Ship the weekly report every Monday without lifting a finger.
 
 <p align="center">
-  <a href="docs/screenshots/v2/workflow-runs.png"><img src="docs/screenshots/v2/workflow-runs.png" alt="A workflow's run history: today's run in progress with step one expanded and step two spinning, yesterday's run failed at step three with the reason and per-step timings written out, and an earlier run marked Done" width="900"></a>
+  <a href="docs/screenshots/workflow-runs.png"><img src="docs/screenshots/workflow-runs.png" alt="A workflow's run history: today's run still Running with step one done in 41 s and step two spinning, yesterday's run Failed at step three with the reason written out and per-step timings, and an earlier run marked Done" width="900"></a>
 </p>
 
 <p align="center"><sub><em>Give a bot a job and a time. It tells you what happened — including the failures.</em></sub></p>
@@ -110,7 +110,7 @@ A **workflow** is an ordered list of prompts a bot runs on a trigger: chain the 
 One real Chrome the company shares — **log in once**, then lend individual tabs to named bots. When a bot hits a login wall you can **take the wheel**, sign in, and hand the tab back.
 
 <p align="center">
-  <a href="docs/screenshots/v2/browser-drive.png"><img src="docs/screenshots/v2/browser-drive.png" alt="The company's shared browser with the Drive control engaged: a rail of company tabs, the tab signed in and verified six minutes ago, and the page it hit asking a human to verify — 'The agent hit a challenge it can't solve. Take the wheel.'" width="900"></a>
+  <a href="docs/screenshots/browser-drive.png"><img src="docs/screenshots/browser-drive.png" alt="The company's shared browser with the Drive control engaged: a rail of company tabs, the tab signed in and verified six minutes ago, and the page it hit asking a human to verify — 'The agent hit a challenge it can't solve. Take the wheel.'" width="900"></a>
 </p>
 
 <p align="center"><sub><em>When it's stuck, take the wheel — then hand it back.</em></sub></p>
@@ -151,13 +151,13 @@ The pitch that made Grok bots go viral — a team of agents that never sleeps �
 Bot Mode runs on top of a real product. Underneath the companies is the thing supermux has always been: **the easiest way to run a roomful of Claude Code agents from your phone** — live overview, real push, resume, files, MCP/skills, remote hosts.
 
 <p align="center">
-  <a href="docs/screenshots/v2/overview-desktop.png"><img src="docs/screenshots/v2/overview-desktop.png" alt="The overview with a bot selected: the roster on the left grouped into who needs you and who's active, and the selected bot's panel open on the right with Open terminal and its Overview, Setup and Workflows tabs" width="900"></a>
+  <a href="docs/screenshots/overview-desktop.png"><img src="docs/screenshots/overview-desktop.png" alt="The overview with a bot selected: the roster on the left grouped into who needs you and who's active, and the selected bot's panel open on the right with Open terminal and its Overview, Setup and Workflows tabs" width="900"></a>
 </p>
 
 <p align="center"><sub><em>Every bot, ranked by who needs you.</em></sub></p>
 
 <p align="center">
-  <a href="docs/screenshots/v2/overview-phone.png"><img src="docs/screenshots/v2/overview-phone.png" alt="The same roster on a phone, grouped the same way: two bots that need you, two working — one listening on 127.0.0.1:8823 — each with its context ring" width="300"></a>
+  <a href="docs/screenshots/overview-phone.png"><img src="docs/screenshots/overview-phone.png" alt="The same roster on a phone, grouped the same way: two bots that need you, two working — one listening on 127.0.0.1:8823 — each with its context ring" width="300"></a>
 </p>
 
 <p align="center"><sub><em>The same control room, in your pocket.</em></sub></p>
@@ -181,13 +181,7 @@ Bot Mode runs on top of a real product. Underneath the companies is the thing su
 - **Mixed fleets welcome**: Claude Code is the default, but the same overview runs [Codex CLI](https://developers.openai.com/codex/cli/) sessions side by side — same live status, push notifications, and prompt history.
 
 <p align="center">
-  <a href="docs/screenshots/v2/overview-phone-menu.png"><img src="docs/screenshots/v2/overview-phone-menu.png" alt="A long press on a bot row raises its actions sheet: Info, Mark unread, Rename, Pin, Restart, Stop, Archive, and Move to company" width="300"></a>
-</p>
-
-<p align="center"><sub><em>Long-press any row for the whole lifecycle.</em></sub></p>
-
-<p align="center">
-  <a href="docs/screenshots/v2/hire-sheet-phone.png"><img src="docs/screenshots/v2/hire-sheet-phone.png" alt="The hire-a-teammate sheet on a phone: a rerollable avatar named Watch, the job written in one sentence — 'Watch the nightly build and open a PR when it breaks.' — and an Advanced disclosure for engine, model and folder" width="300"></a>
+  <a href="docs/screenshots/hire-sheet-phone.png"><img src="docs/screenshots/hire-sheet-phone.png" alt="The hire-a-teammate sheet on a phone: a rerollable avatar with 'Tap the avatar to reroll' under the name field, the job written in one sentence — 'Research a topic and summarize the best sources.' — a suggestion chip below it, and an Advanced disclosure for engine, model and folder" width="300"></a>
 </p>
 
 <p align="center"><sub><em>Hiring a bot is one sentence.</em></sub></p>
@@ -326,6 +320,13 @@ If `tailscaled` is running on the target host, the installer auto-detects it and
 - **Company isolation is best-effort, not a hard multi-tenant jail.** Separation is app-layer scoping plus the systemd sandbox (and best-effort Landlock where the kernel allows) — sandboxed isolation on a box you control, not fully isolated tenants. Don't host mutually-hostile companies on one instance.
 - **Letting outside humans into a company needs your own domain + OAuth.** Out of the box supermux is single-owner behind an auth token (and ideally Tailscale); external human access is your setup to add.
 - **It runs Claude Code.** Bot Mode is as capable — and as fallible — as the agent driving it. It does the things you could do at a keyboard, and it makes the mistakes an agent makes. Keep a human in the loop for anything that matters.
+- **Chat renders permission prompts; it can't answer them yet.** When Claude asks to run something, the card shows up in chat with the command and its options — and says out loud that you have to answer it in the terminal. The screenshot below is the real state, footnote and all.
+
+<p align="center">
+  <a href="docs/screenshots/chat-permission-phone.png"><img src="docs/screenshots/chat-permission-phone.png" alt="A permission prompt in a bot's chat on a phone: 'Run cargo publish --dry-run?' with Bash · in supermux/server underneath, three options keyed 1, 2 and 3 — Allow once, Allow while this session runs, Not now — and the footnote 'Answer in the terminal — chat can't answer this one yet.'" width="300"></a>
+</p>
+
+<p align="center"><sub><em>Claude asks. Chat shows you what it's asking — and where you have to answer.</em></sub></p>
 
 ---
 
