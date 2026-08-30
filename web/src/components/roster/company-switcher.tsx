@@ -33,7 +33,7 @@
  * focus to the trigger (the combobox pattern).
  */
 import * as React from 'react'
-import { ChevronsUpDown, Plus, Trash2, UserPlus } from 'lucide-react'
+import { ChevronsUpDown, Plus, SlidersHorizontal, Trash2, UserPlus } from 'lucide-react'
 
 import { useCompanies } from '@/hooks/use-companies'
 import { useUI } from '@/stores/ui-store'
@@ -63,6 +63,11 @@ const InviteWizardSheet = React.lazy(() =>
 const DeleteCompanySheet = React.lazy(() =>
   import('@/components/roster/delete-company-sheet').then((m) => ({
     default: m.DeleteCompanySheet,
+  })),
+)
+const CompanySettingsSheet = React.lazy(() =>
+  import('@/components/roster/company-settings-sheet').then((m) => ({
+    default: m.CompanySettingsSheet,
   })),
 )
 
@@ -119,6 +124,7 @@ export function CompanySwitcher({
   const [createOpen, setCreateOpen] = React.useState(false)
   const [inviteOpen, setInviteOpen] = React.useState(false)
   const [deleteOpen, setDeleteOpen] = React.useState(false)
+  const [settingsOpen, setSettingsOpen] = React.useState(false)
   // The roving highlight index into the flat option list (0 = HQ, then each
   // company, then the New-company action last). −1 = nothing highlighted yet.
   // Only used by the desktop menu; the touch sheet ignores it.
@@ -350,6 +356,27 @@ export function CompanySwitcher({
         {active && (
           <>
             <div className="my-1 h-px bg-border" role="separator" />
+            {/* Company settings — logo, name, accent, and (later) the shared
+                brief. A safe action, so it sits above the delete danger zone. */}
+            <button
+              type="button"
+              role="menuitem"
+              className={`${rowBase} ${rowSkin}`}
+              onMouseEnter={() => !sheet && setCursor(-1)}
+              onClick={() => {
+                setOpen(false)
+                setSettingsOpen(true)
+              }}
+            >
+              <span
+                className="grid place-items-center"
+                aria-hidden
+                style={{ width: markSize, height: markSize, flex: 'none' }}
+              >
+                <SlidersHorizontal size={sheet ? 18 : 15} />
+              </span>
+              Company settings…
+            </button>
             <button
               type="button"
               role="menuitem"
@@ -520,6 +547,12 @@ export function CompanySwitcher({
               setActiveCompany(null)
             }}
           />
+        </React.Suspense>
+      )}
+
+      {settingsOpen && active && (
+        <React.Suspense fallback={null}>
+          <CompanySettingsSheet open={settingsOpen} onOpenChange={setSettingsOpen} company={active} />
         </React.Suspense>
       )}
     </>

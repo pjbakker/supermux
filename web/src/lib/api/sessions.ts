@@ -704,7 +704,9 @@ async function sessReq<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   const token = apiToken()
   if (token) headers.set('Authorization', `Bearer ${token}`)
-  if (init?.body && !(init.body instanceof FormData)) {
+  // Default to JSON, but let a caller that already set a Content-Type (e.g. a
+  // raw image PUT) keep it — FormData sets its own multipart boundary.
+  if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
   let res: Response
@@ -1144,6 +1146,44 @@ export const companiesApi = {
       method: 'PATCH',
       body: JSON.stringify({ display_name }),
     }),
+
+  /** `PATCH /api/companies/{id}` — update any settings field(s): `display_name`,
+   *  `accent` (#rrggbb, `""` clears), `brief`, `default_connectors`, `archived`.
+   *  Returns the refreshed row. */
+  patch: (
+    id: number,
+    fields: Partial<
+      Pick<Company, 'display_name' | 'accent' | 'brief' | 'default_connectors'>
+    > & { archived?: boolean },
+  ): Promise<Company> =>
+    sessReq(`/api/companies/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(fields),
+    }),
+
+  /** `PUT /api/companies/{id}/logo` — upload raw image bytes (the File's own
+   *  Content-Type rides along; the server caps type + size). Returns the row
+   *  (now `has_logo: true`). */
+  uploadLogo: (id: number, file: Blob): Promise<Company> =>
+    sessReq(`/api/companies/${id}/logo`, {
+      method: 'PUT',
+      body: file,
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    }),
+
+  /** `POST /api/companies/{id}/logo/from-url` — grab the site favicon via
+   *  Google's favicon service and store it. `url` may be a full URL or a bare
+   *  domain. */
+  logoFromUrl: (id: number, url: string): Promise<Company> =>
+    sessReq(`/api/companies/${id}/logo/from-url`, {
+      method: 'POST',
+      body: JSON.stringify({ url }),
+    }),
+
+  /** `DELETE /api/companies/{id}/logo` — back to the generated mark (also clears
+   *  the logo-derived accent). */
+  deleteLogo: (id: number): Promise<Company> =>
+    sessReq(`/api/companies/${id}/logo`, { method: 'DELETE' }),
 
   /** `DELETE /api/companies/{id}` — DESTRUCTIVE, irreversible cascade. Owner/
    *  admin-only (a scoped member gets a hide-existence 404). The server tears

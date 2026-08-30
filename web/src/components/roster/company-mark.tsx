@@ -51,6 +51,10 @@ export interface CompanyMarkProps {
    *  omitted the live resolved theme drives it. */
   dark?: boolean
   style?: React.CSSProperties
+  /** When the company has an uploaded logo, the URL that serves it
+   *  (`companyLogoUrl(company)`). Rendered as the tile image in place of the
+   *  generated monogram; `null`/absent falls back to the monogram. */
+  logoUrl?: string | null
 }
 
 /**
@@ -89,9 +93,31 @@ export function CompanyMark({
   className,
   dark,
   style,
+  logoUrl,
 }: CompanyMarkProps) {
+  // Hooks run unconditionally, BEFORE the logo early-return (rules-of-hooks).
   const { resolvedTheme } = useTheme()
   const isDark = dark ?? resolvedTheme === 'dark'
+  // An uploaded logo replaces the generated monogram, keeping the rounded-square
+  // tile geometry so the company silhouette is unchanged. `cover` crops a
+  // non-square favicon into the square without distortion.
+  if (logoUrl) {
+    return (
+      <span
+        aria-hidden
+        className={className}
+        style={{ ...identityTileStyle(size), overflow: 'hidden', ...style }}
+      >
+        <img
+          src={logoUrl}
+          alt=""
+          width={size}
+          height={size}
+          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+        />
+      </span>
+    )
+  }
   const hue = characterFromSeed(slug).hue
   const wash = `color-mix(in srgb, ${bodyColor(hue)} 14%, transparent)`
   const ink = accentInk(hue, isDark)

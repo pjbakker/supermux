@@ -20,6 +20,25 @@ export interface Company {
   archived: number
   created_at?: number
   updated_at?: number
+  /** `#rrggbb` accent (sampled from the logo, or picked). Absent → slug hue. */
+  accent?: string | null
+  /** (Stage 2) shared brief injected into every company bot. */
+  brief?: string | null
+  /** (Stage 2) default-connectors JSON for new bots. */
+  default_connectors?: string | null
+  /** Server-derived: the company has an uploaded logo (fetch it from the logo
+   *  GET). The bytes never ride this row. */
+  has_logo?: boolean
+}
+
+/** The URL that serves a company's uploaded logo. `updatedAt` is appended as a
+ *  cache-buster so a re-upload shows immediately (the GET sets a 60s private
+ *  cache). Returns `null` when the company has no logo → callers fall back to the
+ *  generated `<CompanyMark>`. */
+export function companyLogoUrl(company: Pick<Company, 'id' | 'has_logo' | 'updated_at'>): string | null {
+  if (!company.has_logo) return null
+  const v = company.updated_at ? `?v=${company.updated_at}` : ''
+  return `/api/companies/${company.id}/logo${v}`
 }
 
 /** Resolve a persisted `activeCompany` id against the live company set: an id
