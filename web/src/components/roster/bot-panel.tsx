@@ -100,7 +100,9 @@ import { SessionActionsMenu } from '@/components/session-tile/session-actions-me
 import { IssueList } from '@/components/issues/issue-list'
 import { IssueSurface } from '@/components/issues/issue-surface'
 import { useSession } from '@/hooks/use-sessions'
+import { useSessionAttention } from '@/hooks/use-attention'
 import { useSessionConfig } from '@/hooks/use-session-config'
+import { groupOf, stateWordFor } from '@/lib/team-attention'
 import { useCloneSession } from '@/components/focus-mode/use-clone-session'
 import { useToast } from '@/components/ui/use-toast'
 import { agentsApi, type DelegationEdge, type DelegationsView } from '@/lib/api/agents'
@@ -173,17 +175,46 @@ const RECEIPT_MAX = 3
  *  Pure, so the selection is unit-testable without a live panel — the same shape
  *  `normalizeTab` and `afterUndo` already take in this file.
  *
+ *  THE PAGE SPANS MORE THAN ONE TURN, and the card files everything it collects
+ *  under ONE prompt and one timestamp — `lastSend`. So the walk is scoped to
+ *  THAT prompt's turn, or the card asserts something false: measured on the
+ *  frozen bot `Mail`, it showed three ✓ receipts under "You asked · 12d ago"
+ *  whose entries all PREDATED the prompt they sat beneath (`last_send_at`
+ *  1787064835 over tool calls at …832 / …754 / …749).
+ *
+ *  The page is newest-first, so one pass does it. Anything OLDER than the prompt
+ *  cannot be part of its answer, and a user turn is a boundary — but which kind
+ *  of boundary depends on which side of the prompt it falls:
+ *    · older than `lastSend` ⇒ it is the prompt that opened this turn (or an
+ *      earlier one). Stop.
+ *    · newer than `lastSend` ⇒ a LATER question the row never recorded — a
+ *      `/exit`, a slash command — and everything collected above it answered
+ *      that one. Drop what we have and keep walking down into the exchange the
+ *      card is actually showing. Three live sessions (`Research`, `wvhj-claude`,
+ *      `linkbuilder-exec`) sit in exactly this shape, and stopping here instead
+ *      would blank a card whose answer is one row further down.
+ *
  *  Only the LABEL comes from the chat plane (`condenseReceiptLabel`), never the
  *  chrome: `<ReceiptGroup>` wraps itself in the grok-scoped chat `<Bubble>`, and
  *  this file is committed to Tailwind + shadcn tokens so one component renders
  *  identically in the pane and in the body-portalled sheet. */
-export function lastExchange(entries: RecallEntry[]): LastExchange {
+export function lastExchange(entries: RecallEntry[], lastSend?: LastSend | null): LastExchange {
   const out: LastExchange = { receipts: [] }
+  // Epoch SECONDS on both sides — `RecallEntry.ts` is what the recall list
+  // already renders as `new Date(entry.ts * 1000)`.
+  const since = lastSend ? Math.floor(lastSend.sentAt.getTime() / 1000) : null
   for (const e of entries) {
+    if (e.kind !== 'assistant' && e.kind !== 'tool_use') {
+      if (since === null || e.ts <= since) break
+      out.answer = undefined
+      out.receipts = []
+      continue
+    }
+    if (since !== null && e.ts < since) break
     const text = e.text?.trim() ?? ''
     if (e.kind === 'assistant') {
       if (!out.answer && text) out.answer = text
-    } else if (e.kind === 'tool_use') {
+    } else {
       const label = condenseReceiptLabel(text)
       if (label && out.receipts.length < RECEIPT_MAX) {
         out.receipts.push({ label, ok: e.ok !== false })
@@ -563,6 +594,13 @@ export function normalizeTab(t?: string | null): TabKey {
  *  already carries it — and "one fact rendered three times" is precisely what
  *  got the Status card deleted. State is a word here; colour stays on the face.
  *
+ *  And it is the ROSTER's word, from `stateWordFor` — not `session.status`
+ *  capitalised. The raw enum put `Idle` in this panel while the row it was opened
+ *  from said `done` two hundred pixels to the left, and `Active` beside `working`:
+ *  one fact, two vocabularies, on screen at the same instant. The `needs` bit the
+ *  bucketing wants comes from `useSessionAttention` — the single-row read that
+ *  exists for exactly this case (a surface with no roster to hand).
+ *
  *  Every badge self-nulls when it has nothing to say (their documented
  *  contract), so they mount unguarded and a calm bot's row is two words. */
 function LiveState({
@@ -572,6 +610,7 @@ function LiveState({
   session: ApiSession | null
   lastSend: LastSend | null
 }) {
+  const attention = useSessionAttention(session)
   // Gated on a WORKING status, exactly as this component's two other call sites
   // do (`session-tile/tile.tsx`, `focus-mode/focus-header.tsx`). The backend
   // clears `activity` on Stop/SessionEnd, but a stale label survives often
@@ -583,13 +622,20 @@ function LiveState({
     Boolean(session?.activity?.trim())
   if (!session) return null
 
+  // `.word` only: `.agents` is the ` · N agents` clause, which `<ActivityLine>`
+  // below already renders from the same `agents_live` field.
+  const state = stateWordFor(session, groupOf(session, attention.tier === 'needs'))
+
   return (
     // wrap, never overflow: the badges are the part that grows on a bad day.
     <div
       data-vr="bot-live-state"
       className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]"
     >
-      <span className="font-medium capitalize text-foreground">{session.status}</span>
+      {/* `first-letter:uppercase`, never `capitalize`: the words are the
+          roster's own lowercase vocabulary, and `capitalize` would title-case
+          "needs you" into "Needs You". Only the line's first letter lifts. */}
+      <span className="font-medium first-letter:uppercase text-foreground">{state.word}</span>
       {working ? (
         <>
           <span className="text-muted-foreground" aria-hidden>·</span>
@@ -648,7 +694,10 @@ function LastExchangeBlock({
     staleTime: 30_000,
     retry: false,
   })
-  const exchange = React.useMemo(() => lastExchange(recall.data?.entries ?? []), [recall.data])
+  const exchange = React.useMemo(
+    () => lastExchange(recall.data?.entries ?? [], lastSend),
+    [recall.data, lastSend],
+  )
   const replied = Boolean(exchange.answer || exchange.receipts.length > 0)
 
   // Nothing on the row AND nothing on the wire. One muted line — an empty card

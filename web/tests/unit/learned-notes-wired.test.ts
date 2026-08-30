@@ -20,6 +20,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import { listNotes, searchNotes } from '../../src/lib/api/memory'
+import { emptyState } from '../../src/components/roster/learned-notes'
 
 const realFetch = globalThis.fetch
 
@@ -126,5 +127,30 @@ describe('the memory client reports whether the bot can write, not whether it an
   test('a real failure still throws — an unreachable store is not an empty one', async () => {
     serve(500)
     await expect(listNotes('mena')).rejects.toThrow()
+  })
+})
+
+/**
+ * …and the PANEL must branch on the store before it branches on the box.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `searching` used to be tested first, so typing "deploy" on a bot whose tier is
+ * off replaced the honest "Memory isn't on for this bot yet" with `No note
+ * matches “deploy”` — a statement about a search that never ran, against a store
+ * that does not exist. Verified live on `Mail` before the fix.
+ */
+describe('the empty state ranks the store above the search box', () => {
+  test('a term typed on an UNWIRED bot never claims a miss', () => {
+    expect(emptyState({ notWired: true, eligible: true, searching: true })).toBe('restart-to-wire')
+    expect(emptyState({ notWired: true, eligible: false, searching: true })).toBe('not-a-bot')
+  })
+
+  test('the two unwired shapes stay apart — only one can be restarted into memory', () => {
+    expect(emptyState({ notWired: true, eligible: true, searching: false })).toBe('restart-to-wire')
+    expect(emptyState({ notWired: true, eligible: false, searching: false })).toBe('not-a-bot')
+  })
+
+  test('a WIRED bot still reports a real miss, and a real empty store', () => {
+    expect(emptyState({ notWired: false, eligible: true, searching: true })).toBe('no-match')
+    expect(emptyState({ notWired: false, eligible: true, searching: false })).toBe('none-yet')
   })
 })

@@ -1202,7 +1202,30 @@ const BUDGET_ENTRY_JS = 161 * KB
 //             replacing the toolbar camera, reusing `SessionPicker`),
 //             `human-mark`, `company-switcher`, `company-mark`, `companies`.
 // ceil(measured 438.33) + headroom = 440, the same rule every bump above used.
-const BUDGET_APP_JS = 440 * KB
+//
+// RATCHETED 440 → 441 by the round-3 honesty fixes on the bot panel (same PR).
+// The 440 above was ceil(438.33), but the branch has since drifted to 439.84 —
+// 0.16 KB of headroom, i.e. the same tripwire state the ENTRY ledger above
+// documents ("parked at EXACTLY 160.00/160.00 ... it had silently become a
+// tripwire the next web change of ANY kind would trip"). Measured 440.32, and
+// the +0.48 KB is attributable to ONE chunking move, not new surface:
+//   +0.60 KB  a new shared `team-attention` chunk. The bot panel now renders the
+//             ROSTER's state word (`stateWordFor`) instead of `session.status`
+//             capitalised — `mena` read `done` in the roster and `Idle` in the
+//             panel beside it — so the roster's lazy chunk and the panel's lazy
+//             chunk share the module, and rolldown split it out.
+//   -0.37 KB  `grok-roster`, the same module leaving it. Net for the extraction
+//             is ~+0.23 KB of chunk boilerplate; the rest is real code.
+//   +0.18 KB  `bot-panel` — the recall-page turn bound (`lastExchange` no longer
+//             files an older turn's receipts under the prompt above them) and
+//             the memory panel's empty-state decision.
+//   +0.05 KB  the ENTRY chunk, all of it hash churn in the import map. The gate
+//             that guards first paint stays GREEN at 160.69 / 161 KB and did NOT
+//             move; the alternative placement (folding the word into
+//             `lib/mark-status`, which IS on the hero path) measured 161.02 and
+//             was rejected for exactly that reason.
+// ceil(measured 440.32) + headroom = 441, the same rule every bump above used.
+const BUDGET_APP_JS = 441 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

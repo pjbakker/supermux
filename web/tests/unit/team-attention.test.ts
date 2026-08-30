@@ -7,12 +7,16 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  groupOf,
+  groupSessions,
   groupTeamsByTier,
   rosteredTeams,
+  stateWordFor,
   teamTier,
   totalBotCount,
   type LeadSignal,
 } from '../../src/lib/team-attention'
+import type { ApiSession } from '../../src/lib/api'
 import type { MemberStatus, Team, TeamMember } from '../../src/lib/api/teams'
 
 let seq = 0
@@ -125,5 +129,75 @@ describe('the count formulas', () => {
     expect([...g.needs, ...g.active, ...g.done, ...g.idle].map((t) => t.team_name)).not.toContain(
       'solo',
     )
+  })
+})
+
+/**
+ * ONE state, ONE word.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The roster row printed the product's vocabulary (`done` / `working` / `needs
+ * you`) while the bot panel it opens printed `session.status` capitalised
+ * (`Idle` / `Active`) — the two side by side on the same desktop screen, saying
+ * the same fact in two words. `stateWordFor` is now the single renderer of it,
+ * and `groupOf` is the per-session bucketing the panel needs because it holds
+ * one bot and has no roster to group.
+ */
+describe('the state word', () => {
+  const NOW = 1_800_000_000_000
+  const bot = (over: Partial<ApiSession> = {}): ApiSession =>
+    ({
+      name: 'mena',
+      status: 'idle',
+      dir: '',
+      provider: 'claude',
+      preview_lines: [],
+      updated_at: new Date(NOW).toISOString(),
+      ...over,
+    }) as ApiSession
+
+  test('groupOf agrees with groupSessions, row for row', () => {
+    const rows = [
+      bot({ name: 'a', status: 'waiting' }),
+      bot({ name: 'b', status: 'active' }),
+      bot({ name: 'c', status: 'idle' }),
+      bot({ name: 'd', status: 'stopped' }),
+      bot({ name: 'e', status: 'idle', subagents_live: true }),
+    ]
+    const needNames = new Set(['a'])
+    const grouped = groupSessions(rows, needNames, NOW)
+    for (const key of ['needs', 'active', 'done', 'idle'] as const) {
+      for (const s of grouped[key]) {
+        expect(groupOf(s, needNames.has(s.name), NOW)).toBe(key)
+      }
+    }
+  })
+
+  test('an idle bot touched today is "done", not "idle" — the panel’s old lie', () => {
+    const s = bot({ status: 'idle' })
+    expect(stateWordFor(s, groupOf(s, false, NOW)).word).toBe('done')
+  })
+
+  test('an active bot is "working", and its agents clause is a SEPARATE field', () => {
+    // Separate because the bot panel renders the word beside an `<ActivityLine>`
+    // that already draws the same clause from the same `agents_live`.
+    const s = bot({ status: 'active', agents_live: 3 })
+    const sw = stateWordFor(s, groupOf(s, false, NOW))
+    expect(sw.word).toBe('working')
+    expect(sw.agents).toBe(' · 3 agents')
+  })
+
+  test('the needs bucket says "needs you", and a blocked one says "blocked"', () => {
+    const waiting = bot({ status: 'waiting' })
+    expect(stateWordFor(waiting, groupOf(waiting, true, NOW)).word).toBe('needs you')
+    const blocked = bot({ status: 'idle', blocked: { reason: 'limit' } } as Partial<ApiSession>)
+    expect(stateWordFor(blocked, groupOf(blocked, true, NOW)).word).toBe('blocked')
+  })
+
+  test('no word is ever a raw status enum', () => {
+    for (const status of ['idle', 'active', 'starting', 'stopped', 'waiting'] as const) {
+      const s = bot({ status })
+      const sw = stateWordFor(s, groupOf(s, status === 'waiting', NOW))
+      expect(['done', 'working', 'needs you', 'blocked', 'stopped', 'idle']).toContain(sw.word)
+    }
   })
 })
