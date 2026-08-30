@@ -118,7 +118,7 @@ function ScreenShell({
             <span
               key={i}
               className={cn(
-                'h-1 rounded-full transition-all duration-300',
+                'h-1 rounded-full transition-[width,background-color] duration-300',
                 i === index ? 'w-6 bg-white' : 'w-1.5 bg-white/25',
               )}
             />
@@ -144,7 +144,7 @@ function Chip({ children, lit }: { children: React.ReactNode; lit: boolean }) {
   return (
     <span
       className={cn(
-        'rounded-full border px-2.5 py-1 text-[12.5px] font-medium transition-all duration-500',
+        'rounded-full border px-2.5 py-1 text-[12.5px] font-medium transition-[border-color,background-color,color] duration-500',
         lit
           ? 'border-primary/40 bg-primary/10 text-white'
           : 'border-white/10 bg-white/[0.03] text-white/40',

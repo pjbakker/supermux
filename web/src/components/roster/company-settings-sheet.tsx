@@ -216,11 +216,19 @@ export function CompanySettingsSheet({ open, onOpenChange, company }: CompanySet
               {hasLogo ? 'Sampled from your logo. Tap to override.' : 'Tap to pick a colour.'}
             </div>
           </div>
+          {/* The swatch IS the control: the native colour input is `sr-only`
+              and the tinted circle is its label, so tapping the circle opens the
+              OS picker. Named (`htmlFor` + an sr-only text) rather than an
+              anonymous wrapper — a screen reader otherwise reaches an unlabelled
+              colour field. */}
           <label
+            htmlFor="company-accent"
             className="size-9 flex-none cursor-pointer rounded-full border border-border"
             style={{ background: accent ?? 'var(--sm-fill-soft)' }}
           >
+            <span className="sr-only">Accent colour</span>
             <input
+              id="company-accent"
               type="color"
               className="sr-only"
               value={accent ?? '#3da0ff'}

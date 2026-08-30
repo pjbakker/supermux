@@ -367,13 +367,15 @@ describe('the toolbar hosts Paste + Sign-in (out of the page)', () => {
     'utf8',
   )
 
-  test('driving shows Paste + Sign-in in the toolbar slot; watching shows resync', () => {
-    // One slot, forked on `driving` — Paste/Sign-in while driving, the resync
-    // ("refresh the picture") while watching.
+  test('driving shows Paste + Sign-in in the toolbar slot; watching shows the grant verb', () => {
+    // One slot, forked on `driving` — Paste/Sign-in while driving (a canvas
+    // cannot be autofilled), and while watching the way in to "who may use this
+    // tab". That second half used to be resync; the owner moved the share verb
+    // into the cell and resync into the ⋯ page menu (browser-address-bar.test).
     expect(chrome).toContain('driving ? (')
     expect(chrome).toContain('data-chrome-paste')
     expect(chrome).toContain('data-chrome-signin')
-    expect(chrome).toContain('data-chrome-resync')
+    expect(chrome).toContain('data-chrome-grant')
   })
 
   test('Sign-in carries the no-form reason (the "not usable when no fields" rule)', () => {

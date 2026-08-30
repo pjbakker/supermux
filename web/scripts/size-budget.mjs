@@ -1164,7 +1164,45 @@ const BUDGET_ENTRY_JS = 161 * KB
 // RATCHETED 423 → 427 by the group-chat DELIGHT pass (jump-to-latest pill, day
 // dividers, unread separator, URL/PR-ref linkifier, animation wiring — reuses the
 // existing [data-grok] motion bank, no new deps): ceil(measured 425.10) + headroom.
-const BUDGET_APP_JS = 427 * KB
+//
+// RATCHETED 427 → 440 by the rest of the BOT-MODE SUITE (the company identity +
+// onboarding tail of PR #123). Measured 438.33 against 425.14 for the tree that
+// set the 427 ceiling (f32296f2, the delight pass) — a +13.19 KB wave, measured
+// by rebuilding that exact tree rather than trusting the last number written
+// down. Where every KB of it went, by CHUNK (the diff of the two reports, so
+// this is attribution, not a story):
+//   +6.87 KB  `use-company-channel` — the group chat's data plane, now its OWN
+//             chunk because the full-screen `/company/:id/chat` route shares it
+//             with the overview hero. It did not appear from nowhere: the same
+//             pass took `grok-roster` DOWN 13.12 → 8.12, so the extraction is
+//             about +1.9 KB net and the rest is code that already existed moving
+//             to where both surfaces reach it without a second copy.
+//   +3.35 KB  `botmode-intro` — the five-screen "Run a company of bots" intro.
+//             It landed on the ENTRY chunk when it was written; this PR makes it
+//             `React.lazy` (`onboarding-host.tsx`), which is what took the hero
+//             path from 163.02 back to 160.35. A first-run-only story does not
+//             belong on every cold load, and now nobody but a first-runner
+//             fetches it.
+//   +2.41 KB  `company-settings-sheet` (lazy) — the logo upload / favicon fetch
+//             / accent picker sheet, plus `dominant-color.ts` sampling the
+//             uploaded logo. Reached only from a company's ⋯ menu.
+//   +1.83 KB  `delete-company-sheet` (lazy) — the type-to-confirm cascade
+//             teardown. Same door, same reader.
+//   +1.48 KB  `ui-store` — the zustand store hoisted into its own shared chunk
+//             now that the sheets above and the intro all read it. Shared code
+//             leaving the chunks it was inlined in, not new code.
+//   +1.11 KB  `company-chat` — the phone-sized full-screen channel route.
+//   +0.56 KB  the ENTRY chunk (159.79 → 160.35), and the sign is what matters:
+//             the intro's ~3 KB came OFF it in this PR, so the residue is the
+//             company logo/accent reads (`companyLogoUrl` + `apiToken` in
+//             `company-mark`) plus the nav/roster leaves the scope ring pulls in.
+//             The gate that actually guards first paint stays GREEN at
+//             160.35 / 161 KB, and it did NOT move up to make room for anything.
+//   ~+0.9 KB  the remainder, spread over `browser` (+0.45 — the grant verb
+//             replacing the toolbar camera, reusing `SessionPicker`),
+//             `human-mark`, `company-switcher`, `company-mark`, `companies`.
+// ceil(measured 438.33) + headroom = 440, the same rule every bump above used.
+const BUDGET_APP_JS = 440 * KB
 // RATCHETED 30 → 31 by the Grok-2026 mobile nav (bot mode). The bot-mode phone
 // tab bar was a Material `BottomNavigationView` — a full-bleed slab welded to the
 // screen edge with a `h-1 w-8` top-underline active mark. It is now a floating

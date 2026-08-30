@@ -29,6 +29,14 @@ import { Facepile, type FacepileMember } from '../ui'
 import { useCompanyChannel } from './use-company-channel'
 import type { GroupChatRow } from './types'
 
+/** "3m ago" for the newest row. The clock is read HERE rather than in the
+ *  render body: a component that calls `Date.now()` while rendering is impure
+ *  (and its output cannot be replayed) — the same shape the roster row's
+ *  `relativeTime` uses for a session's age. */
+function agoOf(tsSeconds: number): string {
+  return ago(Math.floor(Date.now() / 1000) - tsSeconds)
+}
+
 /** One line of preview for the latest row — "author: body", the routing/
  *  milestone verbs left to the full channel. Kept short; the row truncates. */
 function previewOf(row: GroupChatRow): string {
@@ -54,7 +62,6 @@ export function GroupChatEntry({ company, sessions, onOpen, style, className }: 
   const { enabled, members, feed } = channel
 
   const latest = feed.rows.length > 0 ? feed.rows[feed.rows.length - 1]! : null
-  const nowSec = Math.floor(Date.now() / 1000)
 
   // HQ, or a company that never enabled group chat: nothing at all.
   if (!enabled || !company) return null
@@ -102,7 +109,7 @@ export function GroupChatEntry({ company, sessions, onOpen, style, className }: 
           </span>
           {latest && (
             <span className="ml-auto flex-none pl-1 text-[11.5px] tabular-nums text-ink-3">
-              {ago(nowSec - latest.ts)}
+              {agoOf(latest.ts)}
             </span>
           )}
         </div>

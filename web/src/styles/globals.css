@@ -885,6 +885,36 @@
   }
 }
 
+/* ── Chat loading skeleton (the anti-flash delay) ──────────────────────────
+   `<ChatLoadingSkeleton>` fades in on a DELAY so a fast/cached message seed
+   replaces it before it is ever visible (no flash of the skeleton, no added
+   delay on the conversation itself). `both` holds opacity 0 through the delay.
+
+   HERE, not in grok-mode.css: this is the chat RENDERER's behaviour, and the
+   renderer outlives the skin — `supermux:grok-mode = '0'` kills the skin while
+   the chat renderer stays on (lib/bot-mode-flag.ts), so a `[data-grok]`-scoped
+   rule would drop the anti-flash in exactly that split. The skin reuses the
+   keyframe for its own mount fade, the way it already reuses `sm-spin`. */
+@keyframes sm-mount-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.sm-chat-skel {
+  animation: sm-mount-fade 0.22s ease-out 0.14s both;
+}
+/* Reduce Motion: keep the ANTI-FLASH delay (hold hidden ~140ms) but drop the
+   fade — a single opacity step, not a sweep. A skeleton is decoration around an
+   absence, so it owes the reader no motion, only the courtesy of not blinking. */
+@media (prefers-reduced-motion: reduce) {
+  .sm-chat-skel {
+    animation: sm-mount-fade 0.14s step-end both;
+  }
+}
+
 /* ── Edit sheet ──────────────────────────────
    The MobileComposeSheet's textarea is prose for an LLM, not code — system font
    (not mono), with the iOS systemBlue accent for the caret + selection so the

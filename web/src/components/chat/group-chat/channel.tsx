@@ -480,11 +480,18 @@ export function ChatChannel({
   // The arrival pop is for milestones that LAND, not for the history that was
   // already here. The hero MOUNTS EMPTY (loading), so freezing at mount would
   // capture seq 0 and pop the entire seed. Instead the baseline is frozen to the
-  // FIRST non-empty window — the seed's high-water mark — the once it appears
-  // (setting a ref during render is idempotent). Only rows past it get
-  // `.grok-entry`, so the seed rests and the next socket row pops.
-  const seqBaseline = React.useRef<number | null>(null)
-  if (seqBaseline.current === null && lastSeq > 0) seqBaseline.current = lastSeq
+  // FIRST non-empty window — the seed's high-water mark — the once it appears.
+  // Only rows past it get `.grok-entry`, so the seed rests and the next socket
+  // row pops.
+  //
+  // Frozen in an EFFECT, not during render: a render that writes (or reads) a
+  // ref is impure, and the effect costs nothing here — while the baseline is
+  // still `null` every row reads as OLD, which is exactly the right answer for
+  // the frame the seed itself lands in.
+  const [seqBaseline, setSeqBaseline] = React.useState<number | null>(null)
+  React.useEffect(() => {
+    if (lastSeq > 0) setSeqBaseline((prev) => (prev === null ? lastSeq : prev))
+  }, [lastSeq])
 
   // A pill needs to know it is off the bottom, but the sticky-scroll logic must
   // stay on a ref (it runs every flick frame — state there would re-render the
@@ -643,7 +650,7 @@ export function ChatChannel({
                     members={byName}
                     ring={ring}
                     surface={surface}
-                    fresh={seqBaseline.current !== null && row.seq > seqBaseline.current}
+                    fresh={seqBaseline !== null && row.seq > seqBaseline}
                   />
                 </React.Fragment>
               )

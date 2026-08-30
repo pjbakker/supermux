@@ -1023,29 +1023,10 @@
     transform: none;
   }
 }
-@keyframes sm-mount-fade {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-/* Chat loading skeleton — fades in on a DELAY so a fast/cached message seed
-   replaces it before it is ever visible (no flash of the skeleton, no added
-   delay on the conversation itself). `both` holds opacity 0 through the delay. */
-.sm-chat-skel {
-  animation: sm-mount-fade 0.22s ease-out 0.14s both;
-}
-/* Reduce Motion: keep the ANTI-FLASH delay (hold hidden ~140ms) but drop the
-   fade — a single opacity step, not a sweep. A skeleton is decoration around an
-   absence, so it owes the reader no motion, only the courtesy of not blinking. */
-@media (prefers-reduced-motion: reduce) {
-  .sm-chat-skel {
-    animation: sm-mount-fade 0.14s step-end both;
-  }
-}
+/* `sm-mount-fade` is REUSED from globals.css (like the 2.4s `sm-spin` below):
+   the chat loading skeleton fades with it too, and the skeleton is renderer
+   behaviour that must survive the skin's kill-switch — so the keyframe lives
+   with the app, not with the skin. */
 @keyframes sm-typing-dot {
   0%,
   55%,

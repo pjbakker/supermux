@@ -40,7 +40,15 @@ import { useUI } from '@/stores/ui-store'
 import { shouldShowBotModeIntro } from '@/lib/botmode-onboarding'
 import { WelcomeBanner } from './welcome-banner'
 import { TourOverlay } from './tour-overlay'
-import { BotModeIntro } from './botmode-intro'
+// Lazy: five full-screen story screens with their own glimpse mock-ups, shown
+// ONCE per install to a user who has not turned Bot Mode on. Eagerly imported it
+// put ~3 KB gz of first-run-only art on every cold load forever — the same
+// argument that made Files, the store and the attention picker lazy. The decision
+// to show it is a synchronous localStorage read, so the chunk is requested only
+// on the load that actually renders it.
+const BotModeIntro = React.lazy(() =>
+  import('./botmode-intro').then((m) => ({ default: m.BotModeIntro })),
+)
 
 // Where the user is in the migrated-v2 unboxing. `null` = the user has taken
 // over (started the tour, or dismissed) — see `step`.
@@ -129,9 +137,13 @@ export function OnboardingHost() {
   // and let it own the screen (it suppresses the v2 banner while up).
   if (showBotIntro && onOverview) {
     return (
-      <AnimatePresence>
-        <BotModeIntro key="botmode-intro" onClose={() => setShowBotIntro(false)} />
-      </AnimatePresence>
+      // `fallback={null}`: the intro is the first thing this user sees, and a
+      // spinner-then-story reads worse than the story arriving a frame later.
+      <React.Suspense fallback={null}>
+        <AnimatePresence>
+          <BotModeIntro key="botmode-intro" onClose={() => setShowBotIntro(false)} />
+        </AnimatePresence>
+      </React.Suspense>
     )
   }
 

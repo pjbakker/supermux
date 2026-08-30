@@ -158,9 +158,18 @@ describe('the chrome is persistent — it reports, it does not vanish', () => {
     expect(live).toContain('data-nav-reload="reload"')
   })
 
-  test('resync is wired at last, and disabled while nothing is live', () => {
-    expect(chrome()).toContain('data-chrome-resync')
+  test('the watching cell is the SHARE verb, and resync keeps its door', () => {
+    // That cell used to hold resync ("refresh the picture"). It now holds
+    // "Give a bot access to this tab" — the owner's own call: in the browser the
+    // thing you reach for beside a live page is handing it to a bot, and on a
+    // phone this is the ONLY way in (the lent-count chip is desktop-only).
+    // Resync did not die with the button: the socket verb is still wired, from
+    // the ⋯ page menu, and this asserts BOTH halves so neither can rot.
+    expect(chrome()).toContain('data-chrome-grant')
     expect(chrome({ live: false, canDrive: false })).toContain('disabled=""')
+    const workspace = readFileSync('src/components/browser/workspace.tsx', 'utf8')
+    expect(workspace).toContain("id: 'resync'")
+    expect(workspace).toContain('ctl.current?.resync()')
   })
 
   test('Watch/Drive keeps its radiogroup, and Drive waits for a live socket', () => {

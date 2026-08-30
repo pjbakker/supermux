@@ -68,6 +68,7 @@
 import * as React from 'react'
 
 import {
+  Aperture,
   ArrowLeft,
   ArrowRight,
   Copy,
@@ -450,6 +451,11 @@ export function BrowserWorkspace({
     { id: 'back', label: 'Back', icon: ArrowLeft, disabled: !nav.canGoBack },
     { id: 'forward', label: 'Forward', icon: ArrowRight, disabled: !nav.canGoForward },
     { id: 'reload', label: 'Reload', icon: RotateCw, disabled: !active },
+    // The PICTURE, not the page: it re-pulls a full frame when the relayed
+    // canvas has drifted, and never reloads anything. It held a toolbar cell
+    // until the "give a bot access" verb took that slot — the socket verb
+    // outlived the button, so this menu is the door it keeps.
+    { id: 'resync', label: 'Refresh the picture', icon: Aperture, disabled: !live },
     {
       id: 'find',
       label: 'Find in page',
@@ -520,6 +526,9 @@ export function BrowserWorkspace({
             () => (onReload ? onReload(active.id) : url && onNavigate?.(active.id, url)),
           )
         }
+        return
+      case 'resync':
+        ctl.current?.resync()
         return
       case 'find':
         openFind()
