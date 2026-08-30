@@ -20,9 +20,12 @@
  *     safe-area padding and a grabber, scrollable, ≥44px rows — nothing can clip
  *     off the right edge the way a fixed-width anchored menu did on a phone.
  *   • fine pointer (mouse) → the compact anchored menu the roster already uses for
- *     its overflow menu (`role=menu absolute z-30 rounded-xl border bg-popover
- *     shadow-lg`), now VIEWPORT-SAFE: width capped to `min(300px, 100vw−24px)` so
- *     it can never overflow the right edge. Keyboard nav lives here.
+ *     its overflow menu (`role=menu rounded-xl border bg-popover shadow-lg`),
+ *     PORTALLED to the grok shell root and placed `fixed` from the trigger's
+ *     measured rect, VIEWPORT-SAFE: width capped to `min(300px, 100vw−24px)` and
+ *     height to the space it has, so it can never overflow an edge — nor be
+ *     clipped by the `overflow:hidden` nav rail it docks in. Keyboard nav lives
+ *     here.
  *
  * The row markup is authored ONCE (`renderOptions`) and skinned per shell, so the
  * HQ cell, each company row, the "New company…" action and the footer hint are
@@ -31,13 +34,18 @@
  * Keyboard (desktop): ⌘/Ctrl+⇧+O opens (footer hint); ⌘/Ctrl+1..9 jump to the Nth
  * company; ↑/↓ move a roving highlight, Enter activates, Escape closes and returns
  * focus to the trigger (the combobox pattern).
+ *
+ * The desktop menu is PORTALLED and viewport-fixed (`menuAnchor` below) — see the
+ * WHY there: an `absolute` menu could never leave the nav rail it docks in.
  */
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 import { ChevronsUpDown, Plus, SlidersHorizontal, Trash2, UserPlus } from 'lucide-react'
 
 import { useCompanies } from '@/hooks/use-companies'
 import { useUI } from '@/stores/ui-store'
 import { companyForDigit } from '@/lib/companies'
+import { anchoredMenuStyle } from '@/lib/anchored-menu'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { CompanyMark, HqMark } from '@/components/roster/company-mark'
 import { CompanyPicker } from '@/components/roster/company-picker'
@@ -129,6 +137,12 @@ export function CompanySwitcher({
   // company, then the New-company action last). −1 = nothing highlighted yet.
   // Only used by the desktop menu; the touch sheet ignores it.
   const [cursor, setCursor] = React.useState(-1)
+  // The trigger's viewport rect + the node the menu portals into, both captured
+  // from the OPEN event (and re-captured on resize/scroll while open) — never
+  // read off the ref during render, which `react-hooks/refs` rightly forbids.
+  // They drive the desktop menu's FIXED placement; see the WHY on `menuStyle`.
+  const [anchor, setAnchor] = React.useState<DOMRect | null>(null)
+  const [portalHost, setPortalHost] = React.useState<HTMLElement | null>(null)
 
   const triggerRef = React.useRef<HTMLButtonElement>(null)
   const menuRef = React.useRef<HTMLDivElement>(null)
@@ -142,6 +156,17 @@ export function CompanySwitcher({
   // The flat option order the arrow keys walk: HQ, companies…, New company.
   const optionCount = 1 + companies.length + 1
   const newCompanyIndex = optionCount - 1
+
+  // Measure the trigger and pick the portal host in one go. The host is the grok
+  // SHELL ROOT, not `<body>`: the menu's own `.gr-cmenu` rules (and everything
+  // else it inherits) are `[data-grok]`-scoped, so portalling past that marker
+  // would strip the skin off the menu.
+  const measureFrom = React.useCallback((el: HTMLElement | null) => {
+    setAnchor(el ? el.getBoundingClientRect() : null)
+    setPortalHost(
+      el ? ((el.closest('[data-grok-root]') as HTMLElement | null) ?? document.body) : null,
+    )
+  }, [])
 
   const select = React.useCallback(
     (id: number | null) => {
@@ -174,6 +199,8 @@ export function CompanySwitcher({
       // Open — ⌘/Ctrl+Shift+O (KeyO is layout-stable).
       if (e.shiftKey && (e.code === 'KeyO' || e.key.toLowerCase() === 'o')) {
         e.preventDefault()
+        // The keyboard opens the menu too, so it must anchor it as well.
+        measureFrom(triggerRef.current)
         setOpen((v) => !v)
         return
       }
@@ -198,7 +225,7 @@ export function CompanySwitcher({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [companies, setActiveCompany, shortcuts])
+  }, [companies, measureFrom, setActiveCompany, shortcuts])
 
   // Seat the highlight on the active row whenever the list opens (both shells).
   // Done on the open TRANSITION during render (the "adjust state when a prop
@@ -212,6 +239,20 @@ export function CompanySwitcher({
       setCursor(active ? companies.findIndex((c) => c.id === active.id) + 1 : 0)
     }
   }
+
+  // Keep the fixed menu glued to its trigger while it is open — the window can
+  // resize and an ancestor can scroll under it. Only listeners here (no setState
+  // in the effect body), so the measurement stays a real event response.
+  React.useEffect(() => {
+    if (!open || isMobile) return
+    const remeasure = () => measureFrom(triggerRef.current)
+    window.addEventListener('resize', remeasure)
+    window.addEventListener('scroll', remeasure, true)
+    return () => {
+      window.removeEventListener('resize', remeasure)
+      window.removeEventListener('scroll', remeasure, true)
+    }
+  }, [open, isMobile, measureFrom])
 
   // ── Desktop only: dismiss on outside-click, focus the menu on open ───────────
   // The touch sheet is a Vaul modal — it owns its own backdrop-tap / drag-away
@@ -402,6 +443,63 @@ export function CompanySwitcher({
     )
   }
 
+  // ── Desktop placement: PORTALLED, and FIXED to the trigger's viewport rect ──
+  // WHY (owner bug, shipped in v0.6.0 when the scope circle moved into the nav):
+  // the desktop rail this circle docks in is `overflow: hidden` at ≥768px — the
+  // floating window's rounded left corners, `[data-grok] [data-shell-rail]` in
+  // grok-mode.css — AND it carries `z-index: 1`, the SAME layer as the content
+  // column, which is later in the DOM. So the old `absolute … left-full z-30`
+  // menu was doubly doomed: clipped away by the 64px rail box, and painted under
+  // the roster even where it survived. It opened correctly (aria-expanded
+  // flipped, all rows rendered, hit-testing landed on a roster row) but nothing
+  // was ever visible — the desktop company switcher read as dead. An anchored
+  // menu can only escape a clipping, same-layer ancestor by leaving it, so it
+  // portals to the grok shell root (which keeps the `[data-grok]` style scoping
+  // the menu's own `.gr-cmenu` rules need) and is placed from the measured rect.
+  //
+  // Width keeps the old collision-safe cap `min(300px, 100vw−24px)`; the added
+  // max-height keeps a long company list inside the viewport instead of running
+  // off the top edge, since the circle's menu opens UPWARD. The math itself is
+  // pure and pinned in `lib/anchored-menu.ts`.
+  const menuStyle = React.useMemo<React.CSSProperties | null>(() => {
+    const box = anchoredMenuStyle(
+      anchor,
+      { width: window.innerWidth, height: window.innerHeight },
+      // The circle docks at the rail's bottom-left, so it opens up-and-right;
+      // the chip keeps the classic drop under itself.
+      { side: variant === 'circle' ? 'side' : 'below', gap: variant === 'circle' ? 8 : 6 },
+    )
+    if (!box) return null
+    return {
+      ...box,
+      overflowY: 'auto',
+      // The pop grows from the corner it hinges on (the `.gr-cmenu` default is
+      // `top left`, which is the chip's hinge, not the upward circle's).
+      transformOrigin: variant === 'circle' ? 'bottom left' : 'top left',
+    }
+  }, [anchor, variant])
+
+  const desktopMenu =
+    open && !isMobile && menuStyle ? (
+      <div
+        ref={menuRef}
+        id={menuId}
+        role="menu"
+        tabIndex={-1}
+        aria-label="Companies"
+        onKeyDown={onMenuKey}
+        style={menuStyle}
+        className="gr-cmenu fixed z-[70] flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none"
+      >
+        {renderOptions('menu')}
+
+        {/* footer — the open shortcut hint */}
+        <div className="mt-0.5 px-3 pb-0.5 pt-1">
+          <OpenHint />
+        </div>
+      </div>
+    ) : null
+
   return (
     <>
       <div className="relative">
@@ -416,7 +514,10 @@ export function CompanySwitcher({
             aria-controls={menuId}
             aria-label={`Company scope: ${label}`}
             title={`Scope — ${label}`}
-            onClick={() => setOpen((v) => !v)}
+            onClick={(e) => {
+              measureFrom(e.currentTarget)
+              setOpen((v) => !v)
+            }}
           >
             {active ? (
               <CompanyMark
@@ -440,7 +541,10 @@ export function CompanySwitcher({
             aria-expanded={open}
             aria-controls={menuId}
             aria-label="Company scope"
-            onClick={() => setOpen((v) => !v)}
+            onClick={(e) => {
+              measureFrom(e.currentTarget)
+              setOpen((v) => !v)
+            }}
           >
             {active ? (
               <CompanyMark
@@ -458,37 +562,12 @@ export function CompanySwitcher({
           </button>
         )}
 
-        {/* DESKTOP (fine pointer): the compact anchored menu, viewport-safe. The
-            `circle` trigger docks at the rail's BOTTOM-LEFT, so its menu opens
-            UP-and-RIGHT (bottom-aligned, to the side) instead of downward off the
-            screen edge; the chip keeps the under-the-trigger drop. */}
-        {open && !isMobile && (
-          <div
-            ref={menuRef}
-            id={menuId}
-            role="menu"
-            tabIndex={-1}
-            aria-label="Companies"
-            onKeyDown={onMenuKey}
-            // `left-0` anchors it under the (leftmost) trigger; the inline width
-            // cap `min(300px, 100vw−24px)` guarantees it can never spill past the
-            // right viewport edge on any width — the collision-safe replacement
-            // for the old fixed `w-[300px]`.
-            style={{ width: 'min(300px, calc(100vw - 24px))' }}
-            className={
-              variant === 'circle'
-                ? 'gr-cmenu absolute bottom-0 left-full z-30 ml-2 flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none'
-                : 'gr-cmenu absolute left-0 top-full z-30 mt-1.5 flex flex-col gap-0.5 rounded-xl border border-border bg-popover p-1.5 shadow-lg outline-none'
-            }
-          >
-            {renderOptions('menu')}
-
-            {/* footer — the open shortcut hint */}
-            <div className="mt-0.5 px-3 pb-0.5 pt-1">
-              <OpenHint />
-            </div>
-          </div>
-        )}
+        {/* DESKTOP (fine pointer): the compact anchored menu, PORTALLED out of the
+            nav and viewport-FIXED. The `circle` trigger docks at the rail's
+            BOTTOM-LEFT, so its menu opens UP-and-RIGHT (bottom-aligned, to the
+            side) instead of downward off the screen edge; the chip keeps the
+            under-the-trigger drop. */}
+        {desktopMenu && portalHost && createPortal(desktopMenu, portalHost)}
       </div>
 
       {/* MOBILE (coarse pointer): the SAME `<ResponsiveSheet>` bottom sheet the
