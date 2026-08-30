@@ -826,6 +826,23 @@ pub(crate) fn is_retired_provider(provider: &str) -> bool {
 /// be `-` — the session name flows through to argv for the provider CLI
 /// (`claude --session-id <name>` etc.), and a leading dash would be parsed as
 /// an option flag (CLI-flag injection).
+/// Is `prefix` usable as a spawn-guard key (`CreateInput.unless_live_prefix`)?
+///
+/// Same length cap and charset as [`valid_name`], because that is what the
+/// prefix is matched against: `live_with_prefix` runs a `LIKE 'prefix%'` over
+/// session NAMES, so a string that could never prefix a valid name can never
+/// match anything.
+///
+/// Enforced for MEMORY, not only for hygiene. `AppState::spawn_guards` is keyed
+/// by this string, is never swept, and `spawn_guard_for` inserts before the
+/// create's own `exists` / 409 checks — so an unvalidated prefix let an authed
+/// client grow the map without bound with creates that all failed. Deliberately
+/// looser than `valid_name` in one way: a leading `-` and the bare `.` / `..` are
+/// fine here, because a prefix is never used as a path segment or a CLI argument.
+pub(crate) fn valid_guard_prefix(prefix: &str) -> bool {
+    !prefix.is_empty() && prefix.len() <= 100 && NAME_RE.is_match(prefix)
+}
+
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 100
@@ -1328,6 +1345,23 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         .unless_live_prefix
         .as_deref()
         .filter(|p| !p.is_empty());
+    // The prefix is the ONE `CreateInput` string that reached `spawn_guard_for`
+    // unvalidated, and that map is keyed by it, never swept, and written BEFORE
+    // the `exists` / 409 checks below — so even a rejected create left a
+    // permanent entry. An authed client looping creates with a fresh 100 KB
+    // prefix each time therefore grew server memory without bound. It is matched
+    // against session NAMES (`live_with_prefix` does a `LIKE 'prefix%'`), so a
+    // string that could never prefix a valid name is meaningless anyway: hold it
+    // to the same length cap and charset as `valid_name`, and reject before the
+    // entry is created. Bounded key space, and a typo'd prefix now fails loudly
+    // instead of silently matching nothing.
+    if let Some(prefix) = guard_prefix {
+        if !valid_guard_prefix(prefix) {
+            return Err(AppError::BadRequest(
+                "invalid unless_live_prefix (max 100 chars, charset [A-Za-z0-9_.-])".into(),
+            ));
+        }
+    }
     let guard_lock = guard_prefix.map(|prefix| state.spawn_guard_for(prefix));
     // `held` is the critical section; it lives until the explicit `drop` below.
     let held = match guard_lock.as_ref() {
@@ -2885,6 +2919,23 @@ mod tests {
         }
         for no in ["0", "false", "no", "off", "  "] {
             assert!(!is_truthy_flag(no), "{no:?} should read as off");
+        }
+    }
+
+    #[test]
+    fn guard_prefix_is_bounded_and_charset_checked() {
+        // Real prefixes an operator dispatches with.
+        for ok in &["router-", "acme.bot", "team_01", "a", "-lead", "..", "A1.b2-c3"] {
+            assert!(valid_guard_prefix(ok), "{ok:?} should validate");
+        }
+        assert!(valid_guard_prefix(&"n".repeat(100)), "exactly at the cap is fine");
+        // The unbounded-key-space bug: a long or exotic prefix must never reach
+        // `spawn_guard_for`, which inserts a permanent map entry keyed by it.
+        assert!(!valid_guard_prefix(&"n".repeat(101)));
+        assert!(!valid_guard_prefix(&"x".repeat(100_000)));
+        assert!(!valid_guard_prefix(""));
+        for bad in &["has space", "semi;colon", "back`tick", "dollar$", "sl/ash", "quo\"te"] {
+            assert!(!valid_guard_prefix(bad), "{bad:?} should be rejected");
         }
     }
 
