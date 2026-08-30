@@ -147,6 +147,21 @@ pub struct TabPatch {
     pub login_state: Option<String>,
     pub probed_now: bool,
     pub touch_used: bool,
+    // ── keep-signed-in (the `keepalive_*` columns migration 0039 reserved) ──
+    /// The HUMAN's toggle. The only keepalive field a request body may set.
+    pub keepalive_enabled: Option<bool>,
+    /// Minutes between checks. **Server-derived only** — the sweep writes what
+    /// it learned from the cookie jar; no request body reaches this.
+    pub keepalive_every: Option<i64>,
+    /// `soft` (fetch-ping) | `watch` (read the jar, ping nothing). The MODE, not
+    /// a verb: `reload` is not implemented anywhere in this feature.
+    pub keepalive_action: Option<String>,
+    /// Stamp `last_keepalive_at = now` — a completed tick.
+    pub keepalive_stamp_now: bool,
+    /// Stamp `last_keepalive_at = NULL` — "never checked", which `due_at` reads
+    /// as **due now**. This is how enabling schedules its first tick inside 60 s
+    /// with no extra state.
+    pub keepalive_clear_stamp: bool,
 }
 
 /// Apply a [`TabPatch`]. Unknown tab ⇒ `Ok(false)`.
@@ -204,7 +219,53 @@ pub async fn update(pool: &SqlitePool, tab_id: &str, patch: &TabPatch) -> sqlx::
             .execute(pool)
             .await?;
     }
+    if let Some(k) = patch.keepalive_enabled {
+        sqlx::query("UPDATE browser_tabs SET keepalive_enabled = ? WHERE id = ?")
+            .bind(if k { 1 } else { 0 })
+            .bind(tab_id)
+            .execute(pool)
+            .await?;
+    }
+    if let Some(e) = patch.keepalive_every {
+        sqlx::query("UPDATE browser_tabs SET keepalive_every = ? WHERE id = ?")
+            .bind(e)
+            .bind(tab_id)
+            .execute(pool)
+            .await?;
+    }
+    if let Some(a) = &patch.keepalive_action {
+        sqlx::query("UPDATE browser_tabs SET keepalive_action = ? WHERE id = ?")
+            .bind(a)
+            .bind(tab_id)
+            .execute(pool)
+            .await?;
+    }
+    // Order matters only if a caller sets both; it never does — `clear` is the
+    // enable path and `stamp` is the sweep's. Clear runs last so a caller that
+    // asked for "never checked" gets it.
+    if patch.keepalive_stamp_now {
+        sqlx::query("UPDATE browser_tabs SET last_keepalive_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(tab_id)
+            .execute(pool)
+            .await?;
+    }
+    if patch.keepalive_clear_stamp {
+        sqlx::query("UPDATE browser_tabs SET last_keepalive_at = NULL WHERE id = ?")
+            .bind(tab_id)
+            .execute(pool)
+            .await?;
+    }
     Ok(true)
+}
+
+/// **The keep-signed-in sweep's only read**: every tab whose human toggled the
+/// setting on. Ordered by id so a tick is deterministic (the wake budget is
+/// spent on the same tabs first every time, rather than on whoever sorts lucky).
+pub async fn list_keepalive(pool: &SqlitePool) -> sqlx::Result<Vec<TabRow>> {
+    sqlx::query_as::<_, TabRow>("SELECT * FROM browser_tabs WHERE keepalive_enabled = 1 ORDER BY id")
+        .fetch_all(pool)
+        .await
 }
 
 /// Delete a tab row. Its grants cascade. **Does not clear its cookies** — they
@@ -384,6 +445,133 @@ pub fn host_allowed(rules: &[String], host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real migrated pool on a temp data dir — the same idiom
+    /// `db::connectors`'s tests use, so the keepalive columns are asserted
+    /// against migration 0039 itself rather than a hand-built table.
+    async fn test_pool() -> (SqlitePool, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("supermux-tabs-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::config::Config {
+            data_dir: dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            extra_binds: vec![],
+            tls: Default::default(),
+            auth_token: "test-token".to_string(),
+            provider_defaults: Default::default(),
+            ws: Default::default(),
+            remote_callback_url: None,
+            push_sub: None,
+            github_token: None,
+            statusline_tap: false,
+            isolation_mode: crate::isolation::IsolationMode::BestEffort,
+            human_auth: Default::default(),
+            extra_origins: Vec::new(),
+        };
+        let pool = crate::db::init(&config).await.expect("init pool");
+        (pool, dir)
+    }
+
+    #[tokio::test]
+    async fn the_keepalive_patch_fields_round_trip_and_none_leaves_the_column_alone() {
+        let (pool, dir) = test_pool().await;
+        let id = new_tab_id();
+        create(&pool, &id, "https://example.com/", None, &[])
+            .await
+            .unwrap();
+
+        // Migration defaults, unread by anything until this feature.
+        let row = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(row.keepalive_enabled, 0);
+        assert_eq!(row.keepalive_action, "reload");
+        assert_eq!(row.last_keepalive_at, None);
+
+        // The enable path: on, soft, blind interval, "never checked".
+        update(
+            &pool,
+            &id,
+            &TabPatch {
+                keepalive_enabled: Some(true),
+                keepalive_every: Some(15),
+                keepalive_action: Some("soft".into()),
+                keepalive_clear_stamp: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(row.keepalive_enabled, 1);
+        assert_eq!(row.keepalive_every, 15);
+        assert_eq!(row.keepalive_action, "soft");
+        assert_eq!(row.last_keepalive_at, None);
+
+        // A sweep stamp: the tick completed.
+        update(
+            &pool,
+            &id,
+            &TabPatch {
+                keepalive_every: Some(45),
+                keepalive_stamp_now: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = get(&pool, &id).await.unwrap().unwrap();
+        assert!(row.last_keepalive_at.is_some());
+        assert_eq!(row.keepalive_every, 45);
+        // `None` / `false` left everything else exactly as it was.
+        assert_eq!(row.keepalive_enabled, 1);
+        assert_eq!(row.keepalive_action, "soft");
+
+        // Disable keeps the learned cadence — turning it back on shows it again.
+        update(
+            &pool,
+            &id,
+            &TabPatch {
+                keepalive_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(row.keepalive_enabled, 0);
+        assert_eq!(row.keepalive_every, 45);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_keepalive_returns_only_the_enabled_rows() {
+        let (pool, dir) = test_pool().await;
+        let on = new_tab_id();
+        let off = new_tab_id();
+        create(&pool, &on, "https://on.example/", None, &[])
+            .await
+            .unwrap();
+        create(&pool, &off, "https://off.example/", None, &[])
+            .await
+            .unwrap();
+        assert!(list_keepalive(&pool).await.unwrap().is_empty());
+
+        update(
+            &pool,
+            &on,
+            &TabPatch {
+                keepalive_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let rows = list_keepalive(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, on);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tab_ids_are_shape_checked_before_they_are_used_as_keys() {

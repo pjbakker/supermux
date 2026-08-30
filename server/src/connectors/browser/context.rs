@@ -1122,6 +1122,27 @@ impl AgentContext {
             .unwrap_or(Value::Null))
     }
 
+    /// **The cookies the browser would send to THIS page**, straight from the
+    /// jar — httpOnly auth cookies included, which `document.cookie` can never
+    /// see (measured: a test jar's httpOnly `sid` is invisible to it while a
+    /// 5-minute `shortcsrf` is not).
+    ///
+    /// No `urls` argument on purpose: CDP defaults to the page's own frame
+    /// URLs, so a `browser_tabs.url` row that has drifted from where the page
+    /// actually is cannot mis-target the read.
+    ///
+    /// Needs **no `Network.enable`** — measured on the pinned Chrome 149, the
+    /// flat page session answers with the Network domain disabled. Read-only,
+    /// and ungated for exactly the reason [`Self::evaluate`] is.
+    pub async fn cookies(&self) -> Result<Vec<Value>> {
+        let out = self.session_call("Network.getCookies", json!({})).await?;
+        Ok(out
+            .get("cookies")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Convenience: `document.location.href`.
     pub async fn current_url(&self) -> Result<String> {
         Ok(self
