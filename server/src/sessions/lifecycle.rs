@@ -4719,6 +4719,7 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
             config_dir: "/home/agent/.claude-second".into(),
         };
 
@@ -4798,6 +4799,7 @@ mod build_env_tests {
             memory: String::new(),
             skills: "[]".into(),
             role_id: None,
+            archive_on_stop: 0,
             config_dir: "/home/agent/.claude-second".into(),
         };
         // `shell` is deliberately absent: `start` settles a shell session

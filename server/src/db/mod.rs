@@ -214,6 +214,7 @@ mod tests {
             company_id: None,
             runtime: "native".into(),
             model: String::new(),
+            archive_on_stop: false,
             config_dir: "/home/agent/.claude-second".into(),
         };
         sessions::create(&pool, &new).await.unwrap();

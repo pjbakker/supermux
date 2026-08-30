@@ -58,6 +58,7 @@ async fn setup() -> (AppState, axum::Router, std::path::PathBuf) {
         statusline_tap: false,
         isolation_mode: supermux_server::isolation::IsolationMode::BestEffort,
         human_auth: Default::default(),
+        swarm_reaper: Default::default(),
     };
     let pool = db::init(&config).await.expect("db init");
     let state = AppState::new(pool, config);
@@ -86,6 +87,7 @@ async fn insert_session(state: &AppState, name: &str) {
         runtime: "tmux".into(),
         model: String::new(),
         archive_on_stop: false,
+        config_dir: String::new(),
     };
     db::sessions::create(&state.pool, &new).await.unwrap();
 }

@@ -48,6 +48,7 @@ async fn setup() -> (AppState, axum::Router, PathBuf) {
         github_token: None,
         isolation_mode: Default::default(),
         human_auth: Default::default(),
+        swarm_reaper: Default::default(),
     };
     let pool = db::init(&config).await.expect("db init");
     let state = AppState::new(pool, config);
