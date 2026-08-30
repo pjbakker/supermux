@@ -6,7 +6,7 @@
 //!
 //! Three contracts are pinned here:
 //!   * no prompt -> byte-identical to the old create (201, no start attempted),
-//!   * a start failure propagates (5xx) and LEAVES the session row behind, so
+//!   * a start failure propagates and LEAVES the session row behind, so
 //!     the caller can inspect and retry instead of losing the record,
 //!   * the `unless_live_prefix` guard fires before any start, so a 409 means
 //!     nothing was created and the prompt was never delivered.
@@ -24,7 +24,9 @@
 //! right after the INSERT), so the presence of that row proves nothing, and a
 //! start that dies inside `spawn` never reaches the `last_status = "starting"`
 //! write. The status code is the signal instead: with a missing dir, 201 means
-//! no start ran and 5xx means one did.
+//! no start ran and any error status means one did. `start` now checks the dir
+//! up front and reports a missing one as a 400, so these assert on "the boot
+//! failed" rather than pinning a specific error class.
 
 use supermux_server::config::{Config, ProviderDefaults, TlsConfig};
 use supermux_server::state::AppState;
@@ -128,7 +130,8 @@ async fn create_without_prompt_unchanged() {
 }
 
 /// The control for the two start tests below: same unspawnable dir, no prompt.
-/// A 201 here is what makes their 5xx mean "a start ran", not "the dir is bad".
+/// A 201 here is what makes their failure mean "a start ran", not "the dir is
+/// bad".
 #[tokio::test]
 async fn absent_prompt_does_not_start() {
     let (_state, app, _dir) = setup().await;
@@ -173,9 +176,13 @@ async fn prompt_starts_the_session() {
     // The start is real, so it fails on the missing cwd and the error
     // propagates. Paired with `absent_prompt_does_not_start` (same dir, 201)
     // this is proof that the prompt is what triggered a boot.
+    //
+    // The missing directory is now named explicitly by `start` as a 400 rather
+    // than surfacing as an opaque 5xx spawn failure, so this asserts on the
+    // failure itself, not on its status class.
     assert!(
-        status.is_server_error(),
-        "a start against a missing dir must surface as 5xx, got {status}"
+        status.is_client_error() || status.is_server_error(),
+        "a start against a missing dir must fail, got {status}"
     );
 }
 
@@ -193,8 +200,8 @@ async fn prompt_start_failure_keeps_session_row() {
     )
     .await;
     assert!(
-        status.is_server_error(),
-        "the failed start must surface as 5xx (never 4xx, and never a silent 201): {status}"
+        !status.is_success(),
+        "the failed start must surface as an error, never a silent 201: {status}"
     );
     assert!(
         db::sessions::exists(&state.pool, "Operator--f--reply-1")
@@ -228,7 +235,7 @@ async fn failed_boot_archives_a_disposable_spawn() {
         }),
     )
     .await;
-    assert!(status.is_server_error(), "the boot must have failed: {status}");
+    assert!(!status.is_success(), "the boot must have failed: {status}");
     assert_eq!(
         db::sessions::is_archived(&state.pool, "Operator--a--reply-1")
             .await
@@ -257,7 +264,7 @@ async fn failed_boot_archives_a_disposable_spawn() {
         }),
     )
     .await;
-    assert!(status.is_server_error(), "the boot must have failed: {status}");
+    assert!(!status.is_success(), "the boot must have failed: {status}");
     assert_eq!(
         db::sessions::is_archived(&state.pool, "Operator--b--reply-1")
             .await
@@ -287,7 +294,7 @@ async fn failed_boot_frees_its_prefix_for_a_retry() {
         }),
     )
     .await;
-    assert!(status.is_server_error(), "the boot must have failed: {status}");
+    assert!(!status.is_success(), "the boot must have failed: {status}");
 
     // 7200s = the default quiet window, so this also covers the freshness arm
     // that a just-created row would otherwise sit inside.
@@ -300,7 +307,7 @@ async fn failed_boot_frees_its_prefix_for_a_retry() {
     );
 
     // And the guard agrees: the retry gets past it (it then fails its own boot
-    // on the same missing dir, which is a 5xx, not the guard's 409).
+    // on the same missing dir, which is its own error, not the guard's 409).
     let (retry, body) = post_sessions(
         &app,
         json!({
