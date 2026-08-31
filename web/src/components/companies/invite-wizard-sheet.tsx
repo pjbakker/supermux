@@ -43,6 +43,7 @@ import {
   useAgentInbox,
   useCfToken,
   useCompanyHost,
+  useTightenDns,
   useCompanyHumans,
   useDeleteAgentInbox,
   useExternalStatus,
@@ -68,6 +69,13 @@ import {
   type StepMeta,
 } from '@/components/companies/wizard-primitives'
 import type { ExternalStatus, QuickTunnelStatus } from '@/lib/api'
+import {
+  dnsPlanLine,
+  labelOf,
+  previewHost,
+  subdomainError,
+  suggestLabel,
+} from '@/lib/company-subdomain'
 import { quickTunnelView } from '@/lib/quick-tunnel'
 
 /** The minimal company identity the wizard needs. */
@@ -381,6 +389,14 @@ function DomainStep({
   const qt = status?.box_status.quick_tunnel ?? null
   const cfValid = status?.box_status.cf_token === 'valid'
   const baseDomain = status?.box_status.base_domain ?? null
+  // Whether THIS company's address is written yet — Entry B (a new company on an
+  // already-configured box) reaches the connected card with none, and must get a
+  // chance to name it rather than silently inheriting the slug.
+  const hostWritten = status?.company?.company_host_written ?? false
+  // A box provisioned by an older build still holds `*.<base>`; surface it here
+  // (never act on it implicitly) so the owner can narrow their zone in one tap.
+  const wildcardDns = status?.box_status.wildcard_dns ?? false
+  const dnsRecords = status?.box_status.dns_records ?? []
   const tunnel = status?.box_status.tunnel ?? 'none'
   const done = tunnel === 'healthy'
   const startTunnel = () => startQuick.mutate(undefined, { onSuccess: () => refetch() })
@@ -423,11 +439,39 @@ function DomainStep({
 
   if (done) {
     return (
+      <div className="flex flex-col gap-4">
+        {wildcardDns && baseDomain && (
+          <WildcardNotice
+            zone={baseDomain}
+            records={dnsRecords}
+            companyId={company.id}
+            refetch={refetch}
+          />
+        )}
       <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
-        <StatusChip state="done" label={`Connected · reachable at ${host}`} />
+        <StatusChip
+          state={hostWritten ? 'done' : 'idle'}
+          label={hostWritten ? `Connected · reachable at ${host}` : 'Connected · name this company'}
+        />
         <p className="text-sm text-muted-foreground">
-          Your box has a public web address. Continue to set up Google login.
+          {hostWritten
+            ? 'Your box has a public web address. Continue to set up Google login.'
+            : 'Your box has a public web address. Choose the name this company answers on.'}
         </p>
+        {baseDomain && (
+          <AddressEditor
+            // Keyed on the address it is editing: when status catches up with a
+            // save (or a base-domain change), the card re-reads the REAL current
+            // label instead of holding the one it mounted with.
+            key={`${baseDomain}:${host}`}
+            company={company}
+            zone={baseDomain}
+            currentHost={host}
+            written={hostWritten}
+            refetch={refetch}
+          />
+        )}
+      </div>
       </div>
     )
   }
@@ -520,8 +564,24 @@ function DomainStep({
         Your colleagues will reach this supermux at{' '}
         <span className="font-mono text-foreground">{host}</span>.
       </p>
+      {wildcardDns && (
+        <WildcardNotice
+          zone={baseDomain}
+          records={dnsRecords}
+          companyId={company.id}
+          refetch={refetch}
+        />
+      )}
       <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
         <StatusChip state="done" label={`Domain set · ${baseDomain}`} />
+        <AddressEditor
+          key={`${baseDomain}:${host}`}
+          company={company}
+          zone={baseDomain}
+          currentHost={host}
+          written={hostWritten}
+          refetch={refetch}
+        />
 
         {tunnel === 'connecting' || provision.isPending ? (
           <div className="flex flex-col gap-2">
@@ -536,8 +596,15 @@ function DomainStep({
         ) : (
           <div className="flex flex-col gap-2">
             <p className="text-sm text-muted-foreground">
-              One click sets up a wildcard tunnel + DNS and starts the connector — no terminal
-              commands.
+              One click creates the tunnel, starts the connector, and adds{' '}
+              {host ? (
+                <>
+                  one DNS record — <span className="font-mono text-foreground">{host}</span>
+                </>
+              ) : (
+                'one DNS record per company address'
+              )}
+              . Nothing else on <span className="font-mono">{baseDomain}</span> changes.
             </p>
             {provision.isError && <p className="text-sm text-destructive">{errText(provision.error)}</p>}
             <Button
@@ -781,6 +848,211 @@ function QuickTunnelPanel({
   )
 }
 
+// ── A legacy wildcard, and the one-click way out of it ────────────────────────
+
+/** Boxes set up by an older supermux wrote a `*.<domain>` DNS record: every
+ *  undefined name on the operator's own domain resolved here. That is far more of
+ *  someone's zone than this needs, so new boxes get one record per company — but
+ *  an existing wildcard is NEVER deleted behind the owner's back. It is named,
+ *  explained, and replaced only when they press the button. */
+function WildcardNotice({
+  zone,
+  records,
+  companyId,
+  refetch,
+}: {
+  zone: string
+  records: string[]
+  companyId: number
+  refetch: () => void
+}) {
+  const tighten = useTightenDns(companyId)
+  return (
+    <div className="cs-card flex flex-col gap-2 rounded-xl border border-border p-4">
+      <StatusChip state="idle" label="Wildcard DNS record" />
+      <p className="text-[12.5px] leading-snug text-muted-foreground">
+        An older setup added <span className="font-mono text-foreground">*.{zone}</span> to your
+        Cloudflare zone, so every name under <span className="font-mono">{zone}</span> points at
+        this box. supermux only needs{' '}
+        {records.length > 0 ? (
+          <span className="font-mono text-foreground">{records.join(', ')}</span>
+        ) : (
+          'the addresses your companies actually use'
+        )}
+        .
+      </p>
+      {tighten.isError && <p className="text-sm text-destructive">{errText(tighten.error)}</p>}
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="self-start"
+        disabled={tighten.isPending}
+        onClick={() => tighten.mutate(undefined, { onSuccess: () => refetch() })}
+      >
+        {tighten.isPending ? 'Tightening…' : 'Replace it with one record per company'}
+      </Button>
+      <p className="text-[12px] leading-snug text-muted-foreground">
+        Adds the per-company records first, then removes the wildcard — and only if it still points
+        at this box.
+      </p>
+    </div>
+  )
+}
+
+// ── The company's address (the editable subdomain) ────────────────────────────
+
+/** `<label>.<zone>` as ONE control: a text field for the part the owner owns and
+ *  the zone pinned beside it, so the address reads the way it will be typed into
+ *  a browser. Mobile-first — 44px target, the input flexes, the zone never wraps
+ *  off-screen — and the preview/validation line below says the same thing the
+ *  server would (`subdomainError` mirrors its `is_dns_label`). */
+function SubdomainField({
+  id,
+  value,
+  onChange,
+  zone,
+  error,
+}: {
+  id: string
+  value: string
+  onChange: (v: string) => void
+  zone: string
+  error: string | null
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label htmlFor={id} className="text-[12px] text-muted-foreground">
+        The address your teammates will use
+      </label>
+      {/* The field and the zone sit SIDE BY SIDE rather than the field living
+          inside a bordered shell: one box, one focus ring. The zone shrinks (and
+          truncates) before the input does, so a long domain never pushes the
+          typing area off a 390px screen. */}
+      <div className="flex items-center gap-2">
+        <Input
+          id={id}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="team"
+          autoComplete="off"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          inputMode="url"
+          aria-invalid={error ? true : undefined}
+          aria-describedby={`${id}-note`}
+          className="h-11 min-w-0 flex-1 font-mono"
+        />
+        <span className="min-w-0 shrink truncate font-mono text-[12.5px] text-muted-foreground">
+          .{zone}
+        </span>
+      </div>
+      <p
+        id={`${id}-note`}
+        className={error ? 'text-[12px] text-destructive' : 'text-[12px] text-muted-foreground'}
+      >
+        {error ?? (
+          <>
+            Preview: <span className="font-mono text-foreground">{previewHost(value, zone)}</span>
+          </>
+        )}
+      </p>
+      {/* Say exactly what lands on their zone BEFORE they commit — one record,
+          named. supermux never writes a wildcard. */}
+      {!error && (
+        <p className="text-[12px] leading-snug text-muted-foreground">
+          {dnsPlanLine(value, zone)} — nothing else on{' '}
+          <span className="font-mono">{zone}</span> is touched.
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** Change (or first set) the label in front of the base domain, once the domain
+ *  itself is settled. Renaming is honest about its cost: the old address stops
+ *  working and Google needs the new redirect URI, so the card SAYS so before the
+ *  owner commits. Opens by default when this company has no address written yet
+ *  (Entry B — a new company on an already-configured box). */
+function AddressEditor({
+  company,
+  zone,
+  currentHost,
+  written,
+  refetch,
+}: {
+  company: WizardCompany
+  zone: string
+  currentHost: string
+  written: boolean
+  refetch: () => void
+}) {
+  const host = useCompanyHost(company.id)
+  const currentLabel = labelOf(currentHost, zone)
+  const [open, setOpen] = React.useState(!written)
+  const [label, setLabel] = React.useState(() => currentLabel || suggestLabel(company.slug))
+
+  if (!open) {
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="self-start"
+        onClick={() => {
+          setLabel(currentLabel || suggestLabel(company.slug))
+          setOpen(true)
+        }}
+      >
+        Change the address
+      </Button>
+    )
+  }
+
+  const error = subdomainError(label)
+  const next = label.trim().toLowerCase()
+  const moving = written && currentLabel !== '' && next !== currentLabel && !error
+
+  return (
+    <div className="flex flex-col gap-3">
+      <SubdomainField id="company-subdomain" value={label} onChange={setLabel} zone={zone} error={error} />
+      {moving && (
+        <p className="text-[12px] leading-snug text-muted-foreground">
+          <span className="font-mono text-foreground">{currentHost}</span> stops working when you
+          save — its DNS record is removed and the new one added — and Google needs the new
+          redirect URI before anyone can sign in.
+        </p>
+      )}
+      {host.isError && <p className="text-sm text-destructive">{errText(host.error)}</p>}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          disabled={!!error || host.isPending}
+          onClick={async () => {
+            try {
+              await host.mutateAsync(next)
+              setOpen(false)
+              refetch()
+            } catch {
+              /* surfaced by host.isError above */
+            }
+          }}
+          style={{ background: 'var(--sm-accent-fill)', color: 'var(--gr-onaccent)' }}
+        >
+          {host.isPending ? 'Saving…' : written ? 'Save the address' : 'Set the address'}
+        </Button>
+        {written && (
+          <Button type="button" variant="ghost" size="sm" onClick={() => setOpen(false)}>
+            Cancel
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Step 1b — Choose your domain (CF zone auto-discovery) ─────────────────────
 
 /** After the CF token verifies, the operator picks WHICH of the domains that token
@@ -791,17 +1063,32 @@ function QuickTunnelPanel({
 function ChooseDomainStep({ company, refetch }: { company: WizardCompany; refetch: () => void }) {
   const { zones, isLoading, isError, error, refetch: refetchZones } = useZones({ enabled: true })
   const setBase = useSetBaseDomain(company.id)
+  const host = useCompanyHost(company.id)
 
   const [selected, setSelected] = React.useState<string | null>(null)
+  // The label in front of the zone. SUGGESTED from the company slug — which is
+  // what the owner sees first — but theirs to change: "Enverder" does not have to
+  // live at `enverder.<zone>`.
+  const [label, setLabel] = React.useState(() => suggestLabel(company.slug))
   // Auto-select the sole zone so the common case is one confirm, not a choice.
   // Derived, not synced through an effect: while nothing is explicitly picked,
   // `chosen` already falls back to the first zone.
   const chosen = selected ?? (zones.length >= 1 ? zones[0] : null)
-  const preview = chosen ? `${company.slug}.${chosen}` : `${company.slug}.<your-domain>`
+  const labelError = subdomainError(label)
 
-  const confirm = () => {
-    if (!chosen) return
-    setBase.mutate(chosen, { onSuccess: () => refetch() })
+  // Two writes, in order: the base domain (which un-gates everything) and then
+  // THIS company's host entry carrying the chosen label. The entry is what every
+  // later read is resolved from, so the label has to land with it — deriving it
+  // again from the slug downstream is exactly the bug being fixed.
+  const confirm = async () => {
+    if (!chosen || labelError) return
+    try {
+      await setBase.mutateAsync(chosen)
+      await host.mutateAsync(label.trim().toLowerCase())
+    } catch {
+      /* surfaced by the mutation errors below / the address card in the next step */
+    }
+    refetch()
   }
 
   return (
@@ -809,8 +1096,8 @@ function ChooseDomainStep({ company, refetch }: { company: WizardCompany; refetc
       <div className="flex flex-col gap-1">
         <p className="text-sm font-medium text-foreground">Choose your domain</p>
         <p className="text-sm text-muted-foreground">
-          Pick the domain your teammates will use — e.g.{' '}
-          <span className="font-mono text-foreground">company.&lt;your-domain&gt;</span>.
+          Pick the domain your teammates will use, and the name in front of it — we suggest your
+          company&rsquo;s, but it is yours to change.
         </p>
       </div>
 
@@ -840,8 +1127,8 @@ function ChooseDomainStep({ company, refetch }: { company: WizardCompany; refetc
         <div className="cs-card flex flex-col gap-3 rounded-xl border border-border p-4">
           {zones.length === 1 ? (
             <p className="text-sm text-muted-foreground">
-              Your teammates will reach{' '}
-              <span className="font-mono text-foreground">{preview}</span> — use this domain?
+              This token controls <span className="font-mono text-foreground">{chosen}</span> — use
+              it?
             </p>
           ) : (
             <fieldset className="flex flex-col gap-2">
@@ -867,20 +1154,26 @@ function ChooseDomainStep({ company, refetch }: { company: WizardCompany; refetc
             </fieldset>
           )}
 
-          <p className="text-[12px] text-muted-foreground">
-            Preview: <span className="font-mono text-foreground">{preview}</span>
-          </p>
+          <SubdomainField
+            id="choose-subdomain"
+            value={label}
+            onChange={setLabel}
+            zone={chosen ?? '<your-domain>'}
+            error={labelError}
+          />
 
-          {setBase.isError && <p className="text-sm text-destructive">{errText(setBase.error)}</p>}
+          {(setBase.isError || host.isError) && (
+            <p className="text-sm text-destructive">{errText(setBase.error || host.error)}</p>
+          )}
 
           <Button
             type="button"
-            onClick={confirm}
-            disabled={!chosen || setBase.isPending}
+            onClick={() => void confirm()}
+            disabled={!chosen || !!labelError || setBase.isPending || host.isPending}
             className="self-start"
             style={{ background: 'var(--sm-accent-fill)', color: 'var(--gr-onaccent)' }}
           >
-            {setBase.isPending ? 'Saving…' : 'Use this domain'}
+            {setBase.isPending || host.isPending ? 'Saving…' : 'Use this address'}
           </Button>
         </div>
       )}
@@ -1008,7 +1301,10 @@ function GoogleStep({
           onClick={async () => {
             try {
               if (miniStep) {
-                await host.mutateAsync()
+                // No label argument: re-assert the entry the owner already named
+                // (the server keeps it; only a company with none falls back to
+                // the slug). Passing one here would rename their address back.
+                await host.mutateAsync(undefined)
               } else {
                 await google.mutateAsync({ client_id: clientId.trim(), client_secret: secret })
               }

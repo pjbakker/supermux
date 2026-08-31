@@ -190,8 +190,16 @@ async fn provision_tunnel_creates_once_and_reuses_on_rerun() {
         .expect("first provision ok");
     assert_eq!(first.0.data.tunnel_id, "tunnel-xyz");
     assert_eq!(first.0.data.connector, "started");
-    // The wildcard reachable host is derived from the chosen base domain.
-    assert_eq!(first.0.data.reachable_host, "*.example.com");
+    // ZERO DNS on a box with no company hosts yet — and NEVER a wildcard: the
+    // operator's zone gets a record only when a company actually needs one.
+    assert!(first.0.data.dns_records.is_empty(), "no records: {:?}", first.0.data.dns_records);
+    assert_eq!(first.0.data.reachable_host, "");
+    assert!(cf.dns_names().is_empty(), "provision wrote DNS: {:?}", cf.dns_names());
+    assert!(
+        cf.ingress_hosts().is_empty(),
+        "ingress should be the 404 catch-all only: {:?}",
+        cf.ingress_hosts()
+    );
     assert_eq!(cf.create_count(), 1, "created exactly once");
 
     // Re-run: the existing tunnel is reused, no second create.
@@ -422,7 +430,7 @@ async fn company_host_derives_slug_dot_base_domain_and_reloads() {
     let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
         .await
         .unwrap();
-    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id))
+    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
         .await
         .expect("host derive ok");
     assert_eq!(res.0.data.host, "acme.example.com");
@@ -433,7 +441,7 @@ async fn company_host_derives_slug_dot_base_domain_and_reloads() {
         .host_entry("acme.example.com")
         .cloned()
         .expect("host entry live");
-    assert!(e.is_canonical_for("acme", co.id, "example.com"));
+    assert!(e.is_valid_for(co.id, "example.com"));
     cleanup(state, dir).await;
 }
 
@@ -445,12 +453,610 @@ async fn company_host_without_a_base_domain_is_rejected() {
     let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
         .await
         .unwrap();
-    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id)).await;
+    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None).await;
     assert!(matches!(res, Err(AppError::BadRequest(_))), "got {res:?}");
     assert!(
         state.human_auth_cfg().company_hosts.is_empty(),
         "no allowlist entry written without a base domain"
     );
+    cleanup(state, dir).await;
+}
+
+/// The owner's own label wins over the slug — the whole point of an editable
+/// subdomain. The entry, the redirect URI and every downstream read (status,
+/// verify, the invite link) follow the label, not `companies.slug`.
+#[tokio::test]
+async fn company_host_accepts_an_owner_chosen_subdomain() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "enverder", "Enverder", "/tmp/enverder")
+        .await
+        .unwrap();
+    let res = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("  Team  ".into()),
+        })),
+    )
+    .await
+    .expect("owner label accepted");
+    assert_eq!(res.0.data.host, "team.example.com", "trimmed + lower-cased");
+    assert_eq!(res.0.data.redirect_uri, "https://team.example.com/auth/callback");
+    assert!(res.0.data.previous_host.is_none(), "nothing moved on a first write");
+
+    // The live allowlist resolves the CHOSEN host (and only it) to this company.
+    let cfg = state.human_auth_cfg();
+    assert!(cfg.host_entry("team.example.com").is_some());
+    assert!(cfg.host_entry("enverder.example.com").is_none(), "slug host never written");
+    assert!(cfg.company_entry(co.id).unwrap().is_valid_for(co.id, "example.com"));
+
+    // Status reports the published address, not a slug-derived guess.
+    let st = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery {
+            company_id: Some(co.id),
+        }),
+    )
+    .await
+    .unwrap();
+    let company = st.0.data.company.expect("company block");
+    assert_eq!(company.host, "team.example.com");
+    assert_eq!(company.redirect_uri, "https://team.example.com/auth/callback");
+    assert_eq!(company.redirect_registered, "ok");
+    assert!(company.company_host_written);
+
+    // …and so does the invite link.
+    let added = add_human_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Json(AddHumanInput {
+            email: "bob@enverder.test".into(),
+            role: "member".into(),
+            display_name: None,
+        }),
+    )
+    .await
+    .expect("add ok");
+    assert_eq!(added.0.data.login_url, "https://team.example.com");
+    cleanup(state, dir).await;
+}
+
+/// A rename REPLACES the entry (one address per company) and reports what moved,
+/// so the wizard can say the old link stops working.
+#[tokio::test]
+async fn company_host_rename_replaces_the_entry_and_reports_the_old_address() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    let renamed = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await
+    .expect("rename ok");
+    assert_eq!(renamed.0.data.host, "hq.example.com");
+    assert_eq!(renamed.0.data.previous_host.as_deref(), Some("acme.example.com"));
+
+    let cfg = state.human_auth_cfg();
+    assert!(cfg.host_entry("acme.example.com").is_none(), "old host retired");
+    assert!(cfg.host_entry("hq.example.com").is_some());
+    assert_eq!(
+        cfg.company_hosts.iter().filter(|h| h.company_id == co.id).count(),
+        1,
+        "exactly one permanent entry per company"
+    );
+
+    // A BODYLESS re-assert (the Google mini-step) KEEPS the owner's label — it
+    // must never silently rename the address back to the slug.
+    let again = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    assert_eq!(again.0.data.host, "hq.example.com");
+    assert!(again.0.data.previous_host.is_none(), "no move ⇒ no previous_host");
+    cleanup(state, dir).await;
+}
+
+/// Uniform 400s for anything that is not a single DNS label — a name that could
+/// not get a record (or a Universal SSL certificate) never reaches the store.
+#[tokio::test]
+async fn company_host_refuses_an_illegal_subdomain() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    for bad in ["", "-hq", "hq-", "hq.eu", "hq_eu", "hq eu", "a b", &"a".repeat(64)] {
+        let res = host_handler(
+            State(state.clone()),
+            OptCtx(None),
+            Path(co.id),
+            Some(Json(HostInput {
+                subdomain: Some(bad.to_string()),
+            })),
+        )
+        .await;
+        assert!(matches!(res, Err(AppError::BadRequest(_))), "{bad:?} → {res:?}");
+    }
+    assert!(
+        state.human_auth_cfg().company_hosts.is_empty(),
+        "no entry written by a refused label"
+    );
+    cleanup(state, dir).await;
+}
+
+/// Two companies cannot publish the same address: the Host header is what binds a
+/// login cookie to a company, so a collision is a clean 409, not a silent steal.
+#[tokio::test]
+async fn company_host_refuses_a_label_another_company_already_uses() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let one = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let two = crate::db::companies::create(&state.pool, "beta", "Beta", "/tmp/beta")
+        .await
+        .unwrap();
+    let _ = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(one.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await
+    .unwrap();
+    let clash = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(two.id),
+        Some(Json(HostInput {
+            subdomain: Some("HQ".into()),
+        })),
+    )
+    .await;
+    assert!(matches!(clash, Err(AppError::Conflict(_))), "got {clash:?}");
+    // The winner keeps the address; the loser wrote nothing.
+    let cfg = state.human_auth_cfg();
+    assert_eq!(cfg.host_entry("hq.example.com").unwrap().company_id, one.id);
+    assert!(cfg.company_entry(two.id).is_none());
+    // Re-asserting the SAME label for the company that owns it is not a clash.
+    let same = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(one.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await;
+    assert!(same.is_ok(), "idempotent re-assert: {same:?}");
+    cleanup(state, dir).await;
+}
+
+/// A slug that is not a legal hostname label cannot be a silent default — the
+/// owner is told to pick a subdomain instead of getting an address that would
+/// never resolve.
+#[tokio::test]
+async fn company_host_refuses_an_unusable_slug_as_the_default() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme_eu", "Acme EU", "/tmp/acme-eu")
+        .await
+        .unwrap();
+    let res = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None).await;
+    match res {
+        Err(AppError::BadRequest(m)) => assert!(m.contains("choose a subdomain"), "{m}"),
+        other => panic!("expected a 400 telling the owner to choose: {other:?}"),
+    }
+    // …and choosing one works.
+    let fixed = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("acme-eu".into()),
+        })),
+    )
+    .await
+    .expect("explicit label accepted");
+    assert_eq!(fixed.0.data.host, "acme-eu.example.com");
+    cleanup(state, dir).await;
+}
+
+/// The FALLBACK: with no entry written yet, every reader still shows the
+/// slug-derived suggestion (nothing regresses for a company mid-wizard).
+#[tokio::test]
+async fn status_falls_back_to_the_slug_when_no_entry_exists() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let st = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery {
+            company_id: Some(co.id),
+        }),
+    )
+    .await
+    .unwrap();
+    let company = st.0.data.company.expect("company block");
+    assert_eq!(company.host, "acme.example.com", "the wizard's suggestion");
+    assert_eq!(company.redirect_uri, "https://acme.example.com/auth/callback");
+    assert!(!company.company_host_written);
+    assert_eq!(company.redirect_registered, "unknown");
+    cleanup(state, dir).await;
+}
+
+/// An entry under a STALE base domain stays not-ok (fail-closed): the base
+/// changed, so the address must be re-derived rather than trusted.
+#[tokio::test]
+async fn a_stale_base_domain_de_canonicalises_the_entry() {
+    let (state, dir) = test_state().await;
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let _ = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await
+    .unwrap();
+    // The operator moves the box to another zone.
+    let mut cfg = store::read_or_default(&state.config.data_dir).unwrap();
+    cfg.base_domain = Some("other.test".into());
+    store::write_atomic(&state.config.data_dir, &cfg).unwrap();
+    state.reload_human_auth().unwrap();
+
+    let st = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery {
+            company_id: Some(co.id),
+        }),
+    )
+    .await
+    .unwrap();
+    let company = st.0.data.company.expect("company block");
+    assert_eq!(company.redirect_registered, "mismatch", "stale base ⇒ not ok");
+    assert_eq!(company.host, "acme.other.test", "re-derived under the new base");
+    let v = verify_login_handler(State(state.clone()), OptCtx(None), Path(co.id))
+        .await
+        .unwrap();
+    assert!(!v.0.data.ok, "verify must not be green under a stale base");
+    cleanup(state, dir).await;
+}
+
+// ── per-host DNS (the wildcard replacement) ──────────────────────────────────
+
+/// Token + base domain + a provisioned tunnel: the state every DNS test needs.
+/// Returns the CF mock so the zone's records can be seeded and asserted.
+async fn provisioned_box(state: &AppState, dir: &std::path::Path) -> Arc<MockCfApi> {
+    let cf = inject_cf(state);
+    inject_host(state);
+    crate::config::write_token_0600(&dir.join(super::CF_TOKEN_FILE), "valid-cf-token").unwrap();
+    set_base(state).await;
+    provision_tunnel_handler(State(state.clone()), OptCtx(None))
+        .await
+        .expect("provision ok");
+    cf
+}
+
+const OUR_TARGET: &str = "tunnel-xyz.cfargotunnel.com";
+
+/// The core of the footprint change: ONE record and ONE ingress rule for the
+/// company's own address — never `*.<base>`, which would have pointed every
+/// undefined name on the operator's domain at this box.
+#[tokio::test]
+async fn company_host_creates_one_record_and_one_ingress_rule() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    let co = crate::db::companies::create(&state.pool, "enverder", "Enverder", "/tmp/enverder")
+        .await
+        .unwrap();
+    let res = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("team".into()),
+        })),
+    )
+    .await
+    .expect("host ok");
+    assert_eq!(res.0.data.host, "team.example.com");
+    assert_eq!(res.0.data.dns, "created");
+    assert_eq!(cf.dns_names(), vec!["team.example.com".to_string()]);
+    assert_eq!(cf.ingress_hosts(), vec!["team.example.com".to_string()]);
+    assert!(
+        !cf.dns_names().iter().any(|n| n.starts_with('*')),
+        "no wildcard may ever be written"
+    );
+
+    // Re-asserting the same address is idempotent: no second record, no error.
+    let again = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .expect("re-assert ok");
+    assert_eq!(again.0.data.dns, "exists");
+    assert_eq!(cf.created_names().len(), 1, "created exactly once");
+
+    // A SECOND company adds its own record and joins the ingress document.
+    let two = crate::db::companies::create(&state.pool, "beta", "Beta", "/tmp/beta")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(two.id), None)
+        .await
+        .expect("second company ok");
+    assert_eq!(
+        cf.ingress_hosts(),
+        vec!["beta.example.com".to_string(), "team.example.com".to_string()],
+        "ingress enumerates every company host"
+    );
+    cleanup(state, dir).await;
+}
+
+/// A rename moves the record: the new name is created, the OLD one is deleted
+/// (it pointed at our tunnel), and the ingress document follows.
+#[tokio::test]
+async fn company_host_rename_moves_the_record_and_the_ingress() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    assert_eq!(cf.dns_names(), vec!["acme.example.com".to_string()]);
+
+    let renamed = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("hq".into()),
+        })),
+    )
+    .await
+    .expect("rename ok");
+    assert_eq!(renamed.0.data.host, "hq.example.com");
+    assert_eq!(renamed.0.data.dns, "created");
+    assert!(renamed.0.data.previous_dns_removed, "the old record must go");
+    assert_eq!(cf.dns_names(), vec!["hq.example.com".to_string()]);
+    assert_eq!(cf.ingress_hosts(), vec!["hq.example.com".to_string()]);
+    cleanup(state, dir).await;
+}
+
+/// The guard that makes this safe to point at someone's real domain: a name the
+/// OPERATOR already uses is refused, never re-pointed — and nothing is persisted.
+#[tokio::test]
+async fn company_host_refuses_a_name_the_operator_already_uses() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    cf.seed_dns("team.example.com", "someone-elses-app.pages.dev");
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let res = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("team".into()),
+        })),
+    )
+    .await;
+    match res {
+        Err(AppError::Conflict(m)) => {
+            assert!(m.contains("team.example.com"), "{m}");
+            assert!(m.contains("someone-elses-app.pages.dev"), "names the current target: {m}");
+        }
+        other => panic!("expected a conflict naming the existing record, got {other:?}"),
+    }
+    // Untouched, and no allowlist entry written on a refusal.
+    assert_eq!(
+        cf.dns.lock().unwrap()[0].content,
+        "someone-elses-app.pages.dev",
+        "the operator's record must be left exactly as it was"
+    );
+    assert!(cf.dns_deleted.lock().unwrap().is_empty(), "nothing deleted");
+    assert!(state.human_auth_cfg().company_entry(co.id).is_none());
+    cleanup(state, dir).await;
+}
+
+/// Deleting a company releases its address: allowlist entry, DNS record, ingress
+/// rule — and NOTHING that is not ours.
+#[tokio::test]
+async fn releasing_a_company_removes_only_our_record() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    // A record the operator owns, on a name supermux never claimed.
+    cf.seed_dns("www.example.com", "their-site.pages.dev");
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let two = crate::db::companies::create(&state.pool, "beta", "Beta", "/tmp/beta")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(two.id), None)
+        .await
+        .unwrap();
+
+    let warning = super::release_company_host(&state, co.id).await;
+    assert!(warning.is_none(), "clean release: {warning:?}");
+    // Ours is gone; the other company's and the operator's own record remain.
+    let mut names = cf.dns_names();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["beta.example.com".to_string(), "www.example.com".to_string()]
+    );
+    assert_eq!(cf.ingress_hosts(), vec!["beta.example.com".to_string()]);
+    // …and the login surface is retired with it.
+    assert!(state.human_auth_cfg().company_entry(co.id).is_none());
+    assert!(state.human_auth_cfg().host_entry("acme.example.com").is_none());
+    cleanup(state, dir).await;
+}
+
+/// A record that is NOT ours survives a release of the company that claimed that
+/// name — supermux deletes what it created and nothing else.
+#[tokio::test]
+async fn releasing_a_company_never_deletes_a_foreign_record() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    // The operator re-points that name at their own thing behind our back.
+    {
+        let mut dns = cf.dns.lock().unwrap();
+        dns[0].content = "their-own-thing.example.net".to_string();
+    }
+    let warning = super::release_company_host(&state, co.id).await;
+    assert!(warning.is_none(), "{warning:?}");
+    assert_eq!(cf.dns_names(), vec!["acme.example.com".to_string()], "left alone");
+    assert!(cf.dns_deleted.lock().unwrap().is_empty(), "no delete issued");
+    cleanup(state, dir).await;
+}
+
+/// Back-compat: a box provisioned by the old build still has `*.<base>`. It is
+/// SURFACED, kept working (its ingress rule stays), and only replaced when the
+/// operator asks — never implicitly.
+#[tokio::test]
+async fn a_legacy_wildcard_is_surfaced_then_tightened_on_request() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    cf.seed_dns("*.example.com", OUR_TARGET); // what an older build wrote
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    // The wildcard KEEPS its ingress rule until it is explicitly tightened — a
+    // company reachable only through it must not go dark behind our back.
+    assert_eq!(
+        cf.ingress_hosts(),
+        vec!["*.example.com".to_string(), "acme.example.com".to_string()]
+    );
+
+    // Status says so, so the wizard can offer the one-click fix.
+    let st = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery { company_id: None }),
+    )
+    .await
+    .unwrap();
+    assert!(st.0.data.box_status.wildcard_dns, "the wildcard must be surfaced");
+    assert_eq!(st.0.data.box_status.dns_records, vec!["acme.example.com".to_string()]);
+
+    // Tighten: per-company records first, then the narrowed ingress, then the
+    // wildcard record last.
+    let t = tighten_dns_handler(State(state.clone()), OptCtx(None))
+        .await
+        .expect("tighten ok");
+    assert!(t.0.data.wildcard_removed);
+    assert_eq!(t.0.data.records, vec!["acme.example.com".to_string()]);
+    assert_eq!(cf.dns_names(), vec!["acme.example.com".to_string()]);
+    assert_eq!(cf.ingress_hosts(), vec!["acme.example.com".to_string()]);
+
+    let after = status_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Query(StatusQuery { company_id: None }),
+    )
+    .await
+    .unwrap();
+    assert!(!after.0.data.box_status.wildcard_dns, "gone after tightening");
+    cleanup(state, dir).await;
+}
+
+/// A `*.<base>` record that points somewhere ELSE is the operator's own wildcard.
+/// Tightening narrows OUR ingress but must not delete their record.
+#[tokio::test]
+async fn tighten_never_deletes_a_wildcard_that_is_not_ours() {
+    let (state, dir) = test_state().await;
+    let cf = provisioned_box(&state, &dir).await;
+    cf.seed_dns("*.example.com", "their-catch-all.pages.dev");
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
+        .await
+        .unwrap();
+    let t = tighten_dns_handler(State(state.clone()), OptCtx(None))
+        .await
+        .expect("tighten ok");
+    assert!(!t.0.data.wildcard_removed, "not ours ⇒ not deleted");
+    assert!(
+        cf.dns_names().contains(&"*.example.com".to_string()),
+        "the operator's wildcard survives: {:?}",
+        cf.dns_names()
+    );
+    // And it was never treated as ours in the ingress either.
+    assert_eq!(cf.ingress_hosts(), vec!["acme.example.com".to_string()]);
+    cleanup(state, dir).await;
+}
+
+/// Order-independence: choosing the address BEFORE the tunnel exists is the
+/// wizard's actual flow. The record is `pending` then, and provisioning creates
+/// exactly it — still no wildcard.
+#[tokio::test]
+async fn an_address_chosen_before_provisioning_gets_its_record_at_provision() {
+    let (state, dir) = test_state().await;
+    let cf = inject_cf(&state);
+    inject_host(&state);
+    crate::config::write_token_0600(&dir.join(super::CF_TOKEN_FILE), "valid-cf-token").unwrap();
+    set_base(&state).await;
+    let co = crate::db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let res = host_handler(
+        State(state.clone()),
+        OptCtx(None),
+        Path(co.id),
+        Some(Json(HostInput {
+            subdomain: Some("team".into()),
+        })),
+    )
+    .await
+    .expect("host ok before provisioning");
+    assert_eq!(res.0.data.dns, "pending", "no tunnel yet ⇒ nothing written");
+    assert!(cf.dns_names().is_empty());
+
+    let p = provision_tunnel_handler(State(state.clone()), OptCtx(None))
+        .await
+        .expect("provision ok");
+    assert_eq!(p.0.data.dns_records, vec!["team.example.com".to_string()]);
+    assert_eq!(cf.dns_names(), vec!["team.example.com".to_string()]);
+    assert_eq!(cf.ingress_hosts(), vec!["team.example.com".to_string()]);
     cleanup(state, dir).await;
 }
 
@@ -485,7 +1091,7 @@ async fn verify_login_surfaces_redirect_uri_mismatch_then_goes_green() {
     assert!(miss.0.data.detail.contains("https://acme.example.com/auth/callback"));
 
     // After writing the host entry: green.
-    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id))
+    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
         .await
         .unwrap();
     let ok = verify_login_handler(State(state.clone()), OptCtx(None), Path(co.id))
@@ -632,7 +1238,7 @@ async fn member_gets_uniform_404_on_every_wizard_endpoint() {
         member(),
         Query(AgentInboxDeleteQuery { company_id: co.id })
     ));
-    assert_404!(host_handler(State(state.clone()), member(), Path(co.id)));
+    assert_404!(host_handler(State(state.clone()), member(), Path(co.id), None));
     assert_404!(verify_login_handler(State(state.clone()), member(), Path(co.id)));
     assert_404!(add_human_handler(
         State(state.clone()),
@@ -690,7 +1296,7 @@ async fn status_reports_box_and_company_fields() {
     )
     .await
     .unwrap();
-    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id))
+    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
         .await
         .unwrap();
     let s2 = status_handler(
@@ -1190,7 +1796,7 @@ async fn ws_origin_honours_the_company_host_only_once_a_base_is_configured() {
 
     // Choose the base + write the host → the Origin is now allowed.
     set_base(&state).await;
-    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id))
+    let _ = host_handler(State(state.clone()), OptCtx(None), Path(co.id), None)
         .await
         .unwrap();
     assert!(

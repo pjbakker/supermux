@@ -6,14 +6,15 @@
 //! | Method + path | Purpose |
 //! |---|---|
 //! | `POST /api/external-access/cf-token`       | Validate + store the Cloudflare API token (0600, never returned). |
-//! | `POST /api/external-access/provision-tunnel` | One-time idempotent wildcard tunnel + DNS + connector unit. |
+//! | `POST /api/external-access/provision-tunnel` | One-time idempotent tunnel + connector unit (+ a record per configured company host). |
+//! | `POST /api/external-access/tighten-dns`    | Replace a legacy `*.<base>` wildcard with per-company records. |
 //! | `GET  /api/external-access/status`         | Live-verify source the wizard polls. |
 //! | `GET  /api/external-access/zones`          | List the saved CF token's zones (the base-domain choices). |
 //! | `POST /api/external-access/base-domain`    | Set the operator's base domain (must be a controlled zone), hot-reload. |
 //! | `POST /api/external-access/google`         | Save the Google client id + secret (0600), hot-reload. |
 //! | `POST /api/external-access/agent-inbox`    | Mint `agent@<domain>` via CF Email Routing → a connected mailbox. |
 //! | `DELETE /api/external-access/agent-inbox`  | Remove a company's agent-inbox (rule + record). |
-//! | `POST /api/companies/{id}/host`            | Derive + write this company's `company_hosts` entry, hot-reload. |
+//! | `POST /api/companies/{id}/host`            | Write this company's `company_hosts` entry — optional `{subdomain}`, else keep the current label, else the slug — hot-reload. |
 //! | `POST /api/companies/{id}/verify-login`    | Surface the exact redirect URI to register (redirect_uri_mismatch). |
 //! | `POST /api/companies/{id}/humans`          | Seed a colleague `human_users` row; returns the login url. |
 //! | `GET  /api/companies/{id}/humans`          | List invitees + Invited/Pending/Active status. |
@@ -21,9 +22,19 @@
 //!
 //! # Architecture (design §0)
 //!
-//! ONE wildcard tunnel per box (`*.<base_domain> → http://localhost:<port>`), so
-//! adding a company after box setup is just a `company_hosts` entry + a
-//! `human_users` row — ZERO further Cloudflare calls. Cloudflare sits behind
+//! ONE tunnel per box, and the SMALLEST DNS footprint that can work: one proxied
+//! CNAME `<label>.<base_domain> → <tunnel>.cfargotunnel.com` per company host,
+//! one matching ingress rule, and the `http_status:404` catch-all. Adding a
+//! company writes exactly one record; renaming its address moves that one record;
+//! deleting the company removes it.
+//!
+//! It used to be a WILDCARD (`*.<base_domain>` ingress + a `*.<base_domain>`
+//! CNAME) — which was cheap for us and expensive for the operator: every
+//! undefined name under their real domain resolved to this box. Boxes provisioned
+//! by those builds still have that record; `status.wildcard_dns` surfaces it and
+//! `tighten-dns` replaces it with per-company records ON REQUEST. supermux never
+//! deletes it implicitly, and never touches a DNS record that does not point at
+//! its own tunnel. Cloudflare sits behind
 //! [`cf::CfApi`] and the connector unit behind [`systemd::ConnectorHost`] so the
 //! whole flow is unit-testable without a live token or `systemctl --user`.
 //!
@@ -48,7 +59,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{company_canonical_host, company_redirect_uri};
+use crate::config::{company_canonical_host, company_redirect_uri, is_dns_label};
 use crate::error::AppError;
 use crate::scope::OptCtx;
 use crate::state::AppState;
@@ -160,6 +171,10 @@ pub fn router_for(state: AppState) -> Router {
             post(provision_tunnel_handler),
         )
         .route("/api/external-access/status", get(status_handler))
+        .route(
+            "/api/external-access/tighten-dns",
+            post(tighten_dns_handler),
+        )
         .route("/api/external-access/zones", get(zones_handler))
         .route(
             "/api/external-access/base-domain",
@@ -219,9 +234,229 @@ fn require_base_domain(state: &AppState) -> Result<String, AppError> {
         })
 }
 
-/// The wildcard ingress host under a resolved base domain: `*.<base_domain>`.
+/// A company's LIVE public host + redirect URI.
+///
+/// The persisted `company_hosts` entry is AUTHORITATIVE: the wizard SUGGESTS
+/// `<slug>.<base>` but the owner may pick any label, so re-deriving from the slug
+/// at each call site (as every one of these used to) would silently disagree with
+/// the address colleagues actually sign in on. The slug-derived default is only
+/// the fallback — before any entry is written, or when the stored one no longer
+/// sits under the current base domain (a base change must re-derive, fail-closed).
+fn resolve_company_host(
+    cfg: &crate::config::HumanAuthConfig,
+    company_id: i64,
+    slug: &str,
+    base_domain: &str,
+) -> (String, String) {
+    match cfg
+        .company_entry(company_id)
+        .filter(|e| e.is_valid_for(company_id, base_domain))
+    {
+        Some(e) => (
+            e.host.trim().to_ascii_lowercase(),
+            e.redirect_uri.trim().to_string(),
+        ),
+        None => (
+            company_canonical_host(slug, base_domain),
+            company_redirect_uri(slug, base_domain),
+        ),
+    }
+}
+
+/// The LEGACY wildcard host under a base domain: `*.<base_domain>`.
+///
+/// supermux no longer creates this. It exists only so a box provisioned by an
+/// older build can be RECOGNISED (status) and TIGHTENED (the explicit
+/// `tighten-dns` action) — a wildcard record makes every undefined name under
+/// the operator's own domain resolve to this box, which is far more of their zone
+/// than a couple of company hostnames needs. It is never deleted implicitly.
 fn wildcard_host(base_domain: &str) -> String {
     format!("*.{base_domain}")
+}
+
+/// The CNAME content every supermux-owned record points at. A record whose
+/// content is anything else belongs to the OPERATOR — never overwritten, never
+/// deleted (the "only if it is ours" guard).
+fn tunnel_cname_target(tunnel_id: &str) -> String {
+    format!("{tunnel_id}.cfargotunnel.com")
+}
+
+/// The tunnel id this box provisioned, if provisioning has run.
+fn read_tunnel_id(state: &AppState) -> Option<String> {
+    crate::config::read_secret_file(&state.config.data_dir.join(TUNNEL_ID_FILE))
+}
+
+/// Every PERMANENT company hostname this box serves under `base_domain` — the
+/// ingress document, and exactly the set of DNS records that should exist.
+/// Sorted + de-duplicated so the ingress write is stable (no spurious PUTs) and
+/// ephemeral quick-tunnel hosts (which live on `trycloudflare.com` and need no
+/// DNS of ours) are skipped.
+fn company_hostnames(cfg: &crate::config::HumanAuthConfig, base_domain: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = cfg
+        .company_hosts
+        .iter()
+        .filter(|h| !h.ephemeral && h.label_under(base_domain).is_some())
+        .map(|h| h.host.trim().to_ascii_lowercase())
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Everything a Cloudflare DNS write needs, resolved once.
+///
+/// `None` from [`cf_dns_ctx`] means this box has no CF token — it cannot touch
+/// DNS at all, which is a legitimate state (a hand-configured box, or a company
+/// on a quick tunnel), not an error. `tunnel` is `None` before provisioning has
+/// run: the name can still be CHECKED for a foreign record, but the record itself
+/// is created by provisioning, which is when a tunnel target first exists.
+struct CfDns {
+    token: String,
+    account_id: String,
+    zone_id: String,
+    /// `(tunnel_id, cname_target)` once provisioning has run.
+    tunnel: Option<(String, String)>,
+}
+
+async fn cf_dns_ctx(state: &AppState, base_domain: &str) -> Result<Option<CfDns>, AppError> {
+    let Some(token) = read_cf_token(state) else {
+        return Ok(None);
+    };
+    let api = state.external_access.cf();
+    let account_id = cf::discover_account(api.as_ref(), &token)
+        .await
+        .map_err(cf_err)?;
+    let zone_id = api.zone_id(&token, base_domain).await.map_err(cf_err)?;
+    let tunnel = read_tunnel_id(state).map(|id| {
+        let target = tunnel_cname_target(&id);
+        (id, target)
+    });
+    Ok(Some(CfDns {
+        token,
+        account_id,
+        zone_id,
+        tunnel,
+    }))
+}
+
+/// What a company host's DNS record did (surfaced to the wizard so it can say
+/// exactly what happened in the operator's zone).
+const DNS_CREATED: &str = "created";
+const DNS_EXISTS: &str = "exists";
+const DNS_PENDING: &str = "pending";
+const DNS_UNAVAILABLE: &str = "unavailable";
+
+/// Ensure ONE proxied CNAME `<host> → <tunnel>.cfargotunnel.com`.
+///
+/// The probe before the write is the whole point: a name that already resolves to
+/// something else is the OPERATOR'S record, and a product that silently
+/// re-pointed it would be taking over a domain it was only lent. That case is an
+/// honest refusal with the current target named, never an upsert.
+async fn ensure_host_record(
+    state: &AppState,
+    dns: &CfDns,
+    host: &str,
+) -> Result<&'static str, AppError> {
+    let api = state.external_access.cf();
+    let existing = api
+        .find_dns_cname(&dns.token, &dns.zone_id, host)
+        .await
+        .map_err(cf_err)?;
+    let target = dns.tunnel.as_ref().map(|(_, t)| t.clone());
+    match (existing, target) {
+        // Already ours — nothing to do (idempotent re-run).
+        (Some(r), Some(t)) if r.content.trim().eq_ignore_ascii_case(&t) => Ok(DNS_EXISTS),
+        // Someone else's record on that exact name. Refuse; never overwrite.
+        (Some(r), _) => Err(AppError::Conflict(format!(
+            "{host} already has a DNS record in your Cloudflare zone (it points at {}). \
+             supermux will not change a record you made yourself — remove it there, or \
+             pick a different subdomain.",
+            r.content.trim()
+        ))),
+        // Free name, and we know where to point it.
+        (None, Some(t)) => {
+            api.create_dns_cname(&dns.token, &dns.zone_id, host, &t)
+                .await
+                .map_err(cf_err)?;
+            Ok(DNS_CREATED)
+        }
+        // Free name, but no tunnel yet — provisioning creates the record.
+        (None, None) => Ok(DNS_PENDING),
+    }
+}
+
+/// Remove `host`'s record ONLY when it points at our tunnel. A record the
+/// operator made (or one belonging to another tunnel) is left exactly as it is —
+/// teardown removes what supermux created, and nothing else. Returns whether a
+/// record was actually deleted.
+async fn remove_our_record(state: &AppState, dns: &CfDns, host: &str) -> Result<bool, AppError> {
+    let Some((_, target)) = dns.tunnel.as_ref() else {
+        return Ok(false);
+    };
+    let api = state.external_access.cf();
+    let Some(rec) = api
+        .find_dns_cname(&dns.token, &dns.zone_id, host)
+        .await
+        .map_err(cf_err)?
+    else {
+        return Ok(false);
+    };
+    if !rec.content.trim().eq_ignore_ascii_case(target) {
+        return Ok(false); // not ours — hands off
+    }
+    api.delete_dns_record(&dns.token, &dns.zone_id, &rec.id)
+        .await
+        .map_err(cf_err)?;
+    Ok(true)
+}
+
+/// Does a legacy `*.<base>` CNAME pointing at OUR tunnel still exist? Drives both
+/// the status flag and the ingress document (the wildcard rule stays while its
+/// record does, so tightening is never implicit).
+async fn wildcard_is_ours(state: &AppState, dns: &CfDns, base_domain: &str) -> bool {
+    let Some((_, target)) = dns.tunnel.as_ref() else {
+        return false;
+    };
+    let api = state.external_access.cf();
+    match api
+        .find_dns_cname(&dns.token, &dns.zone_id, &wildcard_host(base_domain))
+        .await
+    {
+        Ok(Some(r)) => r.content.trim().eq_ignore_ascii_case(target),
+        _ => false,
+    }
+}
+
+/// Rewrite the tunnel ingress to EXACTLY the company hostnames this box serves
+/// (plus the legacy wildcard while its record still exists), each pointing at the
+/// local service, closed by the `http_status:404` catch-all. Cloudflare's remote
+/// config is a whole-document PUT, so adding and removing a hostname are the same
+/// call with a different list. Returns the hostnames written.
+async fn sync_ingress(
+    state: &AppState,
+    dns: &CfDns,
+    base_domain: &str,
+) -> Result<Vec<String>, AppError> {
+    let Some((tunnel_id, _)) = dns.tunnel.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut hosts = company_hostnames(&state.human_auth_cfg(), base_domain);
+    if wildcard_is_ours(state, dns, base_domain).await {
+        hosts.insert(0, wildcard_host(base_domain));
+    }
+    state
+        .external_access
+        .cf()
+        .put_tunnel_config(
+            &dns.token,
+            &dns.account_id,
+            tunnel_id,
+            &hosts,
+            &local_service(state),
+        )
+        .await
+        .map_err(cf_err)?;
+    Ok(hosts)
 }
 
 /// `http://localhost:<bind-port>` — where the wildcard ingress points.
@@ -281,7 +516,11 @@ struct ProvisionResult {
     connector: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     connector_detail: Option<String>,
+    /// The hostnames now reachable, comma-joined (was: the `*.<base>` wildcard).
     reachable_host: String,
+    /// Exactly the DNS records this box owns in the operator's zone after this
+    /// call — one per company host, and nothing else.
+    dns_records: Vec<String>,
 }
 
 async fn provision_tunnel_handler(
@@ -300,8 +539,10 @@ async fn provision_tunnel_handler(
     let account_id = cf::discover_account(api.as_ref(), &token)
         .await
         .map_err(cf_err)?;
-    let zone_id = api.zone_id(&token, &base).await.map_err(cf_err)?;
-    let wildcard = wildcard_host(&base);
+    // Resolve the zone up front: it proves Zone:Read for exactly the chosen base
+    // (a missing DNS scope should fail HERE, with a message naming the permission,
+    // not later inside the per-host record write).
+    let _zone_id = api.zone_id(&token, &base).await.map_err(cf_err)?;
 
     // Idempotent: reuse an existing tunnel of this name, else create ONE.
     let tunnel = match api
@@ -316,33 +557,29 @@ async fn provision_tunnel_handler(
             .map_err(cf_err)?,
     };
 
-    // Wildcard ingress `*.<base_domain> → http://localhost:<port>` + 404 catch-all.
-    api.put_tunnel_config(
-        &token,
-        &account_id,
-        &tunnel.id,
-        &wildcard,
-        &local_service(&state),
-    )
-    .await
-    .map_err(cf_err)?;
-
-    // Wildcard proxied CNAME `*.<base_domain> → {id}.cfargotunnel.com`.
-    api.upsert_dns_cname(
-        &token,
-        &zone_id,
-        &wildcard,
-        &format!("{}.cfargotunnel.com", tunnel.id),
-    )
-    .await
-    .map_err(cf_err)?;
-
-    // Persist the (non-secret) tunnel id so `status` can poll health.
+    // Persist the (non-secret) tunnel id BEFORE the DNS sync — it is what makes a
+    // record "ours", so nothing may be written while it is unknown.
     crate::config::write_token_0600(
         &state.config.data_dir.join(TUNNEL_ID_FILE),
         &tunnel.id,
     )
     .map_err(AppError::Internal)?;
+
+    // NO WILDCARD. Provisioning creates the tunnel and the connector; the only DNS
+    // it writes is one proxied CNAME per company host ALREADY configured on this
+    // box (the wizard's address step runs first, so that is normally exactly one)
+    // — and a name the operator already uses is refused, never re-pointed. A box
+    // with no companies configured yet gets zero records and an ingress of just
+    // the 404 catch-all.
+    let dns_ctx = cf_dns_ctx(&state, &base).await?;
+    let mut dns_records: Vec<String> = Vec::new();
+    if let Some(dns) = &dns_ctx {
+        for host in company_hostnames(&state.human_auth_cfg(), &base) {
+            ensure_host_record(&state, dns, &host).await?;
+            dns_records.push(host);
+        }
+        sync_ingress(&state, dns, &base).await?;
+    }
 
     // Write the connector unit + start it (behind the mockable seam).
     let host = state.external_access.host();
@@ -361,7 +598,10 @@ async fn provision_tunnel_handler(
         tunnel_id: tunnel.id,
         connector,
         connector_detail,
-        reachable_host: wildcard,
+        // Honest: the hosts this box is actually reachable at, not a wildcard that
+        // would have claimed every name under the operator's domain.
+        reachable_host: dns_records.join(", "),
+        dns_records,
     }))
 }
 
@@ -401,6 +641,15 @@ struct BoxStatus {
     /// when no quick trial is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     quick_tunnel: Option<QuickTunnelStatus>,
+    /// TRUE when a legacy `*.<base_domain>` CNAME pointing at this box's tunnel
+    /// still exists — i.e. every undefined name under the operator's domain still
+    /// resolves here, because this box was provisioned by a build that wrote a
+    /// wildcard. Surfaced (never acted on implicitly) so the wizard can offer the
+    /// one-click `tighten-dns`.
+    wildcard_dns: bool,
+    /// The DNS records supermux owns in the operator's zone right now — one per
+    /// company host. What the wizard shows so the footprint is never a surprise.
+    dns_records: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -501,6 +750,29 @@ async fn status_handler(
         None => None,
     };
 
+    // The zone's actual footprint: which records are ours, and whether a legacy
+    // wildcard is still claiming every name under the operator's domain.
+    //
+    // The zone lookup runs ONLY on a healthy tunnel — which is exactly when this
+    // query stops polling (the wizard re-polls every 1.5s while `connecting`, and
+    // three more Cloudflare calls on every one of those ticks would push a busy
+    // box toward the API rate limit for an answer nothing can act on yet).
+    let (wildcard_dns, dns_records) = match (&base_domain, &tunnel_id) {
+        (Some(base), Some(_)) if tunnel_state == "healthy" => match cf_dns_ctx(&state, base).await {
+            Ok(Some(dns)) => (
+                wildcard_is_ours(&state, &dns, base).await,
+                company_hostnames(&cfg, base),
+            ),
+            // A Cloudflare hiccup must not fail the whole status read — the wizard
+            // polls this. Report "no wildcard seen" rather than inventing one.
+            _ => (false, company_hostnames(&cfg, base)),
+        },
+        // Not provisioned (or still connecting): nothing has been looked up, so
+        // claim nothing about the zone beyond the hosts this box is configured for.
+        (Some(base), _) => (false, company_hostnames(&cfg, base)),
+        _ => (false, Vec::new()),
+    };
+
     let box_status = BoxStatus {
         cf_token: if has_cf { "valid" } else { "none" }.to_string(),
         tunnel: tunnel_state.to_string(),
@@ -513,6 +785,8 @@ async fn status_handler(
         .to_string(),
         base_domain: base_domain.clone(),
         quick_tunnel,
+        wildcard_dns,
+        dns_records,
     };
 
     let company = match q.company_id {
@@ -537,12 +811,15 @@ async fn status_handler(
                 });
             match &base_domain {
                 Some(base) => {
-                    let host = company_canonical_host(&co.slug, base);
-                    let redirect_uri = company_redirect_uri(&co.slug, base);
-                    let entry = cfg.host_entry(&host);
+                    // Entry-authoritative: report the address this company ACTUALLY
+                    // publishes (the owner may have renamed the subdomain), and
+                    // only fall back to the slug-derived suggestion when nothing is
+                    // written yet.
+                    let (host, redirect_uri) = resolve_company_host(&cfg, id, &co.slug, base);
+                    let entry = cfg.company_entry(id);
                     let written = entry.is_some();
                     let redirect_registered = match entry {
-                        Some(e) if e.is_canonical_for(&co.slug, id, base) => "ok",
+                        Some(e) if e.is_valid_for(id, base) => "ok",
                         Some(_) => "mismatch",
                         None => "unknown",
                     };
@@ -1067,16 +1344,57 @@ async fn base_domain_handler(
 
 // ── 5. POST /api/companies/{id}/host ─────────────────────────────────────────
 
+/// Optional body for `POST /api/companies/{id}/host`. The endpoint is also
+/// called with NO body at all (the wizard's Google mini-step just re-asserts the
+/// entry), hence `Option<Json<_>>` at the handler and a defaulted field here.
+#[derive(Debug, Default, Deserialize)]
+struct HostInput {
+    /// The single DNS label the owner wants in front of the base domain. Absent ⇒
+    /// KEEP whatever label this company already publishes, and only fall back to
+    /// the company slug when there is no entry yet. (Defaulting to the slug
+    /// unconditionally would silently rename an owner-chosen address back.)
+    #[serde(default)]
+    subdomain: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct HostResult {
     host: String,
     redirect_uri: String,
+    /// The address this company published BEFORE this call, when the label
+    /// actually changed — so the wizard can say the old link stops working and the
+    /// new redirect URI needs registering. `None` ⇒ nothing moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_host: Option<String>,
+    /// What happened to this host's DNS record in the operator's zone:
+    /// `created` | `exists` | `pending` (no tunnel yet — "Set up access" creates
+    /// it) | `unavailable` (no Cloudflare token on this box).
+    dns: String,
+    /// True when the RENAME deleted the old record (only ever done when that
+    /// record pointed at our own tunnel).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    previous_dns_removed: bool,
+}
+
+/// The one place a `company_hosts` label is validated. Lower-cases + trims, then
+/// pins the single-DNS-label rule; the error text is what the wizard shows.
+fn validated_label(raw: &str) -> Result<String, AppError> {
+    let label = raw.trim().to_ascii_lowercase();
+    if !is_dns_label(&label) {
+        return Err(AppError::BadRequest(
+            "the subdomain must be 1-63 characters of a-z, 0-9 or -, and cannot start \
+             or end with -"
+                .into(),
+        ));
+    }
+    Ok(label)
 }
 
 async fn host_handler(
     State(state): State<AppState>,
     ctx: OptCtx,
     Path(id): Path<i64>,
+    input: Option<Json<HostInput>>,
 ) -> Result<Json<Envelope<HostResult>>, AppError> {
     crate::scope::require_admin(ctx.0.as_ref(), &format!("/api/companies/{id}/host"))?;
     // FAIL-CLOSED: never write a company_hosts entry without a chosen base domain.
@@ -1084,10 +1402,56 @@ async fn host_handler(
     let co = crate::db::companies::get(&state.pool, id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("company id={id}")))?;
-    let host = company_canonical_host(&co.slug, &base);
-    let redirect_uri = company_redirect_uri(&co.slug, &base);
 
-    // Upsert this company's company_hosts entry into the companion store.
+    let live = state.human_auth_cfg();
+    let current = live.company_entry(id);
+    let current_host = current.map(|e| e.host.trim().to_ascii_lowercase());
+    let current_label = current.and_then(|e| e.label_under(&base));
+
+    // The label: what the owner typed, else the one already published, else the
+    // slug the wizard suggests. A slug that is not a legal hostname label cannot
+    // be a silent default — it would need a DNS record that cannot be made, or a
+    // certificate Universal SSL does not issue — so say so instead.
+    let label = match input.and_then(|Json(i)| i.subdomain) {
+        Some(raw) => validated_label(&raw)?,
+        None => match current_label {
+            Some(l) => l,
+            None => validated_label(&co.slug).map_err(|_| {
+                AppError::BadRequest(format!(
+                    "\"{}\" cannot be used as a web address - choose a subdomain \
+                     (a-z, 0-9 and -) for this company",
+                    co.slug.trim()
+                ))
+            })?,
+        },
+    };
+    let host = company_canonical_host(&label, &base);
+    let redirect_uri = company_redirect_uri(&label, &base);
+
+    // Uniform, honest refusal: one address can only serve one company (the Host
+    // header is what binds a login cookie to a company).
+    if live
+        .company_hosts
+        .iter()
+        .any(|h| h.company_id != id && h.host.trim().eq_ignore_ascii_case(&host))
+    {
+        return Err(AppError::Conflict(format!(
+            "{host} is already used by another company - pick a different subdomain"
+        )));
+    }
+
+    // DNS FIRST, so a name the operator already uses is refused before anything is
+    // persisted: `ensure_host_record` probes the zone and only creates a record on
+    // a free name (or reports the one already pointing at our tunnel). No token ⇒
+    // this box does not do DNS at all; no tunnel yet ⇒ provisioning creates it.
+    let dns_ctx = cf_dns_ctx(&state, &base).await?;
+    let dns_state = match &dns_ctx {
+        Some(dns) => ensure_host_record(&state, dns, &host).await?,
+        None => DNS_UNAVAILABLE,
+    };
+
+    // Upsert this company's company_hosts entry into the companion store. A rename
+    // REPLACES the old entry (the old address stops resolving to this company).
     let mut cfg = store::read_or_default(&state.config.data_dir).map_err(AppError::Internal)?;
     cfg.company_hosts.retain(|h| h.company_id != id);
     cfg.company_hosts.push(crate::config::CompanyHost {
@@ -1099,7 +1463,26 @@ async fn host_handler(
     store::write_atomic(&state.config.data_dir, &cfg).map_err(AppError::Internal)?;
     state.reload_human_auth().map_err(AppError::Internal)?;
 
-    Ok(ok(HostResult { host, redirect_uri }))
+    let previous_host = current_host.filter(|h| *h != host);
+
+    // A rename retires the old address: drop its record (ONLY when it points at
+    // our tunnel — an operator's own record is never collateral) and rewrite the
+    // ingress document, which now enumerates the hostnames this box serves.
+    let mut previous_dns_removed = false;
+    if let Some(dns) = &dns_ctx {
+        if let Some(old) = &previous_host {
+            previous_dns_removed = remove_our_record(&state, dns, old).await?;
+        }
+        sync_ingress(&state, dns, &base).await?;
+    }
+
+    Ok(ok(HostResult {
+        host,
+        redirect_uri,
+        previous_host,
+        dns: dns_state.to_string(),
+        previous_dns_removed,
+    }))
 }
 
 // ── 6. POST /api/companies/{id}/verify-login ─────────────────────────────────
@@ -1122,10 +1505,11 @@ async fn verify_login_handler(
     let co = crate::db::companies::get(&state.pool, id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("company id={id}")))?;
-    let redirect_uri = company_redirect_uri(&co.slug, &base);
-    let host = company_canonical_host(&co.slug, &base);
-
     let cfg = state.human_auth_cfg();
+    // Entry-authoritative (see `resolve_company_host`): verify the address this
+    // company actually publishes, not a slug-derived guess.
+    let (host, redirect_uri) = resolve_company_host(&cfg, id, &co.slug, &base);
+
     if cfg.google_client_id.is_none() {
         return Ok(ok(VerifyLoginResult {
             ok: false,
@@ -1138,8 +1522,8 @@ async fn verify_login_handler(
     // redirect URI to be the one Google will see. When it is missing/non-canonical
     // the actionable failure is a redirect_uri_mismatch: hand back the exact URI to
     // register in the Google console.
-    match cfg.host_entry(&host) {
-        Some(e) if e.is_canonical_for(&co.slug, id, &base) => Ok(ok(VerifyLoginResult {
+    match cfg.company_entry(id) {
+        Some(e) if e.is_valid_for(id, &base) => Ok(ok(VerifyLoginResult {
             ok: true,
             detail: format!("Ready — colleagues can sign in at https://{host}."),
             redirect_uri,
@@ -1153,6 +1537,135 @@ async fn verify_login_handler(
             redirect_uri,
         })),
     }
+}
+
+// ── 6b. POST /api/external-access/tighten-dns ────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct TightenDnsResult {
+    /// The per-company records that exist after this call.
+    records: Vec<String>,
+    /// Whether the `*.<base>` record was actually removed (false when there was
+    /// none, or when the one there did not point at our tunnel).
+    wildcard_removed: bool,
+}
+
+/// Replace a legacy `*.<base_domain>` wildcard with one record per company host.
+///
+/// Explicitly operator-driven: a wildcard is never removed as a side effect of
+/// something else, because dropping it is the moment any name that was only
+/// reachable THROUGH it stops resolving. The order is what makes it safe —
+/// per-company records first, then the ingress without the wildcard rule, and the
+/// wildcard record itself LAST (and only when it points at our own tunnel).
+async fn tighten_dns_handler(
+    State(state): State<AppState>,
+    ctx: OptCtx,
+) -> Result<Json<Envelope<TightenDnsResult>>, AppError> {
+    crate::scope::require_admin(ctx.0.as_ref(), "/api/external-access/tighten-dns")?;
+    let base = require_base_domain(&state)?;
+    let dns = cf_dns_ctx(&state, &base)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("save a Cloudflare API token first".into()))?;
+    if dns.tunnel.is_none() {
+        return Err(AppError::BadRequest(
+            "set up access first — there is no tunnel for these records to point at".into(),
+        ));
+    }
+
+    // 1. Every company host gets its own record (a foreign name still refuses).
+    let records = company_hostnames(&state.human_auth_cfg(), &base);
+    for host in &records {
+        ensure_host_record(&state, &dns, host).await?;
+    }
+
+    // 2. Ingress WITHOUT the wildcard rule: exactly the company hosts + 404.
+    let (tunnel_id, target) = dns.tunnel.as_ref().expect("tunnel present, checked above");
+    state
+        .external_access
+        .cf()
+        .put_tunnel_config(
+            &dns.token,
+            &dns.account_id,
+            tunnel_id,
+            &records,
+            &local_service(&state),
+        )
+        .await
+        .map_err(cf_err)?;
+
+    // 3. The wildcard record itself — last, and only if it is ours.
+    let wildcard = wildcard_host(&base);
+    let api = state.external_access.cf();
+    let existing = api
+        .find_dns_cname(&dns.token, &dns.zone_id, &wildcard)
+        .await
+        .map_err(cf_err)?;
+    let wildcard_removed = match existing {
+        Some(r) if r.content.trim().eq_ignore_ascii_case(target) => {
+            api.delete_dns_record(&dns.token, &dns.zone_id, &r.id)
+                .await
+                .map_err(cf_err)?;
+            true
+        }
+        _ => false,
+    };
+
+    Ok(ok(TightenDnsResult {
+        records,
+        wildcard_removed,
+    }))
+}
+
+/// Release everything a company holds on the operator's domain: its
+/// `company_hosts` allowlist entry, its DNS record (only when that record points
+/// at our tunnel) and its ingress rule.
+///
+/// Called by the delete-company cascade — a removed company must not keep a live
+/// login host, and must not leave a record behind on someone's zone. Best-effort
+/// by construction: it returns a human warning instead of an error, because a
+/// Cloudflare hiccup must never stop a destructive teardown half-way. `Ok(None)`
+/// ⇒ nothing to release.
+pub async fn release_company_host(state: &AppState, company_id: i64) -> Option<String> {
+    let host = state
+        .human_auth_cfg()
+        .company_entry(company_id)?
+        .host
+        .trim()
+        .to_ascii_lowercase();
+
+    // The allowlist entry first: whatever Cloudflare does next, this box must stop
+    // treating that Host as the company's login surface.
+    let mut warning = None;
+    match store::read_or_default(&state.config.data_dir) {
+        Ok(mut cfg) => {
+            cfg.company_hosts
+                .retain(|h| !(h.company_id == company_id && !h.ephemeral));
+            if let Err(e) = store::write_atomic(&state.config.data_dir, &cfg) {
+                warning = Some(format!("company host entry not removed: {e}"));
+            } else if let Err(e) = state.reload_human_auth() {
+                warning = Some(format!("auth not reloaded after host removal: {e}"));
+            }
+        }
+        Err(e) => warning = Some(format!("companion store unreadable: {e}")),
+    }
+
+    let base = match state.human_auth_cfg().base_domain.clone() {
+        Some(b) if !b.trim().is_empty() => b.trim().to_ascii_lowercase(),
+        _ => return warning,
+    };
+    match cf_dns_ctx(state, &base).await {
+        Ok(Some(dns)) => {
+            if let Err(e) = remove_our_record(state, &dns, &host).await {
+                warning = Some(format!("DNS record {host} not removed: {e}"));
+            }
+            if let Err(e) = sync_ingress(state, &dns, &base).await {
+                warning = Some(format!("tunnel ingress not updated after removing {host}: {e}"));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warning = Some(format!("cloudflare unreachable while removing {host}: {e}")),
+    }
+    warning
 }
 
 // ── 7. companies humans (invite / list / revoke) ─────────────────────────────
@@ -1253,8 +1766,12 @@ async fn add_human_handler(
                 crate::auth_human::invite::mint_invite_token(&cfg.invite_key, user.id, id, exp);
             format!("https://{}/auth/invite?token={token}", q.host)
         }
-        // Permanent Google path: the canonical company host.
-        (None, Some(base)) => format!("https://{}", company_canonical_host(&co.slug, base)),
+        // Permanent Google path: the company's published host (entry-authoritative,
+        // so an owner-renamed subdomain lands in the invite link too).
+        (None, Some(base)) => format!(
+            "https://{}",
+            resolve_company_host(&state.human_auth_cfg(), id, &co.slug, base).0
+        ),
         // Unreachable: `base` is `Some` whenever `quick` is `None` (set above).
         (None, None) => unreachable!("base domain resolved on the non-quick path"),
     };

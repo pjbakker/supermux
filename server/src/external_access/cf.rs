@@ -7,13 +7,20 @@
 //! `reqwest` implementation hitting `api.cloudflare.com`.
 //!
 //! The operator's chosen zone (their `base_domain`, e.g. `example.com`) is
-//! fronted by ONE wildcard tunnel per box: a single remote-managed `cfd_tunnel`
-//! (`config_src:"cloudflare"`), one wildcard ingress rule
-//! `*.<base_domain> → http://localhost:<port>`, one wildcard proxied CNAME. Every
-//! subsequent company slug is then reachable with ZERO further Cloudflare calls —
-//! only a new `company_hosts` allowlist entry. The zone is discovered from the
-//! token via [`CfApi::list_zones`] and picked in the wizard — nothing is
-//! hardcoded.
+//! fronted by ONE remote-managed `cfd_tunnel` (`config_src:"cloudflare"`) per box
+//! — and by exactly as much DNS as the box actually uses: ONE proxied CNAME per
+//! company host (`team.example.com → <tunnel>.cfargotunnel.com`) plus one ingress
+//! rule per host and the `http_status:404` catch-all.
+//!
+//! It used to be a WILDCARD — `*.<base_domain>` ingress + a `*.<base_domain>`
+//! CNAME — which made every undefined name under the operator's real domain
+//! resolve to this box. That is far too much footprint to take on someone's zone
+//! for a product that needs one or two hostnames, so the wildcard is gone: DNS is
+//! now created per company host, and never touched unless it points at OUR
+//! tunnel ([`CfApi::find_dns_cname`] before every write and every delete).
+//!
+//! The zone is discovered from the token via [`CfApi::list_zones`] and picked in
+//! the wizard — nothing is hardcoded.
 
 use async_trait::async_trait;
 
@@ -77,6 +84,18 @@ pub struct ZoneInfo {
     pub zone_name: String,
 }
 
+/// One DNS record as Cloudflare reports it. `content` is what makes the
+/// only-if-ours guard possible: a record whose content is not
+/// `<our-tunnel-id>.cfargotunnel.com` belongs to the OPERATOR, and supermux must
+/// never overwrite or delete it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DnsRecord {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    pub proxied: bool,
+}
+
 /// The mockable Cloudflare surface.
 #[async_trait]
 pub trait CfApi: Send + Sync {
@@ -123,24 +142,49 @@ pub trait CfApi: Send + Sync {
         account_id: &str,
         tunnel_id: &str,
     ) -> Result<String, CfError>;
-    /// `PUT /accounts/{a}/cfd_tunnel/{id}/configurations` — the wildcard ingress
-    /// (`hostname → service`) plus the `http_status:404` catch-all.
+    /// `PUT /accounts/{a}/cfd_tunnel/{id}/configurations` — ONE ingress rule per
+    /// hostname (in order) plus the `http_status:404` catch-all. The full set is
+    /// always sent: cloudflared's remote config is a whole-document PUT, so
+    /// "add a hostname" and "drop a hostname" are both this call with a different
+    /// list. An EMPTY list is legal and means "this tunnel serves nothing yet".
     async fn put_tunnel_config(
         &self,
         token: &str,
         account_id: &str,
         tunnel_id: &str,
-        ingress_hostname: &str,
+        ingress_hostnames: &[String],
         service: &str,
     ) -> Result<(), CfError>;
-    /// `POST /zones/{z}/dns_records` (idempotent upsert) — the wildcard proxied
-    /// CNAME `*.<base_domain> → {tunnel_id}.cfargotunnel.com`.
-    async fn upsert_dns_cname(
+    /// `GET /zones/{z}/dns_records?type=CNAME&name=<name>` — the existing record
+    /// for exactly this name, if any. Every write and every delete goes through
+    /// here first: it is what tells "our tunnel's record" apart from a record the
+    /// operator made themselves.
+    async fn find_dns_cname(
+        &self,
+        token: &str,
+        zone_id: &str,
+        name: &str,
+    ) -> Result<Option<DnsRecord>, CfError>;
+    /// `POST /zones/{z}/dns_records` — ONE proxied CNAME
+    /// `<host> → {tunnel_id}.cfargotunnel.com`. Idempotent (Cloudflare's
+    /// "record already exists" is success); callers still probe with
+    /// [`CfApi::find_dns_cname`] first so a FOREIGN record is refused rather than
+    /// raced into.
+    async fn create_dns_cname(
         &self,
         token: &str,
         zone_id: &str,
         name: &str,
         content: &str,
+    ) -> Result<(), CfError>;
+    /// `DELETE /zones/{z}/dns_records/{record_id}` — remove one record by id. The
+    /// only-if-ours decision belongs to the CALLER (which is why this takes an id
+    /// that could only have come from [`CfApi::find_dns_cname`]).
+    async fn delete_dns_record(
+        &self,
+        token: &str,
+        zone_id: &str,
+        record_id: &str,
     ) -> Result<(), CfError>;
     /// `GET /accounts/{a}/cfd_tunnel/{id}` `status` — `inactive|degraded|healthy`
     /// (mapped by the caller to none/connecting/healthy).
@@ -583,17 +627,17 @@ impl CfApi for RealCfApi {
         token: &str,
         account_id: &str,
         tunnel_id: &str,
-        ingress_hostname: &str,
+        ingress_hostnames: &[String],
         service: &str,
     ) -> Result<(), CfError> {
-        let body = serde_json::json!({
-            "config": {
-                "ingress": [
-                    { "hostname": ingress_hostname, "service": service },
-                    { "service": "http_status:404" }
-                ]
-            }
-        });
+        // One rule per hostname, in the order given, then the catch-all — the
+        // whole document, because that is the only shape this endpoint takes.
+        let mut ingress: Vec<serde_json::Value> = ingress_hostnames
+            .iter()
+            .map(|h| serde_json::json!({ "hostname": h, "service": service }))
+            .collect();
+        ingress.push(serde_json::json!({ "service": "http_status:404" }));
+        let body = serde_json::json!({ "config": { "ingress": ingress } });
         let resp = self
             .req(
                 reqwest::Method::PUT,
@@ -609,7 +653,74 @@ impl CfApi for RealCfApi {
         env.into_result("put_tunnel_config").map(|_| ())
     }
 
-    async fn upsert_dns_cname(
+    async fn find_dns_cname(
+        &self,
+        token: &str,
+        zone_id: &str,
+        name: &str,
+    ) -> Result<Option<DnsRecord>, CfError> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            #[serde(default)]
+            id: String,
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            content: String,
+            #[serde(default)]
+            proxied: bool,
+        }
+        let resp = self
+            .req(
+                reqwest::Method::GET,
+                token,
+                &format!("/zones/{zone_id}/dns_records?type=CNAME&name={name}"),
+            )
+            .send()
+            .await
+            .map_err(|e| CfError::Api(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(CfError::MissingScope("Zone:DNS:Edit".into()));
+        }
+        let env: CfEnvelope<Vec<R>> =
+            resp.json().await.map_err(|e| CfError::Api(e.to_string()))?;
+        let rows = env.into_result("find_dns_cname")?;
+        Ok(rows.into_iter().next().map(|r| DnsRecord {
+            id: r.id,
+            name: r.name,
+            content: r.content,
+            proxied: r.proxied,
+        }))
+    }
+
+    async fn delete_dns_record(
+        &self,
+        token: &str,
+        zone_id: &str,
+        record_id: &str,
+    ) -> Result<(), CfError> {
+        let resp = self
+            .req(
+                reqwest::Method::DELETE,
+                token,
+                &format!("/zones/{zone_id}/dns_records/{record_id}"),
+            )
+            .send()
+            .await
+            .map_err(|e| CfError::Api(e.to_string()))?;
+        // An already-deleted record (404) is the state we wanted — success.
+        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let status = resp.status();
+        let env: CfEnvelope<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| CfError::Api(format!("{status}: {e}")))?;
+        env.into_result("delete_dns_record").map(|_| ())
+    }
+
+    async fn create_dns_cname(
         &self,
         token: &str,
         zone_id: &str,
@@ -650,7 +761,7 @@ impl CfApi for RealCfApi {
         if already {
             Ok(())
         } else {
-            env.into_result("upsert_dns_cname").map(|_| ())
+            env.into_result("create_dns_cname").map(|_| ())
         }
     }
 
@@ -952,6 +1063,19 @@ pub struct MockCfApi {
     /// The single routing rule this mock "holds" (its tag), shared so a re-run
     /// reuses it and a delete clears it.
     pub existing_rule: std::sync::Mutex<Option<String>>,
+    // ── DNS (the per-host records that replaced the wildcard) ──
+    /// The zone's CNAME records, keyed by name. A test seeds a FOREIGN record
+    /// (content pointing anywhere but our tunnel) to prove supermux refuses to
+    /// clobber it, or a legacy `*.<base>` record to drive the tighten path.
+    pub dns: std::sync::Mutex<Vec<DnsRecord>>,
+    /// Every `create_dns_cname` name, in order — so a test can assert exactly
+    /// which records provisioning did (and did not) create.
+    pub dns_created: std::sync::Mutex<Vec<String>>,
+    /// Every `delete_dns_record` id, in order.
+    pub dns_deleted: std::sync::Mutex<Vec<String>>,
+    /// The hostname list of the LAST `put_tunnel_config` — the ingress document
+    /// as cloudflared would have received it.
+    pub ingress: std::sync::Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -975,6 +1099,10 @@ impl Default for MockCfApi {
             routing_enabled: std::sync::Mutex::new(false),
             rule_create_calls: std::sync::atomic::AtomicUsize::new(0),
             existing_rule: std::sync::Mutex::new(None),
+            dns: std::sync::Mutex::new(Vec::new()),
+            dns_created: std::sync::Mutex::new(Vec::new()),
+            dns_deleted: std::sync::Mutex::new(Vec::new()),
+            ingress: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -987,6 +1115,27 @@ impl MockCfApi {
     pub fn rule_create_count(&self) -> usize {
         self.rule_create_calls
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Seed a record the OPERATOR owns (or a legacy wildcard, by passing our own
+    /// tunnel target as `content`).
+    pub fn seed_dns(&self, name: &str, content: &str) {
+        self.dns.lock().unwrap().push(DnsRecord {
+            id: format!("rec-{}", name.replace(['.', '*'], "-")),
+            name: name.to_string(),
+            content: content.to_string(),
+            proxied: true,
+        });
+    }
+    /// The record names this zone currently holds.
+    pub fn dns_names(&self) -> Vec<String> {
+        self.dns.lock().unwrap().iter().map(|r| r.name.clone()).collect()
+    }
+    /// The hostnames of the last ingress document written.
+    pub fn ingress_hosts(&self) -> Vec<String> {
+        self.ingress.lock().unwrap().clone()
+    }
+    pub fn created_names(&self) -> Vec<String> {
+        self.dns_created.lock().unwrap().clone()
     }
 }
 
@@ -1068,19 +1217,62 @@ impl CfApi for MockCfApi {
         _token: &str,
         _account_id: &str,
         _tunnel_id: &str,
-        _ingress_hostname: &str,
+        ingress_hostnames: &[String],
         _service: &str,
     ) -> Result<(), CfError> {
+        *self.ingress.lock().unwrap() = ingress_hostnames.to_vec();
         Ok(())
     }
 
-    async fn upsert_dns_cname(
+    async fn find_dns_cname(
         &self,
         _token: &str,
         _zone_id: &str,
-        _name: &str,
-        _content: &str,
+        name: &str,
+    ) -> Result<Option<DnsRecord>, CfError> {
+        if !self.scopes_ok {
+            return Err(CfError::MissingScope("Zone:DNS:Edit".into()));
+        }
+        Ok(self
+            .dns
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(name))
+            .cloned())
+    }
+
+    async fn create_dns_cname(
+        &self,
+        _token: &str,
+        _zone_id: &str,
+        name: &str,
+        content: &str,
     ) -> Result<(), CfError> {
+        if !self.scopes_ok {
+            return Err(CfError::MissingScope("Zone:DNS:Edit".into()));
+        }
+        self.dns_created.lock().unwrap().push(name.to_string());
+        let mut dns = self.dns.lock().unwrap();
+        if !dns.iter().any(|r| r.name.eq_ignore_ascii_case(name)) {
+            dns.push(DnsRecord {
+                id: format!("rec-{}", name.replace(['.', '*'], "-")),
+                name: name.to_string(),
+                content: content.to_string(),
+                proxied: true,
+            });
+        }
+        Ok(())
+    }
+
+    async fn delete_dns_record(
+        &self,
+        _token: &str,
+        _zone_id: &str,
+        record_id: &str,
+    ) -> Result<(), CfError> {
+        self.dns_deleted.lock().unwrap().push(record_id.to_string());
+        self.dns.lock().unwrap().retain(|r| r.id != record_id);
         Ok(())
     }
 
