@@ -2974,6 +2974,17 @@
   --sm-popover-shadow: var(--sm-shadow-popover);
 }
 
+/* TRUE OVERLAYS still float. The paper-raised→transparent re-point above is for
+   the chat transcript's glass; a shell overlay (Archived sessions, §11.4) is a
+   real panel placed over arbitrary route content — left transparent, the page
+   reads straight through it and the list scrambles into whatever is behind.
+   Re-solidify exactly this frame: the opaque chrome ground + the popover lift
+   (card shadows are `none` under Grok, which would leave the frame edgeless). */
+[data-grok] [data-testid='shell-overlay-frame'] {
+  background: var(--sm-bg-chrome);
+  box-shadow: var(--sm-shadow-popover);
+}
+
 /* The composer's own raised-glass blur is left to its component (`bg-surface` +
    the `backdrop-blur` utility on `ui/composer.tsx`) — Grok explicitly sanctions
    a raised blur on the composer / popovers (tokens.md §1.2). It is deliberately
