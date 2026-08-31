@@ -93,6 +93,7 @@ import { composerKeyIntent, jumpTarget } from '@/components/chat/composer-keys'
 import { useTheme } from '@/components/theme-provider'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useUI } from '@/stores/ui-store'
+import { useIsOwnerPlane } from '@/stores/viewer-store'
 import { botModeOn, BOT_KILL_SWITCH_KEY } from '@/lib/bot-mode-flag'
 import { GROK_KILL_SWITCH_KEY } from '@/lib/grok-mode-flag'
 
@@ -313,6 +314,16 @@ export function CommandPalette() {
   // already redirects onto these two Settings anchors (App.tsx), so the hash IS
   // the address — the same fact `lib/entity.ts` writes down for schedule and
   // host rows.
+  // OWNER PLANE (fix/invite-viewer-identity). The palette is a second doorway
+  // into every destination, so hiding a nav item without hiding its ⌘K row would
+  // hide nothing. These three are owner plane: Settings (Updates / External
+  // access / the company lifecycle), the remote-host registry, and the global
+  // claude-tools manager (`/api/claude/*` + `/api/skills` are member-denied).
+  // Everything else — Overview, Focus, Files, Connectors, Workflows, the theme
+  // toggle, sessions, slash commands — stays, because a member's own company is
+  // exactly what those reach.
+  const ownerPlane = useIsOwnerPlane()
+
   const goRows: Ranked[] = React.useMemo(() => {
     const go = (
       to: string,
@@ -329,14 +340,18 @@ export function CommandPalette() {
       go('/focus', 'Focus', 'terminal session pane current agent', Terminal),
       go('/files', 'Files', 'file tree browse edit diff working directory', FolderClosed),
       go('/store', 'Connectors', 'connector store mcp integrations add tools plugins connect catalog', Plug),
-      go('/settings', 'Settings', 'preferences config options update theme', SettingsIcon),
+      ...(ownerPlane
+        ? [go('/settings', 'Settings', 'preferences config options update theme', SettingsIcon)]
+        : []),
       go(
         '/workflows',
         'Workflows',
         'scheduler cron recurring timer prompt later workflow steps chain schedule automation',
         CalendarClock,
       ),
-      go('/settings#hosts', 'Remote hosts', 'ssh host remote machine registry', ServerCog),
+      ...(ownerPlane
+        ? [go('/settings#hosts', 'Remote hosts', 'ssh host remote machine registry', ServerCog)]
+        : []),
       {
         row: {
           id: 'go:theme',
@@ -352,7 +367,7 @@ export function CommandPalette() {
         group: 'Go to',
       },
     ]
-  }, [navigate, dark, setTheme])
+  }, [navigate, dark, setTheme, ownerPlane])
 
   // In-app actions (not sessions, not slash commands). Hidden in slash mode
   // (a leading "/" means the user wants a command). Stable identity so arrow-key
@@ -395,15 +410,22 @@ export function CommandPalette() {
         Archive,
         openArchived,
       ),
-      mk(
-        'action:claude-tools',
-        'Manage MCP / skills / commands…',
-        'mcp skills commands tools claude manage servers plugins config',
-        SlidersHorizontal,
-        // Scope to the freshest session's project (if any) so the project-scoped
-        // reads resolve; falls back to global-only when there are no sessions.
-        () => openClaudeTools(pickFreshestSession(sessions)?.name ?? null),
-      ),
+      // The GLOBAL claude-tools manager is owner plane (`/api/claude/*` and
+      // `/api/skills` are member-denied), so a member never gets the row.
+      ...(ownerPlane
+        ? [
+            mk(
+              'action:claude-tools',
+              'Manage MCP / skills / commands…',
+              'mcp skills commands tools claude manage servers plugins config',
+              SlidersHorizontal,
+              // Scope to the freshest session's project (if any) so the
+              // project-scoped reads resolve; falls back to global-only when
+              // there are no sessions.
+              () => openClaudeTools(pickFreshestSession(sessions)?.name ?? null),
+            ),
+          ]
+        : []),
     ]
     // "New group" is only meaningful on the Overview (which installs its
     // handler via `new-group-store`); on every other route the action is null
@@ -420,7 +442,7 @@ export function CommandPalette() {
       )
     }
     return base
-  }, [openArchived, openClaudeTools, sessions, newGroupAction, newSessionAction])
+  }, [openArchived, openClaudeTools, sessions, newGroupAction, newSessionAction, ownerPlane])
 
   // Merge the slash-command list (built-ins + supermux skills) with the registry's
   // file commands (e.g. ~/.claude/commands/*.md, project commands) — deduped by

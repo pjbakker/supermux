@@ -39,6 +39,7 @@ import {
 } from '@/hooks/use-connection-status'
 import { isOverlayState } from '@/stores/api-status-store'
 import { useChatSurfaceMounted } from '@/lib/live-region-owner'
+import { useViewer } from '@/stores/viewer-store'
 
 interface VisualSpec {
   Icon: React.ComponentType<{ className?: string; 'aria-hidden'?: boolean }>
@@ -204,7 +205,19 @@ export function ConnectionOverlay() {
   // occlusion. Everywhere else — the roster, files, settings, a terminal-only
   // focus route — it is still exactly right, and still appears.
   const chatOwnsTheStory = useChatSurfaceMounted()
-  const visible = isOverlayState(status.kind) && !chatOwnsTheStory
+  // AND IT STANDS DOWN FOR A VIEWER WHO IS NOT SIGNED IN.
+  //
+  // Same principle, the other end of the session: while the login gate is up,
+  // "Sign in again — your session expired" is a false statement painted over
+  // the sign-in form that is the actual answer. `pending` is included because
+  // the shell has not decided who is looking yet, and a curtain is the wrong
+  // thing to show first. For the owner this is a no-op: their viewer resolves
+  // to `owner` synchronously, in the store's initial state, before this ever
+  // renders.
+  const signedIn = useViewer(
+    (s) => s.viewer.kind === 'owner' || s.viewer.kind === 'member',
+  )
+  const visible = isOverlayState(status.kind) && !chatOwnsTheStory && signedIn
 
   // Pick the visual spec for the current kind. On a healthy transition we want
   // to keep painting the PREVIOUS visual while AnimatePresence runs the exit

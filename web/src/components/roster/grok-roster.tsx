@@ -93,6 +93,8 @@ import {
 } from '@/components/chat/group-chat'
 import { ScopeTitle } from '@/components/roster/company-switcher'
 import { NavBadgeDot } from '@/components/layout'
+import { MemberAvatar } from '@/components/roster/member-avatar'
+import { useIsMember } from '@/stores/viewer-store'
 import { useUpdateBadge } from '@/hooks/use-update-badge'
 import { agentHueVars } from '@/lib/grok-agent-hue'
 import { characterFromSeed } from '@/brand/marks'
@@ -645,6 +647,7 @@ export default function GrokRoster() {
   // Settings doorway) now that the Settings nav item — its former host — is
   // hidden under grok.
   const { state: updateBadge } = useUpdateBadge()
+  const isMember = useIsMember()
   const { sessions: allSessions } = useSessions()
   const { teams } = useTeams()
   const attention = useAttentionContext()
@@ -1251,28 +1254,37 @@ export default function GrokRoster() {
           >
             <Archive size={18} aria-hidden />
           </button>
-          <button
-            type="button"
-            className="gr-me"
-            aria-label={
-              updateBadge !== 'none'
-                ? 'Sander — settings (update available)'
-                : 'Sander — settings'
-            }
-            title="Settings"
-            onClick={() => navigate('/settings')}
-          >
-            <span className="av" aria-hidden>
-              SB
-            </span>
-            {/* Re-homed update-available dot. It used to hang off the Settings
-                nav item, which grok drops (`grokHidden`); the avatar is the grok
-                Settings doorway, so the "update available" tell rides here now.
-                Absolutely pinned to the avatar's top-right corner. */}
-            <span className="pointer-events-none absolute -right-0.5 -top-0.5">
-              <NavBadgeDot state={updateBadge} />
-            </span>
-          </button>
+          {/* The account slot. The OWNER's button is unchanged, inline, and the
+              only one on the cold path. An invited colleague gets THEIR OWN
+              `<HumanMark>` and an account sheet whose one action is Sign out —
+              never a doorway into the owner's admin plane (bug #3/#4). Lazy, so
+              the owner never downloads it. */}
+          {isMember ? (
+            <MemberAvatar />
+          ) : (
+            <button
+              type="button"
+              className="gr-me"
+              aria-label={
+                updateBadge !== 'none'
+                  ? 'Sander — settings (update available)'
+                  : 'Sander — settings'
+              }
+              title="Settings"
+              onClick={() => navigate('/settings')}
+            >
+              <span className="av" aria-hidden>
+                SB
+              </span>
+              {/* Re-homed update-available dot. It used to hang off the Settings
+                  nav item, which grok drops (`grokHidden`); the avatar is the grok
+                  Settings doorway, so the "update available" tell rides here now.
+                  Absolutely pinned to the avatar's top-right corner. */}
+              <span className="pointer-events-none absolute -right-0.5 -top-0.5">
+                <NavBadgeDot state={updateBadge} />
+              </span>
+            </button>
+          )}
         </span>
       </header>
 

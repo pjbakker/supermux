@@ -73,6 +73,7 @@ import { useAttentionContext } from '@/hooks/use-attention'
 import { useSessionActions } from '@/hooks/use-session-actions'
 import { useSessionConfig } from '@/hooks/use-session-config'
 import { useCompanies } from '@/hooks/use-companies'
+import { useIsOwnerPlane } from '@/stores/viewer-store'
 import { useChatRenderer } from '@/components/chat/use-chat-renderer'
 import { useRendererState } from '@/components/chat/use-renderer-pref'
 import { prefFor, type RendererPref } from '@/components/chat/renderer-pref'
@@ -211,7 +212,12 @@ export function SessionActionsMenu({
   // "Move to company…" — the bot-move entry point (§5). Gated on there being at
   // least one company to move into/among; opens the destination-picker sheet.
   const { companies } = useCompanies()
-  const canMoveCompany = companies.length > 0
+  // Owner plane: `POST /api/sessions/{name}/company` is owner/admin-only, and a
+  // member's company list is fenced to their own single row — so for them the
+  // item could only ever offer "move it where it already is", and then be
+  // refused. Hidden rather than left to fail.
+  const ownerPlane = useIsOwnerPlane()
+  const canMoveCompany = ownerPlane && companies.length > 0
   const [moveCompanyOpen, setMoveCompanyOpen] = React.useState(false)
 
   // Action visibility matrix (per user spec — keep redundancies pruned):

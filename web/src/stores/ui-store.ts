@@ -89,6 +89,19 @@ interface UIStore {
    *  needed. Mirrors `hideStopped`'s field+setter shape. */
   activeCompany: number | null
   setActiveCompany: (id: number | null) => void
+  /** THE MEMBER LOCK (viewer identity plane). `null` for the owner — every
+   *  behaviour below is then exactly what it always was. A number means the
+   *  viewer is an invited colleague, server-fenced to that company
+   *  (`server/src/scope.rs`), and the presentation is fenced with them:
+   *  `botMode` is forced ON, `activeCompany` is pinned to their company, and
+   *  `setBotMode` / `setActiveCompany` become no-ops so neither a persisted
+   *  blob from an earlier visit nor a stray UI action can escape the fence.
+   *  NEVER persisted (see `partialize`) — it is derived from `/auth/me` on every
+   *  load, so a stale copy can neither grant nor withhold scope. */
+  memberCompany: number | null
+  /** Raise the lock: bot mode on, scope pinned, setters sealed. Called once at
+   *  boot by the viewer store, before the shell mounts. */
+  lockToCompany: (id: number) => void
   /** Bot mode — the ONE unified flag (merges the former `chatRenderer` +
    *  `grokMode`). When ON: (1) the shell root carries `data-grok` and the
    *  scoped token layer (styles/grok-mode.css) restyles the whole app in Grok's
@@ -130,6 +143,22 @@ interface UIStore {
   setHideStopped: (v: boolean) => void
 }
 
+/**
+ * What actually reaches `localStorage`.
+ *
+ * `memberCompany` (the member lock) is a per-LOAD fact derived from `/auth/me`,
+ * not a preference — persisting it would let a stale blob claim, or drop, a
+ * fence the server never granted. Everything else persists exactly as before, so
+ * an existing `supermux-ui` blob round-trips byte-identically.
+ *
+ * Exported so the exclusion is testable as itself rather than through the
+ * middleware's storage.
+ */
+export function persistedUISlice(state: UIStore): UIStore {
+  const { memberCompany: _memberCompany, ...rest } = state
+  return rest as UIStore
+}
+
 export const useUI = create<UIStore>()(
   persist(
     (set) => ({
@@ -142,8 +171,13 @@ export const useUI = create<UIStore>()(
       showHidden: true,
       hideStopped: false,
       activeCompany: null,
+      memberCompany: null,
+      lockToCompany: (id) =>
+        set({ memberCompany: id, activeCompany: id, botMode: true }),
       botMode: false,
-      setBotMode: (botMode) => set({ botMode }),
+      // Both setters are SEALED while the member lock holds — that is what makes
+      // the lock derived rather than merely written once.
+      setBotMode: (botMode) => set((s) => (s.memberCompany === null ? { botMode } : {})),
       defaultRenderer: 'chat',
       rendererOverrides: {},
       setDefaultRenderer: (defaultRenderer) => set({ defaultRenderer }),
@@ -177,10 +211,12 @@ export const useUI = create<UIStore>()(
         set({ overviewSizeMobile: clampOverviewSizeMobile(overviewSizeMobile) }),
       setShowHidden: (showHidden) => set({ showHidden }),
       setHideStopped: (hideStopped) => set({ hideStopped }),
-      setActiveCompany: (activeCompany) => set({ activeCompany }),
+      setActiveCompany: (activeCompany) =>
+        set((s) => (s.memberCompany === null ? { activeCompany } : {})),
     }),
     {
       name: 'supermux-ui',
+      partialize: persistedUISlice,
       // Persist schema version. v1 folds the two former experiment flags
       // (`chatRenderer` + `grokMode`) into ONE `botMode`. `migrate` runs BEFORE
       // `onRehydrateStorage`, so the rehydrate hook below sees the migrated

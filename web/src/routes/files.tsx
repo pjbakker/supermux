@@ -56,6 +56,7 @@ import { SendToBotSheet } from '@/components/files/send-to-bot-sheet'
 import { SpaceCrumb } from '@/components/files/space-crumb'
 import { SpacesGrid } from '@/components/files/spaces-grid'
 import { spaceCards, spacesSkipTarget } from '@/components/files/spaces'
+import { useIsMember } from '@/stores/viewer-store'
 import { attachmentSentence } from '@/components/chat/composer-insert'
 import { insertIntoComposer } from '@/components/chat/composer-draft'
 import {
@@ -273,9 +274,13 @@ export function Files() {
   )
 
   const activity = useFilesActivityStore((s) => s.bySpace)
+  // An invited colleague has NO HQ space: they are fenced to one company
+  // server-side (`server/src/scope.rs` — the files jail included), so an HQ card
+  // would be a door that opens on a 404. The owner keeps it, unchanged.
+  const isMember = useIsMember()
   const cards = React.useMemo(
-    () => spaceCards(companies, sessions, activity, { includeHq: true }),
-    [companies, sessions, activity],
+    () => spaceCards(companies, sessions, activity, { includeHq: !isMember }),
+    [companies, sessions, activity, isMember],
   )
 
   // Bots offered by "Send to bot" and the crumb's secondary group: the ACTIVE
@@ -588,6 +593,7 @@ export function Files() {
           gotoSpace({ view: 'spaces' })
         }}
         onPickSession={onPickSession}
+        allowHq={!isMember}
       />
       {wantsDirectory && (
         <Breadcrumb path={dirPath} onNavigate={navigateTo} floor={companyRoot} />

@@ -27,6 +27,7 @@ pub fn router_for(state: AppState) -> Router {
         .route("/auth/invite", get(invite))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/auth/profile", post(profile))
         .with_state(state)
 }
 
@@ -40,6 +41,14 @@ struct LoginQuery {
 struct InviteQuery {
     /// The signed magic-link token (`base64url(payload).hmac_hex`).
     token: Option<String>,
+}
+
+/// `POST /auth/profile` body — the ONE self-service field a human colleague owns.
+#[derive(Debug, Deserialize)]
+struct ProfileInput {
+    /// The name shown on their chat messages and their avatar. Trimmed, 1..=64
+    /// chars; anything else is a 400.
+    display_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +347,89 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     append_cookie(h, &format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"));
     append_cookie(h, &format!("{CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Lax"));
     resp
+}
+
+/// `POST /auth/profile` — a human colleague names THEMSELVES.
+///
+/// The invite flow mints a session for a `human_users` row seeded by the owner,
+/// whose `display_name` is typically a placeholder (or empty). The group chat
+/// resolves a poster's name server-side from that row, and the SPA draws the
+/// avatar monogram from it — so until the colleague sets it, they are nameless
+/// on every surface. This is the one field they own.
+///
+/// Refusals, in the same shape as the rest of this router:
+///   * human surface not configured ⇒ `404` (the route does not exist here);
+///   * no valid session cookie ⇒ `401` (the SPA's cue to show the login gate);
+///   * missing/invalid CSRF header ⇒ `403` — a cookie-borne state change, so the
+///     same double-submit `logout` enforces;
+///   * empty / >64-char name ⇒ `400`.
+///
+/// Writes ONLY the session's own `user_id`: the row is never taken from the body,
+/// so this cannot rename another colleague.
+async fn profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ProfileInput>,
+) -> Response {
+    let cfg = state.human_auth_cfg();
+    // `human_surface_active()` (not `enabled()`): an invite-minted, Google-less
+    // trial must be able to name itself too.
+    if !cfg.human_surface_active() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    // Resolve the session from the cookie (never the body, never a bearer — the
+    // owner is a token, not a person, and has no `human_users` row to rename here).
+    let cookie_header = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = match cookie_value(cookie_header, SESSION_COOKIE)
+        .and_then(|raw| verify_cookie(&cfg.cookie_key, raw))
+    {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let token_hash = sha256_hex(&token);
+    let sess = match crate::db::human_sessions::resolve_valid(&state.pool, &token_hash, now).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "human_sessions resolve failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
+    };
+
+    // CSRF (double-submit) — identical to `logout`.
+    let presented = headers
+        .get(CSRF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let stored = sess.csrf_hash.as_deref().unwrap_or("");
+    if !csrf_matches(&cfg.csrf_key, presented, stored) {
+        return (StatusCode::FORBIDDEN, "missing or invalid CSRF token").into_response();
+    }
+
+    // Validate. Length is counted in CHARS, not bytes, so a 64-char name in any
+    // script is accepted (and a 3-byte emoji does not eat three of the budget).
+    let name = input.display_name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "display_name is required").into_response();
+    }
+    if name.chars().count() > 64 {
+        return (StatusCode::BAD_REQUEST, "display_name is too long (max 64)").into_response();
+    }
+
+    match crate::db::human_users::set_display_name(&state.pool, sess.user_id, name).await {
+        Ok(true) => Json(json!({"ok": true, "display_name": name})).into_response(),
+        // The session outlived its user row (revoked mid-flight) — uniform 401.
+        Ok(false) => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "human_users display_name update failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
+        }
+    }
 }
 
 /// `GET /auth/me` — the resolved identity for the SPA. Owner (bearer) or human

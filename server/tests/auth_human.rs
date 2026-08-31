@@ -458,3 +458,253 @@ async fn disabled_config_makes_auth_routes_inert_and_owner_byte_identical() {
     assert_eq!(no.status(), StatusCode::UNAUTHORIZED);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ── POST /auth/profile — a colleague names themselves ─────────────────────────
+//
+// The invite flow mints a session for an owner-seeded `human_users` row whose
+// `display_name` is a placeholder. Until the colleague can set it, they are
+// nameless in the group chat and their avatar has no monogram — which is exactly
+// the owner-reported "an invited user must give their name". These pin the route
+// and every refusal it owes.
+
+/// POST /auth/profile with the given cookie/csrf pair and body.
+async fn post_profile(
+    app: &axum::Router,
+    cookie: Option<&str>,
+    csrf_header: Option<&str>,
+    body: &str,
+) -> axum::response::Response {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/auth/profile")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(c) = cookie {
+        req = req.header(header::COOKIE, c);
+    }
+    if let Some(x) = csrf_header {
+        req = req.header("x-supermux-csrf", x);
+    }
+    app.clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn profile_sets_own_display_name_and_me_reflects_it() {
+    let (app, state, dir) = enabled_app().await;
+    let cb = login_flow(&app, "good-code").await;
+    let cookie = set_cookie(&cb, "supermux_hsess").unwrap();
+    let csrf = set_cookie(&cb, "supermux_csrf").unwrap();
+    let cookies = format!("supermux_hsess={cookie}; supermux_csrf={csrf}");
+
+    let resp = post_profile(
+        &app,
+        Some(&cookies),
+        Some(&csrf),
+        r#"{"display_name":"  Alice Anderson  "}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "happy path 200");
+
+    // The row is updated — and it is the SESSION's row, trimmed.
+    let user = db::human_users::get_by_email(&state.pool, "alice@acme.test")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.display_name, "Alice Anderson", "trimmed + stored");
+
+    // `/auth/me` now carries the name the SPA draws its avatar + chat rows from.
+    let me = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/me")
+                .header(header::COOKIE, format!("supermux_hsess={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(me.into_body(), 64 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["authenticated"], serde_json::json!(true));
+    assert_eq!(v["identity"]["display_name"], serde_json::json!("Alice Anderson"));
+    assert_eq!(v["identity"]["company_id"], serde_json::json!(COMPANY_ID));
+    assert_eq!(v["identity"]["role"], serde_json::json!("member"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn profile_requires_csrf_and_a_session() {
+    let (app, state, dir) = enabled_app().await;
+    let cb = login_flow(&app, "good-code").await;
+    let cookie = set_cookie(&cb, "supermux_hsess").unwrap();
+    let csrf = set_cookie(&cb, "supermux_csrf").unwrap();
+    let cookies = format!("supermux_hsess={cookie}; supermux_csrf={csrf}");
+
+    // No CSRF header at all → 403.
+    let no_csrf = post_profile(&app, Some(&cookies), None, r#"{"display_name":"Mallory"}"#).await;
+    assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN, "missing CSRF → 403");
+
+    // A WRONG CSRF value → 403 too (double-submit, not mere presence).
+    let bad_csrf = post_profile(
+        &app,
+        Some(&cookies),
+        Some("not-the-csrf-token"),
+        r#"{"display_name":"Mallory"}"#,
+    )
+    .await;
+    assert_eq!(bad_csrf.status(), StatusCode::FORBIDDEN, "wrong CSRF → 403");
+
+    // Anonymous (no cookie) → 401, whatever CSRF is presented.
+    let anon = post_profile(&app, None, Some(&csrf), r#"{"display_name":"Mallory"}"#).await;
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED, "anon → 401");
+
+    // The owner BEARER is a token, not a person: it has no session cookie here,
+    // so it cannot rename anybody through this route either.
+    let owner = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/profile")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"display_name":"Mallory"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner.status(), StatusCode::UNAUTHORIZED, "bearer-only → 401");
+
+    // None of the refusals wrote anything.
+    let user = db::human_users::get_by_email(&state.pool, "alice@acme.test")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.display_name, "Alice", "no refusal may write");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn profile_validates_length() {
+    let (app, state, dir) = enabled_app().await;
+    let cb = login_flow(&app, "good-code").await;
+    let cookie = set_cookie(&cb, "supermux_hsess").unwrap();
+    let csrf = set_cookie(&cb, "supermux_csrf").unwrap();
+    let cookies = format!("supermux_hsess={cookie}; supermux_csrf={csrf}");
+
+    // Empty / whitespace-only → 400.
+    for body in [r#"{"display_name":""}"#, r#"{"display_name":"   "}"#] {
+        let resp = post_profile(&app, Some(&cookies), Some(&csrf), body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "empty name → 400: {body}");
+    }
+
+    // 65 chars → 400; exactly 64 → OK (the boundary is inclusive).
+    let too_long = format!(r#"{{"display_name":"{}"}}"#, "a".repeat(65));
+    let resp = post_profile(&app, Some(&cookies), Some(&csrf), &too_long).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "65 chars → 400");
+
+    let at_limit = format!(r#"{{"display_name":"{}"}}"#, "b".repeat(64));
+    let resp = post_profile(&app, Some(&cookies), Some(&csrf), &at_limit).await;
+    assert_eq!(resp.status(), StatusCode::OK, "64 chars accepted");
+    let user = db::human_users::get_by_email(&state.pool, "alice@acme.test")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.display_name, "b".repeat(64));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn profile_is_inert_when_the_human_surface_is_not_configured() {
+    let dir = std::env::temp_dir().join(format!("supermux-profdis-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = config_with(&dir, HumanAuthConfig::default());
+    let pool = db::init(&config).await.unwrap();
+    let state = AppState::new(pool, config);
+    let app = http::router(state);
+
+    let resp = post_profile(&app, None, None, r#"{"display_name":"Anyone"}"#).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "inert → 404");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ── GET /api/companies is fenced to the member's OWN company ──────────────────
+//
+// The client draws the member's scope chip (mark + name) from this list. It is
+// ALSO the surface that would leak the existence of every other tenant if it
+// were not fenced, so the fence is pinned here as a regression rather than
+// assumed from `list_handler`'s filter.
+
+#[tokio::test]
+async fn companies_list_shows_a_member_only_their_own_company() {
+    let (app, state, dir) = enabled_app().await;
+    // Two real companies; alice is seeded into COMPANY_ID (1).
+    let mine = db::companies::create(&state.pool, "acme", "Acme", "/tmp/acme")
+        .await
+        .unwrap();
+    let theirs = db::companies::create(&state.pool, "initech", "Initech", "/tmp/initech")
+        .await
+        .unwrap();
+    assert_eq!(mine.id, COMPANY_ID, "alice's seeded company id");
+
+    let cb = login_flow(&app, "good-code").await;
+    let cookie = set_cookie(&cb, "supermux_hsess").unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/companies")
+                .header(header::COOKIE, format!("supermux_hsess={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let rows = v["data"].as_array().expect("data is an array");
+    assert_eq!(rows.len(), 1, "a member sees exactly one company: {v}");
+    assert_eq!(rows[0]["id"], serde_json::json!(mine.id));
+    assert_eq!(rows[0]["display_name"], serde_json::json!("Acme"));
+
+    // The OWNER still sees both (the fence is scoped, not global).
+    let owner = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/companies")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(owner.into_body(), 256 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"].as_array().unwrap().len(), 2, "owner sees both");
+
+    // And a direct fetch of the OTHER company is the uniform hide-existence 404.
+    let foreign = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/companies/{}", theirs.id))
+                .header(header::COOKIE, format!("supermux_hsess={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND, "cross-company → 404");
+
+    let _ = std::fs::remove_dir_all(dir);
+}

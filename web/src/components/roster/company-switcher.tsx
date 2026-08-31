@@ -44,6 +44,7 @@ import { ChevronsUpDown, Plus, SlidersHorizontal, Trash2, UserPlus } from 'lucid
 
 import { useCompanies } from '@/hooks/use-companies'
 import { useUI } from '@/stores/ui-store'
+import { useViewer } from '@/stores/viewer-store'
 import { companyForDigit } from '@/lib/companies'
 import { anchoredMenuStyle } from '@/lib/anchored-menu'
 import { useMediaQuery } from '@/hooks/use-media-query'
@@ -122,6 +123,13 @@ export function CompanySwitcher({
   const { companies } = useCompanies()
   const activeCompany = useUI((s) => s.activeCompany)
   const setActiveCompany = useUI((s) => s.setActiveCompany)
+  // OWNER BUG #4 — a scoped member has no scope to SWITCH. Their `/api/companies`
+  // is fenced to exactly one row server-side, there is no HQ for them, and every
+  // action this menu carries (invite a teammate, company settings, delete, start
+  // a company) is owner/admin-only and 404s for them anyway. So they get the
+  // identity, not the control: a static chip. Read here, above every other hook,
+  // so hook order is identical on both branches.
+  const isMember = useViewer((s) => s.viewer.kind === 'member')
 
   // Fork on input modality — the SAME `(pointer: coarse)` signal
   // `<ResponsiveSheet>` / the tile hover-fork use. Coarse → bottom sheet; fine →
@@ -193,7 +201,10 @@ export function CompanySwitcher({
 
   // ── Global shortcuts: ⌘/Ctrl+⇧+O opens; ⌘/Ctrl+1..9 jumps to the Nth ─────────
   React.useEffect(() => {
-    if (!shortcuts) return
+    // `!isMember`: a member has exactly one scope, the setters are sealed by the
+    // member lock, and ⌘1 means "go to HQ" — so the whole shortcut set is a
+    // no-op that would still swallow the browser's own ⌘1..9. Don't register it.
+    if (!shortcuts || isMember) return
     const onKey = (e: KeyboardEvent) => {
       if (!isCmdOrCtrl(e)) return
       // Open — ⌘/Ctrl+Shift+O (KeyO is layout-stable).
@@ -225,7 +236,7 @@ export function CompanySwitcher({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [companies, measureFrom, setActiveCompany, shortcuts])
+  }, [companies, isMember, measureFrom, setActiveCompany, shortcuts])
 
   // Seat the highlight on the active row whenever the list opens (both shells).
   // Done on the open TRANSITION during render (the "adjust state when a prop
@@ -500,6 +511,49 @@ export function CompanySwitcher({
       </div>
     ) : null
 
+  // ── THE MEMBER CHIP (owner bug #4) ─────────────────────────────────────────
+  // Identity without control: the same mark + name the trigger shows, in a
+  // non-interactive element. No menu, no HQ row, no "Start a company…", no
+  // invite / settings / delete. Placed AFTER every hook above so the hook order
+  // is byte-identical on both branches (rules-of-hooks), and it reuses the exact
+  // `.gr-scope-circle` / `.gr-company` classes so the skin needs no new rules —
+  // the `:active`/`:hover` affordances simply never fire on a span.
+  if (isMember) {
+    // NEVER the `label` fallback: that is the string "HQ", the one scope a
+    // member must never be shown. Until their (single, fenced) company row
+    // arrives, the chip is the same empty ringed circle the lazy trigger holds
+    // the slot with.
+    const memberLabel = active?.display_name ?? ''
+    const mark = active ? (
+      <CompanyMark
+        slug={active.slug}
+        name={active.display_name}
+        size={variant === 'circle' ? 26 : 22}
+        className="grok-identity"
+        logo={active}
+      />
+    ) : null
+    return variant === 'circle' ? (
+      <span
+        className="gr-scope-circle"
+        data-static=""
+        aria-label={memberLabel ? `Company: ${memberLabel}` : undefined}
+        title={memberLabel || undefined}
+      >
+        {mark}
+      </span>
+    ) : (
+      <span
+        className="gr-company"
+        data-static=""
+        aria-label={memberLabel ? `Company: ${memberLabel}` : undefined}
+      >
+        {mark}
+        <span className="gr-company-lbl">{memberLabel}</span>
+      </span>
+    )
+  }
+
   return (
     <>
       <div className="relative">
@@ -650,7 +704,13 @@ export function CompanySwitcher({
 export function ScopeTitle() {
   const { companies } = useCompanies()
   const activeCompany = useUI((s) => s.activeCompany)
+  const isMember = useViewer((s) => s.viewer.kind === 'member')
   const active = companies.find((c) => c.id === activeCompany) ?? null
+  // A member has no HQ. Until their (single, fenced) company row lands, the
+  // title is empty rather than the one scope name they must never be shown —
+  // the roster header is on screen from the first frame, so the fallback string
+  // is not a detail.
+  const hq = !active && !isMember
   return (
     <span className="gr-scope-title">
       {active ? (
@@ -661,10 +721,12 @@ export function ScopeTitle() {
           className="grok-identity"
           logo={active}
         />
-      ) : (
+      ) : hq ? (
         <HqMark size={24} />
-      )}
-      <span className="gr-scope-title-lbl">{active ? active.display_name : 'HQ'}</span>
+      ) : null}
+      <span className="gr-scope-title-lbl">
+        {active ? active.display_name : hq ? 'HQ' : ''}
+      </span>
     </span>
   )
 }
