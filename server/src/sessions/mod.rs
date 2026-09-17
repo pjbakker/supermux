@@ -1267,9 +1267,12 @@ pub struct CreateInput {
     #[serde(default)]
     pub config_dir: Option<String>,
     /// The company a new session is created into (migration 0032). Absent /
-    /// null => a main bot (`company_id` NULL). When set, the create path forces
-    /// `dir` under the company's `root_dir/<name>/`, IGNORING (overriding, never
-    /// rejecting) any client-supplied `dir`.
+    /// null => a main bot (`company_id` NULL). When set, the create path keeps
+    /// `dir` inside the company's `root_dir`: an explicit client-supplied `dir`
+    /// is honored only when it canonicalizes to a path inside `root_dir`, and
+    /// every other case (no dir, a dir outside the root, `..` traversal, a
+    /// symlink out of it) is forced to `root_dir/<name>/`, overriding and never
+    /// rejecting what the client sent.
     /// Membership is fixed at create — `ConfigInput` deliberately has no
     /// `company_id`, so `PATCH …/config` cannot reassign it.
     #[serde(default)]
@@ -1303,6 +1306,51 @@ pub struct CreateInput {
 /// proven in production dispatcher use. An idle session that has said nothing
 /// for longer than this no longer blocks a respawn of its identity.
 pub const GUARD_QUIET_SECS: i64 = 7200;
+
+/// The company-session dir decision: the canonical client dir when it is
+/// EXPLICIT and lands inside `root_dir`, else `None` so the caller forces
+/// `<root_dir>/<name>/`.
+///
+/// Extracted from [`create`] so it can be tested without a database, a
+/// session name or a `$HOME`. Only `client_dir` is ever eligible: the
+/// main-bot default that falls back to `$HOME` must never reach this check,
+/// or a company create with no dir would land in `$HOME` on any box where
+/// `$HOME` sits inside a company root.
+///
+/// The dir must be ABSOLUTE. A relative dir would canonicalize against the
+/// server process's working directory, which would make the outcome depend on
+/// how the daemon was started rather than on the request, so it falls back to
+/// forced (the same rule [`valid_config_dir`] applies).
+///
+/// Both sides are canonicalized first, so a symlinked root cannot defeat the
+/// check, and they are compared by path COMPONENT (`Path::starts_with`), so a
+/// sibling like `/root-evil` is not treated as living in `/root`. The target
+/// must also BE a directory: an existing regular file inside the root would
+/// otherwise be stored as a session cwd and fail much later, at spawn, with a
+/// misleading "directory does not exist". A blank dir, a relative dir, a
+/// nonexistent dir, a non-directory, `..` traversal out of the root, a symlink
+/// pointing out of the root and an uncanonicalizable root all return `None`.
+///
+/// A client dir equal to `root_dir` IS honored: it is inside the jail, and a
+/// bot working at the company root is a legitimate ask.
+///
+/// The check is CREATE TIME only. Nothing re-validates the stored path at
+/// spawn, so anything that can write inside the company root can later swap a
+/// path component for a symlink pointing out of it. The worst case is a failed
+/// or crippled boot, not an escape: the sandbox grant is built from `root_dir`
+/// and resolved when the child opens a file, so the child still cannot write
+/// outside the company tree (see `isolation::SandboxSpec::for_company`).
+fn honored_company_dir(
+    client_dir: Option<&str>,
+    root_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let client_dir = client_dir
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && std::path::Path::new(d).is_absolute())?;
+    let root = std::fs::canonicalize(root_dir).ok()?;
+    let p = std::fs::canonicalize(client_dir).ok()?;
+    (p.starts_with(&root) && p.is_dir()).then_some(p)
+}
 
 pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView, AppError> {
     let name = input.name.trim().to_string();
@@ -1421,25 +1469,13 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         )));
     }
 
-    // The main/HQ default dir: the caller-supplied dir, or $HOME. Used only for
-    // main bots (`company_id` NULL) — a company bot's dir is server-owned and
-    // OVERRIDES this below.
-    let default_dir = input
-        .dir
-        .clone()
-        .filter(|d| !d.trim().is_empty())
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| ".".into())
-        });
-
-    // Company sessions live under their company's `root_dir/<name>/`. The server
-    // OWNS this dir: hiring a bot in a company just works, so ANY client-supplied
-    // `input.dir` is IGNORED and the dir is FORCED to `<root_dir>/<name>/` — the
-    // client never has to get it right, and a company bot can never land outside
-    // its company root. Main bots (`company_id` NULL) keep the free-form
-    // default-to-$HOME dir above, byte-identical.
+    // Company sessions live under their company's root. The server owns the
+    // namespace: an EXPLICIT client-supplied `input.dir` is honored ONLY when
+    // it canonicalizes inside `root_dir` (see below); anything else, including
+    // a create that sends no dir at all, is FORCED to `<root_dir>/<name>/`, so
+    // a company bot can never land outside its company root. Main bots
+    // (`company_id` NULL) keep the free-form default-to-$HOME dir, bound in the
+    // `else` arm below and byte-identical to upstream.
     let dir = if let Some(cid) = input.company_id {
         let company = db::companies::get(&state.pool, cid)
             .await?
@@ -1447,15 +1483,57 @@ pub async fn create(state: &AppState, input: CreateInput) -> Result<SessionView,
         if company.archived != 0 {
             return Err(AppError::BadRequest("company is archived".into()));
         }
-        // OVERRIDE, never compare/reject: whatever the client sent (or nothing),
-        // the derived dir is `<root_dir>/<name>/`.
-        let forced = std::path::Path::new(&company.root_dir).join(&name);
-        std::fs::create_dir_all(&forced).map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("mkdir {}: {e}", forced.display()))
-        })?;
-        forced.display().to_string()
+        // The company root OWNS the namespace, but an EXPLICIT client dir that
+        // canonicalizes to a path INSIDE the root is honored: the hub
+        // dispatcher spawns operator sessions into a portfolio repo that
+        // already lives in the company tree, and forcing `<root_dir>/<name>/`
+        // there would strand every such boot in an empty per-spawn dir. Only
+        // `input.dir` is eligible: the main-bot default that falls back to
+        // `$HOME` is bound in the `else` arm below, out of scope here, so it
+        // cannot be honored into a company root (see [`honored_company_dir`]
+        // for the full rule set).
+        let honored = honored_company_dir(
+            input.dir.as_deref(),
+            std::path::Path::new(&company.root_dir),
+        );
+        if let Some(p) = honored {
+            p.display().to_string()
+        } else {
+            let forced = std::path::Path::new(&company.root_dir).join(&name);
+            std::fs::create_dir_all(&forced).map_err(|e| {
+                AppError::Internal(anyhow::anyhow!("mkdir {}: {e}", forced.display()))
+            })?;
+            // A client that ASKED for a dir and did not get it is the one case
+            // worth a line: "why is my bot not in the repo I sent" is otherwise
+            // undiagnosable from the log. A create that sent no dir is the
+            // normal path and stays silent.
+            if let Some(sent) = input.dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                tracing::debug!(
+                    session = %name,
+                    sent = %sent,
+                    root = %company.root_dir,
+                    forced = %forced.display(),
+                    "company create: client dir not honored, forced under the company root"
+                );
+            }
+            forced.display().to_string()
+        }
     } else {
-        default_dir
+        // The main/HQ default dir: the caller-supplied dir, or $HOME. Bound
+        // HERE, inside the main-bot arm, and deliberately NOT in scope in the
+        // company arm above: feeding this value (and with it the $HOME
+        // fallback) to the honored-dir check is exactly the bug this binding's
+        // placement prevents. A company bot's dir is derived from its company
+        // root, never from this default.
+        input
+            .dir
+            .clone()
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| ".".into())
+            })
     };
     let tags = input.tags.unwrap_or_default();
     let display_name = input
@@ -3145,10 +3223,13 @@ mod tests {
         (c.id, root)
     }
 
-    /// §4.1 — a company session's `dir` is FORCED under `<root_dir>/<name>/`.
-    /// The server OWNS the company session dir: any client-supplied `dir` is
-    /// IGNORED (overridden, never a 400) so hiring a bot in a company just
-    /// works. A main bot (no company) keeps its free-form dir.
+    /// §4.1: a company session's `dir` is FORCED under `<root_dir>/<name>/`
+    /// whenever the client dir is not honored. The server OWNS the company
+    /// session namespace: a client-supplied `dir` OUTSIDE the root is
+    /// overridden, never a 400, so hiring a bot in a company just works. (A
+    /// client dir INSIDE the root is honored instead, see
+    /// `company_session_dir_honors_client_dir_inside_root`.) A main bot (no
+    /// company) keeps its free-form dir.
     #[tokio::test]
     async fn company_session_dir_is_forced_under_root_ignoring_client_dir() {
         let (state, dir) = test_state().await;
@@ -3198,6 +3279,336 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A throwaway company root for the [`honored_company_dir`] unit tests.
+    /// Returns `(root, cleanup_base)`: the root is one level below the base so
+    /// a `..` from the root still lands in a dir the test owns.
+    fn helper_root(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("supermux-honored-{tag}-{}", uuid::Uuid::new_v4()));
+        let root = base.join("co-root");
+        std::fs::create_dir_all(&root).unwrap();
+        (root, base)
+    }
+
+    /// §4.1: no client dir and a blank client dir are NEVER honored, whatever
+    /// happens to live inside the root. This is the `$HOME` regression guard:
+    /// `create()` must pass `input.dir`, not the main-bot default that falls
+    /// back to `$HOME`, so even a root that CONTAINS a plausible default
+    /// cannot turn an absent dir into an honored one.
+    #[test]
+    fn honored_company_dir_ignores_absent_and_blank_client_dir() {
+        let (root, base) = helper_root("blank");
+        // A real, canonicalizable dir inside the root, standing in for the
+        // `$HOME` (or cwd) that the old code fed into this check.
+        std::fs::create_dir_all(root.join("home")).unwrap();
+
+        assert_eq!(honored_company_dir(None, &root), None, "no client dir");
+        assert_eq!(honored_company_dir(Some(""), &root), None, "empty client dir");
+        assert_eq!(honored_company_dir(Some("   "), &root), None, "blank client dir");
+        assert_eq!(
+            honored_company_dir(Some("\t\n"), &root),
+            None,
+            "whitespace-only client dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// §4.1: a real subdir of the root is honored, canonicalized, and so is a
+    /// dir written with surrounding whitespace or an interior `.` segment.
+    #[test]
+    fn honored_company_dir_honors_a_dir_inside_the_root() {
+        let (root, base) = helper_root("inside");
+        let repo = root.join("portfolio");
+        std::fs::create_dir_all(&repo).unwrap();
+        let want = std::fs::canonicalize(&repo).unwrap();
+
+        assert_eq!(honored_company_dir(Some(repo.to_str().unwrap()), &root), Some(want.clone()));
+        assert_eq!(
+            honored_company_dir(Some(&format!("  {}  ", repo.display())), &root),
+            Some(want.clone()),
+            "surrounding whitespace is trimmed"
+        );
+        let dotted = root.join(".").join("portfolio").display().to_string();
+        assert_eq!(
+            honored_company_dir(Some(&dotted), &root),
+            Some(want),
+            "canonicalization resolves `.` segments"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// §4.1: the root ITSELF is honored. It is inside the jail, and a bot that
+    /// works at the company root is a legitimate ask.
+    #[test]
+    fn honored_company_dir_honors_the_root_itself() {
+        let (root, base) = helper_root("self");
+        let want = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(honored_company_dir(Some(root.to_str().unwrap()), &root), Some(want));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// §4.1: a symlink that LIVES inside the root but POINTS outside it is not
+    /// a way out. Canonicalization resolves the link before the prefix check.
+    #[test]
+    fn honored_company_dir_rejects_a_symlink_escaping_the_root() {
+        let (root, base) = helper_root("symlink");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = root.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        assert_eq!(honored_company_dir(Some(link.to_str().unwrap()), &root), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// §4.1: `..` out of the root is refused even though the target is a REAL
+    /// dir, so the refusal comes from the prefix check and not from a failed
+    /// canonicalize.
+    #[test]
+    fn honored_company_dir_rejects_traversal_out_of_the_root() {
+        let (root, base) = helper_root("traversal");
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        let traversal = root.join("..").join("elsewhere").display().to_string();
+
+        assert_eq!(honored_company_dir(Some(&traversal), &root), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// §4.1: the check is by path COMPONENT, so a sibling whose name merely
+    /// starts with the root's name is outside the jail. A string prefix check
+    /// would wrongly accept `co-root-evil` for root `co-root`.
+    #[test]
+    fn honored_company_dir_rejects_a_sibling_with_the_root_as_a_string_prefix() {
+        let (root, base) = helper_root("sibling");
+        let evil = base.join("co-root-evil");
+        std::fs::create_dir_all(&evil).unwrap();
+
+        assert!(
+            evil.display().to_string().starts_with(&root.display().to_string()),
+            "fixture must be a string prefix of the root, or this test proves nothing"
+        );
+        assert_eq!(honored_company_dir(Some(evil.to_str().unwrap()), &root), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// §4.1: a dir that does not exist, and a root that does not exist, both
+    /// fall back to forced instead of being honored on a path that cannot be
+    /// resolved.
+    #[test]
+    fn honored_company_dir_rejects_unresolvable_paths() {
+        let (root, base) = helper_root("missing");
+        let ghost = root.join("no-such-dir");
+        assert_eq!(honored_company_dir(Some(ghost.to_str().unwrap()), &root), None);
+
+        let missing_root = base.join("no-such-root");
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        assert_eq!(
+            honored_company_dir(Some(real.to_str().unwrap()), &missing_root),
+            None,
+            "an uncanonicalizable root falls back to forced"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// §4.1: an existing REGULAR FILE inside the root is not a session cwd.
+    /// It canonicalizes and it passes the prefix check, so only the is-a-dir
+    /// filter keeps it out; without that the 200 would be followed much later
+    /// by a start that fails with a misleading "directory does not exist".
+    #[test]
+    fn honored_company_dir_rejects_a_regular_file_inside_the_root() {
+        let (root, base) = helper_root("file");
+        let f = root.join("README.md");
+        std::fs::write(&f, b"not a directory").unwrap();
+
+        assert_eq!(honored_company_dir(Some(f.to_str().unwrap()), &root), None);
+        // Same name, now a dir: honored, so the refusal above is the file-ness
+        // and not the path.
+        std::fs::remove_file(&f).unwrap();
+        std::fs::create_dir_all(&f).unwrap();
+        assert_eq!(
+            honored_company_dir(Some(f.to_str().unwrap()), &root),
+            std::fs::canonicalize(&f).ok()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// §4.1: a RELATIVE client dir is refused even when it really does resolve
+    /// inside the root, because it resolves against the daemon's working
+    /// directory: the outcome of a request must not depend on how the server
+    /// was started. The fixture is rooted under the process cwd (the crate's
+    /// `target/`, gitignored and disposable) so the relative path genuinely
+    /// lands in the root and the refusal cannot be an accident.
+    #[test]
+    fn honored_company_dir_rejects_a_relative_client_dir() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let rel_base = std::path::PathBuf::from("target")
+            .join(format!("supermux-honored-rel-{}", uuid::Uuid::new_v4()));
+        let repo_rel = rel_base.join("co-root").join("portfolio");
+        std::fs::create_dir_all(&repo_rel).unwrap();
+        let root_abs = cwd.join(&rel_base).join("co-root");
+        let repo_abs = cwd.join(&repo_rel);
+
+        // The fixture is real: the relative spelling DOES resolve inside root.
+        assert!(std::fs::canonicalize(&repo_rel)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(&root_abs).unwrap()));
+
+        assert_eq!(
+            honored_company_dir(Some(repo_rel.to_str().unwrap()), &root_abs),
+            None,
+            "a relative client dir is refused"
+        );
+        assert_eq!(
+            honored_company_dir(Some(repo_abs.to_str().unwrap()), &root_abs),
+            std::fs::canonicalize(&repo_abs).ok(),
+            "the same dir spelled absolutely is honored"
+        );
+
+        let _ = std::fs::remove_dir_all(cwd.join(&rel_base));
+    }
+
+    /// §4.1: an EXPLICIT client dir that canonicalizes INSIDE the company root
+    /// is HONORED. The hub dispatcher boots operator sessions into a portfolio
+    /// repo that already lives in the company tree; forcing `<root>/<name>/`
+    /// there would strand every such boot in an empty per-spawn dir.
+    #[tokio::test]
+    async fn company_session_dir_honors_client_dir_inside_root() {
+        let (state, dir) = test_state().await;
+        let (acme, root) = seed_company(&state, "acme").await;
+
+        // A real repo inside the company root, exactly what the dispatcher sends.
+        let repo = std::path::Path::new(&root).join("portfolio");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut a = input("bot-in-root");
+        a.dir = Some(repo.display().to_string());
+        a.company_id = Some(acme);
+        let view = create(&state, a).await.expect("create bot-in-root");
+
+        let want = std::fs::canonicalize(&repo).unwrap().display().to_string();
+        assert_eq!(view.dir, want, "an in-root client dir is honored as sent");
+        assert_eq!(view.company_id, Some(acme));
+        let forced = std::path::Path::new(&root).join("bot-in-root");
+        assert!(
+            !forced.exists(),
+            "the forced per-session dir must not be created when the client dir wins"
+        );
+
+        crate::sessions::native::forget("bot-in-root");
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §4.1: a symlink that LIVES inside the root but POINTS outside it is not
+    /// a way out of the jail. Canonicalization resolves the link first, so the
+    /// prefix check fails and the forced `<root>/<name>/` dir is used.
+    #[tokio::test]
+    async fn company_session_dir_rejects_symlink_escaping_root() {
+        let (state, dir) = test_state().await;
+        let (acme, root) = seed_company(&state, "acme").await;
+
+        let outside =
+            std::env::temp_dir().join(format!("supermux-co-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = std::path::Path::new(&root).join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let mut a = input("bot-escape");
+        a.dir = Some(link.display().to_string());
+        a.company_id = Some(acme);
+        let view = create(&state, a).await.expect("create bot-escape");
+
+        let want = std::path::Path::new(&root)
+            .join("bot-escape")
+            .display()
+            .to_string();
+        assert_eq!(view.dir, want, "a symlink out of the root falls back to forced");
+        assert!(std::path::Path::new(&want).is_dir(), "forced folder mkdir'd");
+
+        crate::sessions::native::forget("bot-escape");
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// §4.1: `..` traversal out of the root falls back to forced. The target is
+    /// a REAL dir, so the fallback is the prefix check itself and not a failed
+    /// canonicalize, and a plain string prefix check would wrongly accept it.
+    #[tokio::test]
+    async fn company_session_dir_rejects_traversal() {
+        let (state, dir) = test_state().await;
+        let (acme, root) = seed_company(&state, "acme").await;
+
+        let parent = std::path::Path::new(&root)
+            .parent()
+            .expect("root has a parent")
+            .to_path_buf();
+        let elsewhere = parent.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let traversal = std::path::Path::new(&root)
+            .join("..")
+            .join("elsewhere")
+            .display()
+            .to_string();
+
+        let mut a = input("bot-dotdot");
+        a.dir = Some(traversal);
+        a.company_id = Some(acme);
+        let view = create(&state, a).await.expect("create bot-dotdot");
+
+        let want = std::path::Path::new(&root)
+            .join("bot-dotdot")
+            .display()
+            .to_string();
+        assert_eq!(view.dir, want, "`..` out of the root falls back to forced");
+        assert!(std::path::Path::new(&want).is_dir(), "forced folder mkdir'd");
+
+        crate::sessions::native::forget("bot-dotdot");
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// §4.1: with NO client dir (and with a blank one), the forced default is
+    /// used, end to end through `create()`. The `$HOME` regression itself is
+    /// pinned without touching the real home by
+    /// [`honored_company_dir_ignores_absent_and_blank_client_dir`] above: the
+    /// main-bot fallback dir must never reach the honored-dir check.
+    #[tokio::test]
+    async fn company_session_dir_with_no_client_dir_is_forced() {
+        let (state, dir) = test_state().await;
+        let (acme, root) = seed_company(&state, "acme").await;
+
+        for (name, client_dir) in [("bot-nodir", None), ("bot-blankdir", Some("   ".to_string()))] {
+            let mut a = input(name);
+            a.dir = client_dir;
+            a.company_id = Some(acme);
+            let view = create(&state, a).await.expect("create company bot");
+
+            let want = std::path::Path::new(&root).join(name).display().to_string();
+            assert_eq!(view.dir, want, "no client dir keeps the forced default");
+            assert!(std::path::Path::new(&want).is_dir(), "forced folder mkdir'd");
+            if let Some(home) = dirs::home_dir() {
+                assert_ne!(
+                    view.dir,
+                    home.display().to_string(),
+                    "the $HOME fallback must never become a company session dir"
+                );
+            }
+            crate::sessions::native::forget(name);
+        }
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
     /// §4.1 — `duplicate()` bypasses `create()`'s dir-forcing; a duplicated
     /// COMPANY session gets its own re-derived `<root_dir>/<new>/` (never the
     /// source's folder), while a main-bot duplicate copies `dir` verbatim.
