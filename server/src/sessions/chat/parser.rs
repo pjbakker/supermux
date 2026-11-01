@@ -495,6 +495,19 @@ fn user_block(line: &Map<String, Value>, base: &Header, i: usize, b: &Value) -> 
     match ty {
         "text" => {
             let text = b.get("text").and_then(Value::as_str).unwrap_or("");
+            // THE COMPACTION SUMMARY. Right after a `compact_boundary` Claude
+            // Code writes the whole summary of the dropped turns as a user line
+            // flagged `isCompactSummary`. Nobody typed it, so it is never a
+            // prompt: as one it drew a page-long bubble in the user's mouth and
+            // became the tile's last-prompt preview. The renderer drops it.
+            if bool_at(line, &["isCompactSummary"]) == Some(true) {
+                return base.entry_at(
+                    i,
+                    Kind::System,
+                    serde_json::json!({ "content": text, "level": "info" }),
+                    Some("compact_summary"),
+                );
+            }
             // THE GRACE WINDOW (`limit.grace_window`). Between "approaching" and
             // "blocked" the server sets `anthropic-ratelimit-unified-grace-status`
             // and Claude Code INJECTS a wrap-up instruction into the model's
@@ -1480,6 +1493,54 @@ mod tests {
         };
         assert_eq!(e[0].body["trigger"], "manual");
         assert!(e[0].body.get("pre_tokens").is_none());
+    }
+
+    #[test]
+    fn compact_summary_is_a_system_entry_never_a_prompt() {
+        // Shape as CC 2.1.310 writes it: string content, no `promptSource`.
+        let l = r#"{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation."},"isVisibleInTranscriptOnly":true,"isCompactSummary":true,"uuid":"cs1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1"}"#;
+        let ParsedLine::Entry(e) = parse_line(l, 2048) else {
+            panic!()
+        };
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].kind, Kind::System);
+        assert_eq!(e[0].label.as_deref(), Some("compact_summary"));
+        assert_eq!(e[0].offset, 2048, "the cursor still moves past the summary");
+        assert!(e[0].body["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("This session is being continued"));
+
+        // Block-list content is caught the same way.
+        let l = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"This session is being continued"}]},"isCompactSummary":true,"uuid":"cs2","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let ParsedLine::Entry(e) = parse_line(l, 0) else {
+            panic!()
+        };
+        assert_eq!(e[0].kind, Kind::System);
+        assert_eq!(e[0].label.as_deref(), Some("compact_summary"));
+    }
+
+    #[test]
+    fn the_same_text_without_the_flag_is_still_a_prompt() {
+        // Pasting a summary by hand is a real prompt: only the flag decides.
+        let l = r#"{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation"},"isCompactSummary":false,"uuid":"cs3","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let ParsedLine::Entry(e) = parse_line(l, 0) else {
+            panic!()
+        };
+        assert_eq!(e[0].kind, Kind::Prompt);
+    }
+
+    #[test]
+    fn a_boundary_then_its_summary_keeps_the_cursor_moving() {
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"c1","timestamp":"2026-01-01T00:00:00Z","compactMetadata":{"trigger":"auto"}}"#;
+        let summary = r#"{"type":"user","message":{"role":"user","content":"This session is being continued"},"isCompactSummary":true,"uuid":"cs1","timestamp":"2026-01-01T00:00:01Z"}"#;
+        let prompt = r#"{"type":"user","message":{"role":"user","content":"next"},"uuid":"u1","timestamp":"2026-01-01T00:00:02Z"}"#;
+        let raw = format!("{boundary}\n{summary}\n{prompt}\n");
+        let (e, end) = parse_stream(std::io::Cursor::new(raw.as_bytes()), 0);
+        assert_eq!(end, raw.len() as u64);
+        let kinds: Vec<Kind> = e.iter().map(|x| x.kind).collect();
+        assert_eq!(kinds, vec![Kind::CompactBoundary, Kind::System, Kind::Prompt]);
+        assert_eq!(e[1].offset, (boundary.len() + 1) as u64);
     }
 
     #[test]

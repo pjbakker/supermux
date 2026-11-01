@@ -1221,6 +1221,11 @@ fn classify_user(v: &serde_json::Value) -> Option<ClassifiedUser> {
         .and_then(|s| s.as_str())
         .unwrap_or("");
 
+    let is_compact_summary = v
+        .get("isCompactSummary")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+
     // 2) Content shape.
     let content = v.get("message")?.get("content")?;
 
@@ -1248,6 +1253,17 @@ fn classify_user(v: &serde_json::Value) -> Option<ClassifiedUser> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
+    }
+
+    // 3b) The compaction summary Claude Code writes after a `compact_boundary`.
+    //    No `promptSource`, no `isMeta`, so without this it lands in step 9 as
+    //    a prompt the user never typed.
+    if is_compact_summary {
+        return Some(ClassifiedUser {
+            kind: Kind::System,
+            text: short_summary(trimmed),
+            label: None,
+        });
     }
 
     // 4) `promptSource: "typed"` — the harness's own positive signal that
@@ -2152,6 +2168,19 @@ mod tests {
             "message": { "role": "user", "content": content },
         });
         classify_user(&v).expect("classified")
+    }
+
+    #[test]
+    fn classify_compact_summary_is_system_not_a_prompt() {
+        let v = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "This session is being continued from a previous conversation that ran out of context." },
+            "isVisibleInTranscriptOnly": true,
+            "isCompactSummary": true,
+        });
+        let c = classify_user(&v).expect("classified");
+        assert_eq!(c.kind, Kind::System);
+        assert!(!c.kind.is_user_initiated());
     }
 
     #[test]

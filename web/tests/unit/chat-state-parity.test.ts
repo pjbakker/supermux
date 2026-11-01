@@ -352,28 +352,32 @@ describe('the roster badge names the bucket without a chat store', () => {
   })
 })
 
-describe('the compaction seam says how much history went away', () => {
-  // "Conversation compacted" answers "what happened" and nothing else. The
-  // payload has always carried `compactMetadata` — trigger, preTokens,
-  // postTokens — and the row dropped all three, so the transcript could not say
-  // whether the user asked for the compaction or the context filled up, nor how
-  // much was summarised away. The size of the drop is the only thing that
-  // explains why the model forgot something specific.
-  test('the trigger and the token counts reach the row', () => {
-    const row = byName('a compaction seam')
-    const entries = toChatEntries([wireFrom(row)])
-    expect(entries).toHaveLength(1)
-    expect(entries[0].text).toBe('earlier turns are summarised automatically · 1.0M → 17k tokens')
-    expect(itemNode(buildTranscript(toDisplayList(entries), {}))?.speaker).toBe('system')
+describe('compaction leaves no trace in the chat view', () => {
+  // The owner's call: the seam and the summary Claude Code writes after it have
+  // zero value in the chat and only clutter it.
+  test('the seam renders nothing, with or without its metadata', () => {
+    const seam = wireFrom(byName('a compaction seam'))
+    expect(toChatEntries([seam])).toHaveLength(0)
+    const bare = { ...seam, body: { content: 'Conversation compacted' } }
+    expect(toChatEntries([bare])).toHaveLength(0)
   })
 
-  test('a payload without the metadata still gets its row, minus the clauses', () => {
-    // A CC version that renames a field must produce LESS on the row, never a
-    // wrong number and never a missing seam (`parser.rs` reads all three
-    // defensively for the same reason).
-    const bare = { ...wireFrom(byName('a compaction seam')), body: { content: 'Conversation compacted' } }
-    const entries = toChatEntries([bare])
-    expect(entries[0].text).toBe('earlier turns are summarised')
+  test('the summary is never a bubble, and the prompt after it still is', () => {
+    const seam = wireFrom(byName('a compaction seam'), 1)
+    const summary = wireFrom(byName('a compaction summary'), 2)
+    expect(summary.kind).toBe('system')
+    const prompt: WireEntry = {
+      ...summary,
+      seq: 3,
+      uuid: 'after-compact',
+      kind: 'prompt',
+      label: undefined,
+      body: { text: 'carry on' },
+    }
+    const entries = toChatEntries([seam, summary, prompt])
+    expect(entries).toHaveLength(1)
+    expect(entries[0].uuid).toBe('after-compact')
+    expect(entries[0].text).toBe('carry on')
   })
 })
 
