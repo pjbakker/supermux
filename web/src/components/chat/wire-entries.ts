@@ -572,18 +572,6 @@ function bool(body: unknown, key: string): boolean {
   return field(body, key) === true
 }
 
-/** `999996` → `1.0M`, `16752` → `17k`. Two significant figures is all a "how
- *  much history went away" clause can support, and an exact token count would
- *  read as a precision the number does not have. */
-function tokenCount(n: number): string {
-  const k = Math.round(n / 1_000)
-  // The promotion is on the ROUNDED value, not on the raw one: 999,996 tokens
-  // is "1.0M", never "1000k".
-  if (k >= 1_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${k}k`
-  return String(n)
-}
-
 function str(body: unknown, key: string): string | undefined {
   const v = field(body, key)
   return typeof v === 'string' && v.trim() ? v.trim() : undefined
@@ -593,33 +581,18 @@ function str(body: unknown, key: string): string | undefined {
  * One allowlisted system entry → the centred line it becomes, or `null` for
  * the subtypes that stay dropped.
  *
- * The copy states the CONSEQUENCE, not the subtype: "earlier turns are
- * summarised" is why the history above a compaction seam looks amputated, and
- * naming both models is the whole content of a fallback notice — a warning that
- * says "model_refusal_fallback" tells the reader nothing they can act on.
+ * The copy states the CONSEQUENCE, not the subtype: naming both models is the
+ * whole content of a fallback notice, and a warning that says
+ * "model_refusal_fallback" tells the reader nothing they can act on.
  */
 function systemRow(w: WireEntry): { text: string; badge: string; detail?: string } | null {
-  if (w.kind === 'compact_boundary') {
-    // THE NUMBERS ARE THE POINT. "earlier turns are summarised" says the history
-    // above the seam is not what the model has any more; it does not say whether
-    // the user asked for that or the context filled up, nor how much went away —
-    // and the size of the drop is the only thing that explains why the model
-    // forgot something specific. All three fields are optional on the wire
-    // (`parser.rs` reads them defensively), so each clause appears only when the
-    // payload actually carried it.
-    const trigger = str(w.body, 'trigger')
-    const pre = num(w.body, 'pre_tokens')
-    const post = num(w.body, 'post_tokens')
-    const how = trigger === 'auto' ? ' automatically' : trigger === 'manual' ? ' on request' : ''
-    const size = pre && post ? ` · ${tokenCount(pre)} → ${tokenCount(post)} tokens` : ''
-    return {
-      text: `earlier turns are summarised${how}${size}`,
-      badge: 'compaction',
-    }
-  }
+  // COMPACTION IS NOT A CHAT EVENT. The seam and the summary Claude Code writes
+  // after it (`parser.rs` labels it `compact_summary`) only clutter the view.
+  if (w.kind === 'compact_boundary') return null
   switch (w.label) {
     case 'turn_started':
-    case 'turn_complete': return null
+    case 'turn_complete':
+    case 'compact_summary': return null
     case 'turn_aborted': return { text: str(w.body, 'content') ?? 'Turn interrupted.', badge: 'harness' }
     case 'model_refusal_fallback':
     case 'model_fallback':
@@ -999,11 +972,11 @@ export function toChatEntries(
 
     // ── THE SYSTEM ROWS THAT CARRY A FACT ───────────────────────────────────
     // A NARROW allowlist, not an open door. `toChatEntries` dropped every
-    // system entry, which made a silent model swap, a retry storm and a
-    // compaction seam all render as literally nothing — the turn looked
-    // finished. Everything still absent from this switch (stop_hook_summary,
-    // turn_duration, local_command, scheduled_task_fire) stays dropped: those
-    // are genuinely chrome, and the census counts 4257 of the first alone.
+    // system entry, which made a silent model swap and a retry storm render as
+    // literally nothing, so the turn looked finished. Everything still absent
+    // from this switch (stop_hook_summary, turn_duration, local_command,
+    // scheduled_task_fire) and the compaction seam and summary stay dropped:
+    // those are chrome, and the census counts 4257 of the first alone.
     if (w.kind === 'system' || w.kind === 'compact_boundary') {
       // A RETRACTION outranks whatever else the line was. It is read before
       // `systemRow` because the subtype that carries it is not fixed (see
