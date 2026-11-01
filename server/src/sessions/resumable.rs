@@ -230,7 +230,9 @@ fn parse_transcript(path: &Path) -> Parsed {
                     continue;
                 }
                 message_count += 1;
-                if ty == "user" && first_user_text.is_none() {
+                // The compaction summary is CC's text, never the user's opener.
+                let compact = v.get("isCompactSummary").and_then(|b| b.as_bool()) == Some(true);
+                if ty == "user" && !compact && first_user_text.is_none() {
                     if let Some(t) = extract_user_text(&v) {
                         first_user_text = Some(t);
                     }
@@ -411,6 +413,24 @@ mod tests {
 
         // updated_at is a parseable RFC3339 timestamp.
         assert!(chrono::DateTime::parse_from_rfc3339(&list[0].updated_at).is_ok());
+    }
+
+    #[test]
+    fn a_compaction_summary_is_never_the_fallback_title() {
+        // A resumed-after-compaction transcript can open with the summary.
+        let proj = temp_dir();
+        write_jsonl(
+            &proj,
+            "dddddddd-0000-0000-0000-000000000004",
+            &[
+                r#"{"type":"system","subtype":"compact_boundary"}"#,
+                r#"{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation"},"isCompactSummary":true}"#,
+                r#"{"type":"user","message":{"role":"user","content":"fix the login bug"}}"#,
+            ],
+        );
+        let list = list_in_project_dir(&proj);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].summary, "fix the login bug");
     }
 
     #[test]

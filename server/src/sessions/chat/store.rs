@@ -839,6 +839,26 @@ mod tests {
         assert_eq!(t.ts, 30, "the tail stamp is the NEWEST of the two");
     }
 
+    #[test]
+    fn tail_summary_skips_a_compaction_summary_newer_than_the_last_prompt() {
+        // The tile's last-prompt preview must stay the user's own words.
+        use crate::sessions::chat::parser::{parse_line, ParsedLine};
+        let line = r#"{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation"},"isCompactSummary":true,"uuid":"cs1","timestamp":"2026-01-01T00:00:40Z"}"#;
+        let ParsedLine::Entry(mut parsed) = parse_line(line, 0) else {
+            panic!()
+        };
+        let summary = parsed.remove(0);
+        let store = ChatStore::new();
+        let mut p = ChatEntry::test_text("p1", "real prompt");
+        p.kind = Kind::Prompt;
+        p.ts_ms = 10;
+        let mut a = ChatEntry::test_text("a1", "an answer");
+        a.ts_ms = 20;
+        store.publish(vec![p, a, summary]);
+        let t = store.tail_summary().unwrap();
+        assert_eq!(t.user, "real prompt");
+    }
+
     /* ── fase B2 T5: the unread counter's domain ──────────────────────────── */
 
     #[test]

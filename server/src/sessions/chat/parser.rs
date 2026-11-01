@@ -103,7 +103,7 @@ pub fn parse_line_with(dialect: Dialect, line: &str, offset: u64) -> ParsedLine 
         return ParsedLine::Skip;
     }
     if line.len() > MAX_LINE_BYTES {
-        return ParsedLine::Entry(vec![oversize_entry(line, offset)]);
+        return ParsedLine::Entry(vec![oversize_entry(line, offset, false)]);
     }
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -193,6 +193,11 @@ pub fn parse_scan_with<R: BufRead>(
             let mut consumed = n as u64;
             let mut terminated = false;
             let mut skip: Vec<u8> = Vec::new();
+            // CC writes `isCompactSummary` AFTER the content, so on an oversize
+            // line it sits in the discarded tail. Scan it there, carrying a few
+            // bytes so a flag split across two chunks is still seen.
+            let mut compact = false;
+            let mut carry: Vec<u8> = buf[buf.len().saturating_sub(COMPACT_FLAG.len())..].to_vec();
             loop {
                 skip.clear();
                 let m = (&mut reader)
@@ -203,6 +208,11 @@ pub fn parse_scan_with<R: BufRead>(
                     break;
                 }
                 consumed += m as u64;
+                if !compact {
+                    carry.extend_from_slice(&skip);
+                    compact = contains_bytes(&carry, COMPACT_FLAG.as_bytes());
+                    carry.drain(..carry.len().saturating_sub(COMPACT_FLAG.len()));
+                }
                 if skip.last() == Some(&b'\n') {
                     terminated = true;
                     break;
@@ -212,7 +222,7 @@ pub fn parse_scan_with<R: BufRead>(
                 break;
             }
             let prefix = String::from_utf8_lossy(&buf);
-            let stop = !sink(oversize_entry(&prefix, offset));
+            let stop = !sink(oversize_entry(&prefix, offset, compact));
             offset += consumed;
             if stop {
                 break;
@@ -1051,9 +1061,29 @@ fn agent_error_body(
 /// The scan is a heuristic by construction — we are deliberately not running a
 /// JSON parser over a 950 KB line — so the uuid may be missing (synthesised)
 /// and the kind is the coarse top-level one. `fetch-full` streams the real line.
-fn oversize_entry(line: &str, offset: u64) -> ChatEntry {
+fn oversize_entry(line: &str, offset: u64, compact_in_tail: bool) -> ChatEntry {
     let ty = scan_top_level_type(line).unwrap_or("");
     let uuid = scan_field(line, "uuid").unwrap_or_else(|| format!("@{offset}"));
+
+    // A compaction summary too big to parse must still not come back as a
+    // prompt with an empty body: same verdict as the parsed path.
+    if ty == "user" && (compact_in_tail || line.contains(COMPACT_FLAG)) {
+        return ChatEntry {
+            uuid,
+            kind: Kind::System,
+            ts_ms: parse_ts_ms(scan_field(line, "timestamp").as_deref()),
+            offset,
+            session_id: scan_field(line, "session_id").or_else(|| scan_field(line, "sessionId")),
+            tool_use_id: None,
+            label: Some("compact_summary".to_string()),
+            ok: None,
+            is_sidechain: line.contains("\"isSidechain\":true"),
+            agent_id: scan_field(line, "agentId"),
+            is_meta: line.contains("\"isMeta\":true"),
+            oversize: true,
+            body: Value::Null,
+        };
+    }
 
     // A blocked/failed assistant record must stay blocked even when oversized.
     // The reduction below would otherwise collapse an `isApiErrorMessage` /
@@ -1167,6 +1197,13 @@ fn kind_for_top_level(ty: &str) -> Kind {
         "mode" | "permission-mode" => Kind::Mode,
         _ => Kind::Unknown,
     }
+}
+
+/// The raw-bytes form of the `isCompactSummary` flag, for lines too big to parse.
+const COMPACT_FLAG: &str = "\"isCompactSummary\":true";
+
+fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 /// First `"type":"…"` whose value is a known top-level type, else the first one.
@@ -1560,6 +1597,39 @@ mod tests {
             }
             other => panic!("oversize line must still produce a placeholder entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_oversized_compact_summary_is_still_not_a_prompt() {
+        // The flag comes AFTER the content, as CC writes it, so the streaming
+        // path only sees it in the discarded tail of the line.
+        let huge = format!(
+            r#"{{"type":"user","uuid":"big-cs","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"user","content":"This session is being continued {}"}},"isVisibleInTranscriptOnly":true,"isCompactSummary":true}}"#,
+            "x".repeat(MAX_LINE_BYTES)
+        );
+        let ParsedLine::Entry(e) = parse_line(&huge, 0) else {
+            panic!("oversize line must still produce a placeholder entry")
+        };
+        assert_eq!(e[0].kind, Kind::System);
+        assert_eq!(e[0].label.as_deref(), Some("compact_summary"));
+        assert!(e[0].oversize);
+
+        let prompt = r#"{"type":"user","message":{"role":"user","content":"next"},"uuid":"u1","timestamp":"2026-01-01T00:00:02Z"}"#;
+        let raw = format!("{huge}\n{prompt}\n");
+        let (e, end) = parse_stream(std::io::Cursor::new(raw.as_bytes()), 0);
+        assert_eq!(end, raw.len() as u64, "the cursor still moves past it");
+        assert_eq!(e.len(), 2);
+        assert!(e[0].oversize);
+        assert_eq!(e[0].kind, Kind::System, "streamed: flag found in the tail");
+        assert_eq!(e[0].label.as_deref(), Some("compact_summary"));
+        assert_eq!(e[0].uuid, "big-cs");
+        assert_eq!(e[1].kind, Kind::Prompt);
+
+        // Without the flag an oversize user line keeps the old coarse kind.
+        let plain = huge.replace(r#","isCompactSummary":true"#, "");
+        let raw = format!("{plain}\n");
+        let (e, _) = parse_stream(std::io::Cursor::new(raw.as_bytes()), 0);
+        assert_eq!(e[0].kind, Kind::Prompt);
     }
 
     #[test]
