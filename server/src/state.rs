@@ -421,6 +421,17 @@ pub enum EditResult {
 /// ([`AppState::note_teammate_conversation`]).
 pub const TEAMMATE_CONVERSATIONS_CAP: usize = 256;
 
+/// One session's teammate conversation ids, oldest first.
+///
+/// The set is behind an `Arc` so the chat tailer's sibling scan reads a
+/// snapshot without copying the ids on every pass; a write (a teammate
+/// starting, rare) copies on write only while a snapshot is outstanding.
+#[derive(Debug, Default, Clone)]
+pub struct TeammateConversations {
+    order: std::collections::VecDeque<String>,
+    set: Arc<std::collections::HashSet<String>>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     /// SQLite connection pool (WAL, FK on).
@@ -524,15 +535,16 @@ pub struct AppState {
     /// `()` value = a presence set; cleared on session delete/rename.
     pub hooks_live: Arc<DashMap<String, ()>>,
     /// Per-session set of Claude conversation ids that belong to the session's
-    /// IN-PROCESS TEAMMATES (agent teams), learnt from their own
-    /// lifecycle/pointer hooks (`hooks.rs`, the `foreign_agent` predicate).
+    /// IN-PROCESS TEAMMATES (agent teams), learnt from a teammate's own
+    /// `SessionStart` with `source: "startup"` (`hooks.rs`, the `foreign_agent`
+    /// predicate) and forgotten again when the lead's pointer adopts an id.
     /// A teammate writes its transcript as a top-level sibling of the lead's,
     /// so the chat tailer's `--resume` backstop excludes these ids from its
     /// sibling scan; otherwise every busy teammate read as "a newer
     /// conversation in this project". Bounded per session
     /// ([`TEAMMATE_CONVERSATIONS_CAP`]); cleared on delete, renamed with the
     /// session.
-    pub teammate_conversations: Arc<DashMap<String, std::collections::HashSet<String>>>,
+    pub teammate_conversations: Arc<DashMap<String, TeammateConversations>>,
     /// Per-session detector wake — "within 1s of a real Claude
     /// notification". The hook endpoint `notify_one`s this so the affected
     /// session's 2s detector loop re-ticks immediately instead of waiting out the
@@ -1446,29 +1458,47 @@ impl AppState {
     }
 
     /// Remember `conv_id` as an in-process teammate's conversation under
-    /// session `name`. Idempotent. Past [`TEAMMATE_CONVERSATIONS_CAP`] the set
-    /// is reset rather than grown: forgetting old teammates only re-arms the
-    /// backstop for their (by then long cold) transcripts.
+    /// session `name`. Idempotent. Past [`TEAMMATE_CONVERSATIONS_CAP`] the
+    /// OLDEST id is evicted: forgetting the longest-started teammate only
+    /// re-arms the backstop for its transcript, and busy recent ones stay.
     pub fn note_teammate_conversation(&self, name: &str, conv_id: &str) {
         let conv_id = conv_id.trim();
         if conv_id.is_empty() {
             return;
         }
-        let mut set = self.teammate_conversations.entry(name.to_string()).or_default();
-        if set.contains(conv_id) {
+        let mut guard = self.teammate_conversations.entry(name.to_string()).or_default();
+        let entry = &mut *guard;
+        if entry.set.contains(conv_id) {
             return;
         }
-        if set.len() >= TEAMMATE_CONVERSATIONS_CAP {
-            set.clear();
+        let set = Arc::make_mut(&mut entry.set);
+        while set.len() >= TEAMMATE_CONVERSATIONS_CAP {
+            let Some(oldest) = entry.order.pop_front() else { break };
+            set.remove(&oldest);
         }
         set.insert(conv_id.to_string());
+        entry.order.push_back(conv_id.to_string());
+    }
+
+    /// Drop `conv_id` from `name`'s teammate set: the lead's own pointer just
+    /// adopted it, so it is the lead's conversation, never a teammate's.
+    pub fn forget_teammate_conversation(&self, name: &str, conv_id: &str) {
+        let Some(mut entry) = self.teammate_conversations.get_mut(name) else {
+            return;
+        };
+        if !entry.set.contains(conv_id) {
+            return;
+        }
+        Arc::make_mut(&mut entry.set).remove(conv_id);
+        entry.order.retain(|c| c != conv_id);
     }
 
     /// The teammate conversation ids recorded for `name` (empty when none).
-    pub fn teammate_conversations_of(&self, name: &str) -> std::collections::HashSet<String> {
+    /// A shared snapshot: no ids are copied.
+    pub fn teammate_conversations_of(&self, name: &str) -> Arc<std::collections::HashSet<String>> {
         self.teammate_conversations
             .get(name)
-            .map(|s| s.clone())
+            .map(|e| e.set.clone())
             .unwrap_or_default()
     }
 

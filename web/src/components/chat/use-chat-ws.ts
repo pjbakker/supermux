@@ -38,6 +38,7 @@ import {
   type ChatConnState,
   type ChatGone,
   type ChatSnapshot,
+  type ChatSocketOptions,
 } from './chat-socket'
 import {
   chatPresentation,
@@ -121,7 +122,14 @@ interface SnapshotStore {
  *  threaded rather than branched on because everything else in here — the
  *  foreground redial, the link aggregate, the dispose discipline — is behaviour
  *  a second data plane must inherit, not copy. */
-function chatStore(name: string, enabled: boolean, path?: string): SnapshotStore {
+export function chatStore(
+  name: string,
+  enabled: boolean,
+  path?: string,
+  /** Test seam only: the socket's transport and clock. Production passes
+   *  nothing and gets the real WebSocket and timers. */
+  deps?: Partial<Omit<ChatSocketOptions, 'name' | 'path' | 'onSnapshot'>>,
+): SnapshotStore {
   let snapshot: ChatSnapshot = EMPTY_SNAPSHOT
   let socket: ChatSocket | null = null
   const listeners = new Set<() => void>()
@@ -185,6 +193,7 @@ function chatStore(name: string, enabled: boolean, path?: string): SnapshotStore
       listeners.add(onChange)
       if (enabled && socket === null) {
         socket = new ChatSocket({
+          ...deps,
           name,
           path,
           onSnapshot: (s) => {

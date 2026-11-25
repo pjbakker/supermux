@@ -273,7 +273,18 @@ pub(crate) async fn ingest(
     // `--resume` backstop does not read a busy teammate as "a newer
     // conversation in this project" (`tailer.rs::newest_sibling_mtime_ms`).
     // Rides the predicate already computed above: no extra work on tool hooks.
-    if foreign_agent {
+    //
+    // ONLY from the unambiguous teammate shape: a `SessionStart` with
+    // `source: "startup"`. An `--agent` lead carries `agent_type` on its own
+    // payloads too, so after a terminal-side resume or `/clear` whose
+    // SessionStart was lost, its next UserPromptSubmit names the NEW id and
+    // reads as foreign. Learning that id would hide the very transcript the
+    // backstop exists to spot. A switch the lead announces (`clear`/`resume`)
+    // is the lead's by definition, and is adopted below.
+    if foreign_agent
+        && is_session_start(&body.event)
+        && payload_str(&raw_payload, "source") == Some("startup")
+    {
         if let Some(id) = payload_str(&raw_payload, "session_id")
             .or_else(|| payload_str(&raw_payload, "sessionId"))
         {
@@ -572,6 +583,9 @@ async fn track_pointer_attributed(
             return;
         }
     }
+    // The lead's pointer is adopting `id`, so it is not a teammate's: keep it
+    // visible to the tailer's sibling scan should the lead move off it again.
+    state.forget_teammate_conversation(session, id);
     if db::sessions::track_cc_conversation_id(&state.pool, session, id)
         .await
         .unwrap_or(false)
@@ -1189,6 +1203,10 @@ fn is_stop_failure(event: &str) -> bool {
 /// [`is_foreign_agent_payload`] this is the "teammate lifecycle" guard; tool and
 /// turn events from a teammate are deliberately NOT filtered, so they still count
 /// toward the pane's live activity.
+fn is_session_start(event: &str) -> bool {
+    matches!(event, "session_start" | "SessionStart")
+}
+
 fn is_lifecycle_event(event: &str) -> bool {
     matches!(
         event,
@@ -3391,7 +3409,7 @@ mod tests {
     #[tokio::test]
     async fn a_teammate_conversation_is_learned_for_the_sibling_scan() {
         // An in-process teammate's transcript sits beside the lead's. Its id is
-        // learned from its own lifecycle/pointer hooks so the chat tailer's
+        // learned from its own startup SessionStart so the chat tailer's
         // `--resume` backstop can skip it; the lead's own ids never are.
         let (state, dir) = test_state().await;
         let s = "lead-learns-mates";
@@ -3407,6 +3425,8 @@ mod tests {
             false,
         )
         .await;
+        // A teammate's later prompt is not a learning shape (an `--agent` lead's
+        // prompt looks the same), and the lead's own events never are.
         ingest(
             &state,
             s,
@@ -3416,34 +3436,116 @@ mod tests {
             false,
         )
         .await;
-        // The lead's own events, with or without `agent_type` (an `--agent`
-        // lead carries it), are never taken for a teammate's.
         ingest(&state, s, "%3", "user_prompt_submit", p(r#"{"session_id":"lead-conv"}"#), false)
             .await;
+
+        let mates = state.teammate_conversations_of(s);
+        assert!(mates.contains("mate-conv"));
+        assert!(!mates.contains("mate-2"));
+        assert!(!mates.contains("lead-conv"));
+        assert_eq!(mates.len(), 1);
+
+        state.forget_session(s);
+        assert!(state.teammate_conversations_of(s).is_empty());
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_agent_lead_lost_resume_stays_visible_to_the_backstop() {
+        // A lead launched with `--agent` carries `agent_type` on its OWN
+        // payloads. It resumes in the terminal and the SessionStart is lost:
+        // its next UserPromptSubmit names the NEW conversation under a
+        // different tracked id, so it reads as foreign. That id must NOT be
+        // learned as a teammate's, or the sibling scan skips exactly the
+        // transcript the backstop exists to catch.
+        let (state, dir) = test_state().await;
+        let s = "agent-lead-lost-resume";
+        db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
+        db::sessions::set_cc_conversation_id(&state.pool, s, "old-conv").await.unwrap();
+
         ingest(
             &state,
             s,
             "%3",
             "user_prompt_submit",
-            p(r#"{"session_id":"lead-conv","agent_type":"reviewer"}"#),
+            p(r#"{"session_id":"new-conv","agent_type":"reviewer"}"#),
             false,
         )
         .await;
-
-        let mates = state.teammate_conversations_of(s);
-        assert!(mates.contains("mate-conv"));
-        assert!(mates.contains("mate-2"));
-        assert!(!mates.contains("lead-conv"));
-        assert_eq!(mates.len(), 2);
-
-        // Bounded: past the cap the set starts over instead of growing.
-        for i in 0..crate::state::TEAMMATE_CONVERSATIONS_CAP {
-            state.note_teammate_conversation(s, &format!("bulk-{i}"));
-        }
-        assert!(state.teammate_conversations_of(s).len() <= crate::state::TEAMMATE_CONVERSATIONS_CAP);
-
-        state.forget_session(s);
         assert!(state.teammate_conversations_of(s).is_empty());
+        // The pointer was not followed either (pre-existing behaviour), which
+        // is what leaves the backstop as the only signal.
+        let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
+        assert_eq!(row.cc_conversation_id, "old-conv");
+
+        // An announced switch is the lead's own: not learned, and adopted.
+        ingest(
+            &state,
+            s,
+            "%3",
+            "session_start",
+            p(r#"{"session_id":"cleared-conv","agent_type":"reviewer","source":"clear"}"#),
+            false,
+        )
+        .await;
+        assert!(state.teammate_conversations_of(s).is_empty());
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_pointer_adoption_drops_the_id_from_the_teammate_set() {
+        // An id once taken for a teammate's (an `--agent` lead restarted by
+        // hand reports `startup` too) stops being one the moment the lead's
+        // pointer adopts it, so a later switch away from it is visible again.
+        let (state, dir) = test_state().await;
+        let s = "lead-adopts-mate-id";
+        db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
+        db::sessions::set_cc_conversation_id(&state.pool, s, "lead-conv").await.unwrap();
+        state.note_teammate_conversation(s, "conv-b");
+        state.note_teammate_conversation(s, "mate-conv");
+
+        ingest(
+            &state,
+            s,
+            "%3",
+            "session_start",
+            p(r#"{"session_id":"conv-b","agent_type":"reviewer","source":"resume"}"#),
+            false,
+        )
+        .await;
+        let row = db::sessions::get(&state.pool, s).await.unwrap().unwrap();
+        assert_eq!(row.cc_conversation_id, "conv-b", "precondition: the pointer adopted it");
+        let mates = state.teammate_conversations_of(s);
+        assert!(!mates.contains("conv-b"));
+        assert!(mates.contains("mate-conv"));
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_teammate_set_evicts_its_oldest_id_at_the_cap() {
+        let (state, dir) = test_state().await;
+        let s = "lead-cap";
+        let cap = crate::state::TEAMMATE_CONVERSATIONS_CAP;
+        for i in 0..cap {
+            state.note_teammate_conversation(s, &format!("m-{i}"));
+        }
+        let held = state.teammate_conversations_of(s);
+        state.note_teammate_conversation(s, "newest");
+        let mates = state.teammate_conversations_of(s);
+        assert_eq!(mates.len(), cap);
+        assert!(!mates.contains("m-0"), "the oldest goes first");
+        assert!(mates.contains("m-1"));
+        assert!(mates.contains("newest"));
+        // A snapshot taken before the write is unaffected (copy on write).
+        assert!(held.contains("m-0"));
+        state.forget_teammate_conversation(s, "m-1");
+        assert!(!state.teammate_conversations_of(s).contains("m-1"));
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(dir);

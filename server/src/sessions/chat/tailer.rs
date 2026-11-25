@@ -281,9 +281,12 @@ pub fn classify_pointer(i: PointerInputs) -> TailState {
 /// (`AppState::teammate_conversations`). They write their transcripts beside
 /// the lead's while their tool hooks arrive under the lead's token, so without
 /// this exclusion a lead waiting on a busy teammate tripped the `--resume`
-/// backstop every few seconds. A real resumed conversation is never in the
-/// set: its id only lands there from a payload carrying `agent_type` under a
-/// different tracked id, which a resume of the lead does not produce.
+/// backstop every few seconds. A real resumed conversation stays visible: ids
+/// are learnt only from a teammate-shaped `SessionStart` (`source: "startup"`,
+/// `agent_type`, an id other than the lead's tracked one), never from the
+/// UserPromptSubmit an `--agent` lead sends after a lost resume, and an id the
+/// lead's pointer adopts is dropped from the set (`hooks.rs`). Residual: an
+/// `--agent` lead restarted by hand inside its pane also reports `startup`.
 pub fn newest_sibling_mtime_ms(
     project_dir: &Path,
     conversation_id: &str,
@@ -1054,7 +1057,7 @@ async fn run(state: AppState, name: String, handle: Arc<TailerHandle>) {
         } else {
             Default::default()
         };
-        let pass = tokio::task::spawn_blocking(move || blocking_pass(taken, want_siblings, &teammates))
+        let pass = tokio::task::spawn_blocking(move || blocking_pass(taken, want_siblings, teammates.as_ref()))
             .await;
         // The blocking pool is gone (shutdown), or the pass panicked. Either
         // way this task is done — say so, loudly, instead of leaving every
