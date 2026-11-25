@@ -268,6 +268,18 @@ pub(crate) async fn ingest(
     } else {
         false
     };
+    // A teammate's conversation id names a transcript that sits beside the
+    // lead's in the same project dir. Remember it so the chat tailer's
+    // `--resume` backstop does not read a busy teammate as "a newer
+    // conversation in this project" (`tailer.rs::newest_sibling_mtime_ms`).
+    // Rides the predicate already computed above: no extra work on tool hooks.
+    if foreign_agent {
+        if let Some(id) = payload_str(&raw_payload, "session_id")
+            .or_else(|| payload_str(&raw_payload, "sessionId"))
+        {
+            state.note_teammate_conversation(&body.session, id);
+        }
+    }
 
     // Child failures do not end the main turn. The direct child identifier is
     // authoritative; named main agents may also carry agent_type, so that field
@@ -3374,6 +3386,67 @@ mod tests {
             &p(r#"{"session_id":"teammate-9","agent_type":"general-purpose"}"#)
         ));
         assert!(!has_agent_type(&p(r#"{"agent_type":" "}"#)));
+    }
+
+    #[tokio::test]
+    async fn a_teammate_conversation_is_learned_for_the_sibling_scan() {
+        // An in-process teammate's transcript sits beside the lead's. Its id is
+        // learned from its own lifecycle/pointer hooks so the chat tailer's
+        // `--resume` backstop can skip it; the lead's own ids never are.
+        let (state, dir) = test_state().await;
+        let s = "lead-learns-mates";
+        db::sessions::insert_minimal(&state.pool, s, "/tmp", "claude").await.unwrap();
+        db::sessions::set_cc_conversation_id(&state.pool, s, "lead-conv").await.unwrap();
+
+        ingest(
+            &state,
+            s,
+            "%3",
+            "session_start",
+            p(r#"{"session_id":"mate-conv","agent_type":"general-purpose","source":"startup"}"#),
+            false,
+        )
+        .await;
+        ingest(
+            &state,
+            s,
+            "%3",
+            "user_prompt_submit",
+            p(r#"{"session_id":"mate-2","agent_type":"general-purpose"}"#),
+            false,
+        )
+        .await;
+        // The lead's own events, with or without `agent_type` (an `--agent`
+        // lead carries it), are never taken for a teammate's.
+        ingest(&state, s, "%3", "user_prompt_submit", p(r#"{"session_id":"lead-conv"}"#), false)
+            .await;
+        ingest(
+            &state,
+            s,
+            "%3",
+            "user_prompt_submit",
+            p(r#"{"session_id":"lead-conv","agent_type":"reviewer"}"#),
+            false,
+        )
+        .await;
+
+        let mates = state.teammate_conversations_of(s);
+        assert!(mates.contains("mate-conv"));
+        assert!(mates.contains("mate-2"));
+        assert!(!mates.contains("lead-conv"));
+        assert_eq!(mates.len(), 2);
+
+        // Bounded: past the cap the set starts over instead of growing.
+        for i in 0..crate::state::TEAMMATE_CONVERSATIONS_CAP {
+            state.note_teammate_conversation(s, &format!("bulk-{i}"));
+        }
+        assert!(state.teammate_conversations_of(s).len() <= crate::state::TEAMMATE_CONVERSATIONS_CAP);
+
+        state.forget_session(s);
+        assert!(state.teammate_conversations_of(s).is_empty());
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

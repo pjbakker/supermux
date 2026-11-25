@@ -274,16 +274,30 @@ pub fn classify_pointer(i: PointerInputs) -> TailState {
 }
 
 /// Newest mtime (ms) among the project dir's top-level `*.jsonl` files, ignoring
-/// our own `<conv>.jsonl`. `None` when there is no other conversation.
-pub fn newest_sibling_mtime_ms(project_dir: &Path, conversation_id: &str) -> Option<i64> {
+/// our own `<conv>.jsonl` and every conversation in `teammates`. `None` when
+/// there is no other conversation.
+///
+/// `teammates` are the session's own in-process teammates
+/// (`AppState::teammate_conversations`). They write their transcripts beside
+/// the lead's while their tool hooks arrive under the lead's token, so without
+/// this exclusion a lead waiting on a busy teammate tripped the `--resume`
+/// backstop every few seconds. A real resumed conversation is never in the
+/// set: its id only lands there from a payload carrying `agent_type` under a
+/// different tracked id, which a resume of the lead does not produce.
+pub fn newest_sibling_mtime_ms(
+    project_dir: &Path,
+    conversation_id: &str,
+    teammates: &std::collections::HashSet<String>,
+) -> Option<i64> {
     let mut newest: Option<i64> = None;
     for entry in std::fs::read_dir(project_dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        if path.file_stem().and_then(|s| s.to_str()) == Some(conversation_id) {
-            continue;
+        match path.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) if stem == conversation_id || teammates.contains(stem) => continue,
+            _ => {}
         }
         if let Some(ms) = entry.metadata().ok().and_then(|m| mtime_ms(&m)) {
             newest = Some(newest.map_or(ms, |n: i64| n.max(ms)));
@@ -897,7 +911,11 @@ struct Pass {
 /// hooked, *recently* hooked session. The loop body runs on every poll AND on
 /// every debounced FS burst, so computing it unconditionally cost thousands of
 /// `statx` per second across a busy server for a value most passes discarded.
-fn blocking_pass(mut core: Tailer, want_siblings: bool) -> (Tailer, Pass) {
+fn blocking_pass(
+    mut core: Tailer,
+    want_siblings: bool,
+    teammates: &std::collections::HashSet<String>,
+) -> (Tailer, Pass) {
     let poll = core.poll();
     let meta = std::fs::metadata(core.transcript_path()).ok();
     let subagent_appended = poll.entries.iter().any(|e| e.is_sidechain);
@@ -912,7 +930,7 @@ fn blocking_pass(mut core: Tailer, want_siblings: bool) -> (Tailer, Pass) {
         pointer_exists: meta.is_some(),
         pointer_mtime_ms: meta.as_ref().and_then(mtime_ms),
         newest_sibling_mtime_ms: want_siblings
-            .then(|| newest_sibling_mtime_ms(core.project_dir(), core.conversation_id()))
+            .then(|| newest_sibling_mtime_ms(core.project_dir(), core.conversation_id(), teammates))
             .flatten(),
     };
     (core, pass)
@@ -1030,7 +1048,14 @@ async fn run(state: AppState, name: String, handle: Arc<TailerHandle>) {
         // next to the main file); a Codex rollout has no siblings to scan.
         let want_siblings =
             dialect == Dialect::Claude && running && hooks_live && hook_fresh;
-        let pass = tokio::task::spawn_blocking(move || blocking_pass(taken, want_siblings)).await;
+        // Only cloned when the scan will run, which is the rare branch.
+        let teammates = if want_siblings {
+            state.teammate_conversations_of(&name)
+        } else {
+            Default::default()
+        };
+        let pass = tokio::task::spawn_blocking(move || blocking_pass(taken, want_siblings, &teammates))
+            .await;
         // The blocking pool is gone (shutdown), or the pass panicked. Either
         // way this task is done — say so, loudly, instead of leaving every
         // attached socket waiting on a tail that will never move again.
@@ -2319,9 +2344,28 @@ mod tests {
         let dir = tmp_project("siblings");
         std::fs::write(dir.join("conv-a.jsonl"), "").unwrap();
         std::fs::write(dir.join("notes.md"), "x").unwrap();
-        assert_eq!(newest_sibling_mtime_ms(&dir, "conv-a"), None);
+        let none = std::collections::HashSet::new();
+        assert_eq!(newest_sibling_mtime_ms(&dir, "conv-a", &none), None);
         std::fs::write(dir.join("conv-b.jsonl"), "").unwrap();
-        assert!(newest_sibling_mtime_ms(&dir, "conv-a").is_some());
+        assert!(newest_sibling_mtime_ms(&dir, "conv-a", &none).is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn newest_sibling_scan_ignores_our_own_teammates() {
+        // An in-process teammate writes `<teammate>.jsonl` beside the lead's
+        // transcript. Counted as a sibling, a busy teammate read as "a newer
+        // conversation in this project" while the lead waited on it, and the
+        // chat flickered Reconnecting every few seconds.
+        let dir = tmp_project("teammate-siblings");
+        std::fs::write(dir.join("conv-a.jsonl"), "").unwrap();
+        std::fs::write(dir.join("mate-1.jsonl"), "").unwrap();
+        let mates: std::collections::HashSet<String> = ["mate-1".to_string()].into();
+        assert_eq!(newest_sibling_mtime_ms(&dir, "conv-a", &mates), None);
+        // A conversation that is NOT a known teammate still counts: the
+        // backstop's own job (a lost `--resume` SessionStart) is intact.
+        std::fs::write(dir.join("resumed.jsonl"), "").unwrap();
+        assert!(newest_sibling_mtime_ms(&dir, "conv-a", &mates).is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2334,13 +2378,13 @@ mod tests {
         let f = dir.join("conv-a.jsonl");
         append(&f, &[user_line("u1")]);
         let core = Tailer::new(&dir, "conv-a");
-        let (core, pass) = blocking_pass(core, false);
+        let (core, pass) = blocking_pass(core, false, &Default::default());
         assert!(!pass.subagent_appended, "a main-only poll flags no subagent append");
         // A subagent file appears and writes → the next pass drains its sidechain
         // line and flags the append.
         let sub = dir.join("conv-a").join("subagents").join("agent-x1.jsonl");
         append(&sub, &[user_line("s1")]);
-        let (_core, pass) = blocking_pass(core, false);
+        let (_core, pass) = blocking_pass(core, false, &Default::default());
         assert!(pass.subagent_appended, "a drained subagent line flags an append");
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -417,6 +417,10 @@ pub enum EditResult {
     Cancelled,
 }
 
+/// Most teammate conversation ids remembered per session
+/// ([`AppState::note_teammate_conversation`]).
+pub const TEAMMATE_CONVERSATIONS_CAP: usize = 256;
+
 #[derive(Clone)]
 pub struct AppState {
     /// SQLite connection pool (WAL, FK on).
@@ -519,6 +523,16 @@ pub struct AppState {
     /// but must NOT read as "the agent is working" (the core fragility this fixes).
     /// `()` value = a presence set; cleared on session delete/rename.
     pub hooks_live: Arc<DashMap<String, ()>>,
+    /// Per-session set of Claude conversation ids that belong to the session's
+    /// IN-PROCESS TEAMMATES (agent teams), learnt from their own
+    /// lifecycle/pointer hooks (`hooks.rs`, the `foreign_agent` predicate).
+    /// A teammate writes its transcript as a top-level sibling of the lead's,
+    /// so the chat tailer's `--resume` backstop excludes these ids from its
+    /// sibling scan; otherwise every busy teammate read as "a newer
+    /// conversation in this project". Bounded per session
+    /// ([`TEAMMATE_CONVERSATIONS_CAP`]); cleared on delete, renamed with the
+    /// session.
+    pub teammate_conversations: Arc<DashMap<String, std::collections::HashSet<String>>>,
     /// Per-session detector wake — "within 1s of a real Claude
     /// notification". The hook endpoint `notify_one`s this so the affected
     /// session's 2s detector loop re-ticks immediately instead of waiting out the
@@ -860,6 +874,7 @@ impl AppState {
             subagent_active_at: Arc::new(DashMap::new()),
             agents: Arc::new(DashMap::new()),
             hooks_live: Arc::new(DashMap::new()),
+            teammate_conversations: Arc::new(DashMap::new()),
             detector_wake: Arc::new(DashMap::new()),
             chat_pointer_wake: Arc::new(DashMap::new()),
             pty_heartbeat: Arc::new(DashMap::new()),
@@ -1428,6 +1443,33 @@ impl AppState {
     /// typing at the prompt can't flip the card to busy).
     pub fn mark_hooks_live(&self, name: &str) {
         self.hooks_live.entry(name.to_string()).or_insert(());
+    }
+
+    /// Remember `conv_id` as an in-process teammate's conversation under
+    /// session `name`. Idempotent. Past [`TEAMMATE_CONVERSATIONS_CAP`] the set
+    /// is reset rather than grown: forgetting old teammates only re-arms the
+    /// backstop for their (by then long cold) transcripts.
+    pub fn note_teammate_conversation(&self, name: &str, conv_id: &str) {
+        let conv_id = conv_id.trim();
+        if conv_id.is_empty() {
+            return;
+        }
+        let mut set = self.teammate_conversations.entry(name.to_string()).or_default();
+        if set.contains(conv_id) {
+            return;
+        }
+        if set.len() >= TEAMMATE_CONVERSATIONS_CAP {
+            set.clear();
+        }
+        set.insert(conv_id.to_string());
+    }
+
+    /// The teammate conversation ids recorded for `name` (empty when none).
+    pub fn teammate_conversations_of(&self, name: &str) -> std::collections::HashSet<String> {
+        self.teammate_conversations
+            .get(name)
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     /// Record `pane` of `session` as carrying Claude conversation `conv_id`
@@ -2137,6 +2179,7 @@ impl AppState {
         self.subagent_active_at.remove(name);
         self.agents.remove(name);
         self.hooks_live.remove(name);
+        self.teammate_conversations.remove(name);
         self.detector_wake.remove(name);
         self.chat_pointer_wake.remove(name);
         self.pty_heartbeat.remove(name);
@@ -2245,6 +2288,9 @@ impl AppState {
         }
         if let Some((_, v)) = self.hooks_live.remove(old) {
             self.hooks_live.insert(new.to_string(), v);
+        }
+        if let Some((_, v)) = self.teammate_conversations.remove(old) {
+            self.teammate_conversations.insert(new.to_string(), v);
         }
         if let Some((_, v)) = self.detector_wake.remove(old) {
             self.detector_wake.insert(new.to_string(), v);
