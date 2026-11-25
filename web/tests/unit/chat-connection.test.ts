@@ -60,11 +60,24 @@ describe('the four words', () => {
     expect(isPlaneDown('offline')).toBe(true)
   })
 
-  test('the global banner sees a dead chat socket, and NOT a quiet one', () => {
-    expect(linkStateFor('live')).toBe('connected')
-    expect(linkStateFor('stale')).toBe('connected')
+  test('the global banner reads the TRANSPORT, one word per socket state', () => {
+    expect(linkStateFor('connecting')).toBe('connecting')
+    expect(linkStateFor('open')).toBe('connected')
     expect(linkStateFor('reconnecting')).toBe('reconnecting')
     expect(linkStateFor('offline')).toBe('offline')
+  })
+
+  test('a tail that says reconnecting over an open socket does not paint the global banner', () => {
+    // The flicker: a newer sibling transcript (an in-process teammate, or a
+    // neighbour session in the same working dir) makes the tailer report
+    // `reconnecting` for a few seconds while the socket is perfectly healthy.
+    // The chat chip says so; the app-wide banner must not.
+    const tailSays = chatPresentation({ state: 'reconnecting', lastSignalAtMs: 1, nowMs: 2 })
+    expect(tailSays).toBe('reconnecting')
+    useConnection.setState({ links: {}, state: 'idle', justRecovered: false })
+    useConnection.getState().report('chat:flicker', linkStateFor('open'))
+    expect(useConnection.getState().state).toBe('connected')
+    useConnection.getState().release('chat:flicker')
   })
 
   test('a TERMINAL close is `gone`, not a degraded link', () => {
@@ -75,6 +88,7 @@ describe('the four words', () => {
     // since the 4404 stopped the dialler outright.
     expect(linkStateFor('offline', 'no-session')).toBe('gone')
     expect(linkStateFor('offline', 'chat-unavailable')).toBe('gone')
+    expect(linkStateFor('open', 'no-session')).toBe('gone')
     expect(linkStateFor('offline', null)).toBe('offline')
   })
 

@@ -189,48 +189,17 @@ function chatStore(name: string, enabled: boolean, path?: string): SnapshotStore
           path,
           onSnapshot: (s) => {
             snapshot = s
-            // A6 T2.4 — the chat socket joins the app-wide link aggregate, so
-            // `<ReconnectBanner>` / `<ConnectionOverlay>` stop being blind to
-            // a dead chat socket. `stale` reports as CONNECTED on purpose:
-            // the socket really is up, and a global red banner for a session
-            // that is merely quiet is the false alarm T2 exists to remove.
-            useConnection
-              .getState()
-              .report(
-                linkId,
-                // The INITIAL connect handshake is NOT a reconnection. The socket
-                // opens in `connecting` before its first seed, and
-                // `chatPresentation` collapses `connecting`→`reconnecting`, so a
-                // freshly-mounted socket reported `reconnecting` → the global
-                // aggregate went degraded → and the amber→green "Connected" flash
-                // fired on the FIRST open. Harmless for a warm, long-lived socket,
-                // but the company group chat's page re-mounts (and re-dials) on
-                // every navigation, so it greeted the user with a "Connected" pill
-                // + slide EVERY time home↔chat. Report the first handshake as the
-                // calm `connecting` the banner already opens cold on; a genuine
-                // mid-session drop uses `reconnecting` with `seeded` still true,
-                // so real recoveries still flash. (`s.state === 'connecting'` only
-                // ever holds before the first seed — a reconnect is `reconnecting`.)
-                !s.seeded && s.state === 'connecting'
-                  ? 'connecting'
-                  : linkStateFor(
-                      // A session that has never had a transcript is not a link
-                      // failure, and the global banner must not shout about one:
-                      // the tail says `reconnecting` for a file that was never
-                      // written, so an app-wide "Reconnecting…" toast greeted
-                      // every new chat session. `connected` is the honest reading
-                      // — the socket is up and there is simply nothing in the file
-                      // yet.
-                      isFresh(s)
-                        ? 'live'
-                        : chatPresentation({ state: s.state, lastSignalAtMs: null, nowMs: 0 }),
-                      // A TERMINAL close is reported as `gone`, which the aggregate
-                      // skips entirely. Reporting it as `offline` is what made a
-                      // deleted session paint the global "Reconnecting…" spinner
-                      // for 30 s of grace on a socket that had already given up.
-                      s.gone,
-                    ),
-              )
+            // A6 T2.4: the chat socket joins the app-wide link aggregate, so
+            // `<ReconnectBanner>` / `<ConnectionOverlay>` see a dead chat
+            // socket. Only the TRANSPORT is reported (`linkStateFor`). The
+            // tail's own state (`reconnecting` while the pointer re-resolves,
+            // a never-written transcript, `no_hooks`, a quiet `stale`) stays on
+            // the chat surface's chip: it is not a network fact, and reporting
+            // it here made the global banner flicker over a healthy socket.
+            // The first handshake reports the calm `connecting`, so a page that
+            // re-mounts its socket on navigation does not flash "Connected".
+            // A TERMINAL close is reported as `gone`, which the aggregate skips.
+            useConnection.getState().report(linkId, linkStateFor(s.transport, s.gone))
             for (const l of listeners) l()
           },
         })

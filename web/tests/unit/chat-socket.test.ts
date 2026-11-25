@@ -485,6 +485,99 @@ describe('the reason behind “reconnecting”', () => {
   })
 })
 
+/* The global `<ReconnectBanner>` reads `transport`, never `state`: the tail's
+ * own `reconnecting` / `no_hooks` is a fact about the conversation, and
+ * reporting it app-wide made the banner flicker over a healthy socket. */
+describe('the transport, apart from the tail', () => {
+  const stateFrame = (state: string, reason?: string) =>
+    JSON.stringify({ type: 'state', state, reason })
+
+  test('connecting until the first seed, open after it', () => {
+    const h = harness()
+    expect(h.socket.snapshot().transport).toBe('connecting')
+    h.ws().deliver('{"type":"auth_ok"}')
+    h.ws().deliver('{"type":"seed","entries":[],"has_more":false,"next_before":null}')
+    expect(h.last().transport).toBe('connecting')
+    h.ws().greet([entry({ seq: 1, uuid: 'a' })], 2)
+    expect(h.last().transport).toBe('open')
+    h.socket.dispose()
+  })
+
+  test('a tail reconnecting / no_hooks / resync over an open socket leaves it open', () => {
+    const h = harness()
+    h.ws().greet([entry({ seq: 1, uuid: 'a' })], 2)
+    h.ws().deliver(stateFrame('reconnecting', 'newer conversation in this project'))
+    expect(h.last().state).toBe('reconnecting')
+    expect(h.last().transport).toBe('open')
+    h.ws().deliver(stateFrame('no_hooks'))
+    expect(h.last().state).toBe('no_hooks')
+    expect(h.last().transport).toBe('open')
+    h.ws().deliver('{"type":"resync","reason":"pointer moved"}')
+    expect(h.last().state).toBe('connecting')
+    expect(h.last().transport).toBe('open')
+    h.ws().deliver(stateFrame('live'))
+    h.ws().greet([entry({ seq: 5, uuid: 'b' })], 6)
+    expect(h.last().transport).toBe('open')
+    h.socket.dispose()
+  })
+
+  test('a never-written transcript is still an open socket', () => {
+    const h = harness()
+    h.ws().deliver('{"type":"auth_ok"}')
+    h.ws().deliver('{"type":"seed","entries":[],"has_more":false,"next_before":null}')
+    h.ws().deliver(
+      JSON.stringify({
+        type: 'seed_done',
+        state: 'reconnecting',
+        reason: 'no transcript for the tracked conversation',
+        resync_epoch: 0,
+        high_water: 1,
+      }),
+    )
+    expect(h.last().state).toBe('reconnecting')
+    expect(h.last().transport).toBe('open')
+    h.socket.dispose()
+  })
+
+  test('a dropped socket is reconnecting until a new seed lands', () => {
+    const h = harness()
+    h.ws().greet([entry({ seq: 1, uuid: 'a' })], 2)
+    h.ws().drop(1006)
+    expect(h.last().transport).toBe('reconnecting')
+    h.clock.runAll()
+    const fresh = h.ws()
+    fresh.onopen?.(null)
+    fresh.deliver('{"type":"auth_ok"}')
+    expect(h.socket.snapshot().transport).toBe('reconnecting')
+    fresh.greet([entry({ seq: 7, uuid: 'x' })], 8)
+    expect(h.last().transport).toBe('open')
+    h.socket.dispose()
+  })
+
+  test('a failed first dial is reconnecting too, and a terminal close is offline', () => {
+    const h = harness()
+    h.ws().drop(1006)
+    expect(h.last().transport).toBe('reconnecting')
+    h.socket.dispose()
+
+    const gone = harness()
+    gone.ws().greet([entry({ seq: 1, uuid: 'a' })], 2)
+    gone.ws().drop(4404, CLOSE_REASON_NO_SESSION)
+    expect(gone.last().transport).toBe('offline')
+    gone.socket.dispose()
+
+    const spent = harness()
+    for (let i = 0; i < 20; i++) {
+      const ws = spent.ws()
+      ws.onopen?.(null)
+      ws.drop(1006)
+      spent.clock.runAll()
+    }
+    expect(spent.last().transport).toBe('offline')
+    spent.socket.dispose()
+  })
+})
+
 describe('source-fenced full body recovery', () => {
   test('offset UUID reuse never applies old source body, and new-source fetch is not blocked by old in-flight work', async () => {
     const pending: Array<(body: unknown) => void> = []

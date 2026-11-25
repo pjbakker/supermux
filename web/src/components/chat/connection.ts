@@ -29,7 +29,7 @@
  * the surface.
  */
 
-import type { ChatConnState, ChatGone } from './chat-socket'
+import type { ChatConnState, ChatGone, ChatTransport } from './chat-socket'
 
 /** What a surface is allowed to say about the data plane. */
 export type ChatPresentation = 'live' | 'reconnecting' | 'stale' | 'offline'
@@ -157,25 +157,32 @@ export function isPlaneDown(p: ChatPresentation): boolean {
  * its own "— messages sent now won't be picked up." clause. */
 export const CHAT_OFFLINE_BLOCKED = 'You’re offline'
 
-/** The chat socket's state, on `connection-store.ts`'s vocabulary, so the
- *  app-wide `<ReconnectBanner>` stops being blind to a dead chat socket
- *  (A6 T2.4). `stale` is NOT reported as degraded: the socket is genuinely
- *  connected, and a global red banner for a quiet session would be the false
- *  alarm this whole task exists to remove. */
+/** The chat socket's TRANSPORT, on `connection-store.ts`'s vocabulary, so the
+ *  app-wide `<ReconnectBanner>` sees a dead chat socket (A6 T2.4) and nothing
+ *  else.
+ *
+ *  It reads `ChatTransport`, not the presentation word. The presentation folds
+ *  the server's tail state into `reconnecting` (a pointer re-resolving, a
+ *  newer sibling transcript, a session that never had one) and `stale` (a
+ *  quiet conversation, `no_hooks`). Those are facts about the CONVERSATION and
+ *  belong on the chat surface's own chip. Reporting them here made the global
+ *  banner flicker "Reconnecting..." every ~10 s over a healthy socket whenever
+ *  in-process teammates or a neighbour session wrote transcripts beside ours. */
 export function linkStateFor(
-  p: ChatPresentation,
+  t: ChatTransport,
   gone: ChatGone | null = null,
 ): 'connecting' | 'connected' | 'reconnecting' | 'offline' | 'gone' {
   // A TERMINAL CLOSE IS NOT A DEGRADED LINK. The app-wide aggregate treats an
   // `offline` link as still-reconnecting for its 30 s grace, so a session that
-  // was DELETED under an open panel painted "Reconnecting…" with a spinner —
+  // was DELETED under an open panel painted "Reconnecting..." with a spinner,
   // a promise nothing can keep, since the 4404 is terminal and the dialler has
   // already stopped. `gone` is reported instead and the aggregate skips it: the
   // link is not unhealthy, it is finished.
   if (gone !== null) return 'gone'
-  switch (p) {
-    case 'live':
-    case 'stale':
+  switch (t) {
+    case 'connecting':
+      return 'connecting'
+    case 'open':
       return 'connected'
     case 'reconnecting':
       return 'reconnecting'

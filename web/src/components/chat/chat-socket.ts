@@ -63,6 +63,27 @@ export type ChatConnState =
   | 'offline'
 
 /**
+ * The WebSocket itself, apart from the transcript tail it carries.
+ *
+ * `ChatConnState` folds the server's tail state (`reconnecting` while the
+ * tailer re-resolves its pointer, `no_hooks`) into the same word as a dropped
+ * socket. That is right for the chat surface's own chip and wrong for the
+ * app-wide `<ReconnectBanner>`, which is about the network: a tail that says
+ * `reconnecting` over a perfectly healthy socket painted a global
+ * "Reconnecting..." that flickered every few seconds. This is what the banner
+ * reads instead (`linkStateFor`).
+ */
+export type ChatTransport =
+  /** First dial, nothing seeded yet. */
+  | 'connecting'
+  /** A seed completed on the current socket, which has not dropped since. */
+  | 'open'
+  /** The socket dropped and the redialler is backing off or dialling. */
+  | 'reconnecting'
+  /** Terminal close, or the redialler gave up. */
+  | 'offline'
+
+/**
  * WHY a 4404 closed this socket — the server's own `reason`, kept apart from
  * the one word `state` collapses it to (the same shape `noTranscript` uses).
  *
@@ -104,6 +125,9 @@ export interface ChatSnapshot {
   sourceRevision?: number
   entries: readonly WireEntry[]
   state: ChatConnState
+  /** The WebSocket's own state, without the tail's. What the global link
+   *  aggregate is told (`use-chat-ws.ts`). */
+  transport: ChatTransport
   /** A complete seed page is on screen (`seed_done` landed at least once). */
   seeded: boolean
   /** Bumped by every server-ordered re-seed — a different conversation. */
@@ -164,6 +188,7 @@ const NO_UUIDS: ReadonlySet<string> = new Set()
 export const EMPTY_SNAPSHOT: ChatSnapshot = {
   entries: [],
   state: 'connecting',
+  transport: 'connecting',
   seeded: false,
   resyncCount: 0,
   hasMore: false,
@@ -259,6 +284,7 @@ export class ChatSocket {
   private readonly opts: Required<ChatSocketOptions>
   private wire: WireState = EMPTY_WIRE
   private conn: ChatConnState = 'connecting'
+  private transport: ChatTransport = 'connecting'
   /** Set once, by a terminal 4404 carrying a reason we recognise. */
   private gone: ChatGone | null = null
   private ws: SocketLike | null = null
@@ -303,6 +329,7 @@ export class ChatSocket {
       entries: this.wire.entries,
       conversationId: this.wire.conversationId, sourceGeneration: this.wire.sourceGeneration, sourceEpoch: this.wire.sourceEpoch, sourceRevision: this.wire.sourceRevision,
       state: this.conn,
+      transport: this.transport,
       seeded: this.wire.seeded,
       resyncCount: this.wire.resyncCount,
       hasMore: this.wire.hasMore,
@@ -462,6 +489,9 @@ export class ChatSocket {
       if (this.wire !== before) this.lastSignalAt = this.opts.now()
       if (this.wire !== before) {
         this.conn = stateFor(this.wire)
+        // A seed on this socket proves the transport works, whatever the tail
+        // goes on to say about its pointer.
+        if (this.wire.seeded) this.transport = 'open'
         this.pump()
         this.emit()
       }
@@ -490,6 +520,7 @@ export class ChatSocket {
           // sentence, and only one of them is an outage.
           if (ev.code === CLOSE_NOT_RUNNING) this.gone = goneFor(ev.reason)
           this.conn = 'offline'
+          this.transport = 'offline'
           this.emit()
           return
         case CLOSE_AGAIN:
@@ -506,11 +537,13 @@ export class ChatSocket {
     if (this.disposed) return
     if (this.attempt >= MAX_ATTEMPTS) {
       this.conn = 'offline'
+      this.transport = 'offline'
       this.emit()
       return
     }
     const attempt = this.attempt++
     this.conn = 'reconnecting'
+    this.transport = 'reconnecting'
     this.emit()
     this.retryTimer = this.opts.schedule(
       () => {
